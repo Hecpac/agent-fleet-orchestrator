@@ -19,30 +19,41 @@ result_dir="$runs_dir/results/$feature"
 instance_lock="$runs_dir/locks/$feature.$instance_id.lock"
 heavy_lock="$runs_dir/locks/local-heavy.lock"
 result_file="$result_dir/$run_id.txt"
+leases="$repo_root/scripts/fleet_leases.py"
+lease_args=(--lease "$instance_lock" --lease "$local_slot" --lease "$role_slot")
+[[ "$resource_class" == "local_heavy" ]] && lease_args+=(--lease "$heavy_lock")
 
+terminal_written=0
 cleanup() {
-  rm -rf "$instance_lock"
-  if [[ "$resource_class" == "local_heavy" ]]; then
-    rm -rf "$heavy_lock"
+  prior_rc=$?
+  if (( terminal_written == 0 )); then
+    if python3 "$repo_root/scripts/fleet_ledger.py" "$ledger" \
+      --run-id "$run_id" --feature "$feature" --instance "$instance_id" \
+      --role "$role_type" --phase "$phase" --status abandoned \
+      --task-sha256 "$task_sha256" --exit-code 4 \
+      --reason runner_exited_before_terminal >/dev/null 2>&1; then
+      terminal_written=1
+    else
+      echo "ERROR: terminal ledger write failed; preserving leases for $run_id" >&2
+    fi
   fi
-  rm -rf "$local_slot" "$role_slot"
+  if (( terminal_written == 1 )); then
+    python3 "$leases" release "$runs_dir" --run-id "$run_id" \
+      "${lease_args[@]}" >/dev/null 2>&1 || \
+      echo "WARNING: lease release skipped for non-owner run $run_id" >&2
+  fi
+  return "$prior_rc"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
 
-lease_owned() {
-  local lock="$1"
-  [[ -d "$lock" && -f "$lock/owner" && "$(<"$lock/owner")" == "$run_id" ]]
-}
-
-if [[ ! -f "$task_file" ]] || ! lease_owned "$instance_lock" || \
-  ! lease_owned "$local_slot" || ! lease_owned "$role_slot"; then
+if [[ ! -f "$task_file" ]] || ! python3 "$leases" validate "$runs_dir" \
+  --run-id "$run_id" "${lease_args[@]}"; then
   echo "Task or dispatch lease missing for $run_id" >&2
   exit 2
 fi
-if [[ "$resource_class" == "local_heavy" ]] && ! lease_owned "$heavy_lock"; then
-  echo "Heavy-worker lease missing for $run_id" >&2
-  exit 2
-fi
+pgid="$(ps -o pgid= -p $$ | tr -d ' ')"
+python3 "$leases" activate "$runs_dir" --run-id "$run_id" \
+  --pid "$$" --pgid "$pgid" "${lease_args[@]}"
 
 mkdir -p "$result_dir"
 chmod 700 "$result_dir"
@@ -66,6 +77,11 @@ chmod 600 "$result_file"
 status="failed"
 [[ $rc -eq 0 ]] && status="succeeded"
 [[ $rc -eq 3 ]] && status="blocked"
+ledger_rc="$rc"
+if [[ $rc -eq 130 || $rc -eq 143 ]]; then
+  status="abandoned"
+  ledger_rc=4
+fi
 token_args=()
 if [[ -f "$usage_file" ]]; then
   tokens="$(python3 -c 'import json, sys
@@ -79,6 +95,7 @@ fi
 python3 "$repo_root/scripts/fleet_ledger.py" "$ledger" \
   --run-id "$run_id" --feature "$feature" --instance "$instance_id" \
   --role "$role_type" --phase "$phase" --status "$status" --task-sha256 "$task_sha256" \
-  --exit-code "$rc" --result-file "$result_file" \
+  --exit-code "$ledger_rc" --result-file "$result_file" \
   ${token_args[@]+"${token_args[@]}"}
+terminal_written=1
 exit "$rc"

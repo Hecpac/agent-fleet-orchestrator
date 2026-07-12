@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Agent race: give the same task to N agents in parallel; the first completion
-# becomes a candidate. Other agents keep running unless --cancel-losers is
-# explicitly requested. A candidate is never treated as verified truth.
+# Agent race: give the same task to N agents in parallel; the first successful
+# completion becomes a candidate. Failed/blocked/abandoned local runs are
+# reported but do not stop the race while another candidate remains viable.
 #
 # Usage:
 #   ./scripts/fleet-race.sh <name> "<task>" [instance=role ...] [--timeout <sec>] [--cancel-losers]
@@ -24,12 +24,20 @@ keep_losers=1
 role_specs=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --timeout) timeout_sec="$2"; shift 2 ;;
+    --timeout)
+      [[ $# -ge 2 ]] || { echo "--timeout requires seconds" >&2; exit 2; }
+      timeout_sec="$2"
+      shift 2
+      ;;
     --keep-losers) keep_losers=1; shift ;;
     --cancel-losers) keep_losers=0; shift ;;
     *) role_specs+=("$1"); shift ;;
   esac
 done
+if [[ ! "$timeout_sec" =~ ^[1-9][0-9]*$ ]]; then
+  echo "--timeout must be a positive integer" >&2
+  exit 2
+fi
 if [[ ${#role_specs[@]} -eq 0 ]]; then
   while IFS= read -r role_type; do
     [[ -n "$role_type" ]] && role_specs+=("$role_type")
@@ -78,34 +86,88 @@ fi
 first_phase="$race_phases"
 python3 "$repo_root/scripts/fleet_state.py" advance "$manifest" "$first_phase" --evidence "race-candidate-search:$name" >/dev/null
 
-# Arm the event listener BEFORE dispatching so a fast finisher can't slip
-# past the subscription window.
-result_file="$(mktemp)"
-"$repo_root/scripts/fleet-wait.sh" "$feature" "${instances[@]}" --any --timeout "$timeout_sec" \
-  > "$result_file" 2>/dev/null &
-wait_pid=$!
-sleep 1
-
-echo "== dispatching task to all racers"
+# Local dispatches come first so the waiter can bind each instance to its exact
+# run_id. A local run that finishes before subscription remains observable in
+# the durable ledger. Frontier turns are sent only after the event ACK waiter
+# has been armed.
+run_args=()
+frontier_instances=()
+echo "== dispatching task to local racers"
 for instance in "${instances[@]}"; do
-  surface="$(manifest_value "$instance")"
   if is_frontier "$instance"; then
-    "$repo_root/scripts/fleet-send.sh" "$feature" "$instance" "$task" >/dev/null
+    frontier_instances+=("$instance")
   else
-    "$repo_root/scripts/fleet-dispatch.sh" "$feature" "$instance" "$task" >/dev/null
+    dispatch_output="$("$repo_root/scripts/fleet-dispatch.sh" "$feature" "$instance" "$task")"
+    run_id="$(sed -n 's/.*dispatched run_id=\([^ ]*\).*/\1/p' <<< "$dispatch_output" | tail -1)"
+    if [[ -z "$run_id" ]]; then
+      echo "Could not recover run_id for local racer '$instance'." >&2
+      exit 2
+    fi
+    run_args+=(--run "$instance=$run_id")
   fi
 done
 
+result_file="$(mktemp)"
+ready_file="$result_file.ready"
+wait_pid=""
+cleanup_waiter() {
+  if [[ -n "$wait_pid" ]] && kill -0 "$wait_pid" 2>/dev/null; then
+    kill "$wait_pid" 2>/dev/null || true
+    wait "$wait_pid" 2>/dev/null || true
+  fi
+  rm -f "$result_file" "$ready_file"
+}
+trap cleanup_waiter EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+FLEET_WAIT_READY_FILE="$ready_file" \
+"$repo_root/scripts/fleet-wait.sh" "$feature" "${instances[@]}" \
+  ${run_args[@]+"${run_args[@]}"} --any --json --timeout "$timeout_sec" \
+  > "$result_file" &
+wait_pid=$!
+
+if [[ ${#frontier_instances[@]} -gt 0 ]]; then
+  ready=0
+  for _ in {1..200}; do
+    if [[ -f "$ready_file" ]]; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "$wait_pid" 2>/dev/null; then
+      wait "$wait_pid" 2>/dev/null || true
+      wait_pid=""
+      echo "Race waiter exited before subscription ACK." >&2
+      exit 5
+    fi
+    sleep 0.05
+  done
+  if (( ready == 0 )); then
+    echo "Race waiter did not confirm subscription ACK." >&2
+    exit 5
+  fi
+  echo "== dispatching task to frontier racers"
+  for instance in "${frontier_instances[@]}"; do
+    "$repo_root/scripts/fleet-send.sh" "$feature" "$instance" "$task" >/dev/null
+  done
+fi
+
 echo "== racing (timeout ${timeout_sec}s)..."
-wait "$wait_pid" || true
-result="$(grep '=done' "$result_file" | head -1 || true)"
-rm -f "$result_file"
-candidate="${result%%=*}"
+set +e
+wait "$wait_pid"
+wait_rc=$?
+set -e
+wait_pid=""
+candidate="$(jq -r 'select(.status == "succeeded") | .instance' "$result_file" | head -1)"
 
 if [[ -z "$candidate" ]]; then
-  echo "RACE TIMED OUT — no agent finished within ${timeout_sec}s" >&2
-  cmux notify --title "race-$name: timeout" --body "no candidate in ${timeout_sec}s" >/dev/null
-  exit 124
+  if (( wait_rc == 124 )); then
+    echo "RACE TIMED OUT — no successful agent within ${timeout_sec}s" >&2
+    cmux notify --title "race-$name: timeout" --body "no successful candidate in ${timeout_sec}s" >/dev/null || true
+    exit 124
+  fi
+  echo "RACE ENDED — every candidate terminated without success (exit $wait_rc)" >&2
+  exit "$wait_rc"
 fi
 
 echo "== FIRST CANDIDATE (NOT VERIFIED): $candidate"

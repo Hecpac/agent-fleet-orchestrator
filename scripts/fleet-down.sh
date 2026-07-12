@@ -7,8 +7,15 @@ set -euo pipefail
 #   ./scripts/fleet-down.sh <feature>
 
 feature="${1:-}"
+recover_absent=0
+if [[ "${2:-}" == "--recover-absent" ]]; then
+  recover_absent=1
+elif [[ -n "${2:-}" ]]; then
+  echo "Unknown option: $2" >&2
+  exit 2
+fi
 if [[ -z "$feature" ]]; then
-  echo "Usage: $0 <feature>" >&2
+  echo "Usage: $0 <feature> [--recover-absent]" >&2
   exit 2
 fi
 
@@ -16,6 +23,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runs_dir="${FLEET_RUNS_DIR:-$repo_root/orchestration/runs}"
 manifest="$runs_dir/fleet-$feature.manifest"
 identity="$repo_root/scripts/fleet_identity.py"
+leases="$repo_root/scripts/fleet_leases.py"
 export CMUX_QUIET=1
 
 manifest_value() {
@@ -40,19 +48,47 @@ if [[ ! -f "$manifest" ]]; then
   exit 1
 fi
 
-python3 "$identity" validate "$manifest" >/dev/null || {
-  echo "Refusing teardown: manifest identity does not match cmux tree." >&2
-  exit 2
+workspace_uuid="$(manifest_value workspace_uuid)"
+close_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+close_started=0
+cleanup_close() {
+  prior_rc=$?
+  trap - EXIT
+  if (( close_started == 1 )); then
+    if ! python3 "$leases" end-close "$runs_dir" --feature "$feature" \
+      --close-id "$close_id" >/dev/null; then
+      echo "Could not release teardown ownership for fleet '$feature'." >&2
+      (( prior_rc == 0 )) && prior_rc=75
+    fi
+  fi
+  exit "$prior_rc"
 }
+trap cleanup_close EXIT
+python3 "$leases" begin-close "$runs_dir" --feature "$feature" \
+  --close-id "$close_id" --workspace-uuid "$workspace_uuid" >/dev/null || exit $?
+close_started=1
+
+workspace_already_absent=0
+if ! python3 "$identity" validate "$manifest" >/dev/null; then
+  if (( recover_absent == 1 )); then
+    set +e
+    python3 "$identity" exists "$manifest" >/dev/null 2>&1
+    identity_rc=$?
+    set -e
+    if (( identity_rc == 1 )); then
+      workspace_already_absent=1
+    else
+      echo "Refusing recovery: workspace absence was not confirmed." >&2
+      exit 2
+    fi
+  else
+    echo "Refusing teardown: manifest identity does not match cmux tree." >&2
+    echo "If the workspace was intentionally removed, retry with --recover-absent." >&2
+    exit 2
+  fi
+fi
 
 ws_ref="$(grep '^workspace=' "$manifest" | cut -d= -f2)"
-shopt -s nullglob
-active_locks=("$runs_dir/locks/$feature."*.lock)
-shopt -u nullglob
-if (( ${#active_locks[@]} > 0 )); then
-  echo "Refusing teardown: fleet '$feature' has active dispatch leases." >&2
-  exit 75
-fi
 
 # Writer worktrees must be reconciled before the fleet disappears: uncommitted
 # work would be orphaned, so fail closed and keep the fleet alive.
@@ -100,7 +136,9 @@ for entry in ${worktree_entries[@]+"${worktree_entries[@]}"}; do
   worktree_bases+=("$base_sha")
 done
 
-cmux close-workspace --workspace "$ws_ref" >/dev/null
+if (( workspace_already_absent == 0 )); then
+  cmux close-workspace --workspace "$ws_ref" >/dev/null
+fi
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   set +e
   python3 "$identity" exists "$manifest" >/dev/null 2>&1

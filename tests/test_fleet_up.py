@@ -374,6 +374,97 @@ class FleetUpTests(unittest.TestCase):
         archives = list((self.runs / "archive").glob("teardown-*/manifest"))
         self.assertEqual(len(archives), 1)
 
+    def test_teardown_recovers_only_after_confirmed_workspace_absence(self) -> None:
+        result = self.run_fleet("recover-absent", "triage")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.runs / "fleet-recover-absent.manifest"
+        manifest_text = manifest.read_text()
+        workspace = re.search(r"^workspace=(.+)$", manifest_text, re.M).group(1)
+        workspace_uuid = re.search(
+            r"^workspace_uuid=(.+)$", manifest_text, re.M
+        ).group(1)
+        surface_uuid = re.search(
+            r"^triage\.uuid=(.+)$", manifest_text, re.M
+        ).group(1)
+        run_id = "recover-absent-run"
+        acquired = subprocess.run(
+            [
+                "python3", str(ROOT / "scripts" / "fleet_leases.py"),
+                "acquire", str(self.runs), "--run-id", run_id,
+                "--feature", "recover-absent", "--instance", "triage",
+                "--role", "triage", "--phase", "RECON",
+                "--resource-class", "local_light", "--task-sha256", "a" * 64,
+                "--workspace-uuid", workspace_uuid, "--surface-uuid", surface_uuid,
+                "--max-local", "3", "--role-limit", "2",
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(acquired.returncode, 0, acquired.stderr)
+        running = subprocess.run(
+            [
+                "python3", str(ROOT / "scripts" / "fleet_ledger.py"),
+                str(self.runs / "fleet-recover-absent.ledger.jsonl"),
+                "--run-id", run_id, "--feature", "recover-absent",
+                "--instance", "triage", "--role", "triage", "--phase", "RECON",
+                "--status", "running", "--task-sha256", "a" * 64,
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(running.returncode, 0, running.stderr)
+        closed = subprocess.run(
+            ["cmux", "close-workspace", "--workspace", workspace],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+
+        refused = subprocess.run(
+            ["bash", str(FLEET_DOWN), "recover-absent"],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(refused.returncode, 2, refused.stderr)
+        self.assertTrue(manifest.exists())
+
+        recovered = subprocess.run(
+            ["bash", str(FLEET_DOWN), "recover-absent", "--recover-absent"],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(manifest.exists())
+        archived_ledger = next(
+            (self.runs / "archive").glob("recover-absent-*/ledger.jsonl")
+        )
+        events = [json.loads(line) for line in archived_ledger.read_text().splitlines()]
+        self.assertEqual(events[-1]["run_id"], run_id)
+        self.assertEqual(events[-1]["status"], "abandoned")
+        self.assertTrue(
+            list((self.runs / "archive" / "leases" / run_id).glob("*.lock"))
+        )
+
     def make_target_repo(self) -> Path:
         target = self.tmp / "target-repo"
         target.mkdir()
