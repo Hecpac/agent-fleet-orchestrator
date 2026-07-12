@@ -51,6 +51,7 @@ def main() -> int:
     parser.add_argument("manifest")
     parser.add_argument("value", nargs="?")
     parser.add_argument("--evidence")
+    parser.add_argument("--approved-by")
     args = parser.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -107,12 +108,22 @@ def main() -> int:
     if not args.evidence:
         print("phase transition requires --evidence <path|sha|gate-id>", file=sys.stderr)
         return 2
+    if current == "BUILD" and not args.approved_by:
+        print(
+            "leaving BUILD requires --approved-by <human>: "
+            "a person signs off on the writer's diff before it becomes a candidate",
+            file=sys.stderr,
+        )
+        return 2
     state["active_phase"] = requested
-    state["history"].append({
+    entry = {
         "phase": requested,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "evidence": args.evidence,
-    })
+    }
+    if args.approved_by:
+        entry["approved_by"] = args.approved_by
+    state["history"].append(entry)
     write_atomic(path, state)
     print(f"advanced {current} -> {requested}")
     return 0

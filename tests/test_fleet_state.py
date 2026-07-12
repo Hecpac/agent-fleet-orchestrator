@@ -40,10 +40,32 @@ class FleetStateTests(unittest.TestCase):
         self.assertEqual(self.run_state("check", "build").returncode, 0)
         self.assertEqual(self.run_state("check", "verify").returncode, 3)
         self.assertEqual(
-            self.run_state("advance", "VERIFY", "--evidence", "build-frozen").returncode, 0
+            self.run_state(
+                "advance", "VERIFY", "--evidence", "build-frozen", "--approved-by", "hector"
+            ).returncode,
+            0,
         )
         self.assertEqual(self.run_state("check", "build").returncode, 3)
         self.assertEqual(self.run_state("check", "verify").returncode, 0)
+
+    def test_leaving_build_requires_human_approval(self) -> None:
+        self.assertEqual(self.run_state("init").returncode, 0)
+        self.assertEqual(
+            self.run_state("advance", "BUILD", "--evidence", "scope-approved").returncode, 0
+        )
+        unapproved = self.run_state("advance", "VERIFY", "--evidence", "diff-ready")
+        self.assertEqual(unapproved.returncode, 2)
+        self.assertIn("--approved-by", unapproved.stderr)
+        state = json.loads(self.manifest.with_suffix(".state.json").read_text())
+        self.assertEqual(state["active_phase"], "BUILD")
+
+        approved = self.run_state(
+            "advance", "VERIFY", "--evidence", "diff-ready", "--approved-by", "hector"
+        )
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+        state = json.loads(self.manifest.with_suffix(".state.json").read_text())
+        self.assertEqual(state["active_phase"], "VERIFY")
+        self.assertEqual(state["history"][-1]["approved_by"], "hector")
 
     def test_skipping_configured_phase_is_rejected(self) -> None:
         self.assertEqual(self.run_state("init").returncode, 0)

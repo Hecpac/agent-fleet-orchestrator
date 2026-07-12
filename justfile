@@ -24,8 +24,9 @@ status:
     python3 scripts/fleet_status.py
 
 # Advance the durable capability gate with an evidence reference.
-advance feature phase evidence:
-    python3 scripts/fleet_state.py advance orchestration/runs/fleet-{{feature}}.manifest {{phase}} --evidence {{evidence}}
+# Leaving BUILD additionally requires --approved-by <human> (pass it via flags).
+advance feature phase evidence *flags:
+    python3 scripts/fleet_state.py advance orchestration/runs/fleet-{{feature}}.manifest {{phase}} --evidence {{evidence}} {{flags}}
 
 # Send to an interactive agent through UUID and phase validation.
 send feature instance task:
