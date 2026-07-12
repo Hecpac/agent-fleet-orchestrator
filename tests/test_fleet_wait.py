@@ -22,12 +22,26 @@ import time
 with open(os.environ["CMUX_LOG"], "a", encoding="utf-8") as handle:
     handle.write(json.dumps(sys.argv[1:]) + "\n")
 
+if sys.argv[1:2] == ["read-screen"]:
+    print(os.environ.get("FAKE_SCREEN", ""))
+    raise SystemExit(0)
+
 if sys.argv[1:2] != ["events"]:
     raise SystemExit(0)
 
 print(json.dumps({
     "type": "ack",
-    "resume": {"boot_id": "boot-1", "gap": False, "next_seq": 1},
+    "protocol": os.environ.get("FAKE_ACK_PROTOCOL", "cmux-events"),
+    "version": 1,
+    "resume": {
+        "boot_id": os.environ.get("FAKE_BOOT_ID", "boot-1"),
+        "gap": os.environ.get("FAKE_GAP", "0") == "1",
+        "oldest_seq": int(os.environ.get("FAKE_OLDEST_SEQ", "1")),
+        "latest_seq": int(os.environ.get("FAKE_LATEST_SEQ", "1")),
+        "next_seq": int(os.environ.get("FAKE_LATEST_SEQ", "1")) + 1,
+    },
+    "boot_id": os.environ.get("FAKE_BOOT_ID", "boot-1"),
+    "replay_count": int(os.environ.get("FAKE_REPLAY_COUNT", "0")),
 }), flush=True)
 
 scenario = os.environ.get("FAKE_SCENARIO", "blocking")
@@ -57,6 +71,30 @@ elif scenario == "any_first_success":
     print(json.dumps({"type": "heartbeat"}), flush=True)
     append("review", "r2", "succeeded", 0)
     print(json.dumps({"type": "heartbeat"}), flush=True)
+elif scenario == "drain_replay":
+    print(json.dumps({
+        "type": "event",
+        "boot_id": "boot-1",
+        "seq": 1,
+        "name": "notification.requested",
+        "occurred_at": "2026-07-12T00:00:03+00:00",
+        "payload": {},
+    }), flush=True)
+elif scenario == "frontier_finishes_during_replay":
+    for seq, name, phase, when in (
+        (1, "agent.hook.UserPromptSubmit", "received", "2026-07-12T00:00:01Z"),
+        (2, "agent.hook.Stop", "completed", "2026-07-12T00:00:02Z"),
+    ):
+        print(json.dumps({
+            "type": "event",
+            "boot_id": "boot-1",
+            "seq": seq,
+            "id": f"boot-1-{seq}",
+            "name": name,
+            "occurred_at": when,
+            "workspace_id": "",
+            "payload": {"phase": phase, "session_id": "opencode-s1"},
+        }), flush=True)
 
 time.sleep(10)
 '''
@@ -102,6 +140,31 @@ class FleetWaitTestCase(unittest.TestCase):
                 "review.runner=local\n"
             )
         self.env["TREE_BOTH"] += f"\nsurface:2 {UUID_2}"
+
+    def add_frontier_instance(self) -> None:
+        with self.manifest.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "frontier=surface:2\n"
+                f"frontier.uuid={UUID_2}\n"
+                "frontier.runner=interactive\n"
+            )
+        self.env["TREE_BOTH"] += f"\nsurface:2 {UUID_2}"
+
+    def configure_frontier_hooks(self) -> Path:
+        hooks = self.tmp / "hooks"
+        hooks.mkdir(exist_ok=True)
+        (hooks / "opencode-hook-sessions.json").write_text(json.dumps({
+            "sessions": {
+                "s1": {
+                    "sessionId": "s1",
+                    "workspaceId": "",
+                    "surfaceId": UUID_2,
+                    "updatedAt": 10,
+                }
+            }
+        }))
+        self.env["CMUX_HOOK_DIR"] = str(hooks)
+        return hooks
 
     def append_ledger(
         self,
@@ -159,6 +222,12 @@ class FleetWaitEscalationTests(FleetWaitTestCase):
         notifies = [call for call in calls if call and call[0] == "notify"]
         self.assertTrue(notifies, "timeout did not fire a cmux notify escalation")
         self.assertIn("ESCALATION", " ".join(notifies[0]))
+
+    def test_malformed_protocol_ack_fails_closed(self) -> None:
+        self.env["FAKE_ACK_PROTOCOL"] = "other-protocol"
+        result = self.run_wait("10")
+        self.assertEqual(result.returncode, 5)
+        self.assertIn("invalid cmux-events ACK", result.stderr)
 
 
 class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
@@ -227,6 +296,146 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
         result = self.run_wait("10", runs=())
         self.assertEqual(result.returncode, 2)
         self.assertIn("requires --run", result.stderr)
+
+    def test_mixed_any_drains_replay_then_uses_durable_completion_time(self) -> None:
+        self.add_frontier_instance()
+        self.append_ledger(
+            "triage", "r-local", "succeeded", "2026-07-12T00:00:01+00:00"
+        )
+        with self.ledger.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "timestamp": "2026-07-12T00:00:00+00:00",
+                "dispatched_at": "2026-07-12T00:00:00+00:00",
+                "run_id": "r-frontier",
+                "feature": "esc",
+                "instance": "frontier",
+                "role": "minimax",
+                "phase": "CHALLENGE",
+                "runner": "interactive",
+                "status": "dispatched",
+                "task_sha256": "a" * 64,
+                "workspace_uuid": "",
+                "surface_uuid": UUID_2,
+                "event_boot_id": "boot-1",
+                "after_seq": 0,
+            }) + "\n")
+            handle.write(json.dumps({
+                "timestamp": "2026-07-12T00:00:01Z",
+                "completed_at": "2026-07-12T00:00:01Z",
+                "run_id": "r-frontier",
+                "feature": "esc",
+                "instance": "frontier",
+                "status": "succeeded",
+                "exit_code": 0,
+            }) + "\n")
+        self.env["FAKE_SCENARIO"] = "drain_replay"
+        self.env["FAKE_REPLAY_COUNT"] = "1"
+        result = self.run_wait(
+            "10",
+            roles=("triage", "frontier"),
+            runs=("triage=r-local", "frontier=r-frontier"),
+            extra=("--any", "--json"),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([row["instance"] for row in rows], ["frontier"])
+
+    def test_mixed_any_frontier_terminal_during_replay_competes_by_durable_time(self) -> None:
+        self.add_frontier_instance()
+        self.configure_frontier_hooks()
+        self.append_ledger(
+            "triage", "r-local", "succeeded", "2026-07-12T00:00:03+00:00"
+        )
+        with self.ledger.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "timestamp": "2026-07-12T00:00:00+00:00",
+                "dispatched_at": "2026-07-12T00:00:00+00:00",
+                "run_id": "r-frontier",
+                "feature": "esc",
+                "instance": "frontier",
+                "role": "minimax",
+                "phase": "CHALLENGE",
+                "runner": "interactive",
+                "status": "dispatched",
+                "task_sha256": "a" * 64,
+                "workspace_uuid": "",
+                "surface_uuid": UUID_2,
+                "event_boot_id": "boot-1",
+                "after_seq": 0,
+            }) + "\n")
+        self.env.update({
+            "FAKE_SCENARIO": "frontier_finishes_during_replay",
+            "FAKE_REPLAY_COUNT": "2",
+            "FAKE_SCREEN": "answer\nFLEET_RESULT:r-frontier:DONE\n",
+        })
+        result = self.run_wait(
+            "10",
+            roles=("triage", "frontier"),
+            runs=("triage=r-local", "frontier=r-frontier"),
+            extra=("--any", "--json"),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([row["instance"] for row in rows], ["frontier"])
+
+    def test_waiter_recovers_frontier_from_audit_on_boot_change(self) -> None:
+        self.add_frontier_instance()
+        self.configure_frontier_hooks()
+        self.append_ledger(
+            "triage", "r-local", "succeeded", "2026-07-12T00:00:03+00:00"
+        )
+        with self.ledger.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps({
+                "timestamp": "2026-07-12T00:00:00+00:00",
+                "dispatched_at": "2026-07-12T00:00:00+00:00",
+                "run_id": "r-frontier",
+                "feature": "esc",
+                "instance": "frontier",
+                "role": "minimax",
+                "phase": "CHALLENGE",
+                "runner": "interactive",
+                "status": "dispatched",
+                "task_sha256": "a" * 64,
+                "workspace_uuid": "",
+                "surface_uuid": UUID_2,
+                "event_boot_id": "boot-old",
+                "after_seq": 900,
+            }) + "\n")
+        audit = self.tmp / "events.jsonl"
+        audit.write_text("".join(json.dumps(event) + "\n" for event in (
+            {
+                "type": "event", "boot_id": "boot-old", "seq": 900,
+                "id": "boot-old-900", "name": "surface.action",
+                "occurred_at": "2026-07-12T00:00:00Z", "workspace_id": "",
+                "payload": {},
+            },
+            {
+                "type": "event", "boot_id": "boot-new", "seq": 1,
+                "id": "boot-new-1", "name": "agent.hook.UserPromptSubmit",
+                "occurred_at": "2026-07-12T00:00:01Z", "workspace_id": "",
+                "payload": {"phase": "received", "session_id": "opencode-s1"},
+            },
+            {
+                "type": "event", "boot_id": "boot-new", "seq": 2,
+                "id": "boot-new-2", "name": "agent.hook.Stop",
+                "occurred_at": "2026-07-12T00:00:02Z", "workspace_id": "",
+                "payload": {"phase": "completed", "session_id": "opencode-s1"},
+            },
+        )))
+        self.env.update({
+            "CMUX_EVENTS_LOG": str(audit),
+            "FAKE_BOOT_ID": "boot-new",
+            "FAKE_SCREEN": "answer\nFLEET_RESULT:r-frontier:DONE\n",
+        })
+        result = self.run_wait(
+            "10",
+            roles=("triage", "frontier"),
+            runs=("triage=r-local", "frontier=r-frontier"),
+            extra=("--any", "--json"),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual([row["instance"] for row in rows], ["frontier"])
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ fleet-preset feature preset:
 fleet-down feature:
     ./scripts/fleet-down.sh {{feature}}
 
-# Agent race: same task to N agents; first completion is an unverified candidate.
+# Agent race: same task to N agents; first durable success is an unverified candidate.
 # Ex: just race hotfix "find the bug in scripts/foo.sh" codex minimax
 race name task *roles:
     ./scripts/fleet-race.sh {{name}} "{{task}}" {{roles}}
@@ -31,6 +31,10 @@ advance feature phase evidence *flags:
 # Send to an interactive agent through UUID and phase validation.
 send feature instance task:
     ./scripts/fleet-send.sh {{feature}} {{instance}} "{{task}}"
+
+# Explicitly release one indeterminate/active frontier run.
+abandon feature instance run_id reason="operator_abandoned":
+    ./scripts/fleet-abandon.sh {{feature}} {{instance}} {{run_id}} "{{reason}}"
 
 pull-models:
     ./scripts/pull-local-models.sh

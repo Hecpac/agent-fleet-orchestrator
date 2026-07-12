@@ -1,22 +1,27 @@
 #!/usr/bin/env python3
-"""Wait for exact local run IDs and legacy frontier turns via cmux events."""
+"""Wait for exact local and frontier run IDs through durable evidence."""
 
 from __future__ import annotations
 
-import glob
 import json
+from datetime import datetime, timezone
 import os
 from pathlib import Path
-import re
 import signal
 import subprocess
 import sys
 from typing import Any
 
-from fleet_ledger import latest_event
+from fleet_frontier import (
+    FrontierError,
+    frontier_state,
+    process_event,
+    recover_from_audit,
+    validate_event_ack,
+)
+from fleet_ledger import TERMINAL_STATUSES, latest_event
 
 
-TERMINAL_STATUSES = {"succeeded", "failed", "blocked", "abandoned"}
 STATUS_CODES = {
     "succeeded": 0,
     "failed": 1,
@@ -68,22 +73,6 @@ def read_manifest(path: str) -> dict[str, str]:
     )
 
 
-def session_surface(session_id: str) -> str:
-    candidates = {session_id, re.sub(r"^[a-z]+-", "", session_id, count=1)}
-    home = os.path.expanduser("~/.cmuxterm")
-    for path in glob.glob(f"{home}/*-hook-sessions.json"):
-        try:
-            value = json.loads(Path(path).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        sessions = value.get("sessions", {})
-        for candidate in candidates:
-            session = sessions.get(candidate)
-            if session and session.get("surfaceId"):
-                return str(session["surfaceId"]).upper()
-    return ""
-
-
 def emit_result(
     *,
     instance: str,
@@ -98,13 +87,15 @@ def emit_result(
         "status": status,
         "exit_code": (event or {}).get("exit_code", STATUS_CODES[status]),
         "result_file": (event or {}).get("result_file", ""),
+        "completed_at": (event or {}).get("completed_at", (event or {}).get("timestamp", "")),
     }
     if json_mode:
         print(json.dumps(value, sort_keys=True), flush=True)
     else:
         print(
-            f"instance={instance} run_id={run_id or '-'} status={status} "
-            f"exit_code={value['exit_code']} result_file={value['result_file'] or '-'}",
+            f"instance={instance} run_id={run_id} status={status} "
+            f"exit_code={value['exit_code']} result_file={value['result_file'] or '-'} "
+            f"completed_at={value['completed_at'] or '-'}",
             flush=True,
         )
 
@@ -136,6 +127,18 @@ def signal_ready(frame: dict[str, Any]) -> bool:
     return True
 
 
+def completion_key(instance: str, event: dict[str, Any]) -> tuple[datetime, str]:
+    raw = str(event.get("completed_at") or event.get("timestamp") or "")
+    try:
+        completed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if completed.tzinfo is None:
+            completed = completed.replace(tzinfo=timezone.utc)
+        completed = completed.astimezone(timezone.utc)
+    except ValueError:
+        completed = datetime.max.replace(tzinfo=timezone.utc)
+    return completed, instance
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         feature, manifest_path, timeout_sec, any_mode, json_mode, run_map, roles = parse_args(
@@ -150,9 +153,13 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as exc:
         print(f"cannot read manifest: {exc}", file=sys.stderr)
         return 2
+
     tree_text = os.environ.get("TREE_BOTH", "")
-    ref_uuid = dict(re.findall(r"(surface:\d+) ([0-9A-Fa-f-]{36})", tree_text))
-    pending: dict[str, dict[str, str]] = {}
+    workspace_ref = manifest.get("workspace", "")
+    workspace_uuid = manifest.get("workspace_uuid", "").upper()
+    runs_dir = Path(manifest_path).parent
+    ledger = runs_dir / f"fleet-{feature}.ledger.jsonl"
+    pending: dict[str, dict[str, Any]] = {}
     for role in roles:
         if role in pending:
             print(f"duplicate instance: {role}", file=sys.stderr)
@@ -160,38 +167,56 @@ def main(argv: list[str] | None = None) -> int:
         if role not in manifest:
             print(f"unknown instance in manifest: {role}", file=sys.stderr)
             return 2
-        ref = manifest.get(role, "")
-        uuid = ref_uuid.get(ref, "")
-        expected_uuid = manifest.get(f"{role}.uuid", "").upper()
-        runner = manifest.get(f"{role}.runner", "")
-        if not ref or not uuid or not expected_uuid or uuid.upper() != expected_uuid:
+        surface_ref = manifest.get(role, "")
+        surface_uuid = manifest.get(f"{role}.uuid", "").upper()
+        if (
+            not surface_ref
+            or not surface_uuid
+            or f"{surface_ref} {surface_uuid}".upper() not in tree_text.upper()
+        ):
             print(f"instance identity mismatch: {role}", file=sys.stderr)
             return 2
-        if runner == "local" and not run_map.get(role):
-            print(f"local instance requires --run {role}=<run_id>", file=sys.stderr)
+        runner = manifest.get(f"{role}.runner", "")
+        if runner not in {"local", "interactive"}:
+            print(f"instance is not waitable: {role}", file=sys.stderr)
             return 2
-        if runner != "local" and run_map.get(role):
-            print(f"--run is only valid for local instances: {role}", file=sys.stderr)
+        run_id = run_map.get(role, "")
+        if not run_id:
+            print(f"instance requires --run {role}=<run_id>", file=sys.stderr)
             return 2
-        pending[role] = {
-            "surface": uuid.upper(),
+        metadata: dict[str, Any] = {
             "runner": runner,
-            "run_id": run_map.get(role, ""),
-            "notify_title": f"fleet-{feature}:{role}",
+            "run_id": run_id,
+            "surface_ref": surface_ref,
+            "surface_uuid": surface_uuid,
         }
+        if runner == "interactive":
+            state = frontier_state(ledger, run_id=run_id, instance=role)
+            if not state or state.get("runner") != "interactive":
+                print(f"unknown frontier run: {role}={run_id}", file=sys.stderr)
+                return 2
+            if (
+                str(state.get("workspace_uuid", "")).upper() != workspace_uuid
+                or str(state.get("surface_uuid", "")).upper() != surface_uuid
+            ):
+                print(f"frontier run identity mismatch: {role}={run_id}", file=sys.stderr)
+                return 2
+            metadata["state"] = state
+        pending[role] = metadata
     unknown_runs = sorted(set(run_map) - set(pending))
     if unknown_runs:
         print(f"--run references unknown instances: {', '.join(unknown_runs)}", file=sys.stderr)
         return 2
 
-    ledger_path = Path(manifest_path).parent / f"fleet-{feature}.ledger.jsonl"
     statuses: list[str] = []
+    replay_remaining = 0
 
-    def finish(role: str, status: str, event: dict[str, Any] | None = None) -> int | None:
+    def finish(role: str, event: dict[str, Any]) -> int | None:
         metadata = pending.pop(role)
+        status = str(event["status"])
         emit_result(
             instance=role,
-            run_id=metadata["run_id"],
+            run_id=str(metadata["run_id"]),
             status=status,
             event=event,
             json_mode=json_mode,
@@ -203,37 +228,47 @@ def main(argv: list[str] | None = None) -> int:
             return aggregate_exit(statuses)
         return None
 
-    def reconcile_local() -> int | None:
-        terminal: list[tuple[int, str, dict[str, Any]]] = []
-        for order, role in enumerate(list(pending)):
-            metadata = pending[role]
-            if metadata["runner"] != "local":
-                continue
-            event = latest_event(ledger_path, run_id=metadata["run_id"], instance=role)
-            if event and event.get("status") in TERMINAL_STATUSES:
-                terminal.append((order, role, event))
-        if any_mode:
-            terminal.sort(
-                key=lambda item: (
-                    str(item[2].get("timestamp") or "9999"),
-                    item[0],
-                )
+    def terminal_records() -> list[tuple[str, dict[str, Any]]]:
+        records: list[tuple[str, dict[str, Any]]] = []
+        for role, metadata in pending.items():
+            event = latest_event(
+                ledger,
+                run_id=str(metadata["run_id"]),
+                instance=role,
             )
-        for _, role, event in terminal:
-            outcome = finish(role, str(event["status"]), event)
+            if event and event.get("status") in TERMINAL_STATUSES:
+                records.append((role, event))
+        records.sort(key=lambda item: completion_key(item[0], item[1]))
+        return records
+
+    def arbitrate() -> int | None:
+        if replay_remaining > 0:
+            return None
+        for role, event in terminal_records():
+            outcome = finish(role, event)
             if outcome is not None:
                 return outcome
         return None
 
+    frontier_after = [
+        int(metadata["state"]["after_seq"])
+        for metadata in pending.values()
+        if metadata["runner"] == "interactive"
+        and metadata["state"].get("status") not in TERMINAL_STATUSES
+    ]
     command = [
         "cmux",
         "events",
+        "--name",
+        "agent.hook.UserPromptSubmit",
         "--name",
         "agent.hook.Stop",
         "--name",
         "notification.requested",
         "--reconnect",
     ]
+    if frontier_after:
+        command += ["--after", str(min(frontier_after))]
     try:
         proc = subprocess.Popen(
             command,
@@ -286,12 +321,41 @@ def main(argv: list[str] | None = None) -> int:
             except json.JSONDecodeError:
                 continue
             if frame.get("type") == "ack":
+                try:
+                    validate_event_ack(frame)
+                except FrontierError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 5
                 if not acknowledged and not signal_ready(frame):
                     return 5
                 acknowledged = True
-                if (frame.get("resume") or {}).get("gap"):
-                    print("cmux event replay gap; relying on durable local ledger", file=sys.stderr)
-                outcome = reconcile_local()
+                replay_remaining = int(frame.get("replay_count") or 0)
+                resume = frame.get("resume") or {}
+                ack_boot = str(frame.get("boot_id") or "")
+                oldest = int(resume.get("oldest_seq") or 0)
+                latest = int(resume.get("latest_seq") or 0)
+                for role, metadata in list(pending.items()):
+                    if metadata["runner"] != "interactive":
+                        continue
+                    state = frontier_state(
+                        ledger, run_id=str(metadata["run_id"]), instance=role
+                    ) or metadata["state"]
+                    metadata["state"] = state
+                    if state.get("status") in TERMINAL_STATUSES:
+                        continue
+                    after_seq = int(state["after_seq"])
+                    recover = ack_boot != state.get("event_boot_id") or (
+                        bool(resume.get("gap"))
+                        and not (oldest - 1 <= after_seq <= latest)
+                    )
+                    if recover:
+                        recover_from_audit(
+                            runs_dir,
+                            state,
+                            workspace_ref=workspace_ref,
+                            surface_ref=str(metadata["surface_ref"]),
+                        )
+                outcome = arbitrate()
                 if outcome is not None:
                     return outcome
                 continue
@@ -299,31 +363,43 @@ def main(argv: list[str] | None = None) -> int:
                 print("cmux event received before subscription ACK", file=sys.stderr)
                 return 5
 
-            name = frame.get("name")
-            outcome = reconcile_local()
-            if outcome is not None:
-                return outcome
-            if name == "agent.hook.Stop":
-                session_id = (frame.get("payload") or {}).get("session_id")
-                surface = session_surface(session_id) if session_id else ""
+            if frame.get("type") == "event":
                 for role, metadata in list(pending.items()):
-                    if metadata["runner"] != "local" and metadata["surface"] == surface:
-                        outcome = finish(role, "succeeded")
-                        if outcome is not None:
-                            return outcome
-                        break
+                    if metadata["runner"] != "interactive":
+                        continue
+                    state = frontier_state(
+                        ledger, run_id=str(metadata["run_id"]), instance=role
+                    ) or metadata["state"]
+                    metadata["state"] = state
+                    if state.get("status") in TERMINAL_STATUSES:
+                        continue
+                    try:
+                        process_event(
+                            runs_dir,
+                            state,
+                            frame,
+                            workspace_ref=workspace_ref,
+                            surface_ref=str(metadata["surface_ref"]),
+                        )
+                    except FrontierError as exc:
+                        print(f"frontier protocol error for {role}: {exc}", file=sys.stderr)
+                if replay_remaining > 0:
+                    replay_remaining -= 1
 
-            # Notifications and heartbeats are wake-ups only. Exact local
-            # completion always comes from the durable run_id ledger event.
-            outcome = reconcile_local()
+            outcome = arbitrate()
             if outcome is not None:
                 return outcome
 
-        outcome = reconcile_local()
+        outcome = arbitrate()
         if outcome is not None:
             return outcome
         for role in list(pending):
-            outcome = finish(role, "indeterminate")
+            event = {
+                "status": "indeterminate",
+                "exit_code": 5,
+                "timestamp": "",
+            }
+            outcome = finish(role, event)
             if outcome is not None and not pending:
                 return outcome
         return 5

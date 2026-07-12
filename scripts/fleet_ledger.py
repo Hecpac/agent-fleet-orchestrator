@@ -13,7 +13,7 @@ import sys
 from typing import Any
 
 
-TERMINAL_STATUSES = {"succeeded", "failed", "blocked", "abandoned"}
+TERMINAL_STATUSES = {"succeeded", "failed", "blocked", "abandoned", "indeterminate"}
 
 
 def append_event(path: Path, event: dict[str, Any]) -> bool:
@@ -73,6 +73,30 @@ def latest_event(
     except OSError:
         return None
     return latest
+
+
+def events_for_run(
+    path: Path,
+    *,
+    run_id: str,
+    instance: str | None = None,
+) -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for raw in handle:
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("run_id") != run_id:
+                    continue
+                if instance is not None and event.get("instance") != instance:
+                    continue
+                events.append(event)
+    except OSError:
+        return []
+    return events
 
 
 def main() -> int:

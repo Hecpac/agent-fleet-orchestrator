@@ -12,6 +12,7 @@ set -euo pipefail
 feature="${1:-}"
 instance_id="${2:-}"
 task="${3:-}"
+output_mode="${4:-}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runs_dir="${FLEET_RUNS_DIR:-$repo_root/orchestration/runs}"
@@ -20,8 +21,9 @@ identity="$repo_root/scripts/fleet_identity.py"
 leases="$repo_root/scripts/fleet_leases.py"
 export CMUX_QUIET=1
 
-if [[ -z "$feature" || -z "$instance_id" || -z "$task" ]]; then
-  echo "Usage: $0 <feature> <instance-id> \"<task>\"" >&2
+if [[ -z "$feature" || -z "$instance_id" || -z "$task" \
+  || ( -n "$output_mode" && "$output_mode" != "--json" ) ]]; then
+  echo "Usage: $0 <feature> <instance-id> \"<task>\" [--json]" >&2
   exit 2
 fi
 if [[ ! -f "$manifest" ]]; then
@@ -131,4 +133,10 @@ if ! cmux send-key --surface "$surface" --workspace "$ws_ref" enter >/dev/null; 
 fi
 cmux read-screen --surface "$surface" --workspace "$ws_ref" --lines 5 >/dev/null || true
 
-echo "dispatched run_id=$run_id to $instance_id/$role_type ($surface). Wait with: ./scripts/fleet-wait.sh $feature $instance_id --run $instance_id=$run_id"
+if [[ "$output_mode" == "--json" ]]; then
+  jq -n --arg run_id "$run_id" --arg feature "$feature" \
+    --arg instance "$instance_id" --arg role "$role_type" --arg surface "$surface" \
+    '{run_id:$run_id,feature:$feature,instance:$instance,role:$role,surface:$surface,runner:"local"}'
+else
+  echo "dispatched run_id=$run_id to $instance_id/$role_type ($surface). Wait with: ./scripts/fleet-wait.sh $feature $instance_id --run $instance_id=$run_id"
+fi

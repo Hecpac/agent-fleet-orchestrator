@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Event-driven wait for fleet members. Local instances require an exact run_id;
-# the event stream is a wake-up and the durable ledger is authoritative.
+# Event-driven wait for fleet members. Every local or frontier instance requires
+# an exact run_id; the event stream is a wake-up and the ledger is authoritative.
 #
 # Usage:
 #   ./scripts/fleet-wait.sh <feature> <instance-id> [instance-id ...]
 #     [--run instance-id=run-id ...] [--timeout <sec>] [--any] [--json]
 #
 # Signals used:
-#   - frontier roles (lead/codex/gemini/minimax/glm): agent.hook.Stop events,
-#     matched per-surface via the session_id -> surfaceId hook-session files.
+#   - frontier roles: UserPromptSubmit binds session to surface; completed Stop
+#     wakes strict run_id sentinel verification before terminalization.
 #   - local worker roles: exact terminal ledger event for the required run_id;
 #     notifications and heartbeats only trigger reconciliation.
 #

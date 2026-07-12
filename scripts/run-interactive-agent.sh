@@ -16,12 +16,20 @@ fi
 
 keep=()
 for name in HOME PATH USER LOGNAME SHELL TERM COLORTERM LANG LC_ALL LC_CTYPE TMPDIR \
-  CODEX_HOME CLAUDE_CODE_NO_FLICKER HOMEBREW_PREFIX HOMEBREW_CELLAR HOMEBREW_REPOSITORY \
+  CLAUDE_CODE_NO_FLICKER HOMEBREW_PREFIX HOMEBREW_CELLAR HOMEBREW_REPOSITORY \
   FLEET_RUNS_DIR; do
   if [[ -n "${!name:-}" ]]; then
     keep+=("$name=${!name}")
   fi
 done
+
+# Fleet Codex workers must use the default ~/.codex configuration where cmux
+# installs its official hooks. Other interactive providers keep the caller's
+# CODEX_HOME unchanged for backward compatibility.
+case "$role_type" in
+  codex|codex_candidate) ;;
+  *) [[ -n "${CODEX_HOME:-}" ]] && keep+=("CODEX_HOME=$CODEX_HOME") ;;
+esac
 
 # Preserve only the observed cmux identity/hook variables. Future CMUX-prefixed
 # values are not inherited automatically.

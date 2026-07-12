@@ -14,6 +14,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 FLEET_UP = ROOT / "scripts" / "fleet-up.sh"
 FLEET_DISPATCH = ROOT / "scripts" / "fleet-dispatch.sh"
+FLEET_SEND = ROOT / "scripts" / "fleet-send.sh"
+FLEET_RACE = ROOT / "scripts" / "fleet-race.sh"
 FLEET_DOWN = ROOT / "scripts" / "fleet-down.sh"
 ROUTER = ROOT / "orchestration" / "router.yaml"
 
@@ -80,10 +82,27 @@ elif command == "rename-tab":
         if pane["surface"] == surface:
             pane["title"] = title
     save(state)
+elif (
+    command == "send"
+    and os.environ.get("CMUX_FAIL_PROTOCOL_SURFACE") == arg_value("--surface")
+    and "Fleet completion protocol" in args[-1]
+):
+    raise SystemExit(1)
+elif command == "send-key" and os.environ.get("CMUX_FAIL_SEND_KEY") == "1":
+    raise SystemExit(1)
 elif command == "send" or command == "send-key" or command == "workspace-action":
     pass
 elif command == "read-screen":
     print("› ready\n❯\nctrl+p commands" if os.environ.get("CMUX_READY", "1") == "1" else "booting")
+elif command == "events":
+    print(json.dumps({
+        "type": "ack",
+        "protocol": "cmux-events",
+        "version": 1,
+        "boot_id": "boot-test",
+        "replay_count": 0,
+        "resume": {"oldest_seq": 1, "latest_seq": 42, "next_seq": 43, "gap": False},
+    }), flush=True)
 elif command == "close-workspace":
     commit_worktree = os.environ.get("CMUX_COMMIT_WORKTREE_ON_CLOSE")
     if commit_worktree:
@@ -281,6 +300,180 @@ class FleetUpTests(unittest.TestCase):
         self.assertIn("verify.role_type=claude_reviewer", manifest)
         sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
         self.assertTrue(any("run-interactive-agent.sh" in payload for payload in sends))
+        codex_launches = [payload for payload in sends if " codex " in payload]
+        self.assertTrue(codex_launches)
+        self.assertTrue(
+            all("--model gpt-5.6-sol" in payload for payload in codex_launches)
+        )
+
+    def test_frontier_send_returns_exact_run_and_rejects_second_active_turn(self) -> None:
+        result = self.run_fleet("frontier-send", "agent=codex_candidate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        advance = subprocess.run(
+            [
+                "python3", str(ROOT / "scripts" / "fleet_state.py"), "advance",
+                str(self.runs / "fleet-frontier-send.manifest"), "BUILD",
+                "--evidence", "frontier-send-test",
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(advance.returncode, 0, advance.stderr)
+        sent = subprocess.run(
+            ["bash", str(FLEET_SEND), "frontier-send", "agent", "bounded task"],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        run_id = re.search(r"sent run_id=([^ ]+)", sent.stdout).group(1)
+        ledger = [
+            json.loads(line)
+            for line in (self.runs / "fleet-frontier-send.ledger.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(ledger[-1]["run_id"], run_id)
+        self.assertEqual(ledger[-1]["event_boot_id"], "boot-test")
+        self.assertEqual(ledger[-1]["after_seq"], 42)
+        lock = self.runs / "locks" / "frontier-send.agent.lock"
+        self.assertEqual(json.loads((lock / "lease.json").read_text())["run_id"], run_id)
+        sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
+        self.assertTrue(any(f"FLEET_RESULT:{run_id}:<STATUS>" in payload for payload in sends))
+
+        duplicate = subprocess.run(
+            ["bash", str(FLEET_SEND), "frontier-send", "agent", "second task"],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(duplicate.returncode, 75, duplicate.stderr)
+
+        abandoned = subprocess.run(
+            [
+                "bash", str(ROOT / "scripts" / "fleet-abandon.sh"),
+                "frontier-send", "agent", run_id, "test_cleanup",
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(abandoned.returncode, 0, abandoned.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_frontier_send_key_failure_retains_indeterminate_lease(self) -> None:
+        result = self.run_fleet("frontier-send-fail", "agent=codex_candidate")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.runs / "fleet-frontier-send-fail.manifest"
+        advance = subprocess.run(
+            [
+                "python3", str(ROOT / "scripts" / "fleet_state.py"), "advance",
+                str(manifest), "BUILD", "--evidence", "frontier-send-failure-test",
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(advance.returncode, 0, advance.stderr)
+        failed_env = {**self.env, "CMUX_FAIL_SEND_KEY": "1"}
+        sent = subprocess.run(
+            ["bash", str(FLEET_SEND), "frontier-send-fail", "agent", "bounded task"],
+            cwd=ROOT,
+            env=failed_env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(sent.returncode, 1, sent.stderr)
+        ledger = [
+            json.loads(line)
+            for line in (self.runs / "fleet-frontier-send-fail.ledger.jsonl").read_text().splitlines()
+        ]
+        terminal = ledger[-1]
+        self.assertEqual(terminal["status"], "indeterminate")
+        self.assertEqual(terminal["reason"], "frontier_send_transfer_unconfirmed")
+        self.assertTrue(terminal["lease_retained"])
+        lock = self.runs / "locks" / "frontier-send-fail.agent.lock"
+        self.assertTrue(lock.exists())
+        abandoned = subprocess.run(
+            [
+                "bash", str(ROOT / "scripts" / "fleet-abandon.sh"),
+                "frontier-send-fail", "agent", terminal["run_id"], "test_cleanup",
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(abandoned.returncode, 0, abandoned.stderr)
+        self.assertFalse(lock.exists())
+
+    def test_race_partial_dispatch_reports_exact_runs_and_retains_leases(self) -> None:
+        race_env = {**self.env, "CMUX_FAIL_PROTOCOL_SURFACE": "surface:2"}
+        result = subprocess.run(
+            [
+                "bash", str(FLEET_RACE), "partial-dispatch", "bounded task",
+                "first=codex_candidate", "second=codex_candidate", "--timeout", "1",
+            ],
+            cwd=ROOT,
+            env=race_env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("frontier transfer indeterminate run_id=", result.stderr)
+        self.assertIn("Race dispatch stopped after starting these exact runs", result.stderr)
+        self.assertRegex(
+            result.stderr,
+            r"fleet-abandon\.sh race-partial-dispatch first [0-9a-f-]+",
+        )
+        ledger_path = self.runs / "fleet-race-partial-dispatch.ledger.jsonl"
+        events = [json.loads(line) for line in ledger_path.read_text().splitlines()]
+        latest = {}
+        for event in events:
+            latest[event["run_id"]] = event
+        self.assertEqual(len(latest), 2)
+        self.assertEqual(
+            sorted(event["status"] for event in latest.values()),
+            ["dispatched", "indeterminate"],
+        )
+        for event in latest.values():
+            lock = self.runs / "locks" / f"race-partial-dispatch.{event['instance']}.lock"
+            self.assertTrue(lock.exists())
+            cleanup = subprocess.run(
+                [
+                    "bash", str(ROOT / "scripts" / "fleet-abandon.sh"),
+                    "race-partial-dispatch", event["instance"], event["run_id"],
+                    "test_cleanup",
+                ],
+                cwd=ROOT,
+                env=self.env,
+                text=True,
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+            self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+            self.assertFalse(lock.exists())
 
     def test_dispatch_rejects_surface_uuid_mismatch(self) -> None:
         result = self.run_fleet("identity", "triage")

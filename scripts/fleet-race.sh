@@ -86,71 +86,59 @@ fi
 first_phase="$race_phases"
 python3 "$repo_root/scripts/fleet_state.py" advance "$manifest" "$first_phase" --evidence "race-candidate-search:$name" >/dev/null
 
-# Local dispatches come first so the waiter can bind each instance to its exact
-# run_id. A local run that finishes before subscription remains observable in
-# the durable ledger. Frontier turns are sent only after the event ACK waiter
-# has been armed.
+# Every candidate is dispatched with a durable run_id and event baseline before
+# the shared waiter starts. Fast frontier finishes are recovered by replay.
 run_args=()
-frontier_instances=()
-echo "== dispatching task to local racers"
-for instance in "${instances[@]}"; do
-  if is_frontier "$instance"; then
-    frontier_instances+=("$instance")
-  else
-    dispatch_output="$("$repo_root/scripts/fleet-dispatch.sh" "$feature" "$instance" "$task")"
-    run_id="$(sed -n 's/.*dispatched run_id=\([^ ]*\).*/\1/p' <<< "$dispatch_output" | tail -1)"
-    if [[ -z "$run_id" ]]; then
-      echo "Could not recover run_id for local racer '$instance'." >&2
-      exit 2
-    fi
-    run_args+=(--run "$instance=$run_id")
-  fi
-done
-
-result_file="$(mktemp)"
-ready_file="$result_file.ready"
+run_ids=()
+result_file=""
 wait_pid=""
-cleanup_waiter() {
+dispatch_complete=0
+cleanup_race() {
   if [[ -n "$wait_pid" ]] && kill -0 "$wait_pid" 2>/dev/null; then
     kill "$wait_pid" 2>/dev/null || true
     wait "$wait_pid" 2>/dev/null || true
   fi
-  rm -f "$result_file" "$ready_file"
+  [[ -z "$result_file" ]] || rm -f "$result_file"
+  if (( dispatch_complete == 0 && ${#run_ids[@]} > 0 )); then
+    echo "Race dispatch stopped after starting these exact runs; leases remain fail-closed:" >&2
+    for ((cleanup_index=0; cleanup_index<${#run_ids[@]}; cleanup_index++)); do
+      [[ -n "${run_ids[$cleanup_index]:-}" ]] || continue
+      cleanup_instance="${instances[$cleanup_index]}"
+      if is_frontier "$cleanup_instance"; then
+        echo "  after confirming quiescence: ./scripts/fleet-abandon.sh $feature $cleanup_instance ${run_ids[$cleanup_index]} dispatch_failed_after_partial_start" >&2
+      else
+        echo "  wait exact local run: ./scripts/fleet-wait.sh $feature $cleanup_instance --run $cleanup_instance=${run_ids[$cleanup_index]} --timeout $timeout_sec" >&2
+      fi
+    done
+  fi
 }
-trap cleanup_waiter EXIT
+trap cleanup_race EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-FLEET_WAIT_READY_FILE="$ready_file" \
+echo "== dispatching task to all racers"
+for ((index=0; index<${#instances[@]}; index++)); do
+  instance="${instances[$index]}"
+  if is_frontier "$instance"; then
+    dispatch_output="$("$repo_root/scripts/fleet-send.sh" "$feature" "$instance" "$task" --json)"
+  else
+    dispatch_output="$("$repo_root/scripts/fleet-dispatch.sh" "$feature" "$instance" "$task" --json)"
+  fi
+  run_id="$(jq -r '.run_id // empty' <<< "$dispatch_output")"
+  if [[ -z "$run_id" ]]; then
+    echo "Could not recover run_id for racer '$instance'." >&2
+    exit 2
+  fi
+  run_ids[$index]="$run_id"
+  run_args+=(--run "$instance=$run_id")
+done
+dispatch_complete=1
+
+result_file="$(mktemp)"
 "$repo_root/scripts/fleet-wait.sh" "$feature" "${instances[@]}" \
   ${run_args[@]+"${run_args[@]}"} --any --json --timeout "$timeout_sec" \
   > "$result_file" &
 wait_pid=$!
-
-if [[ ${#frontier_instances[@]} -gt 0 ]]; then
-  ready=0
-  for _ in {1..200}; do
-    if [[ -f "$ready_file" ]]; then
-      ready=1
-      break
-    fi
-    if ! kill -0 "$wait_pid" 2>/dev/null; then
-      wait "$wait_pid" 2>/dev/null || true
-      wait_pid=""
-      echo "Race waiter exited before subscription ACK." >&2
-      exit 5
-    fi
-    sleep 0.05
-  done
-  if (( ready == 0 )); then
-    echo "Race waiter did not confirm subscription ACK." >&2
-    exit 5
-  fi
-  echo "== dispatching task to frontier racers"
-  for instance in "${frontier_instances[@]}"; do
-    "$repo_root/scripts/fleet-send.sh" "$feature" "$instance" "$task" >/dev/null
-  done
-fi
 
 echo "== racing (timeout ${timeout_sec}s)..."
 set +e
@@ -173,16 +161,21 @@ fi
 echo "== FIRST CANDIDATE (NOT VERIFIED): $candidate"
 
 if (( keep_losers == 0 )); then
-  for instance in "${instances[@]}"; do
+  for ((index=0; index<${#instances[@]}; index++)); do
+    instance="${instances[$index]}"
     [[ "$instance" == "$candidate" ]] && continue
     surface="$(manifest_value "$instance")"
     if is_frontier "$instance"; then
       cmux send-key --surface "$surface" --workspace "$ws_ref" escape >/dev/null || true
+      python3 "$repo_root/scripts/fleet_frontier.py" mark-indeterminate "$runs_dir" \
+        --feature "$feature" --instance "$instance" --run-id "${run_ids[$index]}" \
+        --reason race_loser_interruption_unconfirmed >/dev/null || true
+      echo "   interruption requested: $instance (lease retained until explicit abandon)"
     else
       cmux send-key --surface "$surface" --workspace "$ws_ref" ctrl+c >/dev/null || true
+      echo "   interrupted: $instance"
     fi
     cmux read-screen --surface "$surface" --workspace "$ws_ref" --lines 5 >/dev/null || true
-    echo "   interrupted: $instance"
   done
 fi
 

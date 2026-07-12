@@ -19,7 +19,7 @@ from fleet_identity import current_tree, mappings
 from fleet_ledger import append_event, latest_event
 
 
-TERMINAL_STATUSES = {"succeeded", "failed", "blocked", "abandoned"}
+TERMINAL_STATUSES = {"succeeded", "failed", "blocked", "abandoned", "indeterminate"}
 
 
 class LeaseError(RuntimeError):
@@ -128,6 +128,38 @@ def _run_groups(runs_dir: Path, feature: str | None = None) -> tuple[dict[str, l
     return groups, unknown
 
 
+def _surface_owner(
+    runs_dir: Path, surface_uuid: str, *, excluding_run_id: str = ""
+) -> dict[str, Any] | None:
+    target = surface_uuid.upper()
+    for lease in _lease_dirs(runs_dir):
+        metadata = read_metadata(lease)
+        if not metadata or metadata.get("run_id") == excluding_run_id:
+            continue
+        if str(metadata.get("surface_uuid") or "").upper() == target:
+            return metadata
+    return None
+
+
+def _reject_surface_owner(runs_dir: Path, surface_uuid: str, run_id: str) -> None:
+    owner = _surface_owner(runs_dir, surface_uuid, excluding_run_id=run_id)
+    if owner:
+        raise LeaseBusy(
+            "surface is busy: "
+            f"{surface_uuid.upper()} owned by "
+            f"{owner.get('feature')}.{owner.get('instance')} "
+            f"run_id={owner.get('run_id')}"
+        )
+
+
+def _reject_unknown_leases(reconciled: dict[str, Any]) -> None:
+    unknown = reconciled.get("unknown") or []
+    if unknown:
+        raise LeaseBusy(
+            "unknown or malformed leases block acquisition: " + ", ".join(unknown)
+        )
+
+
 def _confirmed_absent(metadata: dict[str, Any], tree_text: str) -> tuple[bool, str]:
     if tree_text.strip() and not re.search(
         r"(?:window|workspace|pane|surface) "
@@ -185,7 +217,16 @@ def _reconcile_locked(
         metadata = read_metadata(leases[0]) or {}
         ledger = runs_dir / f"fleet-{metadata.get('feature', '')}.ledger.jsonl"
         event = latest_event(ledger, run_id=run_id)
-        terminal = bool(event and event.get("status") in TERMINAL_STATUSES)
+        retained_indeterminate = bool(
+            event
+            and event.get("status") == "indeterminate"
+            and event.get("lease_retained")
+        )
+        terminal = bool(
+            event
+            and event.get("status") in TERMINAL_STATUSES
+            and not retained_indeterminate
+        )
         reason = "terminal_ledger" if terminal else ""
         if not terminal:
             if tree_text is None and not probe_error:
@@ -240,9 +281,11 @@ def acquire(
     lock_dir = runs_dir / "locks"
     created: list[Path] = []
     with coordinator(runs_dir):
-        _reconcile_locked(runs_dir, tree_reader=tree_reader)
+        reconciled = _reconcile_locked(runs_dir, tree_reader=tree_reader)
+        _reject_unknown_leases(reconciled)
         if _closing_path(runs_dir, feature).exists():
             raise LeaseBusy(f"fleet '{feature}' is closing")
+        _reject_surface_owner(runs_dir, surface_uuid, run_id)
         instance_lock = lock_dir / f"{feature}.{instance}.lock"
         if instance_lock.exists():
             raise LeaseBusy(f"instance '{instance}' is busy")
@@ -298,6 +341,52 @@ def acquire(
         "local_slot": str(local_slot),
         "role_slot": str(role_slot),
     }
+
+
+def acquire_frontier(
+    runs_dir: Path,
+    *,
+    run_id: str,
+    feature: str,
+    instance: str,
+    role: str,
+    phase: str,
+    task_sha256: str,
+    workspace_uuid: str,
+    surface_uuid: str,
+    tree_reader: Callable[[], str] = current_tree,
+) -> Path:
+    lock_dir = runs_dir / "locks"
+    with coordinator(runs_dir):
+        reconciled = _reconcile_locked(runs_dir, tree_reader=tree_reader)
+        _reject_unknown_leases(reconciled)
+        if _closing_path(runs_dir, feature).exists():
+            raise LeaseBusy(f"fleet '{feature}' is closing")
+        _reject_surface_owner(runs_dir, surface_uuid, run_id)
+        instance_lock = lock_dir / f"{feature}.{instance}.lock"
+        if instance_lock.exists():
+            raise LeaseBusy(f"instance '{instance}' is busy")
+        _write_metadata(
+            instance_lock,
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "feature": feature,
+                "instance": instance,
+                "role": role,
+                "phase": phase,
+                "resource_class": "remote",
+                "runner": "interactive",
+                "task_sha256": task_sha256,
+                "workspace_uuid": workspace_uuid.upper(),
+                "surface_uuid": surface_uuid.upper(),
+                "acquired_at": _utc_now(),
+                "pid": None,
+                "pgid": None,
+                "kind": instance_lock.name,
+            },
+        )
+    return instance_lock
 
 
 def validate(runs_dir: Path, run_id: str, leases: list[Path]) -> None:
@@ -423,6 +512,13 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument(f"--{name}", required=True)
     command.add_argument("--max-local", type=int, required=True)
     command.add_argument("--role-limit", type=int, required=True)
+    command = sub.add_parser("acquire-frontier")
+    command.add_argument("runs_dir")
+    for name in (
+        "run-id", "feature", "instance", "role", "phase", "task-sha256",
+        "workspace-uuid", "surface-uuid",
+    ):
+        command.add_argument(f"--{name}", required=True)
     for name in ("validate", "release", "activate"):
         command = sub.add_parser(name)
         command.add_argument("runs_dir")
@@ -463,6 +559,19 @@ def main() -> int:
                 role_limit=args.role_limit,
             )
             print(json.dumps(result, sort_keys=True))
+        elif args.command == "acquire-frontier":
+            lease = acquire_frontier(
+                runs_dir,
+                run_id=args.run_id,
+                feature=args.feature,
+                instance=args.instance,
+                role=args.role,
+                phase=args.phase,
+                task_sha256=args.task_sha256,
+                workspace_uuid=args.workspace_uuid,
+                surface_uuid=args.surface_uuid,
+            )
+            print(lease)
         elif args.command == "reconcile":
             print(json.dumps(reconcile(runs_dir, feature=args.feature), sort_keys=True))
         elif args.command == "check":
