@@ -109,8 +109,8 @@ interactive agents launch through an environment allowlist
 (writer → `workspace-write`, non-writer → `read-only`, CONTROL alone →
 `danger-full-access` to reach the cmux socket). What remains out of scope:
 OS-level process sandboxing. Direct manual `cmux send` bypasses the wrappers,
-so keep one writer and use the scripts. `fleet-race` still returns the first
-completion as a candidate; it is not an acceptance gate.
+so keep one writer and use the scripts. `fleet-race` returns the first
+successful completion as a candidate; it is not an acceptance gate.
 
 Write isolation: pass `--target-repo <path>` (or set `FLEET_TARGET_REPO`) to
 `fleet-up` and every write-authority instance gets a dedicated
@@ -121,9 +121,11 @@ and removes branches that never advanced beyond their base SHA.
 
 Execution economics: local worker runs record prompt/completion token counts
 in the per-feature ledger; `limits.local_token_budget_per_feature` in the
-router makes `fleet-dispatch` warn at 70% spend and refuse new dispatches at
-100%. `fleet-wait` fires a `cmux notify` escalation (title `ESCALATION: ...`)
-naming the stuck instances when its deadline expires.
+router makes `fleet-dispatch` warn at 70% observed spend and refuse new
+dispatches at 100%. This is a soft dispatch-time cap, not a reservation, so
+already-concurrent runs may overshoot it. `fleet-wait` fires a `cmux notify`
+escalation (title `ESCALATION: ...`) naming the stuck instances when its
+deadline expires.
 
 Human-in-the-loop: advancing the durable phase gate out of BUILD requires
 `--approved-by <human>` in addition to `--evidence`; the approver is recorded
@@ -139,10 +141,18 @@ durable workspace/surface UUIDs.
 session (via cmux hook data) and surfaces the ones blocked waiting on a human,
 with age — check it whenever you return to the machine.
 
-Coordination is event-driven, not polled: `scripts/fleet-dispatch.sh` sends a
-task to a worker pane and fires a completion event; `scripts/fleet-wait.sh`
-blocks on the cmux event stream (`agent.hook.Stop` for interactive agents,
-notifications for one-shot workers) until every named role finishes.
+Coordination is event-driven, not polled: `scripts/fleet-dispatch.sh` returns a
+durable local `run_id`; pass it back as `--run instance=run_id` to
+`scripts/fleet-wait.sh`. The waiter subscribes with an ACK, then reconciles the
+exact local run from the ledger. Notifications are wake-ups only. Interactive
+agents still complete through `agent.hook.Stop`. Local dispatch leases are
+owner-checked and crash reconciliation reclaims them only after a terminal
+ledger event or confirmed workspace/surface UUID absence. Teardown publishes
+an atomic closing owner so new dispatches cannot enter after its lease check.
+If a hard-killed runner leaves leases while its pane is still alive, automatic
+PID/TTL reclaim is intentionally disabled: close the workspace deliberately,
+then run `scripts/fleet-down.sh <feature> --recover-absent`; the UUID-absence
+probe records `abandoned`, quarantines the leases, and archives the fleet.
 
 The orchestration playbook (mental model, verbs, wait rules, memory budget)
 lives in both `.agents/skills/cmux/SKILL.md` and `.claude/skills/cmux/SKILL.md`;

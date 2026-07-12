@@ -112,9 +112,15 @@ socket; its environment is still allowlisted.
 Pass `--target-repo <path>` to `fleet-up` and each write-authority instance
 gets a dedicated `fleet/<feature>/<instance>` branch and worktree at the target
 repo's current `HEAD`. Existing branches fail closed; teardown removes only an
-unchanged branch and preserves committed output. Local-worker token spend accrues in the ledger and
-`fleet-dispatch` refuses once `limits.local_token_budget_per_feature` is
-exhausted; `fleet-wait` fires a `cmux notify` ESCALATION on timeout.
+unchanged branch and preserves committed output. Local-worker token spend
+accrues in the ledger and `fleet-dispatch` refuses once observed spend reaches
+`limits.local_token_budget_per_feature`; this is a soft dispatch-time cap, not
+a reservation. `fleet-wait` fires a `cmux notify` ESCALATION on timeout.
+Local leases are owner-checked and reclaimed automatically only from a terminal
+ledger event or confirmed workspace/surface UUID absence. If a hard-killed
+runner leaves leases on a live pane, close that workspace deliberately and use
+`./scripts/fleet-down.sh <feature> --recover-absent`; PID/TTL reclaim is not
+trusted. Teardown uses a closing marker to reject concurrent dispatch.
 
 Roles come in two kinds:
 
@@ -172,9 +178,9 @@ Never busy-wait with sleep + read-screen loops. Dispatch, then block on the
 event stream, then read the result once:
 
 ```bash
-# Local worker: dispatch (adds a completion event automatically) + wait
+# Local worker: dispatch, retain its run_id, then wait for that exact run
 ./scripts/fleet-dispatch.sh <feature> code_worker "explain the bug in scripts/foo.sh"
-./scripts/fleet-wait.sh <feature> code_worker --timeout 600
+./scripts/fleet-wait.sh <feature> code_worker --run code_worker=<run_id> --timeout 600
 cmux read-screen --surface <its surface> --workspace <ws> --lines 50
 
 # Frontier agent: prompt it, then wait for its turn to end
@@ -183,12 +189,14 @@ cmux send-key --surface <s> --workspace <ws> enter
 ./scripts/fleet-wait.sh <feature> codex minimax --timeout 1800   # blocks until BOTH finish
 ```
 
-`fleet-wait.sh` prints `instance=done` per completion and exits 0 when all given
-instances finished (124 on timeout). Frontier completions are detected via
-`agent.hook.Stop` events (works for lead/codex/minimax/glm); local
-workers via the notification `fleet-dispatch.sh` fires. Local workers cannot
-write files themselves; feed them a bounded evidence pack and capture their
-stdout durably when the result is too large for a pane.
+`fleet-wait.sh` prints `instance`, `run_id`, terminal `status`, `exit_code`, and
+`result_file`; pass `--json` for canonical JSONL. Exit codes are 0 succeeded,
+1 failed, 2 usage/identity/protocol, 3 blocked, 4 abandoned, 5 indeterminate,
+and 124 deadline. Frontier completions are detected via `agent.hook.Stop`
+events. Local notifications are wake-ups only: completion is reconciled from
+the durable ledger for the exact required `run_id`. Local workers cannot write
+files themselves; feed them a bounded evidence pack and capture their stdout
+durably when the result is too large for a pane.
 
 Workers answer with a fixed contract: `STATUS: DONE|BLOCKED|FAILED`, then
 `SUMMARY / EVIDENCE / RISKS / NEXT_ACTION`. Parse STATUS before trusting the
@@ -202,7 +210,7 @@ rest; treat a missing STATUS block as still-running or failed.
   (gemma3:4b), `light_code` (granite-code:3b).
 - Never use gemma4:26b, qwen3-coder:30b, devstral:24b locally.
 
-### Agent race (first completion is a candidate)
+### Agent race (first success is a candidate)
 
 For hotfix/needle-in-a-haystack tasks, race heterogeneous agents on the same
 task; losers are interrupted automatically:
@@ -212,9 +220,11 @@ just race <name> "<task>" [instance=role ...]  # defaults come from router
 ./scripts/fleet-race.sh <name> "<task>" candidate_a=codex candidate_b=minimax
 ```
 
-Prints the first candidate and its screen, then leaves the other agents running
-by default. Only use `--cancel-losers` after a separate verification gate. The
-workspace remains available for inspection and teardown.
+Prints the first successful candidate and its screen, then leaves the other
+agents running by default. Failed, blocked, and abandoned candidates do not
+stop `--any` while another candidate remains viable. Only use
+`--cancel-losers` after a separate verification gate. The workspace remains
+available for inspection and teardown.
 
 ### Decision queue (humans are slow — make blocking visible)
 
