@@ -24,8 +24,8 @@ Usage:
   fleet-up.sh --list-presets
 
 --target-repo <path>: git repository the fleet works on. Every instance with
-write authority gets its own detached git worktree there and its agent starts
-inside it, so writers never share a working tree with the daemon or each other.
+write authority gets a dedicated fleet/<feature>/<instance> branch and worktree
+there, so committed output remains reachable after teardown.
 EOF
 }
 
@@ -258,6 +258,32 @@ if [[ -e "$manifest" ]]; then
   echo "Close or reconcile the existing fleet before reusing '$feature'." >&2
   exit 2
 fi
+
+# Resolve writer branches before any cmux mutation. A fleet never reuses an
+# existing branch: that would mix output from two runs under one durable ref.
+worktree_branches=()
+worktree_base_shas=()
+if [[ -n "$target_repo" ]]; then
+  target_head="$(git -C "$target_repo" rev-parse --verify HEAD)"
+  for ((i=0; i<${#instance_ids[@]}; i++)); do
+    worktree_branches[$i]=""
+    worktree_base_shas[$i]=""
+    if [[ "${authorities[$i]}" == "write" ]]; then
+      branch="fleet/$feature/${instance_ids[$i]}"
+      if ! git -C "$target_repo" check-ref-format --branch "$branch" >/dev/null 2>&1; then
+        echo "Writer branch name is invalid: $branch" >&2
+        exit 2
+      fi
+      if git -C "$target_repo" show-ref --verify --quiet "refs/heads/$branch"; then
+        echo "Writer branch already exists: $branch" >&2
+        echo "Reconcile or remove it before reusing fleet '$feature'." >&2
+        exit 2
+      fi
+      worktree_branches[$i]="$branch"
+      worktree_base_shas[$i]="$target_head"
+    fi
+  done
+fi
 if ! cmux ping >/dev/null 2>&1; then
   echo "cmux app is not running (cmux ping failed). Open cmux.app first." >&2
   exit 1
@@ -270,20 +296,78 @@ manifest_published=0
 ws_ref=""
 manifest_tmp=""
 created_worktrees=()
+created_worktree_branches=()
+created_worktree_bases=()
 cleanup_on_exit() {
   local code=$?
+  local workspace_gone=0
+  local rollback_complete=1
+  local tree_output=""
   if (( code != 0 && created_workspace == 1 && completed == 0 )); then
     cmux close-workspace --workspace "$ws_ref" >/dev/null 2>&1 || true
-  fi
-  if (( code != 0 && manifest_published == 1 && completed == 0 )); then
-    rm -f "$manifest"
-    rm -f "${manifest%.manifest}.state.json"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      if tree_output="$(cmux tree --all 2>/dev/null)"; then
+        if ! awk -v target="$ws_ref" '
+          { for (i = 1; i <= NF; i++) if ($i == target) found = 1 }
+          END { exit(found ? 0 : 1) }
+        ' <<< "$tree_output"; then
+          workspace_gone=1
+          break
+        fi
+      fi
+      sleep 0.1
+    done
+  elif (( created_workspace == 0 )); then
+    workspace_gone=1
   fi
   if (( code != 0 && completed == 0 )); then
-    local wt
-    for wt in ${created_worktrees[@]+"${created_worktrees[@]}"}; do
-      git -C "$target_repo" worktree remove --force "$wt" >/dev/null 2>&1 || true
-    done
+    if (( workspace_gone == 0 )); then
+      echo "WARNING: preserving writer worktrees because cmux did not confirm workspace shutdown." >&2
+      rollback_complete=0
+    else
+      local index wt branch base branch_head checked_out_branch worktree_head
+      for ((index=0; index<${#created_worktrees[@]}; index++)); do
+        wt="${created_worktrees[$index]}"
+        branch="${created_worktree_branches[$index]}"
+        base="${created_worktree_bases[$index]}"
+        checked_out_branch="$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+        worktree_head="$(git -C "$wt" rev-parse --verify HEAD 2>/dev/null || true)"
+        branch_head="$(git -C "$target_repo" rev-parse --verify "refs/heads/$branch" 2>/dev/null || true)"
+        if [[ -d "$wt" && ( "$checked_out_branch" != "$branch" || \
+              -z "$worktree_head" || "$worktree_head" != "$branch_head" ) ]]; then
+          echo "WARNING: preserving writer worktree on unexpected HEAD after failed boot: $wt" >&2
+          rollback_complete=0
+          continue
+        fi
+        if [[ -d "$wt" && -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]]; then
+          echo "WARNING: preserving dirty writer worktree after failed boot: $wt" >&2
+          rollback_complete=0
+          continue
+        fi
+        if [[ -d "$wt" ]] && ! git -C "$target_repo" worktree remove "$wt" >/dev/null 2>&1; then
+          echo "WARNING: preserving writer branch because worktree cleanup failed: $branch" >&2
+          rollback_complete=0
+          continue
+        fi
+        if [[ -n "$branch_head" && "$branch_head" == "$base" ]]; then
+          if ! git -C "$target_repo" update-ref -d "refs/heads/$branch" "$base" >/dev/null 2>&1; then
+            echo "WARNING: could not remove unchanged writer branch $branch" >&2
+            rollback_complete=0
+          fi
+        elif [[ -n "$branch_head" ]]; then
+          echo "WARNING: preserving advanced writer branch after failed boot: $branch" >&2
+          rollback_complete=0
+        fi
+      done
+    fi
+  fi
+  if (( code != 0 && manifest_published == 1 && completed == 0 )); then
+    if (( rollback_complete == 1 )); then
+      rm -f "$manifest"
+      rm -f "${manifest%.manifest}.state.json"
+    else
+      echo "WARNING: preserving manifest for incomplete boot recovery: $manifest" >&2
+    fi
   fi
   [[ -n "$manifest_tmp" && -e "$manifest_tmp" ]] && rm -f "$manifest_tmp"
   return "$code"
@@ -291,25 +375,34 @@ cleanup_on_exit() {
 trap cleanup_on_exit EXIT
 
 # Writers never share a working tree: each write-authority instance gets a
-# detached git worktree of the target repo and its agent starts inside it.
+# named branch and dedicated worktree of the target repo, then starts inside it.
 worktrees=()
 if [[ -n "$target_repo" ]]; then
   for ((i=0; i<${#instance_ids[@]}; i++)); do
     worktrees[$i]=""
     if [[ "${authorities[$i]}" == "write" ]]; then
       wt="$runs_dir/worktrees/$feature-${instance_ids[$i]}"
+      branch="${worktree_branches[$i]}"
+      base_sha="${worktree_base_shas[$i]}"
       if [[ -e "$wt" ]]; then
         echo "Worktree path already exists: $wt" >&2
         exit 2
       fi
       mkdir -p "$runs_dir/worktrees"
       chmod 700 "$runs_dir/worktrees"
-      if ! git -C "$target_repo" worktree add --detach "$wt" >/dev/null 2>&1; then
+      if ! git -C "$target_repo" branch "$branch" "$base_sha" >/dev/null 2>&1; then
+        echo "Could not create writer branch $branch; it may have been created concurrently." >&2
+        exit 2
+      fi
+      if ! git -C "$target_repo" worktree add "$wt" "$branch" >/dev/null 2>&1; then
+        git -C "$target_repo" update-ref -d "refs/heads/$branch" "$base_sha" >/dev/null 2>&1 || true
         echo "Could not create worktree for ${instance_ids[$i]} at $wt" >&2
         exit 2
       fi
       worktrees[$i]="$wt"
       created_worktrees+=("$wt")
+      created_worktree_branches+=("$branch")
+      created_worktree_bases+=("$base_sha")
     fi
   done
 fi
@@ -423,6 +516,9 @@ manifest_tmp="$(mktemp "$runs_dir/.fleet-$feature.manifest.XXXXXX")"
     echo "${instance_ids[$i]}.provider=${providers[$i]}"
     if [[ -n "${worktrees[$i]:-}" ]]; then
       echo "${instance_ids[$i]}.worktree=${worktrees[$i]}"
+      echo "${instance_ids[$i]}.branch=${worktree_branches[$i]}"
+      echo "${instance_ids[$i]}.base_sha=${worktree_base_shas[$i]}"
+      echo "${instance_ids[$i]}.final_sha=${worktree_base_shas[$i]}"
     fi
   done
 } > "$manifest_tmp"

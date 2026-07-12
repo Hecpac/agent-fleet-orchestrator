@@ -23,6 +23,7 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 
 state_path = Path(os.environ["CMUX_STATE"])
 log_path = Path(os.environ["CMUX_LOG"])
@@ -84,12 +85,31 @@ elif command == "send" or command == "send-key" or command == "workspace-action"
 elif command == "read-screen":
     print("› ready\n❯\nctrl+p commands" if os.environ.get("CMUX_READY", "1") == "1" else "booting")
 elif command == "close-workspace":
+    commit_worktree = os.environ.get("CMUX_COMMIT_WORKTREE_ON_CLOSE")
+    if commit_worktree:
+        subprocess.run(
+            ["git", "-C", commit_worktree, "commit", "--allow-empty", "-q", "-m", "late branch commit"],
+            check=True,
+        )
+    detach_worktree = os.environ.get("CMUX_DETACH_WORKTREE_ON_CLOSE")
+    if detach_worktree:
+        subprocess.run(["git", "-C", detach_worktree, "switch", "--detach", "-q"], check=True)
+        subprocess.run(
+            ["git", "-C", detach_worktree, "commit", "--allow-empty", "-q", "-m", "late detached"],
+            check=True,
+        )
     state["closed"] = True
     save(state)
 elif command == "tree":
-    if state.get("closed") and "--all" in args:
-        print("window window:1 00000000-0000-0000-0000-000000009999")
-        raise SystemExit(0)
+    if state.get("closed") and os.environ.get("CMUX_TREE_PROBE_ERROR") == "1" and "--all" in args:
+        print("probe failed", file=sys.stderr)
+        raise SystemExit(2)
+    if state.get("closed"):
+        if "--all" in args:
+            print("window window:1 00000000-0000-0000-0000-000000009999")
+            raise SystemExit(0)
+        if "--workspace" in args:
+            raise SystemExit(1)
     if json_mode:
         panes = []
         for index, pane in enumerate(state["panes"]):
@@ -371,8 +391,12 @@ class FleetUpTests(unittest.TestCase):
         self.assertIsNotNone(match, f"no build.worktree entry in manifest:\n{manifest}")
         return Path(match.group(1))
 
-    def test_writer_gets_detached_worktree_in_target_repo(self) -> None:
+    def test_writer_gets_named_branch_from_target_head(self) -> None:
         target = self.make_target_repo()
+        base_sha = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "HEAD"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
         result = self.run_fleet(
             "wt", "--preset", "implementation_review", "--target-repo", str(target)
         )
@@ -383,9 +407,12 @@ class FleetUpTests(unittest.TestCase):
             ["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "HEAD"],
             text=True, capture_output=True, check=False,
         )
-        self.assertEqual(head.stdout.strip(), "HEAD", "writer worktree must be detached")
+        self.assertEqual(head.stdout.strip(), "fleet/wt/build")
         manifest = (self.runs / "fleet-wt.manifest").read_text()
         self.assertIn(f"target_repo={target}", manifest)
+        self.assertIn("build.branch=fleet/wt/build", manifest)
+        self.assertIn(f"build.base_sha={base_sha}", manifest)
+        self.assertIn(f"build.final_sha={base_sha}", manifest)
         self.assertNotIn("verify.worktree=", manifest)
         sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
         self.assertTrue(
@@ -418,6 +445,155 @@ class FleetUpTests(unittest.TestCase):
         self.assertEqual(closed.returncode, 0, closed.stderr)
         self.assertFalse(worktree.exists())
         self.assertFalse((self.runs / "fleet-wtdown.manifest").exists())
+        branch = subprocess.run(
+            ["git", "-C", str(target), "show-ref", "--verify", "refs/heads/fleet/wtdown/build"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertNotEqual(branch.returncode, 0, "unchanged writer branch should be removed")
+
+    def test_teardown_preserves_advanced_writer_branch_and_archives_final_sha(self) -> None:
+        target = self.make_target_repo()
+        result = self.run_fleet(
+            "wtcommit", "--preset", "implementation_review", "--target-repo", str(target)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        worktree = self.writer_worktree("wtcommit")
+        (worktree / "result.txt").write_text("durable\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "result.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(worktree), "commit", "-q", "-m", "agent result"], check=True
+        )
+        final_sha = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+
+        closed = subprocess.run(
+            ["bash", str(FLEET_DOWN), "wtcommit"], cwd=ROOT, env=self.env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+        )
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertFalse(worktree.exists())
+        branch_sha = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "refs/heads/fleet/wtcommit/build"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(branch_sha, final_sha)
+        archived = list((self.runs / "archive").glob("wtcommit-*/manifest"))
+        self.assertEqual(len(archived), 1)
+        archived_manifest = archived[0].read_text()
+        self.assertIn("build.branch=fleet/wtcommit/build", archived_manifest)
+        self.assertIn(f"build.final_sha={final_sha}", archived_manifest)
+
+    def test_teardown_refuses_writer_detached_from_durable_branch(self) -> None:
+        target = self.make_target_repo()
+        result = self.run_fleet(
+            "wtdetached", "--preset", "implementation_review", "--target-repo", str(target)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        worktree = self.writer_worktree("wtdetached")
+        subprocess.run(["git", "-C", str(worktree), "switch", "--detach", "-q"], check=True)
+        subprocess.run(
+            ["git", "-C", str(worktree), "commit", "--allow-empty", "-q", "-m", "detached"],
+            check=True,
+        )
+
+        refused = subprocess.run(
+            ["bash", str(FLEET_DOWN), "wtdetached"], cwd=ROOT, env=self.env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+        )
+        self.assertEqual(refused.returncode, 75, refused.stderr)
+        self.assertIn("not attached", refused.stderr)
+        self.assertTrue(worktree.exists())
+        self.assertTrue((self.runs / "fleet-wtdetached.manifest").exists())
+        branch = subprocess.run(
+            ["git", "-C", str(target), "show-ref", "--verify", "refs/heads/fleet/wtdetached/build"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(branch.returncode, 0)
+
+    def test_teardown_rechecks_writer_after_workspace_shutdown(self) -> None:
+        target = self.make_target_repo()
+        result = self.run_fleet(
+            "wtlate", "--preset", "implementation_review", "--target-repo", str(target)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        worktree = self.writer_worktree("wtlate")
+        self.env["CMUX_DETACH_WORKTREE_ON_CLOSE"] = str(worktree)
+
+        refused = subprocess.run(
+            ["bash", str(FLEET_DOWN), "wtlate"], cwd=ROOT, env=self.env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+        )
+        self.assertEqual(refused.returncode, 75, refused.stderr)
+        self.assertIn("after workspace shutdown", refused.stderr)
+        self.assertTrue(worktree.exists())
+        self.assertTrue((self.runs / "fleet-wtlate.manifest").exists())
+
+    def test_teardown_preserves_state_when_shutdown_probe_fails(self) -> None:
+        target = self.make_target_repo()
+        result = self.run_fleet(
+            "wtprobe", "--preset", "implementation_review", "--target-repo", str(target)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        worktree = self.writer_worktree("wtprobe")
+        self.env["CMUX_TREE_PROBE_ERROR"] = "1"
+
+        refused = subprocess.run(
+            ["bash", str(FLEET_DOWN), "wtprobe"], cwd=ROOT, env=self.env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+        )
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        self.assertIn("identity probes failed", refused.stderr)
+        self.assertTrue(worktree.exists())
+        self.assertTrue((self.runs / "fleet-wtprobe.manifest").exists())
+
+    def test_existing_writer_branch_fails_before_cmux(self) -> None:
+        target = self.make_target_repo()
+        subprocess.run(
+            ["git", "-C", str(target), "branch", "fleet/wtcollision/build"], check=True
+        )
+        result = self.run_fleet(
+            "wtcollision", "--preset", "implementation_review", "--target-repo", str(target)
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("Writer branch already exists", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.runs / "fleet-wtcollision.manifest").exists())
+
+    def test_failed_boot_removes_unchanged_writer_branch(self) -> None:
+        target = self.make_target_repo()
+        self.env["CMUX_READY"] = "0"
+        result = self.run_fleet(
+            "wtfailed", "--preset", "implementation_review", "--target-repo", str(target)
+        )
+        self.assertEqual(result.returncode, 1)
+        branch = subprocess.run(
+            ["git", "-C", str(target), "show-ref", "--verify", "refs/heads/fleet/wtfailed/build"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertNotEqual(branch.returncode, 0)
+        self.assertFalse((self.runs / "worktrees" / "wtfailed-build").exists())
+
+    def test_failed_boot_preserves_writer_branch_that_advanced_during_shutdown(self) -> None:
+        target = self.make_target_repo()
+        worktree = self.runs / "worktrees" / "wtfailedcommit-build"
+        self.env["CMUX_READY"] = "0"
+        self.env["CMUX_COMMIT_WORKTREE_ON_CLOSE"] = str(worktree)
+        result = self.run_fleet(
+            "wtfailedcommit", "--preset", "implementation_review", "--target-repo", str(target)
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(worktree.exists())
+        branch_sha = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "refs/heads/fleet/wtfailedcommit/build"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        base_sha = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "main"],
+            text=True, capture_output=True, check=True,
+        ).stdout.strip()
+        self.assertNotEqual(branch_sha, base_sha)
 
     def test_target_repo_must_be_a_git_repository(self) -> None:
         plain = self.tmp / "plain"

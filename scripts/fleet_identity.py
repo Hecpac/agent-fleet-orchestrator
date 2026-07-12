@@ -28,7 +28,10 @@ def current_tree(workspace: str | None = None) -> str:
     else:
         command += ["--all"]
     command += ["--id-format", "both"]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=10, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"cmux tree probe failed: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "cmux tree failed")
     return result.stdout
@@ -74,7 +77,11 @@ def main() -> int:
     args = parser.parse_args()
     manifest = read_manifest(args.manifest)
     if args.command == "exists":
-        workspaces, _ = mappings(current_tree())
+        try:
+            workspaces, _ = mappings(current_tree())
+        except RuntimeError as exc:
+            print(f"cannot probe cmux identity: {exc}", file=sys.stderr)
+            return 2
         expected = manifest.get("workspace_uuid", "").upper()
         return 0 if expected and expected in {value.upper() for value in workspaces.values()} else 1
     errors = validate(manifest, args.instances)
