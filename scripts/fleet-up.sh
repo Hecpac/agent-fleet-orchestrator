@@ -116,6 +116,7 @@ lead_ready_pattern=""
 lead_phase="CONTROL"
 lead_tool_access=""
 lead_provider=""
+lead_hook_source=""
 instance_ids=()
 role_types=()
 display_ranks=()
@@ -130,9 +131,10 @@ ready_patterns=()
 phases=()
 tool_accesses=()
 providers=()
+hook_sources=()
 warnings=()
 
-while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n; do
+while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n o; do
   case "$record" in
     META)
       schema_version="$a"
@@ -147,6 +149,7 @@ while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n; do
       lead_phase="$k"
       lead_tool_access="$l"
       lead_provider="$m"
+      lead_hook_source="$n"
       ;;
     INSTANCE)
       instance_ids+=("$a")
@@ -163,6 +166,7 @@ while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n; do
       phases+=("$l")
       tool_accesses+=("$m")
       providers+=("$n")
+      hook_sources+=("$o")
       ;;
     WARNING)
       warnings+=("$a")
@@ -494,6 +498,7 @@ manifest_tmp="$(mktemp "$runs_dir/.fleet-$feature.manifest.XXXXXX")"
   echo "lead.authority=control"
   echo "lead.tool_access=$lead_tool_access"
   echo "lead.provider=$lead_provider"
+  echo "lead.hook_source=$lead_hook_source"
   if [[ "${FLEET_NO_LEAD:-0}" == "1" ]]; then
     echo "lead.role_type=monitor"
     echo "lead.runner=monitor"
@@ -514,6 +519,8 @@ manifest_tmp="$(mktemp "$runs_dir/.fleet-$feature.manifest.XXXXXX")"
     echo "${instance_ids[$i]}.phase=${phases[$i]}"
     echo "${instance_ids[$i]}.tool_access=${tool_accesses[$i]}"
     echo "${instance_ids[$i]}.provider=${providers[$i]}"
+    echo "${instance_ids[$i]}.model=${models[$i]}"
+    echo "${instance_ids[$i]}.hook_source=${hook_sources[$i]}"
     if [[ -n "${worktrees[$i]:-}" ]]; then
       echo "${instance_ids[$i]}.worktree=${worktrees[$i]}"
       echo "${instance_ids[$i]}.branch=${worktree_branches[$i]}"

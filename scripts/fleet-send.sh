@@ -36,10 +36,14 @@ role="$(manifest_value "$instance_id.role_type")"
 phase="$(manifest_value "$instance_id.phase")"
 workspace_uuid="$(manifest_value workspace_uuid)"
 surface_uuid="$(manifest_value "$instance_id.uuid")"
+provider="$(manifest_value "$instance_id.provider")"
+model="$(manifest_value "$instance_id.model")"
+hook_source="$(manifest_value "$instance_id.hook_source")"
 
 prepared="$(python3 "$frontier" prepare "$runs_dir" \
   --feature "$feature" --instance "$instance_id" --role "$role" --phase "$phase" \
-  --task "$task" --workspace-uuid "$workspace_uuid" --surface-uuid "$surface_uuid")"
+  --task "$task" --workspace-uuid "$workspace_uuid" --surface-uuid "$surface_uuid" \
+  --provider "$provider" --model "$model" --hook-source "$hook_source")"
 run_id="$(jq -r '.run_id' <<< "$prepared")"
 prompt="$(jq -r '.prompt' <<< "$prepared")"
 send_attempted=0

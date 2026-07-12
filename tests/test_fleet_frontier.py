@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -19,7 +20,7 @@ from fleet_ledger import append_event, latest_event  # noqa: E402
 
 WORKSPACE_UUID = "00000000-0000-0000-0000-000000000001"
 SURFACE_UUID = "00000000-0000-0000-0000-000000000101"
-SESSION_ID = "opencode-ses-frontier"
+SESSION_ID = "opencode-ses_frontier"
 
 
 class FleetFrontierTests(unittest.TestCase):
@@ -61,7 +62,14 @@ class FleetFrontierTests(unittest.TestCase):
             encoding="utf-8",
         )
 
-    def seed_run(self, run_id: str, *, boot_id: str = "boot-1", after_seq: int = 100):
+    def seed_run(
+        self,
+        run_id: str,
+        *,
+        boot_id: str = "boot-1",
+        after_seq: int = 100,
+        opencode: bool = False,
+    ):
         lease = fleet_leases.acquire_frontier(
             self.runs,
             run_id=run_id,
@@ -90,6 +98,14 @@ class FleetFrontierTests(unittest.TestCase):
             "event_boot_id": boot_id,
             "after_seq": after_seq,
         }
+        if opencode:
+            event.update(
+                {
+                    "provider": "minimax",
+                    "model": "MiniMax-M3",
+                    "hook_source": "opencode",
+                }
+            )
         append_event(self.runs / "fleet-frontier.ledger.jsonl", event)
         return event, lease
 
@@ -102,8 +118,11 @@ class FleetFrontierTests(unittest.TestCase):
         phase: str = "received",
         session_id: str = SESSION_ID,
         occurred_at: str = "2026-07-12T00:00:01+00:00",
+        source: str = "",
+        final_opencode_stop: bool = False,
     ) -> dict:
-        return {
+        payload = {"phase": phase, "session_id": session_id}
+        event = {
             "type": "event",
             "protocol": "cmux-events",
             "boot_id": boot_id,
@@ -113,8 +132,14 @@ class FleetFrontierTests(unittest.TestCase):
             "category": "agent",
             "occurred_at": occurred_at,
             "workspace_id": WORKSPACE_UUID,
-            "payload": {"phase": phase, "session_id": session_id},
+            "payload": payload,
         }
+        if source:
+            event["source"] = source
+            payload["_source"] = source
+        if final_opencode_stop:
+            payload.update({"_opencode_request_id": None, "context_length": 100})
+        return event
 
     def test_exact_binding_ignores_old_stop_then_terminalizes_verified_sentinel(self) -> None:
         run_id = "run-exact"
@@ -201,6 +226,221 @@ class FleetFrontierTests(unittest.TestCase):
             ),
             ("indeterminate", "frontier_sentinel_not_final"),
         )
+
+    def test_structured_sentinel_requires_one_final_exact_run(self) -> None:
+        self.assertEqual(
+            fleet_frontier.structured_sentinel_status(
+                "answer\nFLEET_RESULT:run-1:DONE", "run-1"
+            ),
+            ("succeeded", "frontier_sentinel_verified"),
+        )
+        self.assertEqual(
+            fleet_frontier.structured_sentinel_status(
+                "FLEET_RESULT:run-1:DONE\ntrailing", "run-1"
+            ),
+            ("indeterminate", "frontier_sentinel_not_final"),
+        )
+
+    def test_opencode_ignores_intermediate_stops_and_uses_structured_final_response(self) -> None:
+        statuses = {
+            "DONE": "succeeded",
+            "BLOCKED": "blocked",
+            "FAILED": "failed",
+        }
+        for index, (sentinel, expected) in enumerate(statuses.items(), start=1):
+            with self.subTest(sentinel=sentinel):
+                run_id = f"run-opencode-{sentinel.lower()}"
+                state, lease = self.seed_run(run_id, opencode=True)
+                binding = self.hook_event(
+                    "agent.hook.UserPromptSubmit", 100 + index * 10,
+                    source="opencode",
+                )
+                fleet_frontier.process_event(
+                    self.runs, state, binding,
+                    workspace_ref="workspace:1", surface_ref="surface:1",
+                )
+                intermediate = self.hook_event(
+                    "agent.hook.Stop", 101 + index * 10,
+                    phase="completed", source="opencode",
+                )
+                self.assertIsNone(
+                    fleet_frontier.process_event(
+                        self.runs, state, intermediate,
+                        workspace_ref="workspace:1", surface_ref="surface:1",
+                    )
+                )
+                self.assertTrue(lease.exists())
+                final = self.hook_event(
+                    "agent.hook.Stop", 102 + index * 10,
+                    phase="completed", source="opencode", final_opencode_stop=True,
+                )
+                with mock.patch.object(
+                    fleet_frontier,
+                    "opencode_turn_evidence",
+                    return_value=(
+                        f"answer\nFLEET_RESULT:{run_id}:{sentinel}",
+                        "minimax",
+                        "MiniMax-M3",
+                    ),
+                ), mock.patch.object(fleet_frontier, "read_screen") as read_screen:
+                    terminal = fleet_frontier.process_event(
+                        self.runs, state, final,
+                        workspace_ref="workspace:1", surface_ref="surface:1",
+                    )
+                self.assertEqual(terminal["status"], expected)
+                self.assertEqual(terminal["completion_event_id"], final["id"])
+                self.assertFalse(lease.exists())
+                read_screen.assert_not_called()
+
+    def test_opencode_identity_mismatch_is_indeterminate_and_retains_lease(self) -> None:
+        run_id = "run-opencode-mismatch"
+        state, lease = self.seed_run(run_id, opencode=True)
+        fleet_frontier.process_event(
+            self.runs,
+            state,
+            self.hook_event("agent.hook.UserPromptSubmit", 101, source="opencode"),
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        final = self.hook_event(
+            "agent.hook.Stop", 102, phase="completed", source="opencode",
+            final_opencode_stop=True,
+        )
+        with mock.patch.object(
+            fleet_frontier,
+            "opencode_turn_evidence",
+            return_value=(f"answer\nFLEET_RESULT:{run_id}:DONE", "zai", "glm-5.2"),
+        ):
+            terminal = fleet_frontier.process_event(
+                self.runs, state, final,
+                workspace_ref="workspace:1", surface_ref="surface:1",
+            )
+        self.assertEqual(terminal["status"], "indeterminate")
+        self.assertEqual(terminal["reason"], "frontier_opencode_identity_mismatch")
+        self.assertTrue(terminal["lease_retained"])
+        self.assertTrue(lease.exists())
+
+    def test_opencode_unverifiable_final_evidence_is_indeterminate(self) -> None:
+        run_id = "run-opencode-unverifiable"
+        state, lease = self.seed_run(run_id, opencode=True)
+        fleet_frontier.process_event(
+            self.runs,
+            state,
+            self.hook_event("agent.hook.UserPromptSubmit", 101, source="opencode"),
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        final = self.hook_event(
+            "agent.hook.Stop", 102, phase="completed", source="opencode",
+            final_opencode_stop=True,
+        )
+        with mock.patch.object(
+            fleet_frontier,
+            "opencode_turn_evidence",
+            side_effect=fleet_frontier.FrontierError("invalid database evidence"),
+        ):
+            terminal = fleet_frontier.process_event(
+                self.runs, state, final,
+                workspace_ref="workspace:1", surface_ref="surface:1",
+            )
+        self.assertEqual(terminal["status"], "indeterminate")
+        self.assertEqual(terminal["reason"], "frontier_opencode_evidence_unavailable")
+        self.assertTrue(lease.exists())
+
+    def test_opencode_turn_evidence_binds_full_final_message_before_stop(self) -> None:
+        run_id = "run-db-evidence"
+        full_response = f"{'x' * 2000}\nFLEET_RESULT:{run_id}:DONE"
+
+        def row(
+            message_id: str,
+            created: int,
+            role: str,
+            text: str,
+            *,
+            completed: int | None = None,
+            provider: str | None = None,
+            model: str | None = None,
+        ) -> dict:
+            data = {"role": role, "time": {"created": created}}
+            if completed is not None:
+                data["time"]["completed"] = completed
+            if provider is not None:
+                data["providerID"] = provider
+            if model is not None:
+                data["modelID"] = model
+            return {
+                "message_id": message_id,
+                "message_created": created,
+                "message_data": json.dumps(data),
+                "part_id": f"part-{message_id}",
+                "part_created": created + 1,
+                "part_data": json.dumps({"type": "text", "text": text}),
+            }
+
+        rows = [
+            row(
+                "user-current", 1000, "user",
+                f"task FLEET_RESULT:{run_id}:<STATUS>",
+            ),
+            row(
+                "assistant-tool-step", 1100, "assistant", "intermediate",
+                completed=1200, provider="minimax", model="MiniMax-M3",
+            ),
+            row(
+                "assistant-final", 1300, "assistant",
+                full_response,
+                completed=1400, provider="minimax", model="MiniMax-M3",
+            ),
+            row("user-next", 1500, "user", "another turn"),
+            row(
+                "assistant-next", 1600, "assistant", "must not bind",
+                completed=1700, provider="zai", model="glm-5.2",
+            ),
+        ]
+        result = subprocess.CompletedProcess(
+            ["opencode", "db"], 0, stdout=json.dumps(rows), stderr=""
+        )
+        with mock.patch.object(fleet_frontier.subprocess, "run", return_value=result):
+            self.assertEqual(
+                fleet_frontier.opencode_turn_evidence(
+                    SESSION_ID, run_id, "2026-07-12T00:00:03+00:00"
+                ),
+                (
+                    full_response,
+                    "minimax",
+                    "MiniMax-M3",
+                ),
+            )
+
+    def test_opencode_rejects_wrong_source_and_non_opencode_session_file(self) -> None:
+        run_id = "run-opencode-source"
+        state, lease = self.seed_run(run_id, opencode=True)
+        raw = SESSION_ID.removeprefix("opencode-")
+        (self.hooks / "claude-hook-sessions.json").write_text(
+            json.dumps(
+                {"sessions": {raw: {"workspaceId": WORKSPACE_UUID, "surfaceId": "wrong", "updatedAt": 99}}}
+            ),
+            encoding="utf-8",
+        )
+        wrong_source = self.hook_event(
+            "agent.hook.UserPromptSubmit", 101, source="codex"
+        )
+        self.assertIsNone(
+            fleet_frontier.process_event(
+                self.runs, state, wrong_source,
+                workspace_ref="workspace:1", surface_ref="surface:1",
+            )
+        )
+        self.assertIsNone(state.get("session_id"))
+        self.assertTrue(
+            fleet_frontier.session_matches(
+                SESSION_ID,
+                workspace_uuid=WORKSPACE_UUID,
+                surface_uuid=SURFACE_UUID,
+                hook_source="opencode",
+            )
+        )
+        self.assertTrue(lease.exists())
 
     def test_second_submit_in_same_session_is_ambiguous_and_retains_lease(self) -> None:
         state, lease = self.seed_run("run-two-submits")
@@ -310,9 +550,27 @@ class FleetFrontierTests(unittest.TestCase):
                     task="task",
                     workspace_uuid=WORKSPACE_UUID,
                     surface_uuid=SURFACE_UUID,
+                    provider="openai",
+                    hook_source="codex",
                 )
         events = [json.loads(line) for line in ledger.read_text().splitlines()]
         self.assertEqual(events[-1]["status"], "abandoned")
+
+    def test_prepare_rejects_legacy_manifest_identity_before_ledger_write(self) -> None:
+        with self.assertRaisesRegex(
+            fleet_frontier.FrontierError, "provider and hook source"
+        ):
+            fleet_frontier.prepare_run(
+                self.runs,
+                feature="frontier",
+                instance="agent",
+                role="minimax",
+                phase="CHALLENGE",
+                task="task",
+                workspace_uuid=WORKSPACE_UUID,
+                surface_uuid=SURFACE_UUID,
+            )
+        self.assertFalse((self.runs / "fleet-frontier.ledger.jsonl").exists())
 
     def test_cross_boot_audit_recovers_binding_stop_and_status(self) -> None:
         run_id = "run-replay"

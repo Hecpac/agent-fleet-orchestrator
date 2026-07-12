@@ -297,6 +297,9 @@ class FleetUpTests(unittest.TestCase):
         )
         manifest = (self.runs / "fleet-frontier.manifest").read_text()
         self.assertIn("challenge.role_type=glm", manifest)
+        self.assertIn("challenge.provider=zai", manifest)
+        self.assertIn("challenge.model=glm-5.2", manifest)
+        self.assertIn("challenge.hook_source=opencode", manifest)
         self.assertIn("verify.role_type=claude_reviewer", manifest)
         sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
         self.assertTrue(any("run-interactive-agent.sh" in payload for payload in sends))

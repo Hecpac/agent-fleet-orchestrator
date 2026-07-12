@@ -113,6 +113,14 @@ def _expect_rank(value: Any, where: str) -> int:
     return value
 
 
+def _expect_manifest_scalar(value: Any, where: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise RouterError(f"{where} must be a non-empty string")
+    if any(character in value for character in ("\n", "\r", "\x00", US)):
+        raise RouterError(f"{where} contains a forbidden control character")
+    return value
+
+
 def validate_router(config: dict[str, Any]) -> None:
     config = _expect_mapping(config, "router")
     _expect_keys(
@@ -162,7 +170,14 @@ def validate_router(config: dict[str, Any]) -> None:
         "display_rank",
         "concurrency",
     }
-    role_optional = {"command", "healthcheck", "ready_pattern", "model", "instructions"}
+    role_optional = {
+        "command",
+        "healthcheck",
+        "ready_pattern",
+        "model",
+        "instructions",
+        "hook_source",
+    }
     for role_type, raw_role in roles.items():
         _expect_identifier(role_type, f"router.roles.{role_type}", allow_reserved=True)
         role = _expect_mapping(raw_role, f"router.roles.{role_type}")
@@ -178,8 +193,7 @@ def validate_router(config: dict[str, Any]) -> None:
             raise RouterError(
                 f"router.roles.{role_type}.phase must be one of {sorted(PHASES - {'CONTROL'})}"
             )
-        if not isinstance(role["provider"], str) or not role["provider"]:
-            raise RouterError(f"router.roles.{role_type}.provider must be a non-empty string")
+        _expect_manifest_scalar(role["provider"], f"router.roles.{role_type}.provider")
         if not isinstance(role["enabled"], bool):
             raise RouterError(f"router.roles.{role_type}.enabled must be boolean")
         env_names = _expect_string_list(role["requires_env"], f"router.roles.{role_type}.requires_env")
@@ -225,15 +239,48 @@ def validate_router(config: dict[str, Any]) -> None:
                 raise RouterError(f"router.roles.{role_type}.ready_pattern must be a non-empty string")
             if "\n" in role["ready_pattern"] or US in role["ready_pattern"]:
                 raise RouterError(f"router.roles.{role_type}.ready_pattern contains a forbidden control character")
-            if "model" in role or "instructions" in role:
-                raise RouterError(f"router.roles.{role_type} interactive roles cannot set model/instructions")
+            if "instructions" in role:
+                raise RouterError(
+                    f"router.roles.{role_type} interactive roles cannot set instructions"
+                )
+            if "model" in role:
+                _expect_manifest_scalar(
+                    role["model"], f"router.roles.{role_type}.model"
+                )
+            hook_source = _expect_manifest_scalar(
+                role.get("hook_source"), f"router.roles.{role_type}.hook_source"
+            )
+            _expect_identifier(
+                hook_source,
+                f"router.roles.{role_type}.hook_source",
+                allow_reserved=True,
+            )
+            if hook_source == "opencode":
+                if role["command"][0] != "opencode" or "-m" not in role["command"]:
+                    raise RouterError(
+                        f"router.roles.{role_type} OpenCode role must use opencode -m"
+                    )
+                model_index = role["command"].index("-m") + 1
+                if model_index >= len(role["command"]):
+                    raise RouterError(
+                        f"router.roles.{role_type} OpenCode role lacks command model"
+                    )
+                command_model = role["command"][model_index]
+                expected_model = f"{role['provider']}/{role.get('model', '')}"
+                if command_model != expected_model:
+                    raise RouterError(
+                        f"router.roles.{role_type} provider/model must match command -m"
+                    )
+            elif role["command"][0] == "opencode":
+                raise RouterError(
+                    f"router.roles.{role_type} opencode command requires hook_source opencode"
+                )
             if role["resource_class"] != "remote":
                 raise RouterError(f"router.roles.{role_type} interactive role must use resource_class remote")
         else:
             if "command" in role or "healthcheck" in role or "ready_pattern" in role:
                 raise RouterError(f"router.roles.{role_type} local roles cannot set command/healthcheck/ready_pattern")
-            if not isinstance(role.get("model"), str) or not role["model"]:
-                raise RouterError(f"router.roles.{role_type}.model must be a non-empty string")
+            _expect_manifest_scalar(role.get("model"), f"router.roles.{role_type}.model")
             if not isinstance(role.get("instructions"), str) or not role["instructions"]:
                 raise RouterError(f"router.roles.{role_type}.instructions must be a non-empty string")
             if "\n" in role["instructions"] or US in role["instructions"]:
@@ -423,6 +470,7 @@ def select_lead(
                 "display_rank": config["lead"]["display_rank"],
                 "runner": role["runner"],
                 "provider": role["provider"],
+                "hook_source": role["hook_source"],
                 "command": command,
                 "command_shell": shlex.join(command),
                 "executable": role["command"][0],
@@ -542,6 +590,7 @@ def _records(plan: dict[str, Any]) -> str:
                     lead["phase"],
                     ",".join(lead["tool_access"]),
                     lead["provider"],
+                    lead["hook_source"],
                 ]
             )
         )
@@ -564,6 +613,7 @@ def _records(plan: dict[str, Any]) -> str:
                     instance["phase"],
                     ",".join(instance["tool_access"]),
                     instance["provider"],
+                    instance.get("hook_source", ""),
                 ]
             )
         )

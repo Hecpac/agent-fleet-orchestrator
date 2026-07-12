@@ -142,11 +142,20 @@ def validate_event_ack(frame: dict[str, Any]) -> None:
         raise FrontierError("invalid cmux-events ACK")
 
 
-def session_record(session_id: str) -> dict[str, Any] | None:
+def session_record(
+    session_id: str, *, hook_source: str = ""
+) -> dict[str, Any] | None:
     hook_dir = os.environ.get("CMUX_HOOK_DIR", os.path.expanduser("~/.cmuxterm"))
-    candidates = {session_id, re.sub(r"^[a-z]+-", "", session_id, count=1)}
+    if hook_source == "opencode":
+        if not session_id.startswith("opencode-"):
+            return None
+        candidates = {session_id.removeprefix("opencode-")}
+        filenames = [str(Path(hook_dir) / "opencode-hook-sessions.json")]
+    else:
+        candidates = {session_id, re.sub(r"^[a-z]+-", "", session_id, count=1)}
+        filenames = glob.glob(str(Path(hook_dir) / "*-hook-sessions.json"))
     matches: list[dict[str, Any]] = []
-    for filename in glob.glob(str(Path(hook_dir) / "*-hook-sessions.json")):
+    for filename in filenames:
         try:
             data = json.loads(Path(filename).read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -167,8 +176,9 @@ def session_matches(
     *,
     workspace_uuid: str,
     surface_uuid: str,
+    hook_source: str = "",
 ) -> bool:
-    record = session_record(session_id)
+    record = session_record(session_id, hook_source=hook_source)
     return bool(
         record
         and str(record.get("workspaceId", "")).upper() == workspace_uuid.upper()
@@ -217,6 +227,174 @@ def sentinel_status(screen: str, run_id: str) -> tuple[str, str]:
     return SENTINEL_STATUSES[match.group(1)], "frontier_sentinel_verified"
 
 
+def structured_sentinel_status(response: str, run_id: str) -> tuple[str, str]:
+    pattern = re.compile(
+        rf"FLEET_RESULT:{re.escape(run_id)}:(DONE|BLOCKED|FAILED)"
+    )
+    lines = response.splitlines()
+    matches = [
+        (index, match)
+        for index, line in enumerate(lines)
+        if (match := pattern.fullmatch(line.strip()))
+    ]
+    if len(matches) != 1:
+        reason = "frontier_sentinel_missing" if not matches else "frontier_sentinel_ambiguous"
+        return "indeterminate", reason
+    sentinel_index, match = matches[0]
+    if any(line.strip() for line in lines[sentinel_index + 1 :]):
+        return "indeterminate", "frontier_sentinel_not_final"
+    return SENTINEL_STATUSES[match.group(1)], "frontier_sentinel_verified"
+
+
+def _opencode_final_stop(payload: dict[str, Any]) -> bool:
+    return bool(
+        "_opencode_request_id" in payload
+        and payload.get("_opencode_request_id") is None
+        and isinstance(payload.get("context_length"), int)
+        and int(payload["context_length"]) > 0
+    )
+
+
+def opencode_turn_evidence(
+    session_id: str, run_id: str, stop_occurred_at: str
+) -> tuple[str, str, str]:
+    raw_session_id = session_id.removeprefix("opencode-")
+    if not re.fullmatch(r"ses_[A-Za-z0-9]+", raw_session_id):
+        raise FrontierError("OpenCode session id is invalid")
+    stop_time = timestamp_value(stop_occurred_at)
+    if stop_time is None:
+        raise FrontierError("OpenCode Stop has no valid timestamp")
+    stop_millis = int(stop_time.timestamp() * 1000)
+    query = (
+        "SELECT m.id AS message_id, m.time_created AS message_created, "
+        "m.data AS message_data, p.id AS part_id, "
+        "p.time_created AS part_created, p.data AS part_data "
+        "FROM message m LEFT JOIN part p ON p.message_id = m.id "
+        "AND json_extract(p.data, '$.type') = 'text' "
+        f"WHERE m.session_id = '{raw_session_id}' "
+        "ORDER BY m.time_created, p.time_created, p.id"
+    )
+    try:
+        result = subprocess.run(
+            ["opencode", "db", "--format", "json", query],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise FrontierError(f"cannot query OpenCode turn evidence: {exc}") from exc
+    if result.returncode != 0:
+        raise FrontierError("OpenCode turn evidence query failed")
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise FrontierError("OpenCode turn evidence query returned invalid JSON") from exc
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        raise FrontierError("OpenCode turn evidence query returned invalid rows")
+
+    messages: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        message_id = row.get("message_id")
+        if not isinstance(message_id, str) or not message_id:
+            raise FrontierError("OpenCode turn evidence has invalid message id")
+        message_created = row.get("message_created")
+        if isinstance(message_created, bool) or not isinstance(message_created, int):
+            raise FrontierError("OpenCode turn evidence has invalid message timestamp")
+        try:
+            message_data = json.loads(row.get("message_data") or "")
+        except json.JSONDecodeError as exc:
+            raise FrontierError("OpenCode turn evidence has invalid message data") from exc
+        if not isinstance(message_data, dict):
+            raise FrontierError("OpenCode turn evidence message is not an object")
+        message = messages.setdefault(
+            message_id,
+            {
+                "id": message_id,
+                "created": message_created,
+                "data": message_data,
+                "parts": [],
+            },
+        )
+        if message["data"] != message_data or message["created"] != message_created:
+            raise FrontierError("OpenCode turn evidence message rows disagree")
+        part_data_raw = row.get("part_data")
+        if part_data_raw is None:
+            continue
+        try:
+            part_data = json.loads(part_data_raw)
+        except json.JSONDecodeError as exc:
+            raise FrontierError("OpenCode turn evidence has invalid part data") from exc
+        if not isinstance(part_data, dict) or part_data.get("type") != "text":
+            raise FrontierError("OpenCode turn evidence has invalid text part")
+        part_id = row.get("part_id")
+        part_created = row.get("part_created")
+        if (
+            not isinstance(part_id, str)
+            or not part_id
+            or isinstance(part_created, bool)
+            or not isinstance(part_created, int)
+        ):
+            raise FrontierError("OpenCode turn evidence has invalid part identity")
+        text = part_data.get("text")
+        if not isinstance(text, str):
+            raise FrontierError("OpenCode turn evidence text part lacks text")
+        message["parts"].append((part_created, part_id, text))
+
+    ordered = sorted(
+        messages.values(), key=lambda item: (item["created"], item["id"])
+    )
+    contract_marker = f"FLEET_RESULT:{run_id}:<STATUS>"
+    matching_users = [
+        (index, message)
+        for index, message in enumerate(ordered)
+        if message["data"].get("role") == "user"
+        and contract_marker in "\n".join(part[2] for part in message["parts"])
+    ]
+    if len(matching_users) != 1:
+        raise FrontierError("OpenCode turn evidence has ambiguous user binding")
+    user_index, user_message = matching_users[0]
+    next_user_created = None
+    for message in ordered[user_index + 1 :]:
+        if message["data"].get("role") == "user":
+            next_user_created = message["created"]
+            break
+
+    candidates: list[tuple[int, int, str, dict[str, Any]]] = []
+    user_created = user_message["created"]
+    for message in ordered[user_index + 1 :]:
+        created = message["created"]
+        if next_user_created is not None and created >= next_user_created:
+            break
+        data = message["data"]
+        time_data = data.get("time") or {}
+        completed = time_data.get("completed") if isinstance(time_data, dict) else None
+        if (
+            data.get("role") == "assistant"
+            and created >= user_created
+            and isinstance(completed, int)
+            and not isinstance(completed, bool)
+            and completed <= stop_millis
+            and message["parts"]
+        ):
+            candidates.append((completed, created, message["id"], message))
+    if not candidates:
+        raise FrontierError("OpenCode turn evidence has no completed assistant response")
+    _, _, _, assistant = max(candidates)
+    assistant_data = assistant["data"]
+    provider = assistant_data.get("providerID")
+    model = assistant_data.get("modelID")
+    if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+        raise FrontierError("OpenCode turn evidence lacks provider/model identity")
+    response = "\n".join(
+        part[2]
+        for part in sorted(
+            assistant["parts"], key=lambda part: (part[0], part[1])
+        )
+    )
+    return response, provider, model
+
+
 def read_screen(workspace_ref: str, surface_ref: str) -> str:
     try:
         result = subprocess.run(
@@ -254,7 +432,14 @@ def prepare_run(
     task: str,
     workspace_uuid: str,
     surface_uuid: str,
+    provider: str = "",
+    model: str = "",
+    hook_source: str = "",
 ) -> dict[str, Any]:
+    if not provider or not hook_source:
+        raise FrontierError("frontier runs require provider and hook source identity")
+    if hook_source == "opencode" and (not provider or not model):
+        raise FrontierError("OpenCode frontier runs require provider and model identity")
     run_id = str(uuid.uuid4())
     task_sha256 = hashlib.sha256(task.encode("utf-8")).hexdigest()
     ledger = ledger_path(runs_dir, feature)
@@ -271,6 +456,9 @@ def prepare_run(
         "task_sha256": task_sha256,
         "workspace_uuid": workspace_uuid.upper(),
         "surface_uuid": surface_uuid.upper(),
+        "provider": provider,
+        "model": model,
+        "hook_source": hook_source,
         "preparing_at": preparing_at,
     }
     if not append_event(ledger, preparing):
@@ -303,6 +491,9 @@ def prepare_run(
             "task_sha256": task_sha256,
             "workspace_uuid": workspace_uuid.upper(),
             "surface_uuid": surface_uuid.upper(),
+            "provider": provider,
+            "model": model,
+            "hook_source": hook_source,
             "event_boot_id": ack["boot_id"],
             "after_seq": resume["latest_seq"],
             "event_oldest_seq": resume.get("oldest_seq"),
@@ -343,6 +534,9 @@ def _common_event(state: dict[str, Any]) -> dict[str, Any]:
         "task_sha256",
         "workspace_uuid",
         "surface_uuid",
+        "provider",
+        "model",
+        "hook_source",
         "event_boot_id",
         "after_seq",
         "event_oldest_seq",
@@ -451,6 +645,12 @@ def process_event(
     ).upper():
         return None
     payload = event.get("payload") or {}
+    expected_source = str(state.get("hook_source") or "")
+    if expected_source and (
+        event.get("source") != expected_source
+        or payload.get("_source") != expected_source
+    ):
+        return None
     session_id = str(payload.get("session_id") or "")
     if not session_id:
         return None
@@ -462,6 +662,7 @@ def process_event(
             session_id,
             workspace_uuid=str(state["workspace_uuid"]),
             surface_uuid=str(state["surface_uuid"]),
+            hook_source=expected_source,
         ):
             return None
         if state.get("session_id"):
@@ -500,8 +701,35 @@ def process_event(
         session_id,
         workspace_uuid=str(state["workspace_uuid"]),
         surface_uuid=str(state["surface_uuid"]),
+        hook_source=expected_source,
     ):
         return None
+    if expected_source == "opencode":
+        if not _opencode_final_stop(payload):
+            return None
+        try:
+            response, actual_provider, actual_model = opencode_turn_evidence(
+                session_id,
+                str(state["run_id"]),
+                str(event.get("occurred_at") or ""),
+            )
+            status, reason = structured_sentinel_status(response, str(state["run_id"]))
+            if (
+                actual_provider != str(state.get("provider") or "")
+                or actual_model != str(state.get("model") or "")
+            ):
+                status, reason = "indeterminate", "frontier_opencode_identity_mismatch"
+        except FrontierError:
+            status, reason = "indeterminate", "frontier_opencode_evidence_unavailable"
+        return terminalize(
+            runs_dir,
+            state,
+            status=status,
+            reason=reason,
+            completed_at=str(event.get("occurred_at") or utc_now()),
+            event=event,
+            release_lease=status != "indeterminate",
+        )
     try:
         screen = read_screen(workspace_ref, surface_ref)
         status, reason = sentinel_status(screen, str(state["run_id"]))
@@ -702,6 +930,8 @@ def _parser() -> argparse.ArgumentParser:
         "feature", "instance", "role", "phase", "task", "workspace-uuid", "surface-uuid"
     ):
         prepare.add_argument(f"--{name}", required=True)
+    for name in ("provider", "model", "hook-source"):
+        prepare.add_argument(f"--{name}", default="")
     abandon = sub.add_parser("abandon")
     abandon.add_argument("runs_dir")
     for name in ("feature", "instance", "run-id", "reason"):
@@ -727,6 +957,9 @@ def main() -> int:
                 task=args.task,
                 workspace_uuid=args.workspace_uuid,
                 surface_uuid=args.surface_uuid,
+                provider=args.provider,
+                model=args.model,
+                hook_source=args.hook_source,
             )
         elif args.command == "abandon":
             result = abandon_run(

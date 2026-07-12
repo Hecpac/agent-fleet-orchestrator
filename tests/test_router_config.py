@@ -95,6 +95,51 @@ class RouterConfigTests(unittest.TestCase):
         )
         self.assertIn("--agent", plan["instances"][1]["command"])
         self.assertIn("plan", plan["instances"][2]["command"])
+        self.assertEqual(plan["instances"][1]["hook_source"], "opencode")
+        self.assertEqual(plan["instances"][1]["model"], "glm-5.2")
+
+    def test_interactive_roles_declare_hook_source_and_opencode_identity(self) -> None:
+        interactive = {
+            name: role
+            for name, role in self.config["roles"].items()
+            if role["runner"] == "interactive"
+        }
+        self.assertTrue(all(role.get("hook_source") for role in interactive.values()))
+        for name in ("glm", "minimax", "minimax_candidate"):
+            with self.subTest(role=name):
+                self.assertEqual(interactive[name]["hook_source"], "opencode")
+                self.assertTrue(interactive[name].get("model"))
+
+    def test_interactive_role_without_hook_source_is_rejected(self) -> None:
+        config = copy.deepcopy(self.config)
+        del config["roles"]["minimax"]["hook_source"]
+        with self.assertRaisesRegex(router_config.RouterError, "hook_source"):
+            router_config.load_router(self.write_config(config))
+
+    def test_manifest_identity_fields_reject_control_characters(self) -> None:
+        for field, value in (
+            ("hook_source", "opencode\x1finjected"),
+            ("model", "MiniMax-M3\ninjected=value"),
+            ("provider", "minimax\rmalformed"),
+        ):
+            with self.subTest(field=field):
+                config = copy.deepcopy(self.config)
+                config["roles"]["minimax"][field] = value
+                with self.assertRaisesRegex(
+                    router_config.RouterError, "forbidden control character"
+                ):
+                    router_config.load_router(self.write_config(config))
+
+    def test_opencode_provider_model_must_match_command(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["roles"]["minimax"]["model"] = "DifferentModel"
+        with self.assertRaisesRegex(router_config.RouterError, "must match command -m"):
+            router_config.load_router(self.write_config(config))
+
+        config = copy.deepcopy(self.config)
+        del config["roles"]["minimax"]["model"]
+        with self.assertRaisesRegex(router_config.RouterError, "must match command -m"):
+            router_config.load_router(self.write_config(config))
 
     def test_non_build_phases_cannot_write(self) -> None:
         config = copy.deepcopy(self.config)
