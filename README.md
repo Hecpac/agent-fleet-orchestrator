@@ -87,11 +87,12 @@ just fleet <feature> build=codex verify=reviewer  # explicit instances
 just fleet-down <feature>            # tear down
 ```
 
-The default lead provider is Codex. Claude remains a configured but disabled
-fallback until its account entitlement is restored; re-enable it in the router
-before selecting `--lead-provider claude`. Frontier roles run interactive agent
-CLIs tracked by cmux's agent panel: `codex`, `minimax` (opencode + MiniMax-M3,
-`MINIMAX_API_KEY`), and `glm` (opencode + GLM-5.2, `ZHIPU_API_KEY`).
+The default lead provider is Codex. Claude is an enabled fallback candidate:
+`fallback_policy: first_available` walks `lead.candidates` in order, so Claude
+leads only when Codex is unavailable or when you pass `--lead-provider claude`.
+Frontier roles run interactive agent CLIs tracked by cmux's agent panel:
+`codex`, `minimax` (opencode + MiniMax-M3, `MINIMAX_API_KEY`), and `glm`
+(opencode + GLM-5.2, `ZHIPU_API_KEY`).
 
 Panes are ordered by capability rank rather than argument accident:
 `CONTROL → RECON → BUILD → CHALLENGE → VERIFY`. `instance_id` is separate from
@@ -99,10 +100,16 @@ Panes are ordered by capability rank rather than argument accident:
 worker remains independently addressable.
 
 Current enforcement boundary: `authority`, `tool_access`, and resource classes
-are validated declarations, not OS sandboxes or dispatch leases. Until the next
-safety slice adds worktrees/permission wrappers, UUID checks in every consumer,
-and a local-worker semaphore, use one writer, verify `tree` before acting, and
-run heavy local workers sequentially. `fleet-race` still returns the first
+are validated declarations that the supported wrappers now enforce. Every
+consumer (`fleet-send`, `fleet-dispatch`, `fleet-wait`, `fleet-race`,
+`fleet-down`) validates durable UUIDs before acting; dispatch acquires
+instance/heavy/slot leases so local concurrency limits hold at runtime;
+interactive agents launch through an environment allowlist
+(`run-interactive-agent.sh`), with per-authority Codex sandbox levels
+(writer → `workspace-write`, non-writer → `read-only`, CONTROL alone →
+`danger-full-access` to reach the cmux socket). What remains out of scope:
+OS-level process sandboxing. Direct manual `cmux send` bypasses the wrappers,
+so keep one writer and use the scripts. `fleet-race` still returns the first
 completion as a candidate; it is not an acceptance gate.
 
 `scripts/fleet-up.sh` resolves and validates the complete plan before touching

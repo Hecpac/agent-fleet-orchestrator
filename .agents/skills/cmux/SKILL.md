@@ -85,8 +85,8 @@ Always: workers generate, YOU verify claims against source before adopting
 them (small models mark DONE optimistically), and you own the synthesis.
 
 Boot a team from the capability router. The default `small` preset creates a
-Codex lead; Claude is a configured but disabled fallback until its entitlement
-is restored. Panes render by rank: CONTROL → RECON → BUILD → CHALLENGE → VERIFY.
+Codex lead; Claude is an enabled fallback candidate (`first_available` walks
+`lead.candidates` in order). Panes render by rank: CONTROL → RECON → BUILD → CHALLENGE → VERIFY.
 
 ```bash
 just fleet <feature>                              # default small: lead only
@@ -129,7 +129,7 @@ fails closed instead of leaving a shell that can mistake a prompt for a command.
 `fleet-up.sh` writes `orchestration/runs/fleet-<feature>.manifest`:
 
 ```
-schema_version=2
+schema_version=3
 feature=example
 preset=implementation_review
 workspace=workspace:5
