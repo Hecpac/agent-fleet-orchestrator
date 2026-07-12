@@ -146,6 +146,19 @@ class RouterConfigTests(unittest.TestCase):
                         run_healthcheck=False,
                     )
 
+    def test_optional_local_token_budget_is_validated(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["limits"]["local_token_budget_per_feature"] = 200_000
+        loaded = router_config.load_router(self.write_config(config))
+        self.assertEqual(loaded["limits"]["local_token_budget_per_feature"], 200_000)
+        for bad in (0, -5, True, "many"):
+            with self.subTest(bad=bad):
+                config["limits"]["local_token_budget_per_feature"] = bad
+                with self.assertRaisesRegex(
+                    router_config.RouterError, "local_token_budget_per_feature"
+                ):
+                    router_config.load_router(self.write_config(config))
+
     def test_two_writers_in_one_preset_are_rejected(self) -> None:
         config = copy.deepcopy(self.config)
         config["presets"]["two_writers"] = {

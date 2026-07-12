@@ -104,7 +104,22 @@ def main() -> int:
 
     def on_timeout(signum, frame):
         proc.kill()
-        print("timeout", flush=True)
+        stuck = ", ".join(sorted(pending))
+        try:
+            subprocess.run(
+                [
+                    "cmux", "notify",
+                    "--title", f"ESCALATION: fleet-{feature} wait timeout",
+                    "--body", f"pending={stuck} timeout={timeout_sec}s",
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        print(f"timeout; escalated pending: {stuck}", flush=True)
         sys.exit(124)
 
     signal.signal(signal.SIGALRM, on_timeout)

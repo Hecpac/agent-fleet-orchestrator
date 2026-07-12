@@ -30,6 +30,12 @@ fi
 python3 "$identity" validate "$manifest" "$instance_id" >/dev/null || exit 2
 python3 "$repo_root/scripts/fleet_state.py" check "$manifest" "$instance_id" >/dev/null || exit $?
 
+token_budget="$(python3 "$repo_root/scripts/router_config.py" limits-field local_token_budget_per_feature 2>/dev/null || true)"
+if [[ -n "$token_budget" ]]; then
+  python3 "$repo_root/scripts/fleet_budget.py" check \
+    "$runs_dir/fleet-$feature.ledger.jsonl" "$token_budget" || exit $?
+fi
+
 ws_ref="$(grep '^workspace=' "$manifest" | cut -d= -f2)"
 manifest_value() {
   local key="$1"

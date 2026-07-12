@@ -50,6 +50,9 @@ python3 "$repo_root/scripts/fleet_ledger.py" "$ledger" \
   --run-id "$run_id" --feature "$feature" --instance "$instance_id" \
   --role "$role_type" --phase "$phase" --status running --task-sha256 "$task_sha256"
 
+usage_file="$result_dir/$run_id.usage.json"
+export FLEET_USAGE_FILE="$usage_file"
+
 set +e
 "$repo_root/scripts/run-local-worker.sh" "$role_type" "$(<"$task_file")" | tee "$result_file"
 pipeline_status=("${PIPESTATUS[@]}")
@@ -63,8 +66,19 @@ chmod 600 "$result_file"
 status="failed"
 [[ $rc -eq 0 ]] && status="succeeded"
 [[ $rc -eq 3 ]] && status="blocked"
+token_args=()
+if [[ -f "$usage_file" ]]; then
+  tokens="$(python3 -c 'import json, sys
+data = json.load(open(sys.argv[1]))
+print(int(data.get("prompt_eval_count", 0)), int(data.get("eval_count", 0)))' "$usage_file" 2>/dev/null || true)"
+  if [[ -n "$tokens" ]]; then
+    read -r prompt_tokens completion_tokens <<< "$tokens"
+    token_args=(--prompt-tokens "$prompt_tokens" --completion-tokens "$completion_tokens")
+  fi
+fi
 python3 "$repo_root/scripts/fleet_ledger.py" "$ledger" \
   --run-id "$run_id" --feature "$feature" --instance "$instance_id" \
   --role "$role_type" --phase "$phase" --status "$status" --task-sha256 "$task_sha256" \
-  --exit-code "$rc" --result-file "$result_file"
+  --exit-code "$rc" --result-file "$result_file" \
+  ${token_args[@]+"${token_args[@]}"}
 exit "$rc"

@@ -7,6 +7,7 @@
   "limits": {
     "max_local_heavy_in_flight": 1,
     "max_parallel_local_workers": 3,
+    "local_token_budget_per_feature": 200000,
     "avoid_local_models": [
       "gemma4:26b",
       "qwen3-coder:30b",

@@ -299,6 +299,48 @@ class FleetUpTests(unittest.TestCase):
         self.assertEqual(dispatch.returncode, 75)
         self.assertFalse((self.runs / "locks" / "heavy-lock.worker.lock").exists())
 
+    def test_dispatch_refuses_when_feature_token_budget_is_exhausted(self) -> None:
+        router = json.loads(ROUTER.read_text())
+        router["limits"]["local_token_budget_per_feature"] = 1000
+        budget_router = self.tmp / "router-budget.yaml"
+        budget_router.write_text(json.dumps(router))
+        self.env["FLEET_ROUTER_PATH"] = str(budget_router)
+
+        result = self.run_fleet("budget", "triage")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        advance = subprocess.run(
+            [
+                "python3", str(ROOT / "scripts" / "fleet_state.py"), "advance",
+                str(self.runs / "fleet-budget.manifest"), "RECON",
+                "--evidence", "test-scope-approved",
+            ],
+            cwd=ROOT, env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=20, check=False,
+        )
+        self.assertEqual(advance.returncode, 0, advance.stderr)
+
+        seed = subprocess.run(
+            [
+                "python3", str(ROOT / "scripts" / "fleet_ledger.py"),
+                str(self.runs / "fleet-budget.ledger.jsonl"),
+                "--run-id", "spent", "--feature", "budget", "--instance", "triage",
+                "--role", "triage", "--phase", "RECON", "--status", "succeeded",
+                "--task-sha256", "0" * 64, "--exit-code", "0",
+                "--prompt-tokens", "900", "--completion-tokens", "200",
+            ],
+            cwd=ROOT, env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=20, check=False,
+        )
+        self.assertEqual(seed.returncode, 0, seed.stderr)
+
+        dispatch = subprocess.run(
+            ["bash", str(FLEET_DISPATCH), "budget", "triage", "one more task"],
+            cwd=ROOT, env=self.env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=20, check=False,
+        )
+        self.assertEqual(dispatch.returncode, 3, dispatch.stderr)
+        self.assertIn("exhausted", dispatch.stderr)
+
     def test_teardown_deletes_manifest_only_after_workspace_disappears(self) -> None:
         result = self.run_fleet("teardown", "--preset", "small")
         self.assertEqual(result.returncode, 0, result.stderr)

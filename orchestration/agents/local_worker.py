@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -27,7 +28,7 @@ Evidence rules:
 """
 
 
-def call_ollama(host: str, model: str, prompt: str, temperature: float, num_predict: int) -> str:
+def call_ollama(host: str, model: str, prompt: str, temperature: float, num_predict: int) -> dict:
     payload = {
         "model": model,
         "prompt": prompt,
@@ -51,7 +52,18 @@ def call_ollama(host: str, model: str, prompt: str, temperature: float, num_pred
     except urllib.error.URLError as exc:
         raise SystemExit(f"Unable to reach Ollama at {host}: {exc}") from exc
 
-    return body.get("response", "")
+    return body
+
+
+def write_usage_file(path: str, body: dict) -> None:
+    usage = {
+        "prompt_eval_count": int(body.get("prompt_eval_count", 0) or 0),
+        "eval_count": int(body.get("eval_count", 0) or 0),
+    }
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(usage, handle)
+        handle.write("\n")
 
 
 def main() -> int:
@@ -63,6 +75,7 @@ def main() -> int:
     parser.add_argument("--host", default="http://localhost:11434")
     parser.add_argument("--temperature", type=float, default=0.2)
     parser.add_argument("--num-predict", type=int, default=768)
+    parser.add_argument("--usage-file", help="write prompt/eval token counts as JSON")
     args = parser.parse_args()
 
     worker_prompt = "\n\n".join(
@@ -74,8 +87,11 @@ def main() -> int:
             args.prompt,
         ]
     )
-    output = call_ollama(args.host, args.model, worker_prompt, args.temperature, args.num_predict)
-    cleaned = output.strip()
+    body = call_ollama(args.host, args.model, worker_prompt, args.temperature, args.num_predict)
+    if args.usage_file:
+        # Record spend even when the status contract check below fails.
+        write_usage_file(args.usage_file, body)
+    cleaned = body.get("response", "").strip()
     sys.stdout.write(cleaned + "\n")
     statuses = re.findall(r"(?m)^STATUS: (DONE|BLOCKED|FAILED)\s*$", cleaned)
     required_headers = ("SUMMARY:", "EVIDENCE:", "RISKS:", "NEXT_ACTION:")

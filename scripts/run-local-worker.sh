@@ -26,8 +26,14 @@ fi
 model="$(python3 "$router" role-field "$role_type" model)" || exit 2
 instruction="$(python3 "$router" role-field "$role_type" instructions)" || exit 2
 
+usage_args=()
+if [[ -n "${FLEET_USAGE_FILE:-}" ]]; then
+  usage_args=(--usage-file "$FLEET_USAGE_FILE")
+fi
+
 python3 "$repo_root/orchestration/agents/local_worker.py" \
   --role "$role_type" \
   --model "$model" \
   --instruction "$instruction" \
-  --prompt "$task"
+  --prompt "$task" \
+  ${usage_args[@]+"${usage_args[@]}"}

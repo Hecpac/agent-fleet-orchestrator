@@ -22,6 +22,8 @@ def main() -> int:
     parser.add_argument("--task-sha256", required=True)
     parser.add_argument("--exit-code", type=int)
     parser.add_argument("--result-file")
+    parser.add_argument("--prompt-tokens", type=int)
+    parser.add_argument("--completion-tokens", type=int)
     args = parser.parse_args()
 
     event = {
@@ -38,6 +40,10 @@ def main() -> int:
         event["exit_code"] = args.exit_code
     if args.result_file:
         event["result_file"] = args.result_file
+    if args.prompt_tokens is not None:
+        event["prompt_tokens"] = args.prompt_tokens
+    if args.completion_tokens is not None:
+        event["completion_tokens"] = args.completion_tokens
 
     path = Path(args.ledger)
     path.parent.mkdir(parents=True, exist_ok=True)

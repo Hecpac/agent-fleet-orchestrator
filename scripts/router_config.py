@@ -132,11 +132,18 @@ def validate_router(config: dict[str, Any]) -> None:
     _expect_keys(
         limits,
         required={"max_local_heavy_in_flight", "max_parallel_local_workers", "avoid_local_models"},
+        optional={"local_token_budget_per_feature"},
         where="router.limits",
     )
     for key in ("max_local_heavy_in_flight", "max_parallel_local_workers"):
         if isinstance(limits[key], bool) or not isinstance(limits[key], int) or limits[key] < 1:
             raise RouterError(f"router.limits.{key} must be a positive integer")
+    if "local_token_budget_per_feature" in limits:
+        budget = limits["local_token_budget_per_feature"]
+        if isinstance(budget, bool) or not isinstance(budget, int) or budget < 1:
+            raise RouterError(
+                "router.limits.local_token_budget_per_feature must be a positive integer"
+            )
     _expect_string_list(limits["avoid_local_models"], "router.limits.avoid_local_models")
 
     roles = _expect_mapping(config["roles"], "router.roles")

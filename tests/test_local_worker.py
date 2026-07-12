@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
+import tempfile
 from unittest import mock
 import sys
 import unittest
@@ -22,7 +24,7 @@ class LocalWorkerContractTests(unittest.TestCase):
             "--instruction", "test", "--prompt", "test",
         ]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(
-            local_worker, "call_ollama", return_value=response
+            local_worker, "call_ollama", return_value={"response": response}
         ):
             return local_worker.main()
 
@@ -43,6 +45,28 @@ class LocalWorkerContractTests(unittest.TestCase):
             ),
             1,
         )
+
+    def test_usage_file_records_token_counts(self) -> None:
+        response = "STATUS: DONE\nSUMMARY:\nEVIDENCE:\nRISKS:\nNEXT_ACTION:"
+        with tempfile.TemporaryDirectory() as tmp:
+            usage_path = Path(tmp) / "usage.json"
+            argv = [
+                "local_worker.py", "--role", "triage", "--model", "fake",
+                "--instruction", "test", "--prompt", "test",
+                "--usage-file", str(usage_path),
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                local_worker,
+                "call_ollama",
+                return_value={
+                    "response": response,
+                    "prompt_eval_count": 42,
+                    "eval_count": 7,
+                },
+            ):
+                self.assertEqual(local_worker.main(), 0)
+            usage = json.loads(usage_path.read_text())
+            self.assertEqual(usage, {"prompt_eval_count": 42, "eval_count": 7})
 
 
 if __name__ == "__main__":
