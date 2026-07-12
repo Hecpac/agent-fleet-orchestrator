@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import tempfile
@@ -352,6 +353,82 @@ class FleetUpTests(unittest.TestCase):
         self.assertFalse((self.runs / "fleet-teardown.manifest").exists())
         archives = list((self.runs / "archive").glob("teardown-*/manifest"))
         self.assertEqual(len(archives), 1)
+
+    def make_target_repo(self) -> Path:
+        target = self.tmp / "target-repo"
+        target.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=target, check=True)
+        subprocess.run(["git", "-C", str(target), "config", "user.email", "t@example.com"], check=True)
+        subprocess.run(["git", "-C", str(target), "config", "user.name", "t"], check=True)
+        (target / "file.txt").write_text("x\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(target), "add", "-A"], check=True)
+        subprocess.run(["git", "-C", str(target), "commit", "-q", "-m", "init"], check=True)
+        return target
+
+    def writer_worktree(self, feature: str) -> Path:
+        manifest = (self.runs / f"fleet-{feature}.manifest").read_text()
+        match = re.search(r"^build\.worktree=(.+)$", manifest, re.M)
+        self.assertIsNotNone(match, f"no build.worktree entry in manifest:\n{manifest}")
+        return Path(match.group(1))
+
+    def test_writer_gets_detached_worktree_in_target_repo(self) -> None:
+        target = self.make_target_repo()
+        result = self.run_fleet(
+            "wt", "--preset", "implementation_review", "--target-repo", str(target)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        worktree = self.writer_worktree("wt")
+        self.assertTrue(worktree.is_dir())
+        head = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "HEAD"],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(head.stdout.strip(), "HEAD", "writer worktree must be detached")
+        manifest = (self.runs / "fleet-wt.manifest").read_text()
+        self.assertIn(f"target_repo={target}", manifest)
+        self.assertNotIn("verify.worktree=", manifest)
+        sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
+        self.assertTrue(
+            any("cd " in payload and str(worktree) in payload for payload in sends),
+            "writer launch command does not enter its worktree",
+        )
+
+    def test_teardown_refuses_dirty_worktree_then_removes_clean_one(self) -> None:
+        target = self.make_target_repo()
+        result = self.run_fleet(
+            "wtdown", "--preset", "implementation_review", "--target-repo", str(target)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        worktree = self.writer_worktree("wtdown")
+
+        (worktree / "scratch.txt").write_text("dirty\n", encoding="utf-8")
+        refused = subprocess.run(
+            ["bash", str(FLEET_DOWN), "wtdown"], cwd=ROOT, env=self.env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+        )
+        self.assertEqual(refused.returncode, 75, refused.stderr)
+        self.assertIn("uncommitted", refused.stderr)
+        self.assertTrue((self.runs / "fleet-wtdown.manifest").exists())
+
+        (worktree / "scratch.txt").unlink()
+        closed = subprocess.run(
+            ["bash", str(FLEET_DOWN), "wtdown"], cwd=ROOT, env=self.env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+        )
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertFalse(worktree.exists())
+        self.assertFalse((self.runs / "fleet-wtdown.manifest").exists())
+
+    def test_target_repo_must_be_a_git_repository(self) -> None:
+        plain = self.tmp / "plain"
+        plain.mkdir()
+        result = self.run_fleet(
+            "wtbad", "--preset", "implementation_review", "--target-repo", str(plain)
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not a git repository", result.stderr.lower())
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((self.runs / "fleet-wtbad.manifest").exists())
 
     def test_duplicate_bare_role_fails_before_cmux(self) -> None:
         result = self.run_fleet("bad", "triage", "triage")

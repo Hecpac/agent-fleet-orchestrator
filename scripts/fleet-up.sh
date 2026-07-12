@@ -19,9 +19,13 @@ export CMUX_QUIET=1
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  fleet-up.sh <feature> [--preset <name>]
+  fleet-up.sh <feature> [--preset <name>] [--target-repo <path>]
   fleet-up.sh <feature> [--lead-provider <role>] [--allow-fallback] [instance=role ...]
   fleet-up.sh --list-presets
+
+--target-repo <path>: git repository the fleet works on. Every instance with
+write authority gets its own detached git worktree there and its agent starts
+inside it, so writers never share a working tree with the daemon or each other.
 EOF
 }
 
@@ -43,12 +47,18 @@ shift
 preset=""
 lead_provider="${FLEET_LEAD_PROVIDER:-}"
 allow_fallback=0
+target_repo="${FLEET_TARGET_REPO:-}"
 instance_specs=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --preset)
       [[ $# -ge 2 ]] || { echo "--preset requires a name" >&2; exit 2; }
       preset="$2"
+      shift 2
+      ;;
+    --target-repo)
+      [[ $# -ge 2 ]] || { echo "--target-repo requires a path" >&2; exit 2; }
+      target_repo="$2"
       shift 2
       ;;
     --lead-provider|--lead)
@@ -75,6 +85,14 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ -n "$target_repo" ]]; then
+  if ! git -C "$target_repo" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "--target-repo is not a git repository: $target_repo" >&2
+    exit 2
+  fi
+  target_repo="$(cd "$target_repo" && pwd)"
+fi
 
 plan_args=(plan --format records)
 [[ -n "$preset" ]] && plan_args+=(--preset "$preset")
@@ -251,6 +269,7 @@ completed=0
 manifest_published=0
 ws_ref=""
 manifest_tmp=""
+created_worktrees=()
 cleanup_on_exit() {
   local code=$?
   if (( code != 0 && created_workspace == 1 && completed == 0 )); then
@@ -260,10 +279,40 @@ cleanup_on_exit() {
     rm -f "$manifest"
     rm -f "${manifest%.manifest}.state.json"
   fi
+  if (( code != 0 && completed == 0 )); then
+    local wt
+    for wt in ${created_worktrees[@]+"${created_worktrees[@]}"}; do
+      git -C "$target_repo" worktree remove --force "$wt" >/dev/null 2>&1 || true
+    done
+  fi
   [[ -n "$manifest_tmp" && -e "$manifest_tmp" ]] && rm -f "$manifest_tmp"
   return "$code"
 }
 trap cleanup_on_exit EXIT
+
+# Writers never share a working tree: each write-authority instance gets a
+# detached git worktree of the target repo and its agent starts inside it.
+worktrees=()
+if [[ -n "$target_repo" ]]; then
+  for ((i=0; i<${#instance_ids[@]}; i++)); do
+    worktrees[$i]=""
+    if [[ "${authorities[$i]}" == "write" ]]; then
+      wt="$runs_dir/worktrees/$feature-${instance_ids[$i]}"
+      if [[ -e "$wt" ]]; then
+        echo "Worktree path already exists: $wt" >&2
+        exit 2
+      fi
+      mkdir -p "$runs_dir/worktrees"
+      chmod 700 "$runs_dir/worktrees"
+      if ! git -C "$target_repo" worktree add --detach "$wt" >/dev/null 2>&1; then
+        echo "Could not create worktree for ${instance_ids[$i]} at $wt" >&2
+        exit 2
+      fi
+      worktrees[$i]="$wt"
+      created_worktrees+=("$wt")
+    fi
+  done
+fi
 
 ws_output="$(cmux new-workspace --name "fleet-$feature" --cwd "$repo_root" --focus false)"
 ws_ref="$(grep -o 'workspace:[0-9]*' <<< "$ws_output" | head -1)"
@@ -288,6 +337,9 @@ for ((i=${#instance_ids[@]}-1; i>=0; i--)); do
   cmux rename-tab --surface "$surface" --workspace "$ws_ref" "${instance_ids[$i]}" >/dev/null
   if [[ "${runners[$i]}" == "interactive" ]]; then
     launch_command="$(interactive_launch_command "${role_types[$i]}" "${authorities[$i]}" "${required_envs[$i]}" "${commands[$i]}")"
+    if [[ -n "${worktrees[$i]:-}" ]]; then
+      launch_command="$(printf 'cd %q && ' "${worktrees[$i]}")$launch_command"
+    fi
     cmux send --surface "$surface" --workspace "$ws_ref" "$launch_command" >/dev/null
   else
     cmux send --surface "$surface" --workspace "$ws_ref" \
@@ -338,6 +390,9 @@ manifest_tmp="$(mktemp "$runs_dir/.fleet-$feature.manifest.XXXXXX")"
   echo "preset=$resolved_preset"
   echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "workspace_cwd=$repo_root"
+  if [[ -n "$target_repo" ]]; then
+    echo "target_repo=$target_repo"
+  fi
   echo "workspace=$ws_ref"
   echo "workspace_uuid=$workspace_uuid"
   echo "lead=$lead_surface"
@@ -366,6 +421,9 @@ manifest_tmp="$(mktemp "$runs_dir/.fleet-$feature.manifest.XXXXXX")"
     echo "${instance_ids[$i]}.phase=${phases[$i]}"
     echo "${instance_ids[$i]}.tool_access=${tool_accesses[$i]}"
     echo "${instance_ids[$i]}.provider=${providers[$i]}"
+    if [[ -n "${worktrees[$i]:-}" ]]; then
+      echo "${instance_ids[$i]}.worktree=${worktrees[$i]}"
+    fi
   done
 } > "$manifest_tmp"
 mv "$manifest_tmp" "$manifest"

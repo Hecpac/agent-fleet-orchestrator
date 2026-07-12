@@ -36,9 +36,34 @@ if (( ${#active_locks[@]} > 0 )); then
   echo "Refusing teardown: fleet '$feature' has active dispatch leases." >&2
   exit 75
 fi
+
+# Writer worktrees must be reconciled before the fleet disappears: uncommitted
+# work would be orphaned, so fail closed and keep the fleet alive.
+target_repo="$(grep '^target_repo=' "$manifest" | cut -d= -f2- || true)"
+worktree_entries=()
+while IFS= read -r entry; do
+  [[ -n "$entry" ]] && worktree_entries+=("$entry")
+done < <(grep '\.worktree=' "$manifest" || true)
+for entry in ${worktree_entries[@]+"${worktree_entries[@]}"}; do
+  wt="${entry#*=}"
+  instance="${entry%%.*}"
+  if [[ -d "$wt" && -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]]; then
+    echo "Refusing teardown: worktree for '$instance' has uncommitted changes: $wt" >&2
+    echo "Commit/branch the work in the target repo or discard it, then retry." >&2
+    exit 75
+  fi
+done
+
 cmux close-workspace --workspace "$ws_ref" >/dev/null
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   if ! python3 "$identity" exists "$manifest" >/dev/null 2>&1; then
+    for entry in ${worktree_entries[@]+"${worktree_entries[@]}"}; do
+      wt="${entry#*=}"
+      if [[ -d "$wt" && -n "$target_repo" ]]; then
+        git -C "$target_repo" worktree remove "$wt" >/dev/null 2>&1 || \
+          echo "WARNING: could not remove worktree $wt; remove it manually." >&2
+      fi
+    done
     archive="$runs_dir/archive/$feature-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$archive"
     chmod 700 "$runs_dir/archive" "$archive"

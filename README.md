@@ -112,6 +112,22 @@ OS-level process sandboxing. Direct manual `cmux send` bypasses the wrappers,
 so keep one writer and use the scripts. `fleet-race` still returns the first
 completion as a candidate; it is not an acceptance gate.
 
+Write isolation: pass `--target-repo <path>` (or set `FLEET_TARGET_REPO`) to
+`fleet-up` and every write-authority instance gets its own detached git
+worktree of that repo, entered at launch. `fleet-down` refuses teardown while
+a writer worktree has uncommitted changes and removes clean ones after the
+workspace closes.
+
+Execution economics: local worker runs record prompt/completion token counts
+in the per-feature ledger; `limits.local_token_budget_per_feature` in the
+router makes `fleet-dispatch` warn at 70% spend and refuse new dispatches at
+100%. `fleet-wait` fires a `cmux notify` escalation (title `ESCALATION: ...`)
+naming the stuck instances when its deadline expires.
+
+Human-in-the-loop: advancing the durable phase gate out of BUILD requires
+`--approved-by <human>` in addition to `--evidence`; the approver is recorded
+in the state history.
+
 `scripts/fleet-up.sh` resolves and validates the complete plan before touching
 cmux, creates workspace `fleet-<feature>`, verifies the rendered pane order,
 and writes `orchestration/runs/fleet-<feature>.manifest`. The manifest records

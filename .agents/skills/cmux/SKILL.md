@@ -109,6 +109,11 @@ dispatch uses instance/heavy leases. Direct manual `cmux send` remains an
 emergency bypass, so keep one writer and use `fleet-send.sh` normally.
 The CONTROL lead alone uses `danger-full-access` so it can reach the cmux Unix
 socket; its environment is still allowlisted.
+Pass `--target-repo <path>` to `fleet-up` and each write-authority instance
+gets its own detached git worktree there (teardown refuses while it holds
+uncommitted changes). Local-worker token spend accrues in the ledger and
+`fleet-dispatch` refuses once `limits.local_token_budget_per_feature` is
+exhausted; `fleet-wait` fires a `cmux notify` ESCALATION on timeout.
 
 Roles come in two kinds:
 
@@ -157,6 +162,8 @@ just send <feature> build "bounded task"
 
 Only CONTROL and the currently active phase may receive work. Advancing freezes
 earlier phases, so BUILD cannot mutate an artifact during CHALLENGE/VERIFY.
+Leaving BUILD additionally requires `--approved-by <human>` — a person signs
+off on the writer's diff before CHALLENGE/VERIFY see it.
 
 ### Event-driven waiting (preferred — do not poll)
 
