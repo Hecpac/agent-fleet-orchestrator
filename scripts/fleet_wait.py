@@ -160,9 +160,14 @@ def main() -> int:
                         break
             if done_role:
                 if pending[done_role]["runner"] == "local":
+                    # The ledger is the authority: a notification that merely
+                    # matches surface + title length while the run is not yet
+                    # terminal is spurious — keep waiting for the real one.
                     terminal = local_terminal_status(done_role)
+                    if terminal not in {"succeeded", "failed", "blocked"}:
+                        continue
                     if terminal != "succeeded":
-                        print(f"{done_role}={terminal or 'failed'}", flush=True)
+                        print(f"{done_role}={terminal}", flush=True)
                         return 1
                 print(f"{done_role}=done", flush=True)
                 del pending[done_role]
