@@ -110,8 +110,9 @@ emergency bypass, so keep one writer and use `fleet-send.sh` normally.
 The CONTROL lead alone uses `danger-full-access` so it can reach the cmux Unix
 socket; its environment is still allowlisted.
 Pass `--target-repo <path>` to `fleet-up` and each write-authority instance
-gets its own detached git worktree there (teardown refuses while it holds
-uncommitted changes). Local-worker token spend accrues in the ledger and
+gets a dedicated `fleet/<feature>/<instance>` branch and worktree at the target
+repo's current `HEAD`. Existing branches fail closed; teardown removes only an
+unchanged branch and preserves committed output. Local-worker token spend accrues in the ledger and
 `fleet-dispatch` refuses once `limits.local_token_budget_per_feature` is
 exhausted; `fleet-wait` fires a `cmux notify` ESCALATION on timeout.
 

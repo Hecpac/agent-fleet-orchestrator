@@ -113,10 +113,11 @@ so keep one writer and use the scripts. `fleet-race` still returns the first
 completion as a candidate; it is not an acceptance gate.
 
 Write isolation: pass `--target-repo <path>` (or set `FLEET_TARGET_REPO`) to
-`fleet-up` and every write-authority instance gets its own detached git
-worktree of that repo, entered at launch. `fleet-down` refuses teardown while
-a writer worktree has uncommitted changes and removes clean ones after the
-workspace closes.
+`fleet-up` and every write-authority instance gets a dedicated
+`fleet/<feature>/<instance>` branch and worktree, based on the target repo's
+current `HEAD`. Existing branch names fail closed. `fleet-down` refuses
+uncommitted changes, records the final SHA, preserves branches with commits,
+and removes branches that never advanced beyond their base SHA.
 
 Execution economics: local worker runs record prompt/completion token counts
 in the per-feature ledger; `limits.local_token_budget_per_feature` in the
