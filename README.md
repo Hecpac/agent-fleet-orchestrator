@@ -141,18 +141,34 @@ durable workspace/surface UUIDs.
 session (via cmux hook data) and surfaces the ones blocked waiting on a human,
 with age — check it whenever you return to the machine.
 
-Coordination is event-driven, not polled: `scripts/fleet-dispatch.sh` returns a
-durable local `run_id`; pass it back as `--run instance=run_id` to
-`scripts/fleet-wait.sh`. The waiter subscribes with an ACK, then reconciles the
-exact local run from the ledger. Notifications are wake-ups only. Interactive
-agents still complete through `agent.hook.Stop`. Local dispatch leases are
-owner-checked and crash reconciliation reclaims them only after a terminal
-ledger event or confirmed workspace/surface UUID absence. Teardown publishes
-an atomic closing owner so new dispatches cannot enter after its lease check.
+Coordination is event-driven, not polled: both `fleet-dispatch` and `fleet-send`
+return a durable `run_id`; pass every one back as `--run instance=run_id` to
+`fleet-wait`. Local notifications are wake-ups only. Frontier
+`UserPromptSubmit` binds the exact session/surface and a completed `Stop` only
+wakes verification of the run-specific `FLEET_RESULT` sentinel; Stop by itself
+is never success. The sentinel must be the final non-empty line and the Stop
+must follow the single bound submit. Replay is boot-scoped, and gaps attempt
+bounded catch-up from cmux's audit before failing closed as `indeterminate`.
+Catch-up requires the recorded baseline and continuous boot-scoped audit
+sequence; truncated or corrupt audit evidence is rejected. Event ACKs are
+schema-validated before readiness is published.
+Local and frontier dispatch leases are owner-checked; frontier exclusivity is
+enforced by surface UUID across manifest aliases. Fleet Codex workers use the
+default `~/.codex` configuration so cmux's official hooks remain active, while
+the router pins `gpt-5.6-sol` independently of the user's configured model.
+Teardown publishes an atomic closing owner so new dispatches cannot enter
+after its lease check.
 If a hard-killed runner leaves leases while its pane is still alive, automatic
 PID/TTL reclaim is intentionally disabled: close the workspace deliberately,
 then run `scripts/fleet-down.sh <feature> --recover-absent`; the UUID-absence
 probe records `abandoned`, quarantines the leases, and archives the fleet.
+An unrecoverable frontier gap retains its surface lease; release it explicitly
+with `scripts/fleet-abandon.sh <feature> <instance> <run_id> [reason]` only
+after confirming the agent is quiescent. Unconfirmed partial sends and race
+interrupts retain the lease under the same rule.
+
+`fleet-send` and `fleet-dispatch` accept `--json` for callers such as
+`fleet-race`; machine ownership never depends on parsing human-readable output.
 
 The orchestration playbook (mental model, verbs, wait rules, memory budget)
 lives in both `.agents/skills/cmux/SKILL.md` and `.claude/skills/cmux/SKILL.md`;

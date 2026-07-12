@@ -129,9 +129,12 @@ Roles come in two kinds:
   `triage`, `code_worker`, `light_code`, `reviewer`, `general_worker`.
 - **Frontier agents** (interactive CLIs, tracked in cmux's agent panel via
   hooks; prompt them by `send`ing text + enter like a human typing):
-  `codex` (codex CLI),
+`codex` (codex CLI),
   `minimax` (opencode -m minimax/MiniMax-M3, needs `MINIMAX_API_KEY`),
   `glm` (opencode -m zai/glm-5.2, needs `ZHIPU_API_KEY`).
+
+Fleet Codex roles use the official hooks and authentication from `~/.codex`,
+but the router pins `gpt-5.6-sol`; personal model defaults are not inherited.
 
 Frontier panes are interactive agents: after sending a prompt, wait for their
 hook event and then `read-screen`. `fleet-up` preflights executables, keys,
@@ -183,20 +186,29 @@ event stream, then read the result once:
 ./scripts/fleet-wait.sh <feature> code_worker --run code_worker=<run_id> --timeout 600
 cmux read-screen --surface <its surface> --workspace <ws> --lines 50
 
-# Frontier agent: prompt it, then wait for its turn to end
-cmux send --surface <s> --workspace <ws> "your prompt"
-cmux send-key --surface <s> --workspace <ws> enter
-./scripts/fleet-wait.sh <feature> codex minimax --timeout 1800   # blocks until BOTH finish
+# Frontier agent: durable send returns a run_id, then wait for that exact turn
+./scripts/fleet-send.sh <feature> codex "your prompt"
+./scripts/fleet-wait.sh <feature> codex --run codex=<run_id> --timeout 1800
 ```
 
 `fleet-wait.sh` prints `instance`, `run_id`, terminal `status`, `exit_code`, and
 `result_file`; pass `--json` for canonical JSONL. Exit codes are 0 succeeded,
 1 failed, 2 usage/identity/protocol, 3 blocked, 4 abandoned, 5 indeterminate,
-and 124 deadline. Frontier completions are detected via `agent.hook.Stop`
-events. Local notifications are wake-ups only: completion is reconciled from
-the durable ledger for the exact required `run_id`. Local workers cannot write
-files themselves; feed them a bounded evidence pack and capture their stdout
-durably when the result is too large for a pane.
+and 124 deadline. Every local or frontier instance requires `--run`. Frontier
+`UserPromptSubmit` binds session/surface; completed Stop only wakes exact
+`FLEET_RESULT:<run_id>:<STATUS>` verification. Missing or ambiguous evidence is
+indeterminate, never success. The sentinel must be the final non-empty line and
+the Stop must follow the single bound submit. A replay gap attempts catch-up
+from the bounded cmux audit and retains the frontier lease if still
+indeterminate; after confirming the agent is quiescent, release it with
+`./scripts/fleet-abandon.sh <feature> <instance> <run_id> [reason]`. Partial
+sends and unconfirmed race interrupts also retain their surface-UUID lease.
+The dispatch wrappers also accept `--json`; orchestration callers must use that
+canonical output rather than parse human-facing text. Audit recovery requires
+the recorded baseline plus a continuous boot-scoped sequence.
+Local notifications are also wake-ups only. Local workers cannot write files
+themselves; feed them a bounded evidence pack and capture their stdout durably
+when the result is too large for a pane.
 
 Workers answer with a fixed contract: `STATUS: DONE|BLOCKED|FAILED`, then
 `SUMMARY / EVIDENCE / RISKS / NEXT_ACTION`. Parse STATUS before trusting the

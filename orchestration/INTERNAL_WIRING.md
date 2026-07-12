@@ -74,3 +74,55 @@ preserve leases. Ledger appends are serialized, synced to disk, and the first
 terminal event is immutable. Teardown holds an owner-checked closing marker
 that atomically blocks later acquisitions. Recovered leases move to
 `orchestration/runs/archive/leases/<run_id>/` for auditability.
+
+## Exact frontier completion
+
+`rule: frontier_run_completion_is_run_id_scoped`
+
+`enforced_by:`
+
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_exact_binding_ignores_old_stop_then_terminalizes_verified_sentinel`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_missing_or_duplicate_sentinel_is_indeterminate`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_second_submit_in_same_session_is_ambiguous_and_retains_lease`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_stop_must_be_after_binding`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_losing_terminalizer_cannot_release_retained_lease`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_prepare_identity_is_durable_before_lease_acquisition`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_cross_boot_audit_recovers_binding_stop_and_status`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_truncated_audit_cannot_bind_a_later_submit`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_unrecoverable_gap_is_indeterminate_and_retains_lease_until_abandon`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_frontier_instance_lease_rejects_second_active_run`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_frontier_surface_rejects_alias_from_another_feature`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_malformed_lease_blocks_frontier_acquisition`
+- `tests/test_fleet_wait.py::FleetWaitLedgerAuthorityTests::test_mixed_any_drains_replay_then_uses_durable_completion_time`
+- `tests/test_fleet_wait.py::FleetWaitLedgerAuthorityTests::test_mixed_any_frontier_terminal_during_replay_competes_by_durable_time`
+- `tests/test_fleet_wait.py::FleetWaitLedgerAuthorityTests::test_waiter_recovers_frontier_from_audit_on_boot_change`
+- `tests/test_fleet_wait.py::FleetWaitEscalationTests::test_malformed_protocol_ack_fails_closed`
+- `tests/test_fleet_up.py::FleetUpTests::test_frontier_send_returns_exact_run_and_rejects_second_active_turn`
+- `tests/test_fleet_up.py::FleetUpTests::test_frontier_preset_is_reproducible_and_ordered`
+- `tests/test_fleet_up.py::FleetUpTests::test_frontier_send_key_failure_retains_indeterminate_lease`
+- `tests/test_fleet_up.py::FleetUpTests::test_race_partial_dispatch_reports_exact_runs_and_retains_leases`
+- `tests/test_run_interactive_agent.py::InteractiveAgentEnvironmentTests::test_codex_roles_use_default_codex_home`
+
+`why:` Every frontier attempt records a durable `preparing` identity before
+lease acquisition. A surface UUID—not merely its manifest alias—can belong to
+only one active run. Before Enter, dispatch records `run_id`, cmux `boot_id`,
+lower sequence, workspace UUID, and surface UUID. Fleet Codex processes use
+the default `~/.codex` config so the official cmux hooks are active, while the
+router pins `gpt-5.6-sol` so fleet execution does not inherit a personal model.
+`UserPromptSubmit` must bind exactly one later turn to that surface; another
+distinct submit is ambiguous. A completed Stop must follow that binding and is
+only a wake-up: succeeded/blocked/failed requires exactly one matching final
+line `FLEET_RESULT:<run_id>:<STATUS>`. Old, duplicated, cross-surface,
+non-final, or ambiguous evidence cannot complete the run. Known idle-prompt
+chrome rendered after the answer is excluded from final-line evaluation; text
+between the sentinel and that prompt remains a protocol failure, as does any
+unknown suffix after the prompt/status chrome. Audit recovery requires the
+recorded baseline and a contiguous per-boot sequence; a truncated/corrupt audit
+cannot correlate a later submit. Protocol ACKs and lease metadata are validated
+fail-closed. The first terminal
+ledger event alone may release its lease. Boot gaps use the bounded cmux audit
+and otherwise terminalize indeterminate while retaining the lease until
+explicit operator abandonment. Partial sends and unconfirmed race interrupts
+also retain their leases. Mixed races drain ACK replay, normalize durable
+`completed_at` instants to UTC, then use `instance_id` as the deterministic
+tie-breaker.
