@@ -1,0 +1,274 @@
+{
+  "schema_version": 3,
+  "defaults": {
+    "preset": "small",
+    "race_roles": ["codex_candidate", "minimax_candidate"]
+  },
+  "limits": {
+    "max_local_heavy_in_flight": 1,
+    "max_parallel_local_workers": 3,
+    "avoid_local_models": [
+      "gemma4:26b",
+      "qwen3-coder:30b",
+      "devstral:24b"
+    ]
+  },
+  "lead": {
+    "instance_id": "lead",
+    "phase": "CONTROL",
+    "display_rank": 10,
+    "candidates": ["codex", "claude"],
+    "fallback_policy": "first_available",
+    "authority": "control",
+    "tool_access": ["filesystem", "shell", "git", "cmux"],
+    "capabilities": [
+      "planning",
+      "architecture",
+      "routing",
+      "final_decision",
+      "conflict_resolution",
+      "high_risk_code_changes"
+    ]
+  },
+  "roles": {
+    "triage": {
+      "phase": "RECON",
+      "runner": "local",
+      "provider": "ollama",
+      "model": "gemma3:4b",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["summarize", "classify", "extract", "compare_outputs"],
+      "tool_access": ["prompt_only"],
+      "authority": "advisory",
+      "resource_class": "local_light",
+      "display_rank": 20,
+      "concurrency": 2,
+      "instructions": "You classify, summarize, extract, and compare supplied evidence. Be concise."
+    },
+    "light_code": {
+      "phase": "RECON",
+      "runner": "local",
+      "provider": "ollama",
+      "model": "granite-code:3b",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["supplied_grep_analysis", "small_fix_suggestions", "documentation_suggestions"],
+      "tool_access": ["prompt_only"],
+      "authority": "advisory",
+      "resource_class": "local_light",
+      "display_rank": 21,
+      "concurrency": 2,
+      "instructions": "You analyze supplied code and command output. Prefer concrete symbols and do not claim filesystem access."
+    },
+    "general_worker": {
+      "phase": "RECON",
+      "runner": "local",
+      "provider": "ollama",
+      "model": "gemma4:latest",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["general_analysis", "synthesis", "uncertainty_preservation"],
+      "tool_access": ["prompt_only"],
+      "authority": "advisory",
+      "resource_class": "local_heavy",
+      "display_rank": 25,
+      "concurrency": 1,
+      "instructions": "You solve general analysis tasks from supplied evidence and preserve uncertainty."
+    },
+    "codex": {
+      "phase": "BUILD",
+      "runner": "interactive",
+      "provider": "openai",
+      "command": ["codex"],
+      "healthcheck": ["codex", "login", "status"],
+      "ready_pattern": "^[[:space:]]*›[[:space:]].+",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["implementation", "deep_diagnosis", "code_review", "second_opinion"],
+      "tool_access": ["filesystem", "shell", "git"],
+      "authority": "write",
+      "resource_class": "remote",
+      "display_rank": 30,
+      "concurrency": 2
+    },
+    "codex_candidate": {
+      "phase": "BUILD",
+      "runner": "interactive",
+      "provider": "openai",
+      "command": ["codex"],
+      "healthcheck": ["codex", "login", "status"],
+      "ready_pattern": "^[[:space:]]*›[[:space:]].+",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["candidate_generation", "deep_diagnosis", "second_opinion"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "authority": "advisory",
+      "resource_class": "remote",
+      "display_rank": 30,
+      "concurrency": 2
+    },
+    "claude": {
+      "phase": "BUILD",
+      "runner": "interactive",
+      "provider": "anthropic",
+      "command": ["claude"],
+      "healthcheck": ["claude", "auth", "status"],
+      "ready_pattern": "^[[:space:]]*❯[[:space:]]*$|new task\\?",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["planning", "architecture", "implementation", "deep_diagnosis"],
+      "tool_access": ["filesystem", "shell", "git"],
+      "authority": "write",
+      "resource_class": "remote",
+      "display_rank": 31,
+      "concurrency": 1
+    },
+    "code_worker": {
+      "phase": "BUILD",
+      "runner": "local",
+      "provider": "ollama",
+      "model": "qwen2.5-coder:7b",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["supplied_code_analysis", "patch_suggestions", "bug_hypotheses"],
+      "tool_access": ["prompt_only"],
+      "authority": "advisory",
+      "resource_class": "local_heavy",
+      "display_rank": 32,
+      "concurrency": 1,
+      "instructions": "You analyze supplied code and propose small focused changes. Do not claim to have edited files."
+    },
+    "glm": {
+      "phase": "CHALLENGE",
+      "runner": "interactive",
+      "provider": "zai",
+      "command": ["opencode", "-m", "zai/glm-5.2", "--agent", "plan"],
+      "healthcheck": ["opencode", "--version"],
+      "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
+      "enabled": true,
+      "requires_env": ["ZHIPU_API_KEY"],
+      "capabilities": ["diverse_perspective", "parallel_validation", "architecture_challenge"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "authority": "advisory",
+      "resource_class": "remote",
+      "display_rank": 40,
+      "concurrency": 1
+    },
+    "minimax": {
+      "phase": "CHALLENGE",
+      "runner": "interactive",
+      "provider": "minimax",
+      "command": ["opencode", "-m", "minimax/MiniMax-M3", "--agent", "plan"],
+      "healthcheck": ["opencode", "--version"],
+      "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
+      "enabled": true,
+      "requires_env": ["MINIMAX_API_KEY"],
+      "capabilities": ["diverse_perspective", "parallel_validation", "architecture_challenge"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "authority": "advisory",
+      "resource_class": "remote",
+      "display_rank": 40,
+      "concurrency": 1
+    },
+    "minimax_candidate": {
+      "phase": "BUILD",
+      "runner": "interactive",
+      "provider": "minimax",
+      "command": ["opencode", "-m", "minimax/MiniMax-M3", "--agent", "plan"],
+      "healthcheck": ["opencode", "--version"],
+      "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
+      "enabled": true,
+      "requires_env": ["MINIMAX_API_KEY"],
+      "capabilities": ["candidate_generation", "parallel_validation", "diverse_perspective"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "authority": "advisory",
+      "resource_class": "remote",
+      "display_rank": 31,
+      "concurrency": 1
+    },
+    "reviewer": {
+      "phase": "VERIFY",
+      "runner": "local",
+      "provider": "ollama",
+      "model": "code-auditor:latest",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["supplied_diff_review", "security_review", "architecture_review", "regression_checklist"],
+      "tool_access": ["prompt_only"],
+      "authority": "verification",
+      "resource_class": "local_heavy",
+      "display_rank": 50,
+      "concurrency": 1,
+      "instructions": "You review supplied diffs and evidence for security, architecture, regressions, and missing tests."
+    },
+    "claude_reviewer": {
+      "phase": "VERIFY",
+      "runner": "interactive",
+      "provider": "anthropic",
+      "command": ["claude", "--model", "fable", "--effort", "xhigh", "--permission-mode", "plan", "--no-chrome"],
+      "healthcheck": ["claude", "auth", "status"],
+      "ready_pattern": "^[[:space:]]*❯[[:space:]]*$|new task\\?",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["independent_code_review", "test_reproduction", "architecture_challenge"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "authority": "verification",
+      "resource_class": "remote",
+      "display_rank": 50,
+      "concurrency": 1
+    }
+  },
+  "presets": {
+    "small": {
+      "description": "One frontier lead for a bounded sequential task.",
+      "include_lead": true,
+      "instances": []
+    },
+    "audit": {
+      "description": "Independent frontier perspectives followed by a supplied-diff reviewer.",
+      "include_lead": true,
+      "instances": [
+        {"instance_id": "analysis", "role_type": "codex", "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read"]},
+        {"instance_id": "challenge", "role_type": "minimax"},
+        {"instance_id": "verify", "role_type": "reviewer"}
+      ]
+    },
+    "implementation_review": {
+      "description": "One tool-capable writer and one independent supplied-diff reviewer.",
+      "include_lead": true,
+      "instances": [
+        {"instance_id": "build", "role_type": "codex"},
+        {"instance_id": "verify", "role_type": "reviewer"}
+      ]
+    },
+    "frontier_verification": {
+      "description": "One writer, one heterogeneous read-only challenger, and one frontier verifier.",
+      "include_lead": true,
+      "instances": [
+        {"instance_id": "build", "role_type": "codex"},
+        {"instance_id": "challenge", "role_type": "glm"},
+        {"instance_id": "verify", "role_type": "claude_reviewer"}
+      ]
+    },
+    "hotfix_validated": {
+      "description": "Parallel candidates whose first result must still pass deterministic and independent verification gates.",
+      "include_lead": true,
+      "instances": [
+        {"instance_id": "candidate_codex", "role_type": "codex_candidate"},
+        {"instance_id": "candidate_minimax", "role_type": "minimax_candidate"},
+        {"instance_id": "verify", "role_type": "reviewer"}
+      ]
+    },
+    "research": {
+      "description": "Two uniquely addressed local triage instances plus heterogeneous frontier synthesis.",
+      "include_lead": true,
+      "instances": [
+        {"instance_id": "triage_scope", "role_type": "triage"},
+        {"instance_id": "triage_sources", "role_type": "triage"},
+        {"instance_id": "research", "role_type": "codex", "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read"]},
+        {"instance_id": "challenge", "role_type": "glm"}
+      ]
+    }
+  }
+}

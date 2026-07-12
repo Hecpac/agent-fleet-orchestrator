@@ -1,0 +1,12 @@
+# External-project git worktrees the fleet operates on (not part of this repo).
+.worktrees/
+
+# Per-feature runtime state: manifests, state, ledgers, tasks, locks, results.
+orchestration/runs/
+
+# Reports produced by fleet runs over audited projects.
+outputs/
+
+__pycache__/
+*.pyc
+.DS_Store

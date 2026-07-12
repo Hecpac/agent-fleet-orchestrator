@@ -1,0 +1,11 @@
+name: research-team
+description: Resolve the canonical research roster from orchestration/router.yaml.
+preset: research
+router: orchestration/router.yaml
+
+success_criteria:
+  - claims are separated from assumptions
+  - sources or evidence are listed
+  - unresolved questions are explicit
+
+timeout_minutes: 20

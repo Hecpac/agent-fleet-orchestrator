@@ -1,0 +1,11 @@
+name: hotfix-race
+description: Resolve the canonical hotfix roster from orchestration/router.yaml.
+preset: hotfix_validated
+router: orchestration/router.yaml
+
+success_criteria:
+  - at least one candidate fix includes evidence
+  - reviewer identifies no blocker
+  - tests or smoke commands are specified
+
+timeout_minutes: 30
