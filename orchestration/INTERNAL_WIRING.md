@@ -126,3 +126,29 @@ explicit operator abandonment. Partial sends and unconfirmed race interrupts
 also retain their leases. Mixed races drain ACK replay, normalize durable
 `completed_at` instants to UTC, then use `instance_id` as the deterministic
 tie-breaker.
+
+## Structured OpenCode completion
+
+`rule: opencode_completion_requires_structured_final_evidence`
+
+`enforced_by:`
+
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_ignores_intermediate_stops_and_uses_structured_final_response`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_identity_mismatch_is_indeterminate_and_retains_lease`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_unverifiable_final_evidence_is_indeterminate`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_rejects_wrong_source_and_non_opencode_session_file`
+- `tests/test_router_config.py::RouterConfigTests::test_interactive_roles_declare_hook_source_and_opencode_identity`
+- `tests/test_fleet_up.py::FleetUpTests::test_frontier_preset_is_reproducible_and_ordered`
+
+`why:` OpenCode emits multiple completed Stops for one turn. Stops without the
+feed plugin's structured final-context marker remain wake-ups and cannot
+terminalize a run. After that marker, the exact `run_id` user message, later
+assistant messages, full text parts, completion timestamps, provider, and model
+come from the read-only `opencode db` interface—not terminal chrome, truncated
+workstream preambles, or lossy session exports. The last completed assistant
+before the Stop must contain one exact sentinel as its final non-empty line.
+The event source, `opencode-` session prefix, and
+`opencode-hook-sessions.json` workspace/surface binding must also match the
+identity persisted before dispatch. Missing, malformed, temporally late, or
+mismatched evidence terminalizes indeterminate while retaining the lease; it
+never degrades to success by inference.

@@ -203,6 +203,10 @@ from the bounded cmux audit and retains the frontier lease if still
 indeterminate; after confirming the agent is quiescent, release it with
 `./scripts/fleet-abandon.sh <feature> <instance> <run_id> [reason]`. Partial
 sends and unconfirmed race interrupts also retain their surface-UUID lease.
+OpenCode emits multiple Stops: only its structured final Stop is eligible, and
+the run-tagged user message, complete assistant text, completion time,
+provider, and model are read through `opencode db`. Terminal chrome, truncated
+workstream preambles, and lossy exports never prove OpenCode completion.
 The dispatch wrappers also accept `--json`; orchestration callers must use that
 canonical output rather than parse human-facing text. Audit recovery requires
 the recorded baseline plus a continuous boot-scoped sequence.

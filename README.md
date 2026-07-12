@@ -149,6 +149,12 @@ wakes verification of the run-specific `FLEET_RESULT` sentinel; Stop by itself
 is never success. The sentinel must be the final non-empty line and the Stop
 must follow the single bound submit. Replay is boot-scoped, and gaps attempt
 bounded catch-up from cmux's audit before failing closed as `indeterminate`.
+OpenCode can emit several Stops for one turn: only its final structured Stop is
+eligible. Completion then binds the unique run-tagged user message to the last
+assistant completed before that Stop and reads full text plus provider/model
+through the read-only `opencode db` interface. Terminal chrome, truncated
+workstream preambles, and lossy exports are not completion evidence; missing or
+mismatched database evidence retains the lease as `indeterminate`.
 Catch-up requires the recorded baseline and continuous boot-scoped audit
 sequence; truncated or corrupt audit evidence is rejected. Event ACKs are
 schema-validated before readiness is published.
