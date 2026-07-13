@@ -91,9 +91,14 @@ elif scenario == "frontier_finishes_during_replay":
             "seq": seq,
             "id": f"boot-1-{seq}",
             "name": name,
+            "source": "codex",
             "occurred_at": when,
             "workspace_id": "",
-            "payload": {"phase": phase, "session_id": "opencode-s1"},
+            "payload": {
+                "phase": phase,
+                "session_id": "codex-s1",
+                "_source": "codex",
+            },
         }), flush=True)
 
 time.sleep(10)
@@ -153,12 +158,50 @@ class FleetWaitTestCase(unittest.TestCase):
     def configure_frontier_hooks(self) -> Path:
         hooks = self.tmp / "hooks"
         hooks.mkdir(exist_ok=True)
-        (hooks / "opencode-hook-sessions.json").write_text(json.dumps({
+        transcript = self.tmp / "codex-s1.jsonl"
+        transcript.write_text("".join(json.dumps(row) + "\n" for row in (
+            {
+                "type": "session_meta",
+                "timestamp": "2026-07-12T00:00:00Z",
+                "payload": {"id": "s1", "model_provider": "openai"},
+            },
+            {
+                "type": "turn_context",
+                "timestamp": "2026-07-12T00:00:01Z",
+                "payload": {"model": "gpt-5.6-sol"},
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-07-12T00:00:01Z",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": "task FLEET_RESULT:r-frontier:<STATUS>",
+                    }],
+                },
+            },
+            {
+                "type": "response_item",
+                "timestamp": "2026-07-12T00:00:01.500Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "answer\nFLEET_RESULT:r-frontier:DONE",
+                    }],
+                },
+            },
+        )), encoding="utf-8")
+        (hooks / "codex-hook-sessions.json").write_text(json.dumps({
             "sessions": {
                 "s1": {
                     "sessionId": "s1",
                     "workspaceId": "",
                     "surfaceId": UUID_2,
+                    "transcriptPath": str(transcript),
                     "updatedAt": 10,
                 }
             }
@@ -309,7 +352,7 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
                 "run_id": "r-frontier",
                 "feature": "esc",
                 "instance": "frontier",
-                "role": "minimax",
+                "role": "codex",
                 "phase": "CHALLENGE",
                 "runner": "interactive",
                 "status": "dispatched",
@@ -318,6 +361,9 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
                 "surface_uuid": UUID_2,
                 "event_boot_id": "boot-1",
                 "after_seq": 0,
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "hook_source": "codex",
             }) + "\n")
             handle.write(json.dumps({
                 "timestamp": "2026-07-12T00:00:01Z",
@@ -353,7 +399,7 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
                 "run_id": "r-frontier",
                 "feature": "esc",
                 "instance": "frontier",
-                "role": "minimax",
+                "role": "codex",
                 "phase": "CHALLENGE",
                 "runner": "interactive",
                 "status": "dispatched",
@@ -362,6 +408,9 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
                 "surface_uuid": UUID_2,
                 "event_boot_id": "boot-1",
                 "after_seq": 0,
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "hook_source": "codex",
             }) + "\n")
         self.env.update({
             "FAKE_SCENARIO": "frontier_finishes_during_replay",
@@ -391,7 +440,7 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
                 "run_id": "r-frontier",
                 "feature": "esc",
                 "instance": "frontier",
-                "role": "minimax",
+                "role": "codex",
                 "phase": "CHALLENGE",
                 "runner": "interactive",
                 "status": "dispatched",
@@ -400,6 +449,9 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
                 "surface_uuid": UUID_2,
                 "event_boot_id": "boot-old",
                 "after_seq": 900,
+                "provider": "openai",
+                "model": "gpt-5.6-sol",
+                "hook_source": "codex",
             }) + "\n")
         audit = self.tmp / "events.jsonl"
         audit.write_text("".join(json.dumps(event) + "\n" for event in (
@@ -412,14 +464,22 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
             {
                 "type": "event", "boot_id": "boot-new", "seq": 1,
                 "id": "boot-new-1", "name": "agent.hook.UserPromptSubmit",
+                "source": "codex",
                 "occurred_at": "2026-07-12T00:00:01Z", "workspace_id": "",
-                "payload": {"phase": "received", "session_id": "opencode-s1"},
+                "payload": {
+                    "phase": "received", "session_id": "codex-s1",
+                    "_source": "codex",
+                },
             },
             {
                 "type": "event", "boot_id": "boot-new", "seq": 2,
                 "id": "boot-new-2", "name": "agent.hook.Stop",
+                "source": "codex",
                 "occurred_at": "2026-07-12T00:00:02Z", "workspace_id": "",
-                "payload": {"phase": "completed", "session_id": "opencode-s1"},
+                "payload": {
+                    "phase": "completed", "session_id": "codex-s1",
+                    "_source": "codex",
+                },
             },
         )))
         self.env.update({

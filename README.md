@@ -152,9 +152,11 @@ bounded catch-up from cmux's audit before failing closed as `indeterminate`.
 OpenCode can emit several Stops for one turn: only its final structured Stop is
 eligible. Completion then binds the unique run-tagged user message to the last
 assistant completed before that Stop and reads full text plus provider/model
-through the read-only `opencode db` interface. Terminal chrome, truncated
-workstream preambles, and lossy exports are not completion evidence; missing or
-mismatched database evidence retains the lease as `indeterminate`.
+through the read-only `opencode db` interface. Codex and Claude likewise bind
+the exact turn through their source-specific hook session and transcript files;
+their terminal chrome is never completion evidence. Every interactive role pins
+a model before dispatch, and the structured result must confirm it. Missing or
+mismatched evidence retains the lease as `indeterminate`.
 Catch-up requires the recorded baseline and continuous boot-scoped audit
 sequence; truncated or corrupt audit evidence is rejected. Event ACKs are
 schema-validated before readiness is published.

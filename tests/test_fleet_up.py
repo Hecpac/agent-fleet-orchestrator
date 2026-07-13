@@ -296,11 +296,14 @@ class FleetUpTests(unittest.TestCase):
             ["lead", "build", "challenge", "verify"],
         )
         manifest = (self.runs / "fleet-frontier.manifest").read_text()
+        self.assertIn("lead.model=gpt-5.6-sol", manifest)
+        self.assertIn("build.model=gpt-5.6-sol", manifest)
         self.assertIn("challenge.role_type=glm", manifest)
         self.assertIn("challenge.provider=zai", manifest)
         self.assertIn("challenge.model=glm-5.2", manifest)
         self.assertIn("challenge.hook_source=opencode", manifest)
         self.assertIn("verify.role_type=claude_reviewer", manifest)
+        self.assertIn("verify.model=claude-fable-5", manifest)
         sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
         self.assertTrue(any("run-interactive-agent.sh" in payload for payload in sends))
         codex_launches = [payload for payload in sends if " codex " in payload]

@@ -243,10 +243,9 @@ def validate_router(config: dict[str, Any]) -> None:
                 raise RouterError(
                     f"router.roles.{role_type} interactive roles cannot set instructions"
                 )
-            if "model" in role:
-                _expect_manifest_scalar(
-                    role["model"], f"router.roles.{role_type}.model"
-                )
+            model = _expect_manifest_scalar(
+                role.get("model"), f"router.roles.{role_type}.model"
+            )
             hook_source = _expect_manifest_scalar(
                 role.get("hook_source"), f"router.roles.{role_type}.hook_source"
             )
@@ -255,6 +254,10 @@ def validate_router(config: dict[str, Any]) -> None:
                 f"router.roles.{role_type}.hook_source",
                 allow_reserved=True,
             )
+            if hook_source not in {"codex", "claude", "opencode"}:
+                raise RouterError(
+                    f"router.roles.{role_type}.hook_source is not supported: {hook_source}"
+                )
             if hook_source == "opencode":
                 if role["command"][0] != "opencode" or "-m" not in role["command"]:
                     raise RouterError(
@@ -271,7 +274,35 @@ def validate_router(config: dict[str, Any]) -> None:
                     raise RouterError(
                         f"router.roles.{role_type} provider/model must match command -m"
                     )
-            elif role["command"][0] == "opencode":
+            elif hook_source == "codex":
+                if role["provider"] != "openai" or role["command"][0] != "codex":
+                    raise RouterError(
+                        f"router.roles.{role_type} codex source requires openai/codex"
+                    )
+                if "--model" not in role["command"]:
+                    raise RouterError(
+                        f"router.roles.{role_type} codex role lacks command model"
+                    )
+                model_index = role["command"].index("--model") + 1
+                if model_index >= len(role["command"]) or role["command"][model_index] != model:
+                    raise RouterError(
+                        f"router.roles.{role_type} model must match command --model"
+                    )
+            elif hook_source == "claude":
+                if role["provider"] != "anthropic" or role["command"][0] != "claude":
+                    raise RouterError(
+                        f"router.roles.{role_type} claude source requires anthropic/claude"
+                    )
+                if "--model" not in role["command"]:
+                    raise RouterError(
+                        f"router.roles.{role_type} claude role lacks command model"
+                    )
+                model_index = role["command"].index("--model") + 1
+                if model_index >= len(role["command"]) or role["command"][model_index] != model:
+                    raise RouterError(
+                        f"router.roles.{role_type} model must match command --model"
+                    )
+            if role["command"][0] == "opencode" and hook_source != "opencode":
                 raise RouterError(
                     f"router.roles.{role_type} opencode command requires hook_source opencode"
                 )
@@ -470,6 +501,7 @@ def select_lead(
                 "display_rank": config["lead"]["display_rank"],
                 "runner": role["runner"],
                 "provider": role["provider"],
+                "model": role["model"],
                 "hook_source": role["hook_source"],
                 "command": command,
                 "command_shell": shlex.join(command),
@@ -591,6 +623,7 @@ def _records(plan: dict[str, Any]) -> str:
                     ",".join(lead["tool_access"]),
                     lead["provider"],
                     lead["hook_source"],
+                    lead["model"],
                 ]
             )
         )

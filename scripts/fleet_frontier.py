@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-import glob
 import hashlib
 import json
 import os
@@ -37,6 +36,11 @@ SENTINEL_STATUSES = {
     "DONE": "succeeded",
     "BLOCKED": "blocked",
     "FAILED": "failed",
+}
+HOOK_SESSION_FILES = {
+    "codex": "codex-hook-sessions.json",
+    "claude": "claude-hook-sessions.json",
+    "opencode": "opencode-hook-sessions.json",
 }
 
 
@@ -146,29 +150,20 @@ def session_record(
     session_id: str, *, hook_source: str = ""
 ) -> dict[str, Any] | None:
     hook_dir = os.environ.get("CMUX_HOOK_DIR", os.path.expanduser("~/.cmuxterm"))
-    if hook_source == "opencode":
-        if not session_id.startswith("opencode-"):
-            return None
-        candidates = {session_id.removeprefix("opencode-")}
-        filenames = [str(Path(hook_dir) / "opencode-hook-sessions.json")]
-    else:
-        candidates = {session_id, re.sub(r"^[a-z]+-", "", session_id, count=1)}
-        filenames = glob.glob(str(Path(hook_dir) / "*-hook-sessions.json"))
-    matches: list[dict[str, Any]] = []
-    for filename in filenames:
-        try:
-            data = json.loads(Path(filename).read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        sessions = data.get("sessions") or {}
-        for candidate in candidates:
-            value = sessions.get(candidate)
-            if isinstance(value, dict):
-                matches.append(value)
-    if not matches:
+    filename = HOOK_SESSION_FILES.get(hook_source)
+    prefix = f"{hook_source}-"
+    if filename is None or not session_id.startswith(prefix):
         return None
-    matches.sort(key=lambda value: float(value.get("updatedAt") or 0), reverse=True)
-    return matches[0]
+    try:
+        data = json.loads((Path(hook_dir) / filename).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    sessions = data.get("sessions") or {}
+    raw_session_id = session_id.removeprefix(prefix)
+    value = sessions.get(raw_session_id)
+    if not isinstance(value, dict) or value.get("sessionId") != raw_session_id:
+        return None
+    return value
 
 
 def session_matches(
@@ -395,6 +390,192 @@ def opencode_turn_evidence(
     return response, provider, model
 
 
+def _transcript_rows(session_id: str, hook_source: str) -> list[dict[str, Any]]:
+    record = session_record(session_id, hook_source=hook_source)
+    transcript_path = record.get("transcriptPath") if record else None
+    if not isinstance(transcript_path, str) or not transcript_path:
+        raise FrontierError(f"{hook_source} session lacks transcript path")
+    try:
+        lines = Path(transcript_path).expanduser().read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise FrontierError(f"cannot read {hook_source} transcript: {exc}") from exc
+    rows: list[dict[str, Any]] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise FrontierError(f"{hook_source} transcript contains invalid JSON") from exc
+        if not isinstance(row, dict):
+            raise FrontierError(f"{hook_source} transcript row is not an object")
+        rows.append(row)
+    return rows
+
+
+def _message_text(content: Any, *, text_types: set[str]) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    texts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict) or part.get("type") not in text_types:
+            continue
+        text = part.get("text")
+        if isinstance(text, str):
+            texts.append(text)
+    return "\n".join(texts)
+
+
+def codex_turn_evidence(
+    session_id: str, run_id: str, stop_occurred_at: str
+) -> tuple[str, str, str]:
+    raw_session_id = session_id.removeprefix("codex-")
+    if not raw_session_id or raw_session_id == session_id:
+        raise FrontierError("Codex session id is invalid")
+    stop_time = timestamp_value(stop_occurred_at)
+    if stop_time is None:
+        raise FrontierError("Codex Stop has no valid timestamp")
+    rows = _transcript_rows(session_id, "codex")
+    metadata = [
+        row.get("payload")
+        for row in rows
+        if row.get("type") == "session_meta"
+        and isinstance(row.get("payload"), dict)
+        and row["payload"].get("id") == raw_session_id
+    ]
+    if len(metadata) != 1:
+        raise FrontierError("Codex transcript has ambiguous session metadata")
+    provider = metadata[0].get("model_provider")
+    if not isinstance(provider, str) or not provider:
+        raise FrontierError("Codex transcript lacks provider identity")
+
+    marker = f"FLEET_RESULT:{run_id}:<STATUS>"
+    matching_users: list[int] = []
+    for index, row in enumerate(rows):
+        payload = row.get("payload")
+        if (
+            row.get("type") == "response_item"
+            and isinstance(payload, dict)
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+            and marker in _message_text(payload.get("content"), text_types={"input_text"})
+        ):
+            matching_users.append(index)
+    if len(matching_users) != 1:
+        raise FrontierError("Codex transcript has ambiguous user binding")
+    user_index = matching_users[0]
+    next_user_index = len(rows)
+    for index in range(user_index + 1, len(rows)):
+        payload = rows[index].get("payload")
+        if (
+            rows[index].get("type") == "response_item"
+            and isinstance(payload, dict)
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+        ):
+            next_user_index = index
+            break
+
+    model = ""
+    for row in rows[: user_index + 1]:
+        payload = row.get("payload")
+        if row.get("type") == "turn_context" and isinstance(payload, dict):
+            candidate = payload.get("model")
+            if isinstance(candidate, str) and candidate:
+                model = candidate
+    if not model:
+        raise FrontierError("Codex transcript lacks model identity")
+
+    candidates: list[tuple[datetime, int, str]] = []
+    for index in range(user_index + 1, next_user_index):
+        row = rows[index]
+        payload = row.get("payload")
+        if (
+            row.get("type") != "response_item"
+            or not isinstance(payload, dict)
+            or payload.get("type") != "message"
+            or payload.get("role") != "assistant"
+        ):
+            continue
+        occurred_at = timestamp_value(row.get("timestamp"))
+        response = _message_text(payload.get("content"), text_types={"output_text"})
+        if occurred_at is not None and occurred_at <= stop_time and response:
+            candidates.append((occurred_at, index, response))
+    if not candidates:
+        raise FrontierError("Codex transcript has no final assistant response")
+    _, _, response = max(candidates)
+    return response, provider, model
+
+
+def claude_turn_evidence(
+    session_id: str, run_id: str, stop_occurred_at: str
+) -> tuple[str, str, str]:
+    raw_session_id = session_id.removeprefix("claude-")
+    if not raw_session_id or raw_session_id == session_id:
+        raise FrontierError("Claude session id is invalid")
+    stop_time = timestamp_value(stop_occurred_at)
+    if stop_time is None:
+        raise FrontierError("Claude Stop has no valid timestamp")
+    rows = _transcript_rows(session_id, "claude")
+    marker = f"FLEET_RESULT:{run_id}:<STATUS>"
+    matching_users: list[int] = []
+    for index, row in enumerate(rows):
+        message = row.get("message")
+        if (
+            row.get("type") == "user"
+            and row.get("sessionId") == raw_session_id
+            and isinstance(message, dict)
+            and message.get("role") == "user"
+            and marker in _message_text(message.get("content"), text_types={"text"})
+        ):
+            matching_users.append(index)
+    if len(matching_users) != 1:
+        raise FrontierError("Claude transcript has ambiguous user binding")
+    user_index = matching_users[0]
+    next_user_index = len(rows)
+    for index in range(user_index + 1, len(rows)):
+        row = rows[index]
+        message = row.get("message")
+        if (
+            row.get("type") == "user"
+            and row.get("sessionId") == raw_session_id
+            and isinstance(message, dict)
+            and message.get("role") == "user"
+        ):
+            next_user_index = index
+            break
+
+    candidates: list[tuple[datetime, int, str, str]] = []
+    for index in range(user_index + 1, next_user_index):
+        row = rows[index]
+        message = row.get("message")
+        if (
+            row.get("type") != "assistant"
+            or row.get("sessionId") != raw_session_id
+            or not isinstance(message, dict)
+            or message.get("role") != "assistant"
+            or message.get("stop_reason") != "end_turn"
+        ):
+            continue
+        occurred_at = timestamp_value(row.get("timestamp"))
+        response = _message_text(message.get("content"), text_types={"text"})
+        model = message.get("model")
+        if (
+            occurred_at is not None
+            and occurred_at <= stop_time
+            and response
+            and isinstance(model, str)
+            and model
+        ):
+            candidates.append((occurred_at, index, response, model))
+    if not candidates:
+        raise FrontierError("Claude transcript has no final assistant response")
+    _, _, response, model = max(candidates)
+    return response, "anthropic", model
+
+
 def read_screen(workspace_ref: str, surface_ref: str) -> str:
     try:
         result = subprocess.run(
@@ -436,10 +617,10 @@ def prepare_run(
     model: str = "",
     hook_source: str = "",
 ) -> dict[str, Any]:
-    if not provider or not hook_source:
-        raise FrontierError("frontier runs require provider and hook source identity")
-    if hook_source == "opencode" and (not provider or not model):
-        raise FrontierError("OpenCode frontier runs require provider and model identity")
+    if not provider or not model or not hook_source:
+        raise FrontierError("frontier runs require provider, model, and hook source identity")
+    if hook_source not in HOOK_SESSION_FILES:
+        raise FrontierError(f"unsupported frontier hook source: {hook_source}")
     run_id = str(uuid.uuid4())
     task_sha256 = hashlib.sha256(task.encode("utf-8")).hexdigest()
     ledger = ledger_path(runs_dir, feature)
@@ -730,11 +911,33 @@ def process_event(
             event=event,
             release_lease=status != "indeterminate",
         )
+    evidence_readers = {
+        "codex": codex_turn_evidence,
+        "claude": claude_turn_evidence,
+    }
+    evidence_reader = evidence_readers.get(expected_source)
+    if evidence_reader is None:
+        return None
     try:
-        screen = read_screen(workspace_ref, surface_ref)
-        status, reason = sentinel_status(screen, str(state["run_id"]))
+        response, actual_provider, actual_model = evidence_reader(
+            session_id,
+            str(state["run_id"]),
+            str(event.get("occurred_at") or ""),
+        )
+        status, reason = structured_sentinel_status(response, str(state["run_id"]))
+        if (
+            actual_provider != str(state.get("provider") or "")
+            or actual_model != str(state.get("model") or "")
+        ):
+            status, reason = (
+                "indeterminate",
+                f"frontier_{expected_source}_identity_mismatch",
+            )
     except FrontierError:
-        status, reason = "indeterminate", "frontier_screen_unavailable"
+        status, reason = (
+            "indeterminate",
+            f"frontier_{expected_source}_evidence_unavailable",
+        )
     return terminalize(
         runs_dir,
         state,
@@ -742,6 +945,7 @@ def process_event(
         reason=reason,
         completed_at=str(event.get("occurred_at") or utc_now()),
         event=event,
+        release_lease=status != "indeterminate",
     )
 
 

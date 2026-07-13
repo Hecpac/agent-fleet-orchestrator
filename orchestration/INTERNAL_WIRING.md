@@ -113,10 +113,9 @@ router pins `gpt-5.6-sol` so fleet execution does not inherit a personal model.
 distinct submit is ambiguous. A completed Stop must follow that binding and is
 only a wake-up: succeeded/blocked/failed requires exactly one matching final
 line `FLEET_RESULT:<run_id>:<STATUS>`. Old, duplicated, cross-surface,
-non-final, or ambiguous evidence cannot complete the run. Known idle-prompt
-chrome rendered after the answer is excluded from final-line evaluation; text
-between the sentinel and that prompt remains a protocol failure, as does any
-unknown suffix after the prompt/status chrome. Audit recovery requires the
+non-final, or ambiguous evidence cannot complete the run. Provider-specific
+structured evidence—not terminal chrome—must bind that final line to the
+dispatched turn and configured provider/model identity. Audit recovery requires the
 recorded baseline and a contiguous per-boot sequence; a truncated/corrupt audit
 cannot correlate a later submit. Protocol ACKs and lease metadata are validated
 fail-closed. The first terminal
@@ -137,7 +136,7 @@ tie-breaker.
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_identity_mismatch_is_indeterminate_and_retains_lease`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_unverifiable_final_evidence_is_indeterminate`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_rejects_wrong_source_and_non_opencode_session_file`
-- `tests/test_router_config.py::RouterConfigTests::test_interactive_roles_declare_hook_source_and_opencode_identity`
+- `tests/test_router_config.py::RouterConfigTests::test_interactive_roles_declare_supported_source_and_model_identity`
 - `tests/test_fleet_up.py::FleetUpTests::test_frontier_preset_is_reproducible_and_ordered`
 
 `why:` OpenCode emits multiple completed Stops for one turn. Stops without the
@@ -152,3 +151,35 @@ The event source, `opencode-` session prefix, and
 identity persisted before dispatch. Missing, malformed, temporally late, or
 mismatched evidence terminalizes indeterminate while retaining the lease; it
 never degrades to success by inference.
+
+## Structured Codex and Claude completion
+
+`rule: codex_claude_completion_requires_structured_transcript_identity`
+
+`enforced_by:`
+
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_hook_session_lookup_requires_exact_source_prefix_and_file`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_codex_turn_evidence_binds_transcript_response_and_identity`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_claude_turn_evidence_binds_final_end_turn_and_model`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_codex_and_claude_stops_use_structured_evidence_not_screen`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_codex_and_claude_identity_mismatch_is_indeterminate`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_claude_unavailable_transcript_is_indeterminate`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_prepare_rejects_unsupported_hook_source_before_ledger_write`
+- `tests/test_router_config.py::RouterConfigTests::test_interactive_roles_declare_supported_source_and_model_identity`
+- `tests/test_router_config.py::RouterConfigTests::test_codex_and_claude_model_must_match_command`
+- `tests/test_router_config.py::RouterConfigTests::test_unsupported_interactive_hook_source_is_rejected`
+- `tests/test_fleet_wait.py::FleetWaitLedgerAuthorityTests::test_waiter_recovers_frontier_from_audit_on_boot_change`
+
+`why:` Codex and Claude terminal chrome changes with suggestions, timing labels,
+separators, permission modes, and client versions, so it cannot prove where an
+answer ends. Their completed Stops are wake-ups only. Completion reads the
+source-specific transcript path from the exact `codex-` or `claude-` session
+record, binds the unique run-tagged user message, and selects a later final
+assistant response completed no later than the Stop. The transcript must confirm
+the configured model; Codex also supplies its provider, while Claude's provider
+is fixed by the validated `claude`/`anthropic` router contract. Only `codex`,
+`claude`, and `opencode` hook sources are accepted, and each resolves exclusively
+through its matching prefix and hook-session file. Missing, malformed, late, or
+mismatched evidence terminalizes indeterminate and retains the lease. Claude's
+duplicate Stop notifications therefore cannot turn UI timing into success or
+produce conflicting terminal outcomes.

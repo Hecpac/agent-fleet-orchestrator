@@ -117,6 +117,7 @@ lead_phase="CONTROL"
 lead_tool_access=""
 lead_provider=""
 lead_hook_source=""
+lead_model=""
 instance_ids=()
 role_types=()
 display_ranks=()
@@ -150,6 +151,7 @@ while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n o; do
       lead_tool_access="$l"
       lead_provider="$m"
       lead_hook_source="$n"
+      lead_model="$o"
       ;;
     INSTANCE)
       instance_ids+=("$a")
@@ -498,6 +500,7 @@ manifest_tmp="$(mktemp "$runs_dir/.fleet-$feature.manifest.XXXXXX")"
   echo "lead.authority=control"
   echo "lead.tool_access=$lead_tool_access"
   echo "lead.provider=$lead_provider"
+  echo "lead.model=$lead_model"
   echo "lead.hook_source=$lead_hook_source"
   if [[ "${FLEET_NO_LEAD:-0}" == "1" ]]; then
     echo "lead.role_type=monitor"

@@ -20,6 +20,8 @@ from fleet_ledger import append_event, latest_event  # noqa: E402
 
 WORKSPACE_UUID = "00000000-0000-0000-0000-000000000001"
 SURFACE_UUID = "00000000-0000-0000-0000-000000000101"
+CODEX_SESSION_ID = "codex-session-frontier"
+CLAUDE_SESSION_ID = "claude-session-frontier"
 SESSION_ID = "opencode-ses_frontier"
 
 
@@ -42,24 +44,29 @@ class FleetFrontierTests(unittest.TestCase):
         )
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
-        self.write_session(SESSION_ID, SURFACE_UUID)
+        for session_id in (CODEX_SESSION_ID, CLAUDE_SESSION_ID, SESSION_ID):
+            self.write_session(session_id, SURFACE_UUID)
 
     def write_session(self, session_id: str, surface_uuid: str) -> None:
-        key = session_id.removeprefix("opencode-")
-        (self.hooks / "opencode-hook-sessions.json").write_text(
-            json.dumps(
-                {
-                    "sessions": {
-                        key: {
-                            "sessionId": key,
-                            "workspaceId": WORKSPACE_UUID,
-                            "surfaceId": surface_uuid,
-                            "updatedAt": 10,
-                        }
-                    }
-                }
-            ),
-            encoding="utf-8",
+        source, key = session_id.split("-", 1)
+        session_file = self.hooks / f"{source}-hook-sessions.json"
+        data = json.loads(session_file.read_text()) if session_file.exists() else {"sessions": {}}
+        transcript = self.tmp / f"{source}-{key}.jsonl"
+        data["sessions"][key] = {
+            "sessionId": key,
+            "workspaceId": WORKSPACE_UUID,
+            "surfaceId": surface_uuid,
+            "transcriptPath": str(transcript),
+            "updatedAt": 10,
+        }
+        session_file.write_text(json.dumps(data), encoding="utf-8")
+
+    def write_transcript(self, session_id: str, rows: list[dict]) -> None:
+        source, key = session_id.split("-", 1)
+        data = json.loads((self.hooks / f"{source}-hook-sessions.json").read_text())
+        transcript = Path(data["sessions"][key]["transcriptPath"])
+        transcript.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
         )
 
     def seed_run(
@@ -69,6 +76,7 @@ class FleetFrontierTests(unittest.TestCase):
         boot_id: str = "boot-1",
         after_seq: int = 100,
         opencode: bool = False,
+        hook_source: str = "codex",
     ):
         lease = fleet_leases.acquire_frontier(
             self.runs,
@@ -82,6 +90,12 @@ class FleetFrontierTests(unittest.TestCase):
             surface_uuid=SURFACE_UUID,
             tree_reader=lambda: "",
         )
+        if opencode:
+            provider, model, hook_source = "minimax", "MiniMax-M3", "opencode"
+        elif hook_source == "claude":
+            provider, model = "anthropic", "claude-fable-5"
+        else:
+            provider, model = "openai", "gpt-5.6-sol"
         event = {
             "timestamp": "2026-07-12T00:00:00+00:00",
             "dispatched_at": "2026-07-12T00:00:00+00:00",
@@ -97,15 +111,10 @@ class FleetFrontierTests(unittest.TestCase):
             "surface_uuid": SURFACE_UUID,
             "event_boot_id": boot_id,
             "after_seq": after_seq,
+            "provider": provider,
+            "model": model,
+            "hook_source": hook_source,
         }
-        if opencode:
-            event.update(
-                {
-                    "provider": "minimax",
-                    "model": "MiniMax-M3",
-                    "hook_source": "opencode",
-                }
-            )
         append_event(self.runs / "fleet-frontier.ledger.jsonl", event)
         return event, lease
 
@@ -116,11 +125,13 @@ class FleetFrontierTests(unittest.TestCase):
         *,
         boot_id: str = "boot-1",
         phase: str = "received",
-        session_id: str = SESSION_ID,
+        session_id: str | None = None,
         occurred_at: str = "2026-07-12T00:00:01+00:00",
-        source: str = "",
+        source: str = "codex",
         final_opencode_stop: bool = False,
     ) -> dict:
+        if session_id is None:
+            session_id = SESSION_ID if source == "opencode" else CODEX_SESSION_ID
         payload = {"phase": phase, "session_id": session_id}
         event = {
             "type": "event",
@@ -175,8 +186,12 @@ class FleetFrontierTests(unittest.TestCase):
         stop = self.hook_event("agent.hook.Stop", 103, phase="completed")
         with mock.patch.object(
             fleet_frontier,
-            "read_screen",
-            return_value=f"answer\nFLEET_RESULT:{run_id}:DONE\n",
+            "codex_turn_evidence",
+            return_value=(
+                f"answer\nFLEET_RESULT:{run_id}:DONE",
+                "openai",
+                "gpt-5.6-sol",
+            ),
         ):
             terminal = fleet_frontier.process_event(
                 self.runs,
@@ -186,7 +201,7 @@ class FleetFrontierTests(unittest.TestCase):
                 surface_ref="surface:1",
             )
         self.assertEqual(terminal["status"], "succeeded")
-        self.assertEqual(terminal["session_id"], SESSION_ID)
+        self.assertEqual(terminal["session_id"], CODEX_SESSION_ID)
         self.assertFalse(lease.exists())
 
     def test_missing_or_duplicate_sentinel_is_indeterminate(self) -> None:
@@ -240,6 +255,323 @@ class FleetFrontierTests(unittest.TestCase):
             ),
             ("indeterminate", "frontier_sentinel_not_final"),
         )
+
+    def test_hook_session_lookup_requires_exact_source_prefix_and_file(self) -> None:
+        shared = "shared-session"
+        self.write_session(f"codex-{shared}", "codex-surface")
+        self.write_session(f"claude-{shared}", "claude-surface")
+        self.assertEqual(
+            fleet_frontier.session_record(
+                f"codex-{shared}", hook_source="codex"
+            )["surfaceId"],
+            "codex-surface",
+        )
+        self.assertEqual(
+            fleet_frontier.session_record(
+                f"claude-{shared}", hook_source="claude"
+            )["surfaceId"],
+            "claude-surface",
+        )
+        self.assertIsNone(
+            fleet_frontier.session_record(
+                f"claude-{shared}", hook_source="codex"
+            )
+        )
+        self.assertIsNone(
+            fleet_frontier.session_record(
+                f"codex-{shared}", hook_source="future"
+            )
+        )
+        codex_file = self.hooks / "codex-hook-sessions.json"
+        data = json.loads(codex_file.read_text())
+        data["sessions"][shared]["sessionId"] = "different-session"
+        codex_file.write_text(json.dumps(data), encoding="utf-8")
+        self.assertIsNone(
+            fleet_frontier.session_record(f"codex-{shared}", hook_source="codex")
+        )
+
+    def test_codex_turn_evidence_binds_transcript_response_and_identity(self) -> None:
+        run_id = "run-codex-transcript"
+        raw = CODEX_SESSION_ID.removeprefix("codex-")
+        self.write_transcript(
+            CODEX_SESSION_ID,
+            [
+                {
+                    "type": "session_meta",
+                    "timestamp": "2026-07-12T00:00:00Z",
+                    "payload": {
+                        "id": raw,
+                        "model_provider": "openai",
+                    },
+                },
+                {
+                    "type": "turn_context",
+                    "timestamp": "2026-07-12T00:00:01Z",
+                    "payload": {"model": "gpt-5.6-sol"},
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-12T00:00:01Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": f"task FLEET_RESULT:{run_id}:<STATUS>",
+                        }],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-12T00:00:02Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": f"answer\nFLEET_RESULT:{run_id}:DONE",
+                        }],
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "timestamp": "2026-07-12T00:00:04Z",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "next"}],
+                    },
+                },
+            ],
+        )
+        self.assertEqual(
+            fleet_frontier.codex_turn_evidence(
+                CODEX_SESSION_ID, run_id, "2026-07-12T00:00:03Z"
+            ),
+            (
+                f"answer\nFLEET_RESULT:{run_id}:DONE",
+                "openai",
+                "gpt-5.6-sol",
+            ),
+        )
+
+    def test_claude_turn_evidence_binds_final_end_turn_and_model(self) -> None:
+        run_id = "run-claude-transcript"
+        raw = CLAUDE_SESSION_ID.removeprefix("claude-")
+        self.write_transcript(
+            CLAUDE_SESSION_ID,
+            [
+                {
+                    "type": "user",
+                    "sessionId": raw,
+                    "timestamp": "2026-07-12T00:00:01Z",
+                    "message": {
+                        "role": "user",
+                        "content": f"task FLEET_RESULT:{run_id}:<STATUS>",
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": raw,
+                    "timestamp": "2026-07-12T00:00:02Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-fable-5",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "thinking", "thinking": "hidden"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": raw,
+                    "timestamp": "2026-07-12T00:00:02.500Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-fable-5",
+                        "stop_reason": "end_turn",
+                        "content": [{
+                            "type": "text",
+                            "text": f"answer\nFLEET_RESULT:{run_id}:DONE",
+                        }],
+                    },
+                },
+                {
+                    "type": "user",
+                    "sessionId": raw,
+                    "timestamp": "2026-07-12T00:00:04Z",
+                    "message": {"role": "user", "content": "next"},
+                },
+            ],
+        )
+        self.assertEqual(
+            fleet_frontier.claude_turn_evidence(
+                CLAUDE_SESSION_ID, run_id, "2026-07-12T00:00:03Z"
+            ),
+            (
+                f"answer\nFLEET_RESULT:{run_id}:DONE",
+                "anthropic",
+                "claude-fable-5",
+            ),
+        )
+
+    def test_codex_and_claude_stops_use_structured_evidence_not_screen(self) -> None:
+        cases = (
+            (
+                "codex",
+                CODEX_SESSION_ID,
+                "openai",
+                "gpt-5.6-sol",
+                "codex_turn_evidence",
+            ),
+            (
+                "claude",
+                CLAUDE_SESSION_ID,
+                "anthropic",
+                "claude-fable-5",
+                "claude_turn_evidence",
+            ),
+        )
+        for index, (source, session_id, provider, model, reader) in enumerate(cases):
+            with self.subTest(source=source):
+                run_id = f"run-{source}-structured"
+                state, lease = self.seed_run(run_id, hook_source=source)
+                binding = self.hook_event(
+                    "agent.hook.UserPromptSubmit",
+                    200 + index * 10,
+                    source=source,
+                    session_id=session_id,
+                )
+                fleet_frontier.process_event(
+                    self.runs,
+                    state,
+                    binding,
+                    workspace_ref="workspace:1",
+                    surface_ref="surface:1",
+                )
+                stop = self.hook_event(
+                    "agent.hook.Stop",
+                    201 + index * 10,
+                    phase="completed",
+                    source=source,
+                    session_id=session_id,
+                    occurred_at="2026-07-12T00:00:03Z",
+                )
+                with mock.patch.object(
+                    fleet_frontier,
+                    reader,
+                    return_value=(
+                        f"answer\nFLEET_RESULT:{run_id}:DONE",
+                        provider,
+                        model,
+                    ),
+                ), mock.patch.object(fleet_frontier, "read_screen") as read_screen:
+                    terminal = fleet_frontier.process_event(
+                        self.runs,
+                        state,
+                        stop,
+                        workspace_ref="workspace:1",
+                        surface_ref="surface:1",
+                    )
+                self.assertEqual(terminal["status"], "succeeded")
+                self.assertFalse(lease.exists())
+                read_screen.assert_not_called()
+
+    def test_codex_and_claude_identity_mismatch_is_indeterminate(self) -> None:
+        cases = (
+            ("codex", CODEX_SESSION_ID, "codex_turn_evidence"),
+            ("claude", CLAUDE_SESSION_ID, "claude_turn_evidence"),
+        )
+        for index, (source, session_id, reader) in enumerate(cases):
+            with self.subTest(source=source):
+                run_id = f"run-{source}-identity"
+                state, lease = self.seed_run(run_id, hook_source=source)
+                fleet_frontier.process_event(
+                    self.runs,
+                    state,
+                    self.hook_event(
+                        "agent.hook.UserPromptSubmit",
+                        300 + index * 10,
+                        source=source,
+                        session_id=session_id,
+                    ),
+                    workspace_ref="workspace:1",
+                    surface_ref="surface:1",
+                )
+                stop = self.hook_event(
+                    "agent.hook.Stop",
+                    301 + index * 10,
+                    phase="completed",
+                    source=source,
+                    session_id=session_id,
+                )
+                with mock.patch.object(
+                    fleet_frontier,
+                    reader,
+                    return_value=(
+                        f"answer\nFLEET_RESULT:{run_id}:DONE",
+                        "wrong-provider",
+                        "wrong-model",
+                    ),
+                ):
+                    terminal = fleet_frontier.process_event(
+                        self.runs,
+                        state,
+                        stop,
+                        workspace_ref="workspace:1",
+                        surface_ref="surface:1",
+                    )
+                self.assertEqual(terminal["status"], "indeterminate")
+                self.assertEqual(
+                    terminal["reason"], f"frontier_{source}_identity_mismatch"
+                )
+                self.assertTrue(terminal["lease_retained"])
+                self.assertTrue(lease.exists())
+                fleet_frontier.abandon_run(
+                    self.runs,
+                    feature="frontier",
+                    instance="agent",
+                    run_id=run_id,
+                    reason="test_cleanup",
+                )
+
+    def test_claude_unavailable_transcript_is_indeterminate(self) -> None:
+        run_id = "run-claude-no-transcript"
+        state, lease = self.seed_run(run_id, hook_source="claude")
+        fleet_frontier.process_event(
+            self.runs,
+            state,
+            self.hook_event(
+                "agent.hook.UserPromptSubmit",
+                401,
+                source="claude",
+                session_id=CLAUDE_SESSION_ID,
+            ),
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        stop = self.hook_event(
+            "agent.hook.Stop",
+            402,
+            phase="completed",
+            source="claude",
+            session_id=CLAUDE_SESSION_ID,
+        )
+        with mock.patch.object(
+            fleet_frontier,
+            "claude_turn_evidence",
+            side_effect=fleet_frontier.FrontierError("missing transcript"),
+        ):
+            terminal = fleet_frontier.process_event(
+                self.runs,
+                state,
+                stop,
+                workspace_ref="workspace:1",
+                surface_ref="surface:1",
+            )
+        self.assertEqual(terminal["status"], "indeterminate")
+        self.assertEqual(terminal["reason"], "frontier_claude_evidence_unavailable")
+        self.assertTrue(terminal["lease_retained"])
+        self.assertTrue(lease.exists())
 
     def test_opencode_ignores_intermediate_stops_and_uses_structured_final_response(self) -> None:
         statuses = {
@@ -497,7 +829,7 @@ class FleetFrontierTests(unittest.TestCase):
             phase="completed",
             occurred_at="2026-07-12T00:00:02+00:00",
         )
-        with mock.patch.object(fleet_frontier, "read_screen") as read:
+        with mock.patch.object(fleet_frontier, "codex_turn_evidence") as evidence:
             terminal = fleet_frontier.process_event(
                 self.runs,
                 state,
@@ -506,7 +838,7 @@ class FleetFrontierTests(unittest.TestCase):
                 surface_ref="surface:1",
             )
         self.assertIsNone(terminal)
-        read.assert_not_called()
+        evidence.assert_not_called()
         self.assertTrue(lease.exists())
 
     def test_losing_terminalizer_cannot_release_retained_lease(self) -> None:
@@ -551,6 +883,7 @@ class FleetFrontierTests(unittest.TestCase):
                     workspace_uuid=WORKSPACE_UUID,
                     surface_uuid=SURFACE_UUID,
                     provider="openai",
+                    model="gpt-5.6-sol",
                     hook_source="codex",
                 )
         events = [json.loads(line) for line in ledger.read_text().splitlines()]
@@ -558,7 +891,7 @@ class FleetFrontierTests(unittest.TestCase):
 
     def test_prepare_rejects_legacy_manifest_identity_before_ledger_write(self) -> None:
         with self.assertRaisesRegex(
-            fleet_frontier.FrontierError, "provider and hook source"
+            fleet_frontier.FrontierError, "provider, model, and hook source"
         ):
             fleet_frontier.prepare_run(
                 self.runs,
@@ -569,6 +902,25 @@ class FleetFrontierTests(unittest.TestCase):
                 task="task",
                 workspace_uuid=WORKSPACE_UUID,
                 surface_uuid=SURFACE_UUID,
+            )
+        self.assertFalse((self.runs / "fleet-frontier.ledger.jsonl").exists())
+
+    def test_prepare_rejects_unsupported_hook_source_before_ledger_write(self) -> None:
+        with self.assertRaisesRegex(
+            fleet_frontier.FrontierError, "unsupported frontier hook source"
+        ):
+            fleet_frontier.prepare_run(
+                self.runs,
+                feature="frontier",
+                instance="agent",
+                role="future-agent",
+                phase="CHALLENGE",
+                task="task",
+                workspace_uuid=WORKSPACE_UUID,
+                surface_uuid=SURFACE_UUID,
+                provider="future-provider",
+                model="future-model",
+                hook_source="future",
             )
         self.assertFalse((self.runs / "fleet-frontier.ledger.jsonl").exists())
 
@@ -595,8 +947,12 @@ class FleetFrontierTests(unittest.TestCase):
         )
         with mock.patch.object(
             fleet_frontier,
-            "read_screen",
-            return_value=f"FLEET_RESULT:{run_id}:BLOCKED\n",
+            "codex_turn_evidence",
+            return_value=(
+                f"FLEET_RESULT:{run_id}:BLOCKED",
+                "openai",
+                "gpt-5.6-sol",
+            ),
         ):
             terminal = fleet_frontier.recover_from_audit(
                 self.runs,

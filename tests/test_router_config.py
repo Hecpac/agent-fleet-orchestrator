@@ -98,17 +98,38 @@ class RouterConfigTests(unittest.TestCase):
         self.assertEqual(plan["instances"][1]["hook_source"], "opencode")
         self.assertEqual(plan["instances"][1]["model"], "glm-5.2")
 
-    def test_interactive_roles_declare_hook_source_and_opencode_identity(self) -> None:
+    def test_interactive_roles_declare_supported_source_and_model_identity(self) -> None:
         interactive = {
             name: role
             for name, role in self.config["roles"].items()
             if role["runner"] == "interactive"
         }
         self.assertTrue(all(role.get("hook_source") for role in interactive.values()))
+        self.assertTrue(all(role.get("model") for role in interactive.values()))
+        self.assertEqual(
+            {role["hook_source"] for role in interactive.values()},
+            {"codex", "claude", "opencode"},
+        )
         for name in ("glm", "minimax", "minimax_candidate"):
             with self.subTest(role=name):
                 self.assertEqual(interactive[name]["hook_source"], "opencode")
                 self.assertTrue(interactive[name].get("model"))
+
+    def test_codex_and_claude_model_must_match_command(self) -> None:
+        for role_name in ("codex", "codex_candidate", "claude", "claude_reviewer"):
+            with self.subTest(role=role_name):
+                config = copy.deepcopy(self.config)
+                config["roles"][role_name]["model"] = "wrong-model"
+                with self.assertRaisesRegex(
+                    router_config.RouterError, "must match command --model"
+                ):
+                    router_config.load_router(self.write_config(config))
+
+    def test_unsupported_interactive_hook_source_is_rejected(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["roles"]["codex"]["hook_source"] = "future"
+        with self.assertRaisesRegex(router_config.RouterError, "not supported"):
+            router_config.load_router(self.write_config(config))
 
     def test_interactive_role_without_hook_source_is_rejected(self) -> None:
         config = copy.deepcopy(self.config)
@@ -138,7 +159,7 @@ class RouterConfigTests(unittest.TestCase):
 
         config = copy.deepcopy(self.config)
         del config["roles"]["minimax"]["model"]
-        with self.assertRaisesRegex(router_config.RouterError, "must match command -m"):
+        with self.assertRaisesRegex(router_config.RouterError, "non-empty string"):
             router_config.load_router(self.write_config(config))
 
     def test_non_build_phases_cannot_write(self) -> None:
