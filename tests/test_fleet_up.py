@@ -354,6 +354,15 @@ class FleetUpTests(unittest.TestCase):
         for payload in checker_boots:
             self.assertNotIn("--variant", payload)
             self.assertNotIn("minimax/MiniMax-M3", payload)
+        maker_boots = [
+            payload
+            for payload in sends
+            if "codex" in payload and "--sandbox workspace-write" in payload
+        ]
+        self.assertTrue(maker_boots)
+        for payload in maker_boots:
+            self.assertIn("sandbox_workspace_write.writable_roots", payload)
+            self.assertNotIn("danger-full-access", payload)
         state_advance = subprocess.run(
             [
                 "python3", str(ROOT / "scripts" / "fleet_state.py"), "advance",

@@ -441,6 +441,13 @@ for ((i=${#instance_ids[@]}-1; i>=0; i--)); do
   if [[ "${runners[$i]}" == "interactive" ]]; then
     launch_command="$(interactive_launch_command "${role_types[$i]}" "${authorities[$i]}" "${required_envs[$i]}" "${commands[$i]}")"
     if [[ -n "${worktrees[$i]:-}" ]]; then
+      # A linked worktree keeps its Git admin dir and objects in the target
+      # repo's common .git, outside the Codex workspace-write sandbox. Writer
+      # commits are the designed durable output, so grant exactly that dir.
+      if [[ "${providers[$i]}" == "openai" ]]; then
+        writer_git_dir="$(git -C "$target_repo" rev-parse --path-format=absolute --git-common-dir)"
+        launch_command="$launch_command$(printf ' -c %q' "sandbox_workspace_write.writable_roots=[\"$writer_git_dir\"]")"
+      fi
       launch_command="$(printf 'cd %q && ' "${worktrees[$i]}")$launch_command"
     fi
     cmux send --surface "$surface" --workspace "$ws_ref" "$launch_command" >/dev/null
