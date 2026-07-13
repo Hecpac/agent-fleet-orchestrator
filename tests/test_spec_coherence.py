@@ -18,6 +18,7 @@ INTERNAL_WIRING = ROOT / "orchestration" / "INTERNAL_WIRING.md"
 README = ROOT / "README.md"
 FLEET_REVIEWER = ROOT / ".opencode" / "agents" / "fleet-reviewer.md"
 MINIMAX_CHECKER = ROOT / ".opencode" / "agents" / "minimax-checker.md"
+GLM_CHALLENGER = ROOT / ".opencode" / "agents" / "glm-challenger.md"
 SKILL_COPIES = (
     ROOT / ".agents" / "skills" / "cmux" / "SKILL.md",
     ROOT / ".claude" / "skills" / "cmux" / "SKILL.md",
@@ -75,8 +76,29 @@ class SpecCoherenceTests(unittest.TestCase):
         self.assertNotIn("-m", checker_role["command"])
         self.assertNotIn("--variant", checker_role["command"])
 
+        challenge_role = router["roles"][instances["challenge"]]
+        self.assertEqual(
+            challenge_role["command"],
+            ["opencode", "-m", "zai/glm-5.2", "--agent", "glm-challenger"],
+        )
+
+        verify_role = router["roles"][instances["verify"]]
+        self.assertIn("--append-system-prompt", verify_role["command"])
+        appended = verify_role["command"][
+            verify_role["command"].index("--append-system-prompt") + 1
+        ]
+        for hardened_verify in (
+            "HARD OUTPUT CONTRACT",
+            "first visible character",
+            "One stray visible word outside the JSON",
+            "tool-availability notes",
+        ):
+            with self.subTest(hardened_verify=hardened_verify):
+                self.assertIn(hardened_verify, appended)
+
         reviewer = FLEET_REVIEWER.read_text(encoding="utf-8")
         checker_agent = MINIMAX_CHECKER.read_text(encoding="utf-8")
+        challenger_agent = GLM_CHALLENGER.read_text(encoding="utf-8")
         for restriction in (
             'mode: primary',
             'edit: deny',
@@ -90,19 +112,24 @@ class SpecCoherenceTests(unittest.TestCase):
             with self.subTest(restriction=restriction):
                 self.assertIn(restriction, reviewer)
                 self.assertIn(restriction, checker_agent)
+                self.assertIn(restriction, challenger_agent)
         self.assertIn("model: minimax/MiniMax-M3", checker_agent)
         self.assertIn("variant: none", checker_agent)
         self.assertNotIn("\nmodel:", reviewer)
         self.assertNotIn("\nvariant:", reviewer)
+        self.assertNotIn("\nmodel:", challenger_agent)
+        self.assertNotIn("\nvariant:", challenger_agent)
         for hardened in (
             "HARD OUTPUT CONTRACT",
             "exactly one JSON object",
-            "FORBIDDEN anywhere before, between, or after",
             "One stray visible word outside the JSON invalidates",
             "Do not waste your token budget narrating",
         ):
             with self.subTest(hardened=hardened):
                 self.assertIn(hardened, checker_agent)
+                self.assertIn(hardened, challenger_agent)
+        self.assertIn("FORBIDDEN anywhere before, between, or after", checker_agent)
+        self.assertIn("FORBIDDEN anywhere before, between, or after", challenger_agent)
 
         controller = FDP2_CONTROLLER.read_text(encoding="utf-8")
         for contract in (
