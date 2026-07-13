@@ -202,6 +202,11 @@ class FleetFrontierTests(unittest.TestCase):
             )
         self.assertEqual(terminal["status"], "succeeded")
         self.assertEqual(terminal["session_id"], CODEX_SESSION_ID)
+        result_file = Path(terminal["result_file"])
+        self.assertEqual(
+            result_file.read_text(encoding="utf-8"),
+            f"answer\nFLEET_RESULT:{run_id}:DONE",
+        )
         self.assertFalse(lease.exists())
 
     def test_event_snapshot_subscribes_to_session_end(self) -> None:
@@ -552,6 +557,10 @@ class FleetFrontierTests(unittest.TestCase):
                         surface_ref="surface:1",
                     )
                 self.assertEqual(terminal["status"], "succeeded")
+                self.assertEqual(
+                    Path(terminal["result_file"]).read_text(encoding="utf-8"),
+                    f"answer\nFLEET_RESULT:{run_id}:DONE",
+                )
                 self.assertFalse(lease.exists())
                 read_screen.assert_not_called()
 
@@ -988,8 +997,52 @@ class FleetFrontierTests(unittest.TestCase):
                     )
                 self.assertEqual(terminal["status"], expected)
                 self.assertEqual(terminal["completion_event_id"], final["id"])
+                if expected == "succeeded":
+                    self.assertEqual(
+                        Path(terminal["result_file"]).read_text(encoding="utf-8"),
+                        f"answer\nFLEET_RESULT:{run_id}:{sentinel}",
+                    )
+                else:
+                    self.assertNotIn("result_file", terminal)
                 self.assertFalse(lease.exists())
                 read_screen.assert_not_called()
+
+    def test_frontier_result_persistence_failure_is_indeterminate(self) -> None:
+        run_id = "run-result-write-failure"
+        state, lease = self.seed_run(run_id)
+        fleet_frontier.process_event(
+            self.runs,
+            state,
+            self.hook_event("agent.hook.UserPromptSubmit", 101),
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        stop = self.hook_event("agent.hook.Stop", 102, phase="completed")
+        with mock.patch.object(
+            fleet_frontier,
+            "codex_turn_evidence",
+            return_value=(
+                f"answer\nFLEET_RESULT:{run_id}:DONE",
+                "openai",
+                "gpt-5.6-sol",
+            ),
+        ), mock.patch.object(
+            fleet_frontier,
+            "persist_frontier_result",
+            side_effect=OSError("disk unavailable"),
+        ):
+            terminal = fleet_frontier.process_event(
+                self.runs,
+                state,
+                stop,
+                workspace_ref="workspace:1",
+                surface_ref="surface:1",
+            )
+        self.assertEqual(terminal["status"], "indeterminate")
+        self.assertEqual(terminal["reason"], "frontier_result_persistence_failed")
+        self.assertTrue(terminal["lease_retained"])
+        self.assertNotIn("result_file", terminal)
+        self.assertTrue(lease.exists())
 
     def test_opencode_identity_mismatch_is_indeterminate_and_retains_lease(self) -> None:
         run_id = "run-opencode-mismatch"

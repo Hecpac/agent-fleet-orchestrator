@@ -178,6 +178,34 @@ interrupts retain the lease under the same rule.
 `fleet-send` and `fleet-dispatch` accept `--json` for callers such as
 `fleet-race`; machine ownership never depends on parsing human-readable output.
 
+Fleet dialogue is durable and mediated by CONTROL. It does not let workers send
+direct peer traffic and publishing a message never dispatches the recipient.
+Only the byte-exact `result_file` of an exact terminal `succeeded` run can be
+published; the command copies at most 1 MiB into a SHA-256-addressed payload
+store and appends a versioned envelope to a separate dialogue ledger. Every
+operation first validates the manifest's live workspace and surface UUIDs:
+
+```bash
+python3 scripts/fleet_dialogue.py publish orchestration/runs \
+  --feature <feature> --kind proposal --recipient <instance> \
+  --source-instance <instance> --source-run-id <run_id> \
+  --idempotency-key <stable-key> [--reply-to <message_id>]
+
+python3 scripts/fleet_dialogue.py list orchestration/runs \
+  --feature <feature> [--recipient <instance>] [--kind challenge]
+python3 scripts/fleet_dialogue.py show orchestration/runs \
+  --feature <feature> --message-id <message_id>
+python3 scripts/fleet_dialogue.py read orchestration/runs \
+  --feature <feature> --message-id <message_id>
+python3 scripts/fleet_dialogue.py verify orchestration/runs --feature <feature>
+```
+
+Message kinds are `proposal`, `challenge`, `rebuttal`, `revision`, and
+`verification`. The sender is always `CONTROL`, recipients are exact manifest
+instances, retries require the same idempotency key and content, and replies
+name at most one prior message. `fleet-down` blocks new publication through its
+closing marker and archives both the dialogue ledger and payload store.
+
 The orchestration playbook (mental model, verbs, wait rules, memory budget)
 lives in both `.agents/skills/cmux/SKILL.md` and `.claude/skills/cmux/SKILL.md`;
 the two copies must stay synchronized.

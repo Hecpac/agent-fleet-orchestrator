@@ -16,27 +16,29 @@ from typing import Any
 TERMINAL_STATUSES = {"succeeded", "failed", "blocked", "abandoned", "indeterminate"}
 
 
-def append_event(path: Path, event: dict[str, Any]) -> bool:
-    """Append under an exclusive lock; the first terminal event is immutable."""
+def append_record(
+    path: Path,
+    record: dict[str, Any],
+    *,
+    reject_if: Any = None,
+) -> bool:
+    """Append one JSON object durably under an exclusive file lock."""
     path.parent.mkdir(parents=True, exist_ok=True)
     created = not path.exists()
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
     handle = os.fdopen(fd, "r+", encoding="utf-8")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        handle.seek(0)
-        run_id = event.get("run_id")
-        for raw in handle:
-            try:
-                previous = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if (
-                previous.get("run_id") == run_id
-                and previous.get("status") in TERMINAL_STATUSES
-            ):
-                return False
-        handle.write(json.dumps(event, sort_keys=True) + "\n")
+        if reject_if is not None:
+            handle.seek(0)
+            for raw in handle:
+                try:
+                    previous = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if reject_if(previous):
+                    return False
+        handle.write(json.dumps(record, sort_keys=True) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
         if created:
@@ -49,6 +51,19 @@ def append_event(path: Path, event: dict[str, Any]) -> bool:
     finally:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+def append_event(path: Path, event: dict[str, Any]) -> bool:
+    """Append a lifecycle event; the first terminal event is immutable."""
+    run_id = event.get("run_id")
+    return append_record(
+        path,
+        event,
+        reject_if=lambda previous: (
+            previous.get("run_id") == run_id
+            and previous.get("status") in TERMINAL_STATUSES
+        ),
+    )
 
 
 def latest_event(

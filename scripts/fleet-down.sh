@@ -184,6 +184,10 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     [[ -f "$state_file" ]] && mv "$state_file" "$archive/state.json"
     ledger_file="${manifest%.manifest}.ledger.jsonl"
     [[ -f "$ledger_file" ]] && mv "$ledger_file" "$archive/ledger.jsonl"
+    dialogue_ledger="${manifest%.manifest}.dialogue.jsonl"
+    [[ -f "$dialogue_ledger" ]] && mv "$dialogue_ledger" "$archive/dialogue.jsonl"
+    dialogue_store="$runs_dir/dialogue/$feature"
+    [[ -d "$dialogue_store" ]] && mv "$dialogue_store" "$archive/dialogue"
     echo "closed $ws_ref (fleet-$feature)"
     exit 0
   fi

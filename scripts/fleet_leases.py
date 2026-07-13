@@ -85,7 +85,7 @@ def _lease_dirs(runs_dir: Path) -> list[Path]:
     return sorted(path for path in lock_dir.glob("*.lock") if path.is_dir())
 
 
-def _closing_path(runs_dir: Path, feature: str) -> Path:
+def closing_path(runs_dir: Path, feature: str) -> Path:
     return runs_dir / "locks" / f"{feature}.closing"
 
 
@@ -283,7 +283,7 @@ def acquire(
     with coordinator(runs_dir):
         reconciled = _reconcile_locked(runs_dir, tree_reader=tree_reader)
         _reject_unknown_leases(reconciled)
-        if _closing_path(runs_dir, feature).exists():
+        if closing_path(runs_dir, feature).exists():
             raise LeaseBusy(f"fleet '{feature}' is closing")
         _reject_surface_owner(runs_dir, surface_uuid, run_id)
         instance_lock = lock_dir / f"{feature}.{instance}.lock"
@@ -360,7 +360,7 @@ def acquire_frontier(
     with coordinator(runs_dir):
         reconciled = _reconcile_locked(runs_dir, tree_reader=tree_reader)
         _reject_unknown_leases(reconciled)
-        if _closing_path(runs_dir, feature).exists():
+        if closing_path(runs_dir, feature).exists():
             raise LeaseBusy(f"fleet '{feature}' is closing")
         _reject_surface_owner(runs_dir, surface_uuid, run_id)
         instance_lock = lock_dir / f"{feature}.{instance}.lock"
@@ -450,7 +450,7 @@ def begin_close(
         ]
         if active or unknown:
             raise LeaseBusy("active or malformed leases prevent teardown")
-        marker = _closing_path(runs_dir, feature)
+        marker = closing_path(runs_dir, feature)
         if marker.exists():
             try:
                 previous = json.loads(marker.read_text(encoding="utf-8"))
@@ -488,7 +488,7 @@ def begin_close(
 
 def end_close(runs_dir: Path, *, feature: str, close_id: str) -> None:
     with coordinator(runs_dir):
-        marker = _closing_path(runs_dir, feature)
+        marker = closing_path(runs_dir, feature)
         try:
             metadata = json.loads(marker.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:

@@ -20,6 +20,7 @@ from typing import Any
 from fleet_leases import (
     LeaseError,
     acquire_frontier,
+    coordinator,
     read_metadata,
     release,
 )
@@ -69,6 +70,57 @@ def timestamp_value(raw: Any) -> datetime | None:
 
 def ledger_path(runs_dir: Path, feature: str) -> Path:
     return runs_dir / f"fleet-{feature}.ledger.jsonl"
+
+
+def result_path(runs_dir: Path, feature: str, run_id: str) -> Path:
+    return runs_dir / "results" / feature / f"{run_id}.txt"
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def persist_frontier_result(
+    runs_dir: Path,
+    state: dict[str, Any],
+    response: str,
+) -> Path:
+    """Persist the exact structured response before a succeeded terminal event."""
+    if not response:
+        raise FrontierError("frontier result is empty")
+    payload = response.encode("utf-8")
+    path = result_path(runs_dir, str(state["feature"]), str(state["run_id"]))
+    with coordinator(runs_dir):
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if path.exists():
+            if path.is_symlink() or not path.is_file():
+                raise FrontierError(f"frontier result is not a regular file: {path}")
+            try:
+                existing = path.read_bytes()
+            except OSError as exc:
+                raise FrontierError(f"cannot read existing frontier result: {path}") from exc
+            if existing != payload:
+                raise FrontierError(f"frontier result mismatch: {path}")
+            return path
+        temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            _fsync_directory(path.parent)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        return path
 
 
 def frontier_state(
@@ -788,9 +840,24 @@ def terminalize(
     completed_at: str | None = None,
     event: dict[str, Any] | None = None,
     release_lease: bool = True,
+    result_file: Path | None = None,
 ) -> dict[str, Any]:
     if status not in STATUS_CODES:
         raise FrontierError(f"invalid frontier terminal status: {status}")
+    ledger = ledger_path(runs_dir, str(state["feature"]))
+    existing = latest_event(
+        ledger,
+        run_id=str(state["run_id"]),
+        instance=str(state["instance"]),
+    )
+    if existing and existing.get("status") in TERMINAL_STATUSES:
+        return existing
+    if status == "succeeded" and result_file is None:
+        raise FrontierError("succeeded frontier terminal requires a durable result file")
+    if status == "succeeded" and (
+        result_file.is_symlink() or not result_file.is_file()
+    ):
+        raise FrontierError("succeeded frontier result file is not a regular file")
     terminal = {
         **_common_event(state),
         "timestamp": utc_now(),
@@ -811,7 +878,8 @@ def terminalize(
         )
     if not release_lease:
         terminal["lease_retained"] = True
-    ledger = ledger_path(runs_dir, str(state["feature"]))
+    if result_file is not None:
+        terminal["result_file"] = str(result_file)
     appended = append_event(ledger, terminal)
     if appended and release_lease:
         _release_frontier_lease(runs_dir, state)
@@ -820,6 +888,35 @@ def terminalize(
         run_id=str(state["run_id"]),
         instance=str(state["instance"]),
     ) or terminal
+
+
+def terminalize_response(
+    runs_dir: Path,
+    state: dict[str, Any],
+    *,
+    response: str,
+    status: str,
+    reason: str,
+    completed_at: str,
+    event: dict[str, Any],
+) -> dict[str, Any]:
+    result_file: Path | None = None
+    if status == "succeeded":
+        try:
+            result_file = persist_frontier_result(runs_dir, state, response)
+        except (OSError, FrontierError):
+            status = "indeterminate"
+            reason = "frontier_result_persistence_failed"
+    return terminalize(
+        runs_dir,
+        state,
+        status=status,
+        reason=reason,
+        completed_at=completed_at,
+        event=event,
+        release_lease=status != "indeterminate",
+        result_file=result_file,
+    )
 
 
 def _event_after_dispatch(
@@ -946,6 +1043,7 @@ def process_event(
     if expected_source == "opencode":
         if not _opencode_final_stop(payload):
             return None
+        response = ""
         try:
             response, actual_provider, actual_model = opencode_turn_evidence(
                 session_id,
@@ -960,14 +1058,14 @@ def process_event(
                 status, reason = "indeterminate", "frontier_opencode_identity_mismatch"
         except FrontierError:
             status, reason = "indeterminate", "frontier_opencode_evidence_unavailable"
-        return terminalize(
+        return terminalize_response(
             runs_dir,
             state,
+            response=response,
             status=status,
             reason=reason,
             completed_at=str(event.get("occurred_at") or utc_now()),
             event=event,
-            release_lease=status != "indeterminate",
         )
     evidence_readers = {
         "codex": codex_turn_evidence,
@@ -976,6 +1074,7 @@ def process_event(
     evidence_reader = evidence_readers.get(expected_source)
     if evidence_reader is None:
         return None
+    response = ""
     try:
         response, actual_provider, actual_model = transcript_turn_evidence(
             evidence_reader,
@@ -997,14 +1096,14 @@ def process_event(
             "indeterminate",
             f"frontier_{expected_source}_evidence_unavailable",
         )
-    return terminalize(
+    return terminalize_response(
         runs_dir,
         state,
+        response=response,
         status=status,
         reason=reason,
         completed_at=str(event.get("occurred_at") or utc_now()),
         event=event,
-        release_lease=status != "indeterminate",
     )
 
 

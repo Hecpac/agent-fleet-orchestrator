@@ -4,6 +4,38 @@ This file records invariants that the fleet runtime must preserve across
 refactors. Each rule names the tests that lock the behavior and the regression
 that would reopen if the rule disappeared.
 
+## Durable CONTROL-mediated fleet dialogue
+
+`rule: durable_dialogue_is_control_mediated_and_source_run_scoped`
+
+`enforced_by:`
+
+- `tests/test_fleet_dialogue.py::FleetDialogueTests::test_publish_copies_exact_payload_and_queries_by_recipient`
+- `tests/test_fleet_dialogue.py::FleetDialogueTests::test_idempotent_retry_returns_existing_and_changed_request_fails`
+- `tests/test_fleet_dialogue.py::FleetDialogueTests::test_only_exact_succeeded_result_file_is_publishable`
+- `tests/test_fleet_dialogue.py::FleetDialogueTests::test_payload_limit_and_close_marker_fail_closed`
+- `tests/test_fleet_dialogue.py::FleetDialogueTests::test_live_identity_mismatch_and_result_symlink_are_rejected`
+- `tests/test_fleet_dialogue.py::FleetDialogueTests::test_corrupt_payload_is_rejected_by_retry_read_and_verify`
+- `tests/test_fleet_dialogue.py::FleetDialogueTests::test_parallel_cli_retry_appends_one_message`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_codex_and_claude_stops_use_structured_evidence_not_screen`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_frontier_result_persistence_failure_is_indeterminate`
+- `tests/test_fleet_up.py::FleetUpTests::test_teardown_archives_dialogue_ledger_and_payloads`
+
+`why:` Fleet dialogue is an internal, explicit CONTROL relay rather than direct
+peer traffic. Every message names one manifest recipient and one exact
+`source_instance=source_run_id` whose immutable lifecycle terminal is
+`succeeded`. Its payload is the byte-exact durable result, limited to 1 MiB,
+copied into a SHA-256-addressed store, and referenced from a separate synced
+JSONL ledger. A required idempotency key makes retries stable and conflicts
+fail closed; a reply may name only one prior message. Interactive Codex,
+Claude, and OpenCode success is not terminal until that result file is durable.
+Publication shares the lease coordinator lock and rejects the fleet closing
+marker, while teardown archives both the dialogue ledger and every payload.
+Without this lock, agents could consume transformed or stale output, retry into
+duplicate work, publish during teardown, lose frontier evidence, or leave a
+conversation whose hashes can no longer be verified. Publication never starts
+the recipient automatically; CONTROL must use the existing dispatch wrappers.
+
 ## Durable writer branches
 
 `rule: writer_work_survives_worktree_teardown`

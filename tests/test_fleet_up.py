@@ -573,6 +573,37 @@ class FleetUpTests(unittest.TestCase):
         archives = list((self.runs / "archive").glob("teardown-*/manifest"))
         self.assertEqual(len(archives), 1)
 
+    def test_teardown_archives_dialogue_ledger_and_payloads(self) -> None:
+        result = self.run_fleet("dialogue-archive", "--preset", "small")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        dialogue_ledger = self.runs / "fleet-dialogue-archive.dialogue.jsonl"
+        dialogue_ledger.write_text('{"message_id":"message-1"}\n', encoding="utf-8")
+        payload_store = self.runs / "dialogue" / "dialogue-archive" / "payloads"
+        payload_store.mkdir(parents=True)
+        (payload_store / ("a" * 64)).write_bytes(b"durable payload")
+
+        down = subprocess.run(
+            ["bash", str(FLEET_DOWN), "dialogue-archive"],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=20,
+            check=False,
+        )
+
+        self.assertEqual(down.returncode, 0, down.stderr)
+        archive = next((self.runs / "archive").glob("dialogue-archive-*"))
+        self.assertEqual(
+            (archive / "dialogue.jsonl").read_text(encoding="utf-8"),
+            '{"message_id":"message-1"}\n',
+        )
+        self.assertEqual(
+            (archive / "dialogue" / "payloads" / ("a" * 64)).read_bytes(),
+            b"durable payload",
+        )
+
     def test_teardown_recovers_only_after_confirmed_workspace_absence(self) -> None:
         result = self.run_fleet("recover-absent", "triage")
         self.assertEqual(result.returncode, 0, result.stderr)
