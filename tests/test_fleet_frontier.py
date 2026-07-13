@@ -1346,19 +1346,21 @@ class FleetFrontierTests(unittest.TestCase):
             ),
             self.hook_event(
                 "agent.hook.UserPromptSubmit",
-                1,
-                boot_id="boot-new",
+                901,
+                boot_id="boot-old",
                 phase="received",
                 source="claude",
                 session_id=CLAUDE_SESSION_ID,
+                occurred_at="2026-07-12T00:00:01+00:00",
             ),
             self.hook_event(
                 "agent.hook.SessionEnd",
-                2,
+                1,
                 boot_id="boot-new",
                 phase="completed",
                 source="claude",
                 session_id=CLAUDE_SESSION_ID,
+                occurred_at="2026-07-12T00:00:02+00:00",
             ),
         ]
         self.events_log.write_text(
@@ -1375,6 +1377,7 @@ class FleetFrontierTests(unittest.TestCase):
             terminal["reason"], "frontier_session_ended_without_stop"
         )
         self.assertEqual(terminal["completion_boot_id"], "boot-new")
+        self.assertEqual(terminal["completion_seq"], 1)
         self.assertTrue(terminal["lease_retained"])
         self.assertTrue(lease.exists())
 
