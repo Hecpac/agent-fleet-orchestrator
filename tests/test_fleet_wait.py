@@ -261,6 +261,7 @@ class FleetWaitEscalationTests(FleetWaitTestCase):
         event_calls = [call for call in calls if call and call[0] == "events"]
         self.assertEqual(len(event_calls), 1)
         self.assertIn("--reconnect", event_calls[0])
+        self.assertIn("agent.hook.SessionEnd", event_calls[0])
         self.assertNotIn("--no-ack", event_calls[0])
         notifies = [call for call in calls if call and call[0] == "notify"]
         self.assertTrue(notifies, "timeout did not fire a cmux notify escalation")

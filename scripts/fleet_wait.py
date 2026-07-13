@@ -264,6 +264,8 @@ def main(argv: list[str] | None = None) -> int:
         "--name",
         "agent.hook.Stop",
         "--name",
+        "agent.hook.SessionEnd",
+        "--name",
         "notification.requested",
         "--reconnect",
     ]

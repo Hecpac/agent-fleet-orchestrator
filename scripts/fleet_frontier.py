@@ -94,6 +94,8 @@ def event_ack(timeout: float = 10.0) -> dict[str, Any]:
         "agent.hook.UserPromptSubmit",
         "--name",
         "agent.hook.Stop",
+        "--name",
+        "agent.hook.SessionEnd",
         "--no-heartbeat",
     ]
     try:
@@ -910,6 +912,24 @@ def process_event(
         state.update(binding)
         return None
 
+    if name == "agent.hook.SessionEnd" and payload.get("phase") == "completed":
+        if (
+            expected_source != "claude"
+            or not state.get("session_id")
+            or not _event_after_binding(state, event)
+            or state["session_id"] != session_id
+        ):
+            return None
+        return terminalize(
+            runs_dir,
+            state,
+            status="indeterminate",
+            reason="frontier_session_ended_without_stop",
+            completed_at=str(event.get("occurred_at") or utc_now()),
+            event=event,
+            release_lease=False,
+        )
+
     if name != "agent.hook.Stop" or payload.get("phase") != "completed":
         return None
     if not state.get("session_id"):
@@ -1074,7 +1094,12 @@ def recover_from_audit(
     relevant = [
         event
         for event in suffix
-        if event.get("name") in {"agent.hook.UserPromptSubmit", "agent.hook.Stop"}
+        if event.get("name")
+        in {
+            "agent.hook.UserPromptSubmit",
+            "agent.hook.Stop",
+            "agent.hook.SessionEnd",
+        }
         and timestamp_value(event.get("occurred_at")) is not None
         and (
             dispatched_at is None

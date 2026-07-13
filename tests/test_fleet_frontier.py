@@ -204,6 +204,31 @@ class FleetFrontierTests(unittest.TestCase):
         self.assertEqual(terminal["session_id"], CODEX_SESSION_ID)
         self.assertFalse(lease.exists())
 
+    def test_event_snapshot_subscribes_to_session_end(self) -> None:
+        ack = {
+            "type": "ack",
+            "protocol": "cmux-events",
+            "version": 1,
+            "boot_id": "boot-1",
+            "replay_count": 0,
+            "resume": {
+                "gap": False,
+                "oldest_seq": 1,
+                "latest_seq": 10,
+                "next_seq": 11,
+            },
+        }
+        proc = mock.Mock()
+        proc.stdout.readline.return_value = json.dumps(ack)
+        with mock.patch.object(
+            fleet_frontier.subprocess, "Popen", return_value=proc
+        ) as popen, mock.patch.object(
+            fleet_frontier.select, "select", return_value=([proc.stdout], [], [])
+        ):
+            self.assertEqual(fleet_frontier.event_ack(), ack)
+        command = popen.call_args.args[0]
+        self.assertIn("agent.hook.SessionEnd", command)
+
     def test_missing_or_duplicate_sentinel_is_indeterminate(self) -> None:
         self.assertEqual(
             fleet_frontier.sentinel_status("no sentinel", "run-1"),
@@ -742,6 +767,159 @@ class FleetFrontierTests(unittest.TestCase):
         self.assertTrue(terminal["lease_retained"])
         self.assertTrue(lease.exists())
 
+    def test_claude_session_end_without_stop_is_indeterminate_and_retains_lease(
+        self,
+    ) -> None:
+        run_id = "run-claude-session-end"
+        state, lease = self.seed_run(run_id, hook_source="claude")
+        unbound = self.hook_event(
+            "agent.hook.SessionEnd",
+            401,
+            phase="completed",
+            source="claude",
+            session_id=CLAUDE_SESSION_ID,
+        )
+        self.assertIsNone(
+            fleet_frontier.process_event(
+                self.runs,
+                state,
+                unbound,
+                workspace_ref="workspace:1",
+                surface_ref="surface:1",
+            )
+        )
+        fleet_frontier.process_event(
+            self.runs,
+            state,
+            self.hook_event(
+                "agent.hook.UserPromptSubmit",
+                402,
+                source="claude",
+                session_id=CLAUDE_SESSION_ID,
+            ),
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        received = self.hook_event(
+            "agent.hook.SessionEnd",
+            403,
+            phase="received",
+            source="claude",
+            session_id=CLAUDE_SESSION_ID,
+        )
+        wrong_session = self.hook_event(
+            "agent.hook.SessionEnd",
+            404,
+            phase="completed",
+            source="claude",
+            session_id="claude-other-session",
+        )
+        wrong_source = self.hook_event(
+            "agent.hook.SessionEnd",
+            405,
+            phase="completed",
+            source="codex",
+            session_id=CLAUDE_SESSION_ID,
+        )
+        wrong_workspace = self.hook_event(
+            "agent.hook.SessionEnd",
+            406,
+            phase="completed",
+            source="claude",
+            session_id=CLAUDE_SESSION_ID,
+        )
+        wrong_workspace["workspace_id"] = "00000000-0000-0000-0000-000000000999"
+        for event in (received, wrong_session, wrong_source, wrong_workspace):
+            self.assertIsNone(
+                fleet_frontier.process_event(
+                    self.runs,
+                    state,
+                    event,
+                    workspace_ref="workspace:1",
+                    surface_ref="surface:1",
+                )
+            )
+        (self.hooks / "claude-hook-sessions.json").unlink()
+        session_end = self.hook_event(
+            "agent.hook.SessionEnd",
+            407,
+            phase="completed",
+            source="claude",
+            session_id=CLAUDE_SESSION_ID,
+        )
+        with mock.patch.object(fleet_frontier, "claude_turn_evidence") as evidence:
+            terminal = fleet_frontier.process_event(
+                self.runs,
+                state,
+                session_end,
+                workspace_ref="workspace:1",
+                surface_ref="surface:1",
+            )
+        self.assertEqual(terminal["status"], "indeterminate")
+        self.assertEqual(
+            terminal["reason"], "frontier_session_ended_without_stop"
+        )
+        self.assertEqual(terminal["completion_event_id"], session_end["id"])
+        self.assertTrue(terminal["lease_retained"])
+        self.assertTrue(lease.exists())
+        evidence.assert_not_called()
+
+    def test_claude_stop_then_session_end_keeps_verified_terminal_result(self) -> None:
+        run_id = "run-claude-stop-before-session-end"
+        state, lease = self.seed_run(run_id, hook_source="claude")
+        fleet_frontier.process_event(
+            self.runs,
+            state,
+            self.hook_event(
+                "agent.hook.UserPromptSubmit",
+                501,
+                source="claude",
+                session_id=CLAUDE_SESSION_ID,
+            ),
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        stop = self.hook_event(
+            "agent.hook.Stop",
+            502,
+            phase="completed",
+            source="claude",
+            session_id=CLAUDE_SESSION_ID,
+        )
+        with mock.patch.object(
+            fleet_frontier,
+            "claude_turn_evidence",
+            return_value=(
+                f"answer\nFLEET_RESULT:{run_id}:DONE",
+                "anthropic",
+                "claude-fable-5",
+            ),
+        ):
+            succeeded = fleet_frontier.process_event(
+                self.runs,
+                state,
+                stop,
+                workspace_ref="workspace:1",
+                surface_ref="surface:1",
+            )
+        session_end = self.hook_event(
+            "agent.hook.SessionEnd",
+            503,
+            phase="completed",
+            source="claude",
+            session_id=CLAUDE_SESSION_ID,
+        )
+        terminal = fleet_frontier.process_event(
+            self.runs,
+            succeeded,
+            session_end,
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        self.assertEqual(terminal["status"], "succeeded")
+        self.assertEqual(terminal["completion_event_id"], stop["id"])
+        self.assertFalse(lease.exists())
+
     def test_transcript_evidence_retries_bounded_visibility_race(self) -> None:
         reader = mock.Mock(
             side_effect=[
@@ -1152,6 +1330,53 @@ class FleetFrontierTests(unittest.TestCase):
         self.assertEqual(terminal["status"], "blocked")
         self.assertEqual(terminal["completion_boot_id"], "boot-new")
         self.assertFalse(lease.exists())
+
+    def test_cross_boot_audit_recovers_claude_session_end_without_stop(self) -> None:
+        run_id = "run-replay-session-end"
+        state, lease = self.seed_run(
+            run_id, boot_id="boot-old", after_seq=900, hook_source="claude"
+        )
+        events = [
+            self.hook_event(
+                "surface.action",
+                900,
+                boot_id="boot-old",
+                phase="completed",
+                occurred_at="2026-07-12T00:00:00+00:00",
+            ),
+            self.hook_event(
+                "agent.hook.UserPromptSubmit",
+                1,
+                boot_id="boot-new",
+                phase="received",
+                source="claude",
+                session_id=CLAUDE_SESSION_ID,
+            ),
+            self.hook_event(
+                "agent.hook.SessionEnd",
+                2,
+                boot_id="boot-new",
+                phase="completed",
+                source="claude",
+                session_id=CLAUDE_SESSION_ID,
+            ),
+        ]
+        self.events_log.write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+        )
+        terminal = fleet_frontier.recover_from_audit(
+            self.runs,
+            state,
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        self.assertEqual(terminal["status"], "indeterminate")
+        self.assertEqual(
+            terminal["reason"], "frontier_session_ended_without_stop"
+        )
+        self.assertEqual(terminal["completion_boot_id"], "boot-new")
+        self.assertTrue(terminal["lease_retained"])
+        self.assertTrue(lease.exists())
 
     def test_truncated_audit_cannot_bind_a_later_submit(self) -> None:
         run_id = "run-truncated"

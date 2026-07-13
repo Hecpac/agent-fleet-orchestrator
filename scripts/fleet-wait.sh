@@ -10,7 +10,8 @@ set -euo pipefail
 #
 # Signals used:
 #   - frontier roles: UserPromptSubmit binds session to surface; completed Stop
-#     wakes strict run_id sentinel verification before terminalization.
+#     wakes strict run_id sentinel verification, while a bound Claude SessionEnd
+#     without Stop fails closed and retains its lease.
 #   - local worker roles: exact terminal ledger event for the required run_id;
 #     notifications and heartbeats only trigger reconciliation.
 #
