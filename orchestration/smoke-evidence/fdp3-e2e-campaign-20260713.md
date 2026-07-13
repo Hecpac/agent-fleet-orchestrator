@@ -143,3 +143,45 @@ next build session:
    byte-for-byte; spec-lock the pointer shape (single line, no backslashes).
 5. Then rerun the e2e flow to prove the hardened Claude verifier and the
    `verified` terminal + `fdp3-verify` receipt + clean teardown.
+
+## Addendum 2 — Decision C build and e2e5/e2e6 live findings
+
+Slice C built and test-locked (165/165; commits `003a598`, `00e5745`):
+prepare persists the composed prompt to
+`runs_dir/prompts/<feature>/<run_id>.txt`; dispatch is source-conditional;
+`confirm-submit` gates every transfer.
+
+Live falsifications that shaped the final form:
+
+1. **Pointer needed the user-binding marker** — codex evidence extraction
+   locates the dispatched turn by finding `FLEET_RESULT:<run>:<STATUS>` in
+   the user message; the first pointer lacked it →
+   `frontier_codex_evidence_unavailable` even though codex executed the task
+   perfectly (e2e5 run `3fb188da`). Fixed: the pointer carries the marker.
+   Codex through the fixed pointer: 2/2 succeeded (`1d591375`, `927f57f4`).
+2. **MiniMax loses schema fidelity through file indirection** — with the
+   pointer, the checker emitted pure JSON (form contract held) but invented
+   schemas twice: missing `schema_version` + `{id,status,detail}` findings
+   (e2e5 `7682fa87`), then `verdict:"PASS"` + `checks{}` (e2e6 `6263a0d6`).
+   3/3 exact-schema compliance with inline paste vs 0/2 with pointer →
+   opencode keeps the inline single-line FDP_PROMPT payload.
+3. **Multi-submit correlates with accumulated system latency, not pane
+   freshness** — e2e6 checker retries multi-submitted on a reused pane AND
+   on a freshly relaunched opencode session (`74127b2a`, `7d78a649`),
+   while morning fleets ran 5/5 clean pastes. The cmux app had ~13 h of
+   churn and two live zombie workspaces at failure time. Open lane:
+   environment hygiene (cmux restart) before the next e2e, and/or
+   prompt-integrity verification (compare the stored user-message length
+   against the persisted prompt file after submit).
+4. **Finding 3 reproduced by operator error** — a chained `&&` script
+   published the checker message before checking the step outcome on e2e5;
+   the orphan poisoned the store. Fleet `fdp3-e2e5-20260713` (workspace:52)
+   joins e2e3 as a second live exhibit for the publish-gate decision.
+   Operational rule reinforced: one verb per command, assert state before
+   publishing.
+
+State: zombies e2e3 (workspace:50) and e2e5 (workspace:52) pending the
+finding-3 decision; all other fleets torn down clean; maker branches cleaned
+(`f2bbcae` recorded for e2e6). The hardened Claude verify leg and the
+`verified` terminal remain the open lanes, now blocked only on opencode
+transport reliability under system load.
