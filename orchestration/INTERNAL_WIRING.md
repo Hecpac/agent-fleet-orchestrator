@@ -187,3 +187,26 @@ cannot bind or complete the parent run. Missing, malformed, late, or
 mismatched evidence terminalizes indeterminate and retains the lease. Claude's
 duplicate Stop notifications therefore cannot turn UI timing into success or
 produce conflicting terminal outcomes.
+
+## Claude session exit without Stop
+
+`rule: claude_session_end_without_stop_fails_closed`
+
+`enforced_by:`
+
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_event_snapshot_subscribes_to_session_end`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_claude_session_end_without_stop_is_indeterminate_and_retains_lease`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_claude_stop_then_session_end_keeps_verified_terminal_result`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_cross_boot_audit_recovers_claude_session_end_without_stop`
+- `tests/test_fleet_wait.py::FleetWaitEscalationTests::test_timeout_escalates_via_notify_and_uses_ack_stream`
+
+`why:` Claude may emit a completed SessionEnd when its process exits without a
+Stop, including an interrupted tool turn. SessionEnd proves process exit, never
+successful completion. The live snapshot, waiter stream, and contiguous audit
+recovery all observe it, but only a nonterminal Claude run with an exact prior
+UserPromptSubmit binding may consume it. The event must match the bound session,
+workspace, and source and occur after the binding. It terminalizes indeterminate
+with reason `frontier_session_ended_without_stop` while retaining the lease; it
+does not consult a possibly cleaned-up session record or infer success from a
+transcript. An unbound, received-phase, stale, foreign, or post-Stop SessionEnd
+cannot change run ownership or the first terminal result.
