@@ -117,7 +117,7 @@ class RouterConfigTests(unittest.TestCase):
             {role["hook_source"] for role in interactive.values()},
             {"codex", "claude", "opencode"},
         )
-        for name in ("glm", "minimax", "minimax_candidate"):
+        for name in ("glm", "minimax", "minimax_candidate", "minimax_checker"):
             with self.subTest(role=name):
                 self.assertEqual(interactive[name]["hook_source"], "opencode")
                 self.assertTrue(interactive[name].get("model"))
@@ -167,6 +167,63 @@ class RouterConfigTests(unittest.TestCase):
         config = copy.deepcopy(self.config)
         del config["roles"]["minimax"]["model"]
         with self.assertRaisesRegex(router_config.RouterError, "non-empty string"):
+            router_config.load_router(self.write_config(config))
+
+    def test_opencode_variant_must_be_durable_and_agent_pinned(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["roles"]["minimax_checker"]["variant"] = "thinking"
+        with self.assertRaisesRegex(router_config.RouterError, "must match agent variant"):
+            router_config.load_router(self.write_config(config))
+
+        config = copy.deepcopy(self.config)
+        config["roles"]["minimax_checker"]["model"] = "MiniMax-M2.5"
+        with self.assertRaisesRegex(router_config.RouterError, "must match agent model"):
+            router_config.load_router(self.write_config(config))
+
+        config = copy.deepcopy(self.config)
+        config["roles"]["minimax_checker"]["command"] = [
+            "opencode", "--agent", "minimax-checker", "--variant", "none",
+        ]
+        with self.assertRaisesRegex(router_config.RouterError, "aborts the OpenCode TUI"):
+            router_config.load_router(self.write_config(config))
+
+        config = copy.deepcopy(self.config)
+        config["roles"]["minimax_checker"]["command"] = [
+            "opencode", "-m", "minimax/MiniMax-M3", "--agent", "minimax-checker",
+        ]
+        with self.assertRaisesRegex(router_config.RouterError, "not command -m"):
+            router_config.load_router(self.write_config(config))
+
+        config = copy.deepcopy(self.config)
+        config["roles"]["minimax_checker"]["command"] = ["opencode"]
+        with self.assertRaisesRegex(
+            router_config.RouterError, "requires a dedicated command --agent"
+        ):
+            router_config.load_router(self.write_config(config))
+
+        config = copy.deepcopy(self.config)
+        config["roles"]["minimax_checker"]["command"] = [
+            "opencode", "--agent", "no-such-agent",
+        ]
+        with self.assertRaisesRegex(router_config.RouterError, "is missing from"):
+            router_config.load_router(self.write_config(config))
+
+        config = copy.deepcopy(self.config)
+        del config["roles"]["minimax_checker"]["variant"]
+        with self.assertRaisesRegex(router_config.RouterError, "must use opencode -m"):
+            router_config.load_router(self.write_config(config))
+
+        config = copy.deepcopy(self.config)
+        del config["roles"]["minimax_checker"]["variant"]
+        config["roles"]["minimax_checker"]["command"] = [
+            "opencode", "-m", "minimax/MiniMax-M3", "--agent", "minimax-checker",
+        ]
+        with self.assertRaisesRegex(router_config.RouterError, "durable variant identity"):
+            router_config.load_router(self.write_config(config))
+
+        config = copy.deepcopy(self.config)
+        config["roles"]["codex"]["variant"] = "none"
+        with self.assertRaisesRegex(router_config.RouterError, "only for OpenCode"):
             router_config.load_router(self.write_config(config))
 
     def test_non_build_phases_cannot_write(self) -> None:
@@ -270,7 +327,7 @@ class RouterConfigTests(unittest.TestCase):
             {
                 "maker": ("codex", "openai", "gpt-5.6-sol", "BUILD", "write"),
                 "checker": (
-                    "minimax_candidate",
+                    "minimax_checker",
                     "minimax",
                     "MiniMax-M3",
                     "BUILD",
@@ -287,9 +344,10 @@ class RouterConfigTests(unittest.TestCase):
             },
         )
         self.assertEqual(
-            instances["checker"]["command"][-2:],
-            ["--agent", "fleet-reviewer"],
+            instances["checker"]["command"],
+            ["opencode", "--agent", "minimax-checker"],
         )
+        self.assertEqual(instances["checker"]["variant"], "none")
 
     def test_custom_input_is_sorted_by_rank_then_instance(self) -> None:
         plan = router_config.build_plan(

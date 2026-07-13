@@ -116,11 +116,12 @@ ROSTER = {
         "model": "gpt-5.6-sol",
     },
     "checker": {
-        "role_type": "minimax_candidate",
+        "role_type": "minimax_checker",
         "phase": "BUILD",
         "authority": "advisory",
         "provider": "minimax",
         "model": "MiniMax-M3",
+        "variant": "none",
     },
     "challenge": {
         "role_type": "glm",

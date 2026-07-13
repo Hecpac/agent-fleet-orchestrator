@@ -200,6 +200,25 @@
       "display_rank": 31,
       "concurrency": 1
     },
+    "minimax_checker": {
+      "phase": "BUILD",
+      "runner": "interactive",
+      "provider": "minimax",
+      "model": "MiniMax-M3",
+      "variant": "none",
+      "hook_source": "opencode",
+      "command": ["opencode", "--agent", "minimax-checker"],
+      "healthcheck": ["opencode", "--version"],
+      "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
+      "enabled": true,
+      "requires_env": ["MINIMAX_API_KEY"],
+      "capabilities": ["contract_checking", "parallel_validation", "diverse_perspective"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "authority": "advisory",
+      "resource_class": "remote",
+      "display_rank": 31,
+      "concurrency": 1
+    },
     "reviewer": {
       "phase": "VERIFY",
       "runner": "local",
@@ -271,7 +290,7 @@
       "include_lead": true,
       "instances": [
         {"instance_id": "maker", "role_type": "codex"},
-        {"instance_id": "checker", "role_type": "minimax_candidate"},
+        {"instance_id": "checker", "role_type": "minimax_checker"},
         {"instance_id": "challenge", "role_type": "glm"},
         {"instance_id": "verify", "role_type": "claude_reviewer"}
       ]

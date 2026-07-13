@@ -31,6 +31,8 @@ AUTHORITIES = {"control", "write", "advisory", "verification"}
 RESOURCE_CLASSES = {"remote", "local_light", "local_heavy"}
 PHASES = {"CONTROL", "RECON", "BUILD", "CHALLENGE", "VERIFY"}
 US = "\x1f"
+OPENCODE_AGENTS_DIR = ROOT / ".opencode" / "agents"
+OPENCODE_AGENT_IDENTITY_RE = re.compile(r"^(model|variant):[ \t]*(\S(?:.*\S)?)[ \t]*$")
 
 
 class RouterError(ValueError):
@@ -44,6 +46,46 @@ def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
             raise RouterError(f"duplicate key: {key}")
         result[key] = value
     return result
+
+
+def _opencode_agent_name(command: list[str], where: str) -> str | None:
+    if "--agent" not in command:
+        return None
+    agent_index = command.index("--agent") + 1
+    if agent_index >= len(command):
+        raise RouterError(f"{where} command --agent lacks an agent name")
+    agent_name = command[agent_index]
+    if not IDENTIFIER_RE.fullmatch(agent_name):
+        raise RouterError(f"{where} command --agent has an invalid agent name: {agent_name}")
+    return agent_name
+
+
+def _opencode_agent_identity(
+    agent_name: str, where: str, *, required: bool
+) -> dict[str, str] | None:
+    agent_path = OPENCODE_AGENTS_DIR / f"{agent_name}.md"
+    try:
+        lines = agent_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        if required:
+            raise RouterError(
+                f"{where} agent '{agent_name}' is missing from {OPENCODE_AGENTS_DIR}"
+            )
+        return None
+    if not lines or lines[0].strip() != "---":
+        raise RouterError(f"{where} agent '{agent_name}' lacks a frontmatter identity block")
+    identity: dict[str, str] = {}
+    for line in lines[1:]:
+        if line.strip() == "---":
+            return identity
+        match = OPENCODE_AGENT_IDENTITY_RE.match(line)
+        if match is None:
+            continue
+        key, value = match.group(1), match.group(2)
+        if key in identity:
+            raise RouterError(f"{where} agent '{agent_name}' declares duplicate {key}")
+        identity[key] = value
+    raise RouterError(f"{where} agent '{agent_name}' frontmatter is unterminated")
 
 
 def load_router(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
@@ -175,6 +217,7 @@ def validate_router(config: dict[str, Any]) -> None:
         "healthcheck",
         "ready_pattern",
         "model",
+        "variant",
         "instructions",
         "hook_source",
     }
@@ -258,22 +301,76 @@ def validate_router(config: dict[str, Any]) -> None:
                 raise RouterError(
                     f"router.roles.{role_type}.hook_source is not supported: {hook_source}"
                 )
+            if hook_source != "opencode" and "variant" in role:
+                raise RouterError(
+                    f"router.roles.{role_type}.variant is supported only for OpenCode"
+                )
             if hook_source == "opencode":
-                if role["command"][0] != "opencode" or "-m" not in role["command"]:
+                if "--variant" in role["command"]:
                     raise RouterError(
-                        f"router.roles.{role_type} OpenCode role must use opencode -m"
+                        f"router.roles.{role_type} command --variant aborts the OpenCode TUI; "
+                        "pin variant in the dedicated agent"
                     )
-                model_index = role["command"].index("-m") + 1
-                if model_index >= len(role["command"]):
-                    raise RouterError(
-                        f"router.roles.{role_type} OpenCode role lacks command model"
-                    )
-                command_model = role["command"][model_index]
+                variant = role.get("variant")
                 expected_model = f"{role['provider']}/{role.get('model', '')}"
-                if command_model != expected_model:
-                    raise RouterError(
-                        f"router.roles.{role_type} provider/model must match command -m"
+                if variant is not None:
+                    variant = _expect_manifest_scalar(
+                        variant, f"router.roles.{role_type}.variant"
                     )
+                    if "-m" in role["command"]:
+                        raise RouterError(
+                            f"router.roles.{role_type} variant roles pin identity in the "
+                            "dedicated agent, not command -m"
+                        )
+                    if role["command"][0] != "opencode":
+                        raise RouterError(
+                            f"router.roles.{role_type} OpenCode role must run opencode"
+                        )
+                    agent_name = _opencode_agent_name(
+                        role["command"], f"router.roles.{role_type}"
+                    )
+                    if agent_name is None:
+                        raise RouterError(
+                            f"router.roles.{role_type} variant requires a dedicated command --agent"
+                        )
+                    identity = _opencode_agent_identity(
+                        agent_name, f"router.roles.{role_type}", required=True
+                    )
+                    assert identity is not None
+                    if identity.get("model") != expected_model:
+                        raise RouterError(
+                            f"router.roles.{role_type} provider/model must match agent model"
+                        )
+                    if identity.get("variant") != variant:
+                        raise RouterError(
+                            f"router.roles.{role_type} variant must match agent variant"
+                        )
+                else:
+                    if role["command"][0] != "opencode" or "-m" not in role["command"]:
+                        raise RouterError(
+                            f"router.roles.{role_type} OpenCode role must use opencode -m"
+                        )
+                    model_index = role["command"].index("-m") + 1
+                    if model_index >= len(role["command"]):
+                        raise RouterError(
+                            f"router.roles.{role_type} OpenCode role lacks command model"
+                        )
+                    command_model = role["command"][model_index]
+                    if command_model != expected_model:
+                        raise RouterError(
+                            f"router.roles.{role_type} provider/model must match command -m"
+                        )
+                    agent_name = _opencode_agent_name(
+                        role["command"], f"router.roles.{role_type}"
+                    )
+                    if agent_name is not None:
+                        identity = _opencode_agent_identity(
+                            agent_name, f"router.roles.{role_type}", required=False
+                        )
+                        if identity is not None and "variant" in identity:
+                            raise RouterError(
+                                f"router.roles.{role_type} agent variant requires durable variant identity"
+                            )
             elif hook_source == "codex":
                 if role["provider"] != "openai" or role["command"][0] != "codex":
                     raise RouterError(
@@ -309,6 +406,10 @@ def validate_router(config: dict[str, Any]) -> None:
             if role["resource_class"] != "remote":
                 raise RouterError(f"router.roles.{role_type} interactive role must use resource_class remote")
         else:
+            if "variant" in role:
+                raise RouterError(
+                    f"router.roles.{role_type}.variant is supported only for OpenCode"
+                )
             if "command" in role or "healthcheck" in role or "ready_pattern" in role:
                 raise RouterError(f"router.roles.{role_type} local roles cannot set command/healthcheck/ready_pattern")
             _expect_manifest_scalar(role.get("model"), f"router.roles.{role_type}.model")
@@ -624,6 +725,7 @@ def _records(plan: dict[str, Any]) -> str:
                     lead["provider"],
                     lead["hook_source"],
                     lead["model"],
+                    lead.get("variant", ""),
                 ]
             )
         )
@@ -647,6 +749,7 @@ def _records(plan: dict[str, Any]) -> str:
                     ",".join(instance["tool_access"]),
                     instance["provider"],
                     instance.get("hook_source", ""),
+                    instance.get("variant", ""),
                 ]
             )
         )

@@ -333,9 +333,10 @@ class FleetUpTests(unittest.TestCase):
             "maker.role_type=codex",
             "maker.authority=write",
             "maker.phase=BUILD",
-            "checker.role_type=minimax_candidate",
+            "checker.role_type=minimax_checker",
             "checker.authority=advisory",
             "checker.phase=BUILD",
+            "checker.variant=none",
             "challenge.role_type=glm",
             "challenge.phase=CHALLENGE",
             "verify.role_type=claude_reviewer",
@@ -345,6 +346,45 @@ class FleetUpTests(unittest.TestCase):
             self.assertIn(contract, manifest)
         self.assertIn("maker.worktree=", manifest)
         self.assertNotIn("checker.worktree=", manifest)
+        sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
+        checker_boots = [
+            payload for payload in sends if "--agent minimax-checker" in payload
+        ]
+        self.assertTrue(checker_boots)
+        for payload in checker_boots:
+            self.assertNotIn("--variant", payload)
+            self.assertNotIn("minimax/MiniMax-M3", payload)
+        state_advance = subprocess.run(
+            [
+                "python3", str(ROOT / "scripts" / "fleet_state.py"), "advance",
+                str(self.runs / "fleet-fdp2-roster.manifest"), "BUILD",
+                "--evidence", "variant-propagation-test",
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(state_advance.returncode, 0, state_advance.stderr)
+        sent = subprocess.run(
+            ["bash", str(FLEET_SEND), "fdp2-roster", "checker", "check contract"],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        lifecycle = [
+            json.loads(line)
+            for line in (self.runs / "fleet-fdp2-roster.ledger.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(lifecycle[-1]["variant"], "none")
 
     def test_frontier_send_returns_exact_run_and_rejects_second_active_turn(self) -> None:
         result = self.run_fleet("frontier-send", "agent=codex_candidate")

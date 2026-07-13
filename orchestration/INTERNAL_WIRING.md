@@ -66,6 +66,35 @@ can be verified offline. Without the rule, self-validation, stale results,
 silent prompt drift, unbounded debate, or teardown races could be mistaken for
 accepted work.
 
+## Dedicated MiniMax Checker variant identity
+
+`rule: minimax_checker_requires_durable_none_variant`
+
+`enforced_by:`
+
+- `tests/test_router_config.py::RouterConfigTests::test_opencode_variant_must_be_durable_and_agent_pinned`
+- `tests/test_fleet_up.py::FleetUpTests::test_fleet_dialogue_preset_materializes_one_writer_and_three_independent_gates`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_prepare_identity_is_durable_before_lease_acquisition`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_variant_mismatch_is_indeterminate_and_retains_lease`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_missing_required_variant_is_indeterminate`
+- `tests/test_spec_coherence.py::SpecCoherenceTests::test_fdp2_contract_and_documentation_remain_aligned`
+
+`why:` FDP-2 uses a dedicated `minimax_checker` instead of changing the shared
+MiniMax candidate or CHALLENGE roles. The OpenCode 1.17.15 TUI rejects
+`--variant` (only `opencode run` accepts it), so the identity is pinned by the
+dedicated agent `.opencode/agents/minimax-checker.md`, which declares
+`model: minimax/MiniMax-M3` and `variant: none`; the boot command is
+`opencode --agent minimax-checker` with no `-m` or `--variant`. Router
+validation fails closed unless that agent file declares the exact
+provider/model and variant, and rejects any TUI command carrying `--variant`.
+The same expected value is carried through the fleet manifest and every
+lifecycle event for that run. Completion reads the final assistant
+`message.variant` from OpenCode's database and requires an exact match. An
+absent or different variant terminalizes `indeterminate` and retains the lease.
+The strict Checker JSON contract remains byte-exact: no parser relaxation,
+`<think>` stripping, or output repair can convert reasoning leakage into an
+accepted result.
+
 ## Durable writer branches
 
 `rule: writer_work_survives_worktree_teardown`
@@ -177,7 +206,8 @@ only a wake-up: succeeded/blocked/failed requires exactly one matching final
 line `FLEET_RESULT:<run_id>:<STATUS>`. Old, duplicated, cross-surface,
 non-final, or ambiguous evidence cannot complete the run. Provider-specific
 structured evidence—not terminal chrome—must bind that final line to the
-dispatched turn and configured provider/model identity. Audit recovery requires the
+dispatched turn and configured provider/model identity, plus any explicitly
+pinned OpenCode variant. Audit recovery requires the
 recorded baseline and a contiguous per-boot sequence; a truncated/corrupt audit
 cannot correlate a later submit. Protocol ACKs and lease metadata are validated
 fail-closed. The first terminal

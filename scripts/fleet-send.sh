@@ -39,11 +39,13 @@ surface_uuid="$(manifest_value "$instance_id.uuid")"
 provider="$(manifest_value "$instance_id.provider")"
 model="$(manifest_value "$instance_id.model")"
 hook_source="$(manifest_value "$instance_id.hook_source")"
+variant="$(manifest_value "$instance_id.variant")"
 
 prepared="$(python3 "$frontier" prepare "$runs_dir" \
   --feature "$feature" --instance "$instance_id" --role "$role" --phase "$phase" \
   --task "$task" --workspace-uuid "$workspace_uuid" --surface-uuid "$surface_uuid" \
-  --provider "$provider" --model "$model" --hook-source "$hook_source")"
+  --provider "$provider" --model "$model" --hook-source "$hook_source" \
+  --variant "$variant")"
 run_id="$(jq -r '.run_id' <<< "$prepared")"
 prompt="$(jq -r '.prompt' <<< "$prepared")"
 send_attempted=0

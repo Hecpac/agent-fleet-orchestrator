@@ -77,6 +77,7 @@ class FleetFrontierTests(unittest.TestCase):
         after_seq: int = 100,
         opencode: bool = False,
         hook_source: str = "codex",
+        variant: str = "",
     ):
         lease = fleet_leases.acquire_frontier(
             self.runs,
@@ -115,6 +116,8 @@ class FleetFrontierTests(unittest.TestCase):
             "model": model,
             "hook_source": hook_source,
         }
+        if variant:
+            event["variant"] = variant
         append_event(self.runs / "fleet-frontier.ledger.jsonl", event)
         return event, lease
 
@@ -989,6 +992,7 @@ class FleetFrontierTests(unittest.TestCase):
                         f"answer\nFLEET_RESULT:{run_id}:{sentinel}",
                         "minimax",
                         "MiniMax-M3",
+                        None,
                     ),
                 ), mock.patch.object(fleet_frontier, "read_screen") as read_screen:
                     terminal = fleet_frontier.process_event(
@@ -1061,7 +1065,9 @@ class FleetFrontierTests(unittest.TestCase):
         with mock.patch.object(
             fleet_frontier,
             "opencode_turn_evidence",
-            return_value=(f"answer\nFLEET_RESULT:{run_id}:DONE", "zai", "glm-5.2"),
+            return_value=(
+                f"answer\nFLEET_RESULT:{run_id}:DONE", "zai", "glm-5.2", None
+            ),
         ):
             terminal = fleet_frontier.process_event(
                 self.runs, state, final,
@@ -1069,6 +1075,72 @@ class FleetFrontierTests(unittest.TestCase):
             )
         self.assertEqual(terminal["status"], "indeterminate")
         self.assertEqual(terminal["reason"], "frontier_opencode_identity_mismatch")
+        self.assertTrue(terminal["lease_retained"])
+        self.assertTrue(lease.exists())
+
+    def test_opencode_variant_mismatch_is_indeterminate_and_retains_lease(self) -> None:
+        run_id = "run-opencode-variant-mismatch"
+        state, lease = self.seed_run(run_id, opencode=True, variant="none")
+        fleet_frontier.process_event(
+            self.runs,
+            state,
+            self.hook_event("agent.hook.UserPromptSubmit", 101, source="opencode"),
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        final = self.hook_event(
+            "agent.hook.Stop", 102, phase="completed", source="opencode",
+            final_opencode_stop=True,
+        )
+        with mock.patch.object(
+            fleet_frontier,
+            "opencode_turn_evidence",
+            return_value=(
+                f"answer\nFLEET_RESULT:{run_id}:DONE",
+                "minimax",
+                "MiniMax-M3",
+                "thinking",
+            ),
+        ):
+            terminal = fleet_frontier.process_event(
+                self.runs, state, final,
+                workspace_ref="workspace:1", surface_ref="surface:1",
+            )
+        self.assertEqual(terminal["status"], "indeterminate")
+        self.assertEqual(terminal["reason"], "frontier_opencode_variant_mismatch")
+        self.assertTrue(terminal["lease_retained"])
+        self.assertTrue(lease.exists())
+
+    def test_opencode_missing_required_variant_is_indeterminate(self) -> None:
+        run_id = "run-opencode-variant-missing"
+        state, lease = self.seed_run(run_id, opencode=True, variant="none")
+        fleet_frontier.process_event(
+            self.runs,
+            state,
+            self.hook_event("agent.hook.UserPromptSubmit", 101, source="opencode"),
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        final = self.hook_event(
+            "agent.hook.Stop", 102, phase="completed", source="opencode",
+            final_opencode_stop=True,
+        )
+        with mock.patch.object(
+            fleet_frontier,
+            "opencode_turn_evidence",
+            return_value=(
+                f"answer\nFLEET_RESULT:{run_id}:DONE",
+                "minimax",
+                "MiniMax-M3",
+                None,
+            ),
+        ):
+            terminal = fleet_frontier.process_event(
+                self.runs, state, final,
+                workspace_ref="workspace:1", surface_ref="surface:1",
+            )
+        self.assertEqual(terminal["status"], "indeterminate")
+        self.assertEqual(terminal["reason"], "frontier_opencode_variant_mismatch")
         self.assertTrue(terminal["lease_retained"])
         self.assertTrue(lease.exists())
 
@@ -1112,6 +1184,7 @@ class FleetFrontierTests(unittest.TestCase):
             completed: int | None = None,
             provider: str | None = None,
             model: str | None = None,
+            variant: str | None = None,
         ) -> dict:
             data = {"role": role, "time": {"created": created}}
             if completed is not None:
@@ -1120,6 +1193,8 @@ class FleetFrontierTests(unittest.TestCase):
                 data["providerID"] = provider
             if model is not None:
                 data["modelID"] = model
+            if variant is not None:
+                data["variant"] = variant
             return {
                 "message_id": message_id,
                 "message_created": created,
@@ -1142,6 +1217,7 @@ class FleetFrontierTests(unittest.TestCase):
                 "assistant-final", 1300, "assistant",
                 full_response,
                 completed=1400, provider="minimax", model="MiniMax-M3",
+                variant="none",
             ),
             row("user-next", 1500, "user", "another turn"),
             row(
@@ -1161,6 +1237,7 @@ class FleetFrontierTests(unittest.TestCase):
                     full_response,
                     "minimax",
                     "MiniMax-M3",
+                    "none",
                 ),
             )
 
@@ -1287,6 +1364,7 @@ class FleetFrontierTests(unittest.TestCase):
             events = [json.loads(line) for line in ledger.read_text().splitlines()]
             self.assertEqual(events[-1]["status"], "preparing")
             self.assertEqual(events[-1]["instance"], "agent")
+            self.assertEqual(events[-1]["variant"], "none")
             raise fleet_leases.LeaseBusy("occupied")
 
         with mock.patch.object(
@@ -1302,9 +1380,10 @@ class FleetFrontierTests(unittest.TestCase):
                     task="task",
                     workspace_uuid=WORKSPACE_UUID,
                     surface_uuid=SURFACE_UUID,
-                    provider="openai",
-                    model="gpt-5.6-sol",
-                    hook_source="codex",
+                    provider="minimax",
+                    model="MiniMax-M3",
+                    hook_source="opencode",
+                    variant="none",
                 )
         events = [json.loads(line) for line in ledger.read_text().splitlines()]
         self.assertEqual(events[-1]["status"], "abandoned")

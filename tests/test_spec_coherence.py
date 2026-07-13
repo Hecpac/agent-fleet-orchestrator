@@ -17,6 +17,7 @@ FDP2_CONTROLLER = ROOT / "scripts" / "fleet_dialogue_controller.py"
 INTERNAL_WIRING = ROOT / "orchestration" / "INTERNAL_WIRING.md"
 README = ROOT / "README.md"
 FLEET_REVIEWER = ROOT / ".opencode" / "agents" / "fleet-reviewer.md"
+MINIMAX_CHECKER = ROOT / ".opencode" / "agents" / "minimax-checker.md"
 SKILL_COPIES = (
     ROOT / ".agents" / "skills" / "cmux" / "SKILL.md",
     ROOT / ".claude" / "skills" / "cmux" / "SKILL.md",
@@ -57,7 +58,7 @@ class SpecCoherenceTests(unittest.TestCase):
             instances,
             {
                 "maker": "codex",
-                "checker": "minimax_candidate",
+                "checker": "minimax_checker",
                 "challenge": "glm",
                 "verify": "claude_reviewer",
             },
@@ -66,9 +67,16 @@ class SpecCoherenceTests(unittest.TestCase):
         for instance in ("checker", "challenge", "verify"):
             self.assertNotEqual(router["roles"][instances[instance]]["authority"], "write")
         checker_role = router["roles"][instances["checker"]]
-        self.assertEqual(checker_role["command"][-2:], ["--agent", "fleet-reviewer"])
+        self.assertEqual(
+            checker_role["command"],
+            ["opencode", "--agent", "minimax-checker"],
+        )
+        self.assertEqual(checker_role["variant"], "none")
+        self.assertNotIn("-m", checker_role["command"])
+        self.assertNotIn("--variant", checker_role["command"])
 
         reviewer = FLEET_REVIEWER.read_text(encoding="utf-8")
+        checker_agent = MINIMAX_CHECKER.read_text(encoding="utf-8")
         for restriction in (
             'mode: primary',
             'edit: deny',
@@ -81,6 +89,11 @@ class SpecCoherenceTests(unittest.TestCase):
         ):
             with self.subTest(restriction=restriction):
                 self.assertIn(restriction, reviewer)
+                self.assertIn(restriction, checker_agent)
+        self.assertIn("model: minimax/MiniMax-M3", checker_agent)
+        self.assertIn("variant: none", checker_agent)
+        self.assertNotIn("\nmodel:", reviewer)
+        self.assertNotIn("\nvariant:", reviewer)
 
         controller = FDP2_CONTROLLER.read_text(encoding="utf-8")
         for contract in (
@@ -121,6 +134,9 @@ class SpecCoherenceTests(unittest.TestCase):
             'rule: opencode_prompt_transport_is_one_physical_submission', wiring
         )
         self.assertIn(
+            'rule: minimax_checker_requires_durable_none_variant', wiring
+        )
+        self.assertIn(
             'test_opencode_prompt_transport_is_one_submission_with_exact_logical_prompt',
             wiring,
         )
@@ -133,7 +149,6 @@ class SpecCoherenceTests(unittest.TestCase):
         ):
             with self.subTest(documented=documented):
                 self.assertIn(documented, readme)
-
 
 if __name__ == "__main__":
     unittest.main()

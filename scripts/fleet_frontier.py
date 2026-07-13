@@ -319,7 +319,7 @@ def _opencode_final_stop(payload: dict[str, Any]) -> bool:
 
 def opencode_turn_evidence(
     session_id: str, run_id: str, stop_occurred_at: str
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str | None]:
     raw_session_id = session_id.removeprefix("opencode-")
     if not re.fullmatch(r"ses_[A-Za-z0-9]+", raw_session_id):
         raise FrontierError("OpenCode session id is invalid")
@@ -446,15 +446,18 @@ def opencode_turn_evidence(
     assistant_data = assistant["data"]
     provider = assistant_data.get("providerID")
     model = assistant_data.get("modelID")
+    variant = assistant_data.get("variant")
     if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
         raise FrontierError("OpenCode turn evidence lacks provider/model identity")
+    if variant is not None and not isinstance(variant, str):
+        raise FrontierError("OpenCode turn evidence has invalid variant identity")
     response = "\n".join(
         part[2]
         for part in sorted(
             assistant["parts"], key=lambda part: (part[0], part[1])
         )
     )
-    return response, provider, model
+    return response, provider, model, variant
 
 
 def _transcript_rows(session_id: str, hook_source: str) -> list[dict[str, Any]]:
@@ -718,11 +721,16 @@ def prepare_run(
     provider: str = "",
     model: str = "",
     hook_source: str = "",
+    variant: str = "",
 ) -> dict[str, Any]:
     if not provider or not model or not hook_source:
         raise FrontierError("frontier runs require provider, model, and hook source identity")
     if hook_source not in HOOK_SESSION_FILES:
         raise FrontierError(f"unsupported frontier hook source: {hook_source}")
+    if variant and hook_source != "opencode":
+        raise FrontierError("frontier variant identity is supported only for OpenCode")
+    if any(character in variant for character in ("\n", "\r", "\x00", "\x1f")):
+        raise FrontierError("frontier variant identity contains a forbidden control character")
     run_id = str(uuid.uuid4())
     task_sha256 = hashlib.sha256(task.encode("utf-8")).hexdigest()
     ledger = ledger_path(runs_dir, feature)
@@ -744,6 +752,8 @@ def prepare_run(
         "hook_source": hook_source,
         "preparing_at": preparing_at,
     }
+    if variant:
+        preparing["variant"] = variant
     if not append_event(ledger, preparing):
         raise FrontierError(f"frontier run unexpectedly already terminal: {run_id}")
     lease: Path | None = None
@@ -782,6 +792,8 @@ def prepare_run(
             "event_oldest_seq": resume.get("oldest_seq"),
             "dispatched_at": dispatched_at,
         }
+        if variant:
+            event["variant"] = variant
         if not append_event(ledger, event):
             raise FrontierError(f"frontier run unexpectedly already terminal: {run_id}")
         return {
@@ -820,6 +832,7 @@ def _common_event(state: dict[str, Any]) -> dict[str, Any]:
         "provider",
         "model",
         "hook_source",
+        "variant",
         "event_boot_id",
         "after_seq",
         "event_oldest_seq",
@@ -1055,7 +1068,7 @@ def process_event(
             return None
         response = ""
         try:
-            response, actual_provider, actual_model = opencode_turn_evidence(
+            response, actual_provider, actual_model, actual_variant = opencode_turn_evidence(
                 session_id,
                 str(state["run_id"]),
                 str(event.get("occurred_at") or ""),
@@ -1066,6 +1079,8 @@ def process_event(
                 or actual_model != str(state.get("model") or "")
             ):
                 status, reason = "indeterminate", "frontier_opencode_identity_mismatch"
+            elif state.get("variant") and actual_variant != state["variant"]:
+                status, reason = "indeterminate", "frontier_opencode_variant_mismatch"
         except FrontierError:
             status, reason = "indeterminate", "frontier_opencode_evidence_unavailable"
         return terminalize_response(
@@ -1307,7 +1322,7 @@ def _parser() -> argparse.ArgumentParser:
         "feature", "instance", "role", "phase", "task", "workspace-uuid", "surface-uuid"
     ):
         prepare.add_argument(f"--{name}", required=True)
-    for name in ("provider", "model", "hook-source"):
+    for name in ("provider", "model", "hook-source", "variant"):
         prepare.add_argument(f"--{name}", default="")
     abandon = sub.add_parser("abandon")
     abandon.add_argument("runs_dir")
@@ -1337,6 +1352,7 @@ def main() -> int:
                 provider=args.provider,
                 model=args.model,
                 hook_source=args.hook_source,
+                variant=args.variant,
             )
         elif args.command == "abandon":
             result = abandon_run(

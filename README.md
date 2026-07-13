@@ -209,8 +209,13 @@ closing marker and archives both the dialogue ledger and payload store.
 ### FDP-2 bounded Maker–Checker loop
 
 The `fleet_dialogue` preset adds a fail-closed BUILD loop with fixed identities:
-Codex/OpenAI is the only Maker, MiniMax is the read-only Checker, GLM remains the
-CHALLENGE role, and Claude remains the VERIFY role. CONTROL is a stepper: it
+Codex/OpenAI is the only Maker, the dedicated read-only `minimax_checker` pins
+`variant: none` through the `minimax-checker` OpenCode agent (the OpenCode
+1.17.15 TUI rejects `--variant`, so the boot command carries no `-m` or
+`--variant`), GLM remains the CHALLENGE role, and Claude remains the
+VERIFY role. The checker variant is persisted in the manifest and lifecycle
+ledger and must match OpenCode's final `message.variant`; absence or drift closes
+the run as `indeterminate`. CONTROL is a stepper: it
 returns one `next_action` but never dispatches a model or publishes an FDP-1
 message automatically.
 
