@@ -32,9 +32,16 @@ class RouterConfigTests(unittest.TestCase):
         self.assertEqual(self.config["defaults"]["preset"], "small")
         self.assertEqual(
             set(self.config["presets"]),
-            {"small", "audit", "frontier_verification", "implementation_review", "hotfix_validated", "research"},
+            {
+                "small",
+                "audit",
+                "frontier_verification",
+                "fleet_dialogue",
+                "implementation_review",
+                "hotfix_validated",
+                "research",
+            },
         )
-
     def test_duplicate_json_key_is_rejected(self) -> None:
         handle = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
         with handle:
@@ -237,6 +244,52 @@ class RouterConfigTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(router_config.RouterError, "at most one writer"):
             router_config.load_router(self.write_config(config))
+
+    def test_fleet_dialogue_preset_freezes_heterogeneous_roster_in_build_order(self) -> None:
+        plan = router_config.build_plan(
+            self.config,
+            preset_name="fleet_dialogue",
+            run_healthcheck=False,
+        )
+        instances = {item["instance_id"]: item for item in plan["instances"]}
+        self.assertEqual(
+            list(instances),
+            ["maker", "checker", "challenge", "verify"],
+        )
+        self.assertEqual(
+            {
+                name: (
+                    item["role_type"],
+                    item["provider"],
+                    item["model"],
+                    item["phase"],
+                    item["authority"],
+                )
+                for name, item in instances.items()
+            },
+            {
+                "maker": ("codex", "openai", "gpt-5.6-sol", "BUILD", "write"),
+                "checker": (
+                    "minimax_candidate",
+                    "minimax",
+                    "MiniMax-M3",
+                    "BUILD",
+                    "advisory",
+                ),
+                "challenge": ("glm", "zai", "glm-5.2", "CHALLENGE", "advisory"),
+                "verify": (
+                    "claude_reviewer",
+                    "anthropic",
+                    "claude-fable-5",
+                    "VERIFY",
+                    "verification",
+                ),
+            },
+        )
+        self.assertEqual(
+            instances["checker"]["command"][-2:],
+            ["--agent", "fleet-reviewer"],
+        )
 
     def test_custom_input_is_sorted_by_rank_then_instance(self) -> None:
         plan = router_config.build_plan(

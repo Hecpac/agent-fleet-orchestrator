@@ -1344,6 +1344,27 @@ class FleetFrontierTests(unittest.TestCase):
             )
         self.assertFalse((self.runs / "fleet-frontier.ledger.jsonl").exists())
 
+    def test_opencode_prompt_transport_is_one_submission_with_exact_logical_prompt(self) -> None:
+        task = "first line\nsecond line with ñ"
+        run_id = "run-opencode-single-submit"
+
+        prompt = fleet_frontier.prompt_with_contract(
+            task, run_id, hook_source="opencode"
+        )
+
+        self.assertNotIn("\n", prompt)
+        marker = "FDP_PROMPT="
+        logical_prompt = json.loads(prompt.rsplit(marker, 1)[1])
+        self.assertTrue(logical_prompt.startswith(f"{task}\n\nFleet completion protocol:"))
+        self.assertIn(f"FLEET_RESULT:{run_id}:<STATUS>", logical_prompt)
+
+    def test_non_opencode_prompt_transport_keeps_multiline_contract(self) -> None:
+        prompt = fleet_frontier.prompt_with_contract(
+            "first line\nsecond line", "run-codex", hook_source="codex"
+        )
+
+        self.assertIn("first line\nsecond line\n\nFleet completion protocol:", prompt)
+
     def test_cross_boot_audit_recovers_binding_stop_and_status(self) -> None:
         run_id = "run-replay"
         state, lease = self.seed_run(run_id, boot_id="boot-old", after_seq=900)

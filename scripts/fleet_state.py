@@ -115,6 +115,14 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+    if current == "BUILD" and manifest.get("preset") == "fleet_dialogue":
+        try:
+            from fleet_dialogue_controller import ControllerError, accepted_build_gate
+
+            accepted_build_gate(manifest_path.parent, manifest.get("feature", ""), manifest)
+        except ControllerError as exc:
+            print(f"FDP-2 BUILD gate closed: {exc}", file=sys.stderr)
+            return 3
     state["active_phase"] = requested
     entry = {
         "phase": requested,

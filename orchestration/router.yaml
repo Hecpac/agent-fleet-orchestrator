@@ -188,7 +188,7 @@
       "provider": "minimax",
       "model": "MiniMax-M3",
       "hook_source": "opencode",
-      "command": ["opencode", "-m", "minimax/MiniMax-M3", "--agent", "plan"],
+      "command": ["opencode", "-m", "minimax/MiniMax-M3", "--agent", "fleet-reviewer"],
       "healthcheck": ["opencode", "--version"],
       "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
       "enabled": true,
@@ -262,6 +262,16 @@
       "include_lead": true,
       "instances": [
         {"instance_id": "build", "role_type": "codex"},
+        {"instance_id": "challenge", "role_type": "glm"},
+        {"instance_id": "verify", "role_type": "claude_reviewer"}
+      ]
+    },
+    "fleet_dialogue": {
+      "description": "Bounded CONTROL-stepped Maker/Checker dialogue followed by independent challenge and verification.",
+      "include_lead": true,
+      "instances": [
+        {"instance_id": "maker", "role_type": "codex"},
+        {"instance_id": "checker", "role_type": "minimax_candidate"},
         {"instance_id": "challenge", "role_type": "glm"},
         {"instance_id": "verify", "role_type": "claude_reviewer"}
       ]

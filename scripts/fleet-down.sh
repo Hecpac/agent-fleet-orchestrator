@@ -24,6 +24,7 @@ runs_dir="${FLEET_RUNS_DIR:-$repo_root/orchestration/runs}"
 manifest="$runs_dir/fleet-$feature.manifest"
 identity="$repo_root/scripts/fleet_identity.py"
 leases="$repo_root/scripts/fleet_leases.py"
+dialogue_controller="$repo_root/scripts/fleet_dialogue_controller.py"
 export CMUX_QUIET=1
 
 manifest_value() {
@@ -89,6 +90,19 @@ if ! python3 "$identity" validate "$manifest" >/dev/null; then
 fi
 
 ws_ref="$(grep '^workspace=' "$manifest" | cut -d= -f2)"
+preset="$(manifest_value preset)"
+verification_receipt="${manifest%.manifest}.verification-receipt.json"
+if [[ "$preset" == "fleet_dialogue" ]]; then
+  if (( workspace_already_absent == 1 )); then
+    if [[ ! -s "$verification_receipt" ]]; then
+      echo "Refusing FDP-2 recovery: live verification receipt is absent." >&2
+      exit 75
+    fi
+  else
+    python3 "$dialogue_controller" verify "$runs_dir" --feature "$feature" \
+      --require-terminal --write-receipt "$verification_receipt" >/dev/null
+  fi
+fi
 
 # Writer worktrees must be reconciled before the fleet disappears: uncommitted
 # work would be orphaned, so fail closed and keep the fleet alive.
@@ -186,6 +200,9 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     [[ -f "$ledger_file" ]] && mv "$ledger_file" "$archive/ledger.jsonl"
     dialogue_ledger="${manifest%.manifest}.dialogue.jsonl"
     [[ -f "$dialogue_ledger" ]] && mv "$dialogue_ledger" "$archive/dialogue.jsonl"
+    dialogue_control="${manifest%.manifest}.dialogue-control.jsonl"
+    [[ -f "$dialogue_control" ]] && mv "$dialogue_control" "$archive/dialogue-control.jsonl"
+    [[ -f "$verification_receipt" ]] && mv "$verification_receipt" "$archive/verification-receipt.json"
     dialogue_store="$runs_dir/dialogue/$feature"
     [[ -d "$dialogue_store" ]] && mv "$dialogue_store" "$archive/dialogue"
     echo "closed $ws_ref (fleet-$feature)"

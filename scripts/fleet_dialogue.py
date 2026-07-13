@@ -158,8 +158,7 @@ def _validate_envelope(message: dict[str, Any], feature: str) -> None:
             raise DialogueError(f"invalid dialogue {field}")
 
 
-def load_messages(runs_dir: Path, feature: str) -> list[dict[str, Any]]:
-    path = ledger_path(runs_dir, feature)
+def load_messages_from_path(path: Path, feature: str) -> list[dict[str, Any]]:
     try:
         raw_lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
@@ -190,6 +189,10 @@ def load_messages(runs_dir: Path, feature: str) -> list[dict[str, Any]]:
         idempotency_keys.add(idempotency_key)
         messages.append(message)
     return messages
+
+
+def load_messages(runs_dir: Path, feature: str) -> list[dict[str, Any]]:
+    return load_messages_from_path(ledger_path(runs_dir, feature), feature)
 
 
 def _read_bounded_regular_file(path: Path, *, expected_size: int | None = None) -> bytes:
@@ -284,11 +287,44 @@ def _write_payload(path: Path, payload: bytes) -> None:
 
 
 def _verified_payload(runs_dir: Path, feature: str, message: dict[str, Any]) -> tuple[Path, bytes]:
-    path = payload_path(runs_dir, feature, str(message["payload_sha256"]))
+    return _verified_payload_from_store(store_path(runs_dir, feature), message)
+
+
+def _verified_payload_from_store(
+    store: Path, message: dict[str, Any]
+) -> tuple[Path, bytes]:
+    path = store / str(message["payload_sha256"])
     payload = _read_bounded_regular_file(path, expected_size=int(message["payload_bytes"]))
     if hashlib.sha256(payload).hexdigest() != message["payload_sha256"]:
         raise DialogueError("dialogue payload hash does not match envelope")
     return path, payload
+
+
+def verify_storage(
+    dialogue_ledger: Path,
+    payload_store: Path,
+    *,
+    feature: str,
+    instances: set[str] | None = None,
+) -> dict[str, int]:
+    messages = load_messages_from_path(dialogue_ledger, feature)
+    verified: set[str] = set()
+    total_bytes = 0
+    for message in messages:
+        if instances is not None and (
+            message["recipient"] not in instances
+            or message["source_instance"] not in instances
+        ):
+            raise DialogueError("dialogue message references an unknown manifest instance")
+        if message["payload_sha256"] not in verified:
+            _, payload = _verified_payload_from_store(payload_store, message)
+            verified.add(message["payload_sha256"])
+            total_bytes += len(payload)
+    return {
+        "messages": len(messages),
+        "payloads": len(verified),
+        "payload_bytes": total_bytes,
+    }
 
 
 def publish(
@@ -421,21 +457,12 @@ def read_message(runs_dir: Path, *, feature: str, message_id: str) -> bytes:
 def verify(runs_dir: Path, *, feature: str) -> dict[str, int]:
     with coordinator(runs_dir):
         _, instances = _load_manifest(runs_dir, feature)
-        messages = load_messages(runs_dir, feature)
-        verified: set[str] = set()
-        total_bytes = 0
-        for message in messages:
-            if message["recipient"] not in instances or message["source_instance"] not in instances:
-                raise DialogueError("dialogue message references an unknown manifest instance")
-            if message["payload_sha256"] not in verified:
-                _, payload = _verified_payload(runs_dir, feature, message)
-                verified.add(message["payload_sha256"])
-                total_bytes += len(payload)
-        return {
-            "messages": len(messages),
-            "payloads": len(verified),
-            "payload_bytes": total_bytes,
-        }
+        return verify_storage(
+            ledger_path(runs_dir, feature),
+            store_path(runs_dir, feature),
+            feature=feature,
+            instances=instances,
+        )
 
 
 def _parser() -> argparse.ArgumentParser:

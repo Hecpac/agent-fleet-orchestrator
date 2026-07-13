@@ -312,6 +312,40 @@ class FleetUpTests(unittest.TestCase):
             all("--model gpt-5.6-sol" in payload for payload in codex_launches)
         )
 
+    def test_fleet_dialogue_preset_materializes_one_writer_and_three_independent_gates(self) -> None:
+        target = self.make_target_repo()
+        result = self.run_fleet(
+            "fdp2-roster",
+            "--preset",
+            "fleet_dialogue",
+            "--target-repo",
+            str(target),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self.state.read_text())
+        self.assertEqual(
+            [pane["title"] for pane in state["panes"]],
+            ["lead", "maker", "checker", "challenge", "verify"],
+        )
+        manifest = (self.runs / "fleet-fdp2-roster.manifest").read_text()
+        required = (
+            "preset=fleet_dialogue",
+            "maker.role_type=codex",
+            "maker.authority=write",
+            "maker.phase=BUILD",
+            "checker.role_type=minimax_candidate",
+            "checker.authority=advisory",
+            "checker.phase=BUILD",
+            "challenge.role_type=glm",
+            "challenge.phase=CHALLENGE",
+            "verify.role_type=claude_reviewer",
+            "verify.phase=VERIFY",
+        )
+        for contract in required:
+            self.assertIn(contract, manifest)
+        self.assertIn("maker.worktree=", manifest)
+        self.assertNotIn("checker.worktree=", manifest)
+
     def test_frontier_send_returns_exact_run_and_rejects_second_active_turn(self) -> None:
         result = self.run_fleet("frontier-send", "agent=codex_candidate")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -603,6 +637,139 @@ class FleetUpTests(unittest.TestCase):
             (archive / "dialogue" / "payloads" / ("a" * 64)).read_bytes(),
             b"durable payload",
         )
+
+    def test_fdp2_teardown_requires_terminal_and_archives_offline_receipt(self) -> None:
+        target = self.make_target_repo()
+        result = self.run_fleet(
+            "fdp2-archive",
+            "--preset",
+            "fleet_dialogue",
+            "--target-repo",
+            str(target),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = self.runs / "fleet-fdp2-archive.manifest"
+        advance = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "scripts" / "fleet_state.py"),
+                "advance",
+                str(manifest),
+                "BUILD",
+                "--evidence",
+                "fdp2-scope-approved",
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(advance.returncode, 0, advance.stderr)
+        task_spec = Path(self.tempdir.name) / "fdp2-archive-task-spec.json"
+        task_spec.write_text(
+            json.dumps(
+                {
+                    "objective": "exercise FDP-2 teardown",
+                    "negative_scope": ["do not modify the target repository"],
+                    "acceptance_criteria": ["terminal teardown archives a verifiable receipt"],
+                }
+            ),
+            encoding="utf-8",
+        )
+        started = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "scripts" / "fleet_dialogue_controller.py"),
+                "start",
+                str(self.runs),
+                "--feature",
+                "fdp2-archive",
+                "--idempotency-key",
+                "start-archive-test",
+                "--spec-file",
+                str(task_spec),
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(started.returncode, 0, started.stderr)
+
+        active_down = subprocess.run(
+            ["bash", str(FLEET_DOWN), "fdp2-archive"],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(active_down.returncode, 75, active_down.stderr)
+        self.assertIn("active FDP-2 conversation", active_down.stderr)
+
+        abandoned = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "scripts" / "fleet_dialogue_controller.py"),
+                "abandon",
+                str(self.runs),
+                "--feature",
+                "fdp2-archive",
+                "--idempotency-key",
+                "abandon-archive-test",
+                "--reason",
+                "test teardown",
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(abandoned.returncode, 0, abandoned.stderr)
+        (self.runs / "fleet-fdp2-archive.dialogue.jsonl").touch()
+
+        down = subprocess.run(
+            ["bash", str(FLEET_DOWN), "fdp2-archive"],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(down.returncode, 0, down.stderr)
+        archive = next((self.runs / "archive").glob("fdp2-archive-*"))
+        for relative in (
+            "dialogue-control.jsonl",
+            "dialogue.jsonl",
+            "dialogue/control",
+            "verification-receipt.json",
+        ):
+            self.assertTrue((archive / relative).exists(), relative)
+        verified = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "scripts" / "fleet_dialogue_controller.py"),
+                "verify",
+                "--archive",
+                str(archive),
+            ],
+            cwd=ROOT,
+            env=self.env,
+            text=True,
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(verified.returncode, 0, verified.stderr)
+        self.assertEqual(json.loads(verified.stdout)["latest_status"], "abandoned")
 
     def test_teardown_recovers_only_after_confirmed_workspace_absence(self) -> None:
         result = self.run_fleet("recover-absent", "triage")

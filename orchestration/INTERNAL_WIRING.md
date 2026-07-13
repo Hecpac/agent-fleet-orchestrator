@@ -36,6 +36,36 @@ duplicate work, publish during teardown, lose frontier evidence, or leave a
 conversation whose hashes can no longer be verified. Publication never starts
 the recipient automatically; CONTROL must use the existing dispatch wrappers.
 
+## Bounded fail-closed Maker–Checker dialogue
+
+`rule: bounded_fleet_dialogue_is_control_stepped_and_fail_closed`
+
+`enforced_by:`
+
+- `tests/test_fleet_dialogue_controller.py::FleetDialogueControllerTests::test_happy_path_accepts_and_build_gate_revalidates_exact_head`
+- `tests/test_fleet_dialogue_controller.py::FleetDialogueControllerTests::test_invalid_checker_json_terminalizes_indeterminate`
+- `tests/test_fleet_dialogue_controller.py::FleetDialogueControllerTests::test_valid_revision_uses_one_run_for_rebuttal_and_revision_messages`
+- `tests/test_fleet_dialogue_controller.py::FleetDialogueControllerTests::test_start_copies_and_hashes_strict_task_spec`
+- `tests/test_fleet_dialogue_controller.py::FleetDialogueControllerTests::test_live_receipt_and_offline_archive_verify_same_hashes`
+- `tests/test_fleet_state.py::FleetStateTests::test_fdp2_requires_latest_accepted_clean_head_before_leaving_build`
+- `tests/test_fleet_up.py::FleetUpTests::test_fdp2_teardown_requires_terminal_and_archives_offline_receipt`
+- `tests/test_spec_coherence.py::SpecCoherenceTests::test_fdp2_contract_and_documentation_remain_aligned`
+
+`why:` The `fleet_dialogue` preset fixes Maker, Checker, CHALLENGE, and VERIFY
+to independent providers and grants write authority only to Maker. CONTROL
+freezes an exact task-spec hash, exposes one explicit dispatch or publication
+action at a time, and binds every accepted run and message by ID and payload
+hash; it never performs either side effect. Strict JSON contracts, real
+evidence references, a per-run timeout, an absolute deadline, and a three-round
+cap terminalize uncertainty instead of inferring success. Every Maker result
+must be one clean append-only commit. The separate control ledger is a durable
+hash chain, one conversation per feature may be active, and terminal state is
+immutable. Checker acceptance still requires a human BUILD exit and exact clean
+HEAD. Teardown refuses active dialogue and archives a live receipt whose files
+can be verified offline. Without the rule, self-validation, stale results,
+silent prompt drift, unbounded debate, or teardown races could be mistaken for
+accepted work.
+
 ## Durable writer branches
 
 `rule: writer_work_survives_worktree_teardown`
@@ -183,6 +213,26 @@ The event source, `opencode-` session prefix, and
 identity persisted before dispatch. Missing, malformed, temporally late, or
 mismatched evidence terminalizes indeterminate while retaining the lease; it
 never degrades to success by inference.
+
+## Single-submit OpenCode prompt transport
+
+`rule: opencode_prompt_transport_is_one_physical_submission`
+
+`enforced_by:`
+
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_prompt_transport_is_one_submission_with_exact_logical_prompt`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_non_opencode_prompt_transport_keeps_multiline_contract`
+- `tests/test_spec_coherence.py::SpecCoherenceTests::test_fdp2_contract_and_documentation_remain_aligned`
+
+`why:` OpenCode's TUI treats literal newlines pasted through cmux as separate
+submissions. A long multiline task can therefore bind one run to several
+`UserPromptSubmit` events and must fail closed as ambiguous. Frontier dispatch
+preserves the exact logical task and completion contract inside a JSON string,
+then sends that encoded value as one physical line for `hook_source=opencode`.
+The durable `task_sha256` continues to bind the unencoded logical task supplied
+by CONTROL. Codex and Claude retain their native multiline transport. The
+encoding is transport-only: it does not permit a second submit, relax session
+identity, or infer success from terminal chrome.
 
 ## Structured Codex and Claude completion
 

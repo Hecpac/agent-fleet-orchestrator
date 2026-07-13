@@ -238,13 +238,23 @@ def session_matches(
     )
 
 
-def prompt_with_contract(task: str, run_id: str) -> str:
-    return (
+def prompt_with_contract(task: str, run_id: str, *, hook_source: str = "") -> str:
+    logical_prompt = (
         f"{task}\n\n"
         "Fleet completion protocol: in the final answer, include exactly one final line "
         f"using FLEET_RESULT:{run_id}:<STATUS>, where STATUS is DONE, BLOCKED, or FAILED. "
         "Do not emit that line before the final answer."
     )
+    if hook_source == "opencode":
+        # OpenCode treats literal newlines pasted into its TUI as independent
+        # submissions. Encode the complete logical prompt as one JSON string so
+        # cmux transfers exactly one UserPromptSubmit without weakening the
+        # run/prompt identity recorded by CONTROL.
+        return (
+            "Decode the JSON string after FDP_PROMPT= as your exact prompt and follow it. "
+            f"FDP_PROMPT={json.dumps(logical_prompt, ensure_ascii=False)}"
+        )
+    return logical_prompt
 
 
 def sentinel_status(screen: str, run_id: str) -> tuple[str, str]:
@@ -777,7 +787,7 @@ def prepare_run(
         return {
             **event,
             "lease": str(lease),
-            "prompt": prompt_with_contract(task, run_id),
+            "prompt": prompt_with_contract(task, run_id, hook_source=hook_source),
         }
     except Exception:
         append_event(

@@ -206,6 +206,77 @@ instances, retries require the same idempotency key and content, and replies
 name at most one prior message. `fleet-down` blocks new publication through its
 closing marker and archives both the dialogue ledger and payload store.
 
+### FDP-2 bounded Maker–Checker loop
+
+The `fleet_dialogue` preset adds a fail-closed BUILD loop with fixed identities:
+Codex/OpenAI is the only Maker, MiniMax is the read-only Checker, GLM remains the
+CHALLENGE role, and Claude remains the VERIFY role. CONTROL is a stepper: it
+returns one `next_action` but never dispatches a model or publishes an FDP-1
+message automatically.
+
+Start the fleet, enter BUILD, and freeze a strict task spec:
+
+```bash
+./scripts/fleet-up.sh <feature> --preset fleet_dialogue --target-repo <repo>
+python3 scripts/fleet_state.py advance \
+  orchestration/runs/fleet-<feature>.manifest BUILD --evidence <scope-evidence>
+
+cat > /tmp/fdp2-task.json <<'JSON'
+{
+  "objective": "one bounded objective",
+  "negative_scope": ["one explicit exclusion"],
+  "acceptance_criteria": ["one observable acceptance condition"]
+}
+JSON
+
+python3 scripts/fleet_dialogue_controller.py start orchestration/runs \
+  --feature <feature> --spec-file /tmp/fdp2-task.json \
+  --idempotency-key <stable-start-key>
+```
+
+The controller copies the exact spec into the conversation store and freezes
+its SHA-256. For every returned `next_action`:
+
+- `action=dispatch`: read `prompt_file` with `prompt="$(<"$prompt_file")"`,
+  dispatch it to the exact `instance` using `fleet-send.sh`, wait for that exact
+  `run_id`, then call `step --run-id <run_id>` with a new stable idempotency key.
+- `action=publish`: publish the exact source result through
+  `fleet_dialogue.py publish` using every returned binding (`kind`, `recipient`,
+  `source_instance`, `source_run_id`, `reply_to`), then call
+  `step --message-id <message_id>` with a new stable idempotency key.
+- `action=terminal`: stop the loop. Late runs and messages cannot change it.
+
+The prompt files intentionally have no trailing newline, so Bash command
+substitution preserves the byte sequence whose hash is recorded by CONTROL.
+Each Maker result must add exactly one commit to the current accepted base and
+leave its dedicated branch clean. Checker output is strict JSON; malformed
+output, a 30-minute run timeout, the four-hour conversation deadline, or an
+attempted fourth revision round closes the conversation without acceptance.
+
+Inspect or verify without causing model work:
+
+```bash
+python3 scripts/fleet_dialogue_controller.py show orchestration/runs --feature <feature>
+python3 scripts/fleet_dialogue_controller.py verify orchestration/runs --feature <feature>
+python3 scripts/fleet_dialogue_controller.py abandon orchestration/runs \
+  --feature <feature> --reason <reason> --idempotency-key <stable-abandon-key>
+```
+
+An `accepted` dialogue still does not advance phases. A human must approve the
+BUILD exit, and the gate rechecks that the Maker branch is clean and still at
+the exact accepted HEAD:
+
+```bash
+python3 scripts/fleet_state.py advance \
+  orchestration/runs/fleet-<feature>.manifest CHALLENGE \
+  --evidence <accepted-dialogue-evidence> --approved-by <human>
+```
+
+`fleet-down` refuses an active conversation. For a terminal one it creates a
+live verification receipt and archives the control hash chain, task spec,
+prompts, FDP-1 ledger, and payloads. The archive remains independently
+verifiable with `fleet_dialogue_controller.py verify --archive <archive>`.
+
 The orchestration playbook (mental model, verbs, wait rules, memory budget)
 lives in both `.agents/skills/cmux/SKILL.md` and `.claude/skills/cmux/SKILL.md`;
 the two copies must stay synchronized.
