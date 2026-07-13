@@ -471,7 +471,8 @@ class FleetUpTests(unittest.TestCase):
         self.assertTrue(prompt_path.is_file())
         prompt_text = prompt_path.read_text(encoding="utf-8")
         self.assertIn(f"FLEET_RESULT:{run_id}:<STATUS>", prompt_text)
-        self.assertNotIn(f"FLEET_RESULT:{run_id}:<STATUS>", pointer)
+        self.assertIn(f"FLEET_RESULT:{run_id}:<STATUS>", pointer)
+        self.assertLess(len(pointer), 600)
 
         duplicate = subprocess.run(
             ["bash", str(FLEET_SEND), "frontier-send", "agent", "second task"],

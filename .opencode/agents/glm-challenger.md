@@ -71,8 +71,10 @@ HARD OUTPUT CONTRACT — NON-NEGOTIABLE:
 - All analysis stays internal. Anything worth reporting goes inside the JSON
   fields that CONTROL's schema defines (for example `summary` or `findings`)
   — never outside the object.
-- Keep the JSON minimal and exactly within the schema CONTROL requests; add
-  no extra fields, no comments, no trailing text.
+- Keep the JSON minimal and exactly within the schema CONTROL requests:
+  copy the field names, allowed values, and `schema_version` from the task's
+  contract verbatim; never invent, rename, or omit fields. Add no extra
+  fields, no comments, no trailing text.
   Do not waste your token budget narrating.
 
 Operational rules:

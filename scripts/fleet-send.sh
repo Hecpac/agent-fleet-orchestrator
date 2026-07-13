@@ -71,10 +71,23 @@ trap cleanup_untransferred EXIT
 # paste chunking nor cmux escape handling can split or truncate it, then
 # require at least one observed UserPromptSubmit before trusting transfer.
 prompt_path="$(jq -r '.prompt_path' <<< "$prepared")"
-pointer="FLEET_RUN $run_id: open the file $prompt_path and execute its entire content as your exact task for this turn, including its completion protocol."
+# The pointer carries the run's user-binding marker: provider evidence
+# extraction locates the dispatched turn by finding FLEET_RESULT:<run>:<STATUS>
+# in the user message.
+pointer="FLEET_RUN $run_id: open the file $prompt_path and execute its entire content as your exact task for this turn, following its output schema and field names exactly as written. Its completion protocol requires one final line using FLEET_RESULT:$run_id:<STATUS> where STATUS is DONE, BLOCKED, or FAILED."
+# OpenCode prompts are already one single-line FDP_PROMPT-encoded string (no
+# raw newlines, so neither chunk boundaries nor escape handling can submit
+# early), and MiniMax demonstrably loses schema fidelity through file
+# indirection; keep the encoded inline payload there and use the pointer for
+# codex/claude, where it is proven.
+if [[ "$hook_source" == "opencode" ]]; then
+  payload="$prompt"
+else
+  payload="$pointer"
+fi
 send_attempted=1
 since="$(date -u +%Y-%m-%dT%H:%M:%S)"
-cmux send --surface "$surface" --workspace "$workspace" "$pointer" >/dev/null
+cmux send --surface "$surface" --workspace "$workspace" "$payload" >/dev/null
 [[ "${FLEET_SEND_KEY_DELAY:-0.2}" == "0" ]] || sleep "${FLEET_SEND_KEY_DELAY:-0.2}"
 cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
 python3 "$frontier" confirm-submit "$runs_dir" \
