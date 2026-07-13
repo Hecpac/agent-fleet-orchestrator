@@ -162,6 +162,8 @@ never degrades to success by inference.
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_codex_turn_evidence_binds_transcript_response_and_identity`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_claude_turn_evidence_binds_final_end_turn_and_model`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_codex_and_claude_stops_use_structured_evidence_not_screen`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_claude_process_event_accepts_tool_using_main_turn`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_claude_duplicate_run_marker_is_ambiguous`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_codex_and_claude_identity_mismatch_is_indeterminate`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_claude_unavailable_transcript_is_indeterminate`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_prepare_rejects_unsupported_hook_source_before_ledger_write`
@@ -179,7 +181,9 @@ assistant response completed no later than the Stop. The transcript must confirm
 the configured model; Codex also supplies its provider, while Claude's provider
 is fixed by the validated `claude`/`anthropic` router contract. Only `codex`,
 `claude`, and `opencode` hook sources are accepted, and each resolves exclusively
-through its matching prefix and hook-session file. Missing, malformed, late, or
+through its matching prefix and hook-session file. Claude tool-result rows are
+continuations of the bound human turn, never new user turns, and sidechain rows
+cannot bind or complete the parent run. Missing, malformed, late, or
 mismatched evidence terminalizes indeterminate and retains the lease. Claude's
 duplicate Stop notifications therefore cannot turn UI timing into success or
 produce conflicting terminal outcomes.

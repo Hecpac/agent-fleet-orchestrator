@@ -431,6 +431,28 @@ def _message_text(content: Any, *, text_types: set[str]) -> str:
     return "\n".join(texts)
 
 
+def _claude_human_prompt(row: dict[str, Any]) -> bool:
+    if row.get("type") != "user" or row.get("isSidechain") is True:
+        return False
+    message = row.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return False
+    origin = row.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") == "human":
+        return True
+    if row.get("promptSource"):
+        return True
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    if not isinstance(content, list):
+        return False
+    return bool(content) and not any(
+        isinstance(part, dict) and part.get("type") == "tool_result"
+        for part in content
+    )
+
+
 def codex_turn_evidence(
     session_id: str, run_id: str, stop_occurred_at: str
 ) -> tuple[str, str, str]:
@@ -527,10 +549,9 @@ def claude_turn_evidence(
     for index, row in enumerate(rows):
         message = row.get("message")
         if (
-            row.get("type") == "user"
+            _claude_human_prompt(row)
             and row.get("sessionId") == raw_session_id
             and isinstance(message, dict)
-            and message.get("role") == "user"
             and marker in _message_text(message.get("content"), text_types={"text"})
         ):
             matching_users.append(index)
@@ -542,10 +563,8 @@ def claude_turn_evidence(
         row = rows[index]
         message = row.get("message")
         if (
-            row.get("type") == "user"
+            _claude_human_prompt(row)
             and row.get("sessionId") == raw_session_id
-            and isinstance(message, dict)
-            and message.get("role") == "user"
         ):
             next_user_index = index
             break
@@ -557,6 +576,7 @@ def claude_turn_evidence(
         if (
             row.get("type") != "assistant"
             or row.get("sessionId") != raw_session_id
+            or row.get("isSidechain") is True
             or not isinstance(message, dict)
             or message.get("role") != "assistant"
             or message.get("stop_reason") != "end_turn"

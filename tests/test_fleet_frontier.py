@@ -364,6 +364,9 @@ class FleetFrontierTests(unittest.TestCase):
                 {
                     "type": "user",
                     "sessionId": raw,
+                    "isSidechain": False,
+                    "origin": {"kind": "human"},
+                    "promptSource": "typed",
                     "timestamp": "2026-07-12T00:00:01Z",
                     "message": {
                         "role": "user",
@@ -373,6 +376,7 @@ class FleetFrontierTests(unittest.TestCase):
                 {
                     "type": "assistant",
                     "sessionId": raw,
+                    "isSidechain": False,
                     "timestamp": "2026-07-12T00:00:02Z",
                     "message": {
                         "role": "assistant",
@@ -384,6 +388,41 @@ class FleetFrontierTests(unittest.TestCase):
                 {
                     "type": "assistant",
                     "sessionId": raw,
+                    "isSidechain": False,
+                    "timestamp": "2026-07-12T00:00:02.100Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-fable-5",
+                        "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "name": "Read"}],
+                    },
+                },
+                {
+                    "type": "user",
+                    "sessionId": raw,
+                    "isSidechain": False,
+                    "timestamp": "2026-07-12T00:00:02.200Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "content": "ok"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": raw,
+                    "isSidechain": True,
+                    "timestamp": "2026-07-12T00:00:02.400Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "wrong-sidechain-model",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "sidechain"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": raw,
+                    "isSidechain": False,
                     "timestamp": "2026-07-12T00:00:02.500Z",
                     "message": {
                         "role": "assistant",
@@ -396,8 +435,23 @@ class FleetFrontierTests(unittest.TestCase):
                     },
                 },
                 {
+                    "type": "assistant",
+                    "sessionId": raw,
+                    "isSidechain": False,
+                    "timestamp": "2026-07-12T00:00:03.500Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-fable-5",
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "too late"}],
+                    },
+                },
+                {
                     "type": "user",
                     "sessionId": raw,
+                    "isSidechain": False,
+                    "origin": {"kind": "human"},
+                    "promptSource": "typed",
                     "timestamp": "2026-07-12T00:00:04Z",
                     "message": {"role": "user", "content": "next"},
                 },
@@ -475,6 +529,121 @@ class FleetFrontierTests(unittest.TestCase):
                 self.assertEqual(terminal["status"], "succeeded")
                 self.assertFalse(lease.exists())
                 read_screen.assert_not_called()
+
+    def test_claude_process_event_accepts_tool_using_main_turn(self) -> None:
+        run_id = "run-claude-tool-turn"
+        raw = CLAUDE_SESSION_ID.removeprefix("claude-")
+        self.write_transcript(
+            CLAUDE_SESSION_ID,
+            [
+                {
+                    "type": "user",
+                    "sessionId": raw,
+                    "isSidechain": False,
+                    "origin": {"kind": "human"},
+                    "promptSource": "typed",
+                    "timestamp": "2026-07-12T00:00:01Z",
+                    "message": {
+                        "role": "user",
+                        "content": f"task FLEET_RESULT:{run_id}:<STATUS>",
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": raw,
+                    "isSidechain": False,
+                    "timestamp": "2026-07-12T00:00:01.500Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-fable-5",
+                        "stop_reason": "tool_use",
+                        "content": [{"type": "tool_use", "name": "Read"}],
+                    },
+                },
+                {
+                    "type": "user",
+                    "sessionId": raw,
+                    "isSidechain": False,
+                    "timestamp": "2026-07-12T00:00:01.750Z",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "tool_result", "content": "ok"}],
+                    },
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": raw,
+                    "isSidechain": False,
+                    "timestamp": "2026-07-12T00:00:02Z",
+                    "message": {
+                        "role": "assistant",
+                        "model": "claude-fable-5",
+                        "stop_reason": "end_turn",
+                        "content": [{
+                            "type": "text",
+                            "text": f"answer\nFLEET_RESULT:{run_id}:DONE",
+                        }],
+                    },
+                },
+            ],
+        )
+        state, lease = self.seed_run(run_id, hook_source="claude")
+        fleet_frontier.process_event(
+            self.runs,
+            state,
+            self.hook_event(
+                "agent.hook.UserPromptSubmit",
+                501,
+                source="claude",
+                session_id=CLAUDE_SESSION_ID,
+            ),
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        with mock.patch.object(fleet_frontier, "read_screen") as read_screen:
+            terminal = fleet_frontier.process_event(
+                self.runs,
+                state,
+                self.hook_event(
+                    "agent.hook.Stop",
+                    502,
+                    phase="completed",
+                    source="claude",
+                    session_id=CLAUDE_SESSION_ID,
+                    occurred_at="2026-07-12T00:00:03Z",
+                ),
+                workspace_ref="workspace:1",
+                surface_ref="surface:1",
+            )
+        self.assertEqual(terminal["status"], "succeeded")
+        self.assertFalse(lease.exists())
+        read_screen.assert_not_called()
+
+    def test_claude_duplicate_run_marker_is_ambiguous(self) -> None:
+        run_id = "run-claude-duplicate"
+        raw = CLAUDE_SESSION_ID.removeprefix("claude-")
+        prompt = {
+            "type": "user",
+            "sessionId": raw,
+            "isSidechain": False,
+            "origin": {"kind": "human"},
+            "promptSource": "typed",
+            "message": {
+                "role": "user",
+                "content": f"task FLEET_RESULT:{run_id}:<STATUS>",
+            },
+        }
+        self.write_transcript(
+            CLAUDE_SESSION_ID,
+            [
+                {**prompt, "timestamp": "2026-07-12T00:00:01Z"},
+                {**prompt, "timestamp": "2026-07-12T00:00:02Z"},
+            ],
+        )
+        with self.assertRaisesRegex(fleet_frontier.FrontierError, "ambiguous"):
+            fleet_frontier.claude_turn_evidence(
+                CLAUDE_SESSION_ID, run_id, "2026-07-12T00:00:03Z"
+            )
 
     def test_codex_and_claude_identity_mismatch_is_indeterminate(self) -> None:
         cases = (
