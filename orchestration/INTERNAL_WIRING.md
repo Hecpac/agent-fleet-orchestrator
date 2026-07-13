@@ -209,4 +209,7 @@ workspace, and source and occur after the binding. It terminalizes indeterminate
 with reason `frontier_session_ended_without_stop` while retaining the lease; it
 does not consult a possibly cleaned-up session record or infer success from a
 transcript. An unbound, received-phase, stale, foreign, or post-Stop SessionEnd
-cannot change run ownership or the first terminal result.
+cannot change run ownership or the first terminal result. Cross-boot recovery is
+locked at the exact boundary where UserPromptSubmit binds under the old boot and
+SessionEnd arrives as sequence 1 of the new boot; ordering then falls back to
+their durable timestamps without weakening source, workspace, or session checks.
