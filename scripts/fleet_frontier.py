@@ -13,6 +13,7 @@ import re
 import select
 import subprocess
 import sys
+import time
 import uuid
 from typing import Any
 
@@ -42,6 +43,8 @@ HOOK_SESSION_FILES = {
     "claude": "claude-hook-sessions.json",
     "opencode": "opencode-hook-sessions.json",
 }
+TRANSCRIPT_EVIDENCE_ATTEMPTS = 4
+TRANSCRIPT_EVIDENCE_RETRY_SECONDS = 0.1
 
 
 class FrontierError(RuntimeError):
@@ -576,6 +579,21 @@ def claude_turn_evidence(
     return response, "anthropic", model
 
 
+def transcript_turn_evidence(
+    reader: Any, session_id: str, run_id: str, stop_occurred_at: str
+) -> tuple[str, str, str]:
+    last_error: FrontierError | None = None
+    for attempt in range(TRANSCRIPT_EVIDENCE_ATTEMPTS):
+        try:
+            return reader(session_id, run_id, stop_occurred_at)
+        except FrontierError as exc:
+            last_error = exc
+            if attempt + 1 < TRANSCRIPT_EVIDENCE_ATTEMPTS:
+                time.sleep(TRANSCRIPT_EVIDENCE_RETRY_SECONDS)
+    assert last_error is not None
+    raise last_error
+
+
 def read_screen(workspace_ref: str, surface_ref: str) -> str:
     try:
         result = subprocess.run(
@@ -919,7 +937,8 @@ def process_event(
     if evidence_reader is None:
         return None
     try:
-        response, actual_provider, actual_model = evidence_reader(
+        response, actual_provider, actual_model = transcript_turn_evidence(
+            evidence_reader,
             session_id,
             str(state["run_id"]),
             str(event.get("occurred_at") or ""),

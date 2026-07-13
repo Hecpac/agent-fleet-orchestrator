@@ -573,6 +573,26 @@ class FleetFrontierTests(unittest.TestCase):
         self.assertTrue(terminal["lease_retained"])
         self.assertTrue(lease.exists())
 
+    def test_transcript_evidence_retries_bounded_visibility_race(self) -> None:
+        reader = mock.Mock(
+            side_effect=[
+                fleet_frontier.FrontierError("not flushed"),
+                ("answer", "anthropic", "claude-fable-5"),
+            ]
+        )
+        with mock.patch.object(fleet_frontier.time, "sleep") as sleep:
+            evidence = fleet_frontier.transcript_turn_evidence(
+                reader,
+                CLAUDE_SESSION_ID,
+                "run-retry",
+                "2026-07-12T00:00:03Z",
+            )
+        self.assertEqual(evidence, ("answer", "anthropic", "claude-fable-5"))
+        self.assertEqual(reader.call_count, 2)
+        sleep.assert_called_once_with(
+            fleet_frontier.TRANSCRIPT_EVIDENCE_RETRY_SECONDS
+        )
+
     def test_opencode_ignores_intermediate_stops_and_uses_structured_final_response(self) -> None:
         statuses = {
             "DONE": "succeeded",
