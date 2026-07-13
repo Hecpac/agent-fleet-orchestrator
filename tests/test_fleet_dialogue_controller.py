@@ -340,6 +340,39 @@ class FleetDialogueControllerTests(unittest.TestCase):
         with self.assertRaises(fleet_dialogue.DialogueError):
             controller.verify_archive(archive)
 
+    def test_receipt_tolerates_abandoned_conversation_without_publications(self) -> None:
+        self.start()
+        controller.abandon(
+            self.runs,
+            feature=self.feature,
+            idempotency_key="abandon-no-messages",
+            reason="blocked before any publication",
+            now=self.now + timedelta(minutes=1),
+        )
+        self.assertFalse(fleet_dialogue.ledger_path(self.runs, self.feature).exists())
+        receipt_path = self.runs / f"fleet-{self.feature}.verification-receipt.json"
+        receipt = controller.create_live_receipt(
+            self.runs,
+            feature=self.feature,
+            receipt_path=receipt_path,
+            now=self.now + timedelta(minutes=2),
+        )
+        self.assertEqual(receipt["summary"]["latest_status"], "abandoned")
+        self.assertNotIn("dialogue.jsonl", receipt.get("files", {}))
+
+        stray = self.runs / "dialogue" / self.feature / "payloads" / "stray.bin"
+        stray.parent.mkdir(parents=True, exist_ok=True)
+        stray.write_bytes(b"orphan")
+        with self.assertRaisesRegex(
+            controller.ControllerError, "missing while published payloads exist"
+        ):
+            controller.create_live_receipt(
+                self.runs,
+                feature=self.feature,
+                receipt_path=receipt_path,
+                now=self.now + timedelta(minutes=3),
+            )
+
     def test_invalid_checker_json_terminalizes_indeterminate(self) -> None:
         checker_event, _ = self.proposal_to_checker()
         run_id = "checker-invalid-run"

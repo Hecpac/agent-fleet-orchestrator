@@ -1741,9 +1741,19 @@ def _regular_file_hash(path: Path) -> dict[str, Any]:
 
 def _receipt_sources_live(runs_dir: Path, feature: str) -> dict[str, Path]:
     sources = {
-        "dialogue.jsonl": fleet_dialogue.ledger_path(runs_dir, feature),
         "dialogue-control.jsonl": ledger_path(runs_dir, feature),
     }
+    dialogue_ledger = fleet_dialogue.ledger_path(runs_dir, feature)
+    if dialogue_ledger.exists():
+        sources["dialogue.jsonl"] = dialogue_ledger
+    else:
+        # A conversation abandoned before any publication legitimately has no
+        # dialogue ledger; payloads without a ledger never do.
+        payloads = runs_dir / "dialogue" / feature / "payloads"
+        if payloads.is_dir() and any(payloads.iterdir()):
+            raise ControllerError(
+                "FDP-2 dialogue ledger is missing while published payloads exist"
+            )
     lifecycle = runs_dir / f"fleet-{feature}.ledger.jsonl"
     if lifecycle.exists():
         sources["ledger.jsonl"] = lifecycle
