@@ -87,3 +87,32 @@ codex transports submit (single physical submission rule) and what produces a
 second `UserPromptSubmit` on a reused pane — then decide the transport
 hardening slice. Only after that, rerun the full flow to prove the hardened
 Claude leg and the `verified` terminal.
+
+## Addendum — transport root cause nailed (post-campaign recon)
+
+`~/.cmuxterm/events.jsonl` + OpenCode DB for the degraded e2e4 checker pane:
+
+- Turn 1: ONE UserPromptSubmit, but the stored user message is **1341 bytes
+  of a ~3.9 KB prompt** — the pane submitted after the first paste chunk;
+  the model judged with a third of the contract (hence the 3.6 s lazy
+  ACCEPT and glued sentinel).
+- Turns 2–3: THREE UserPromptSubmit each (~0.7 s apart), and the DB shows
+  the prompt split mid-word into 3 user messages (2058 + 984 + 851 bytes:
+  `…m`/`aker``, `…AC`/`CEPT``) — each chunk auto-submitted →
+  `frontier_session_binding_ambiguous`.
+
+Root cause: `fleet-send.sh` delivers multi-KB multi-line prompts via
+`cmux send` paste; under terminal latency the chunked write escapes the
+bracketed paste and newlines submit each chunk. This also retro-explains the
+codex `64cc6743` double-submit. Consequence class is worse than flake: a
+silently TRUNCATED prompt can still produce a well-formed, sentinel-correct,
+fail-open-looking verdict.
+
+Fix fork (human decision):
+- **A. Pointer-send**: dispatch a tiny constant-size instruction referencing
+  the durable, already-hashed `prompt_file`; eliminates chunking
+  deterministically; the pane reads the file (read tools are allowlisted).
+- **B. Post-send verification**: after send, require exactly one
+  UserPromptSubmit (and/or verify stored prompt length) before accepting the
+  dispatch; detect-and-retry instead of prevent.
+- **C. Both** (prevention + detection).
