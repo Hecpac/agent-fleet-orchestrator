@@ -116,3 +116,30 @@ Fix fork (human decision):
   UserPromptSubmit (and/or verify stored prompt length) before accepting the
   dispatch; detect-and-retry instead of prevent.
 - **C. Both** (prevention + detection).
+
+## Frozen Decision C — transport slice spec (authorized 2026-07-13, build pending)
+
+Hector froze option C (pointer-send + post-send verification). Spec for the
+next build session:
+
+1. `fleet_frontier.py prepare`: persist the composed prompt (the exact
+   output of `prompt_with_contract`) to `runs_dir/prompts/<feature>/<run_id>.txt`
+   and return `prompt_path` alongside `prompt`.
+2. `fleet-send.sh`: dispatch ONE single-line pointer with no newlines and no
+   backslash sequences (`cmux send` interprets literal \n/\r as Enter — a
+   second candidate mechanism for the multi-submit, alongside paste
+   chunking; the pointer is immune to both):
+   `FLEET_RUN <run_id>: open <prompt_path> and execute its entire content as
+   your exact task for this turn, including its completion protocol.`
+3. Post-send verification (new frontier verb `confirm-submit`): poll
+   `audit_events()` until >=1 `agent.hook.UserPromptSubmit` (phase received,
+   matching hook_source + workspace_uuid, occurred_at >= dispatch time);
+   on timeout the existing `frontier_send_transfer_unconfirmed` cleanup path
+   marks the run indeterminate. Multi-submit remains guarded by the existing
+   `frontier_session_binding_ambiguous` completion check.
+4. Tests: `test_fleet_up` send-path fixtures must seed a synthetic
+   UserPromptSubmit into `CMUX_EVENTS_LOG`; add a prepare test asserting
+   `prompt_path` exists, is durable, and matches the returned `prompt`
+   byte-for-byte; spec-lock the pointer shape (single line, no backslashes).
+5. Then rerun the e2e flow to prove the hardened Claude verifier and the
+   `verified` terminal + `fdp3-verify` receipt + clean teardown.
