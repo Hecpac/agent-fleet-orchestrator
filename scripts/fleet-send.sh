@@ -66,10 +66,20 @@ cleanup_untransferred() {
 }
 trap cleanup_untransferred EXIT
 
+# Decision C transport: the composed prompt is durable on disk; dispatch a
+# tiny single-line pointer (no newlines, no backslash sequences) so neither
+# paste chunking nor cmux escape handling can split or truncate it, then
+# require at least one observed UserPromptSubmit before trusting transfer.
+prompt_path="$(jq -r '.prompt_path' <<< "$prepared")"
+pointer="FLEET_RUN $run_id: open the file $prompt_path and execute its entire content as your exact task for this turn, including its completion protocol."
 send_attempted=1
-cmux send --surface "$surface" --workspace "$workspace" "$prompt" >/dev/null
+since="$(date -u +%Y-%m-%dT%H:%M:%S)"
+cmux send --surface "$surface" --workspace "$workspace" "$pointer" >/dev/null
 [[ "${FLEET_SEND_KEY_DELAY:-0.2}" == "0" ]] || sleep "${FLEET_SEND_KEY_DELAY:-0.2}"
 cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
+python3 "$frontier" confirm-submit "$runs_dir" \
+  --workspace-uuid "$workspace_uuid" --hook-source "$hook_source" \
+  --since "$since" --timeout "${FLEET_CONFIRM_SUBMIT_TIMEOUT:-10}" >/dev/null
 entered=1
 if [[ "$output_mode" == "--json" ]]; then
   cmux read-screen --surface "$surface" --workspace "$workspace" --lines 8 >/dev/null || true

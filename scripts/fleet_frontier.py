@@ -769,6 +769,12 @@ def prepare_run(
             workspace_uuid=workspace_uuid,
             surface_uuid=surface_uuid,
         )
+        # Persist the exact composed prompt so dispatch can send a tiny
+        # single-line pointer instead of a chunkable multi-KB paste.
+        prompt = prompt_with_contract(task, run_id, hook_source=hook_source)
+        prompt_file = runs_dir / "prompts" / feature / f"{run_id}.txt"
+        prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        prompt_file.write_text(prompt, encoding="utf-8")
         ack = event_ack()
         resume = ack["resume"]
         dispatched_at = utc_now()
@@ -799,7 +805,8 @@ def prepare_run(
         return {
             **event,
             "lease": str(lease),
-            "prompt": prompt_with_contract(task, run_id, hook_source=hook_source),
+            "prompt": prompt,
+            "prompt_path": str(prompt_file),
         }
     except Exception:
         append_event(
@@ -1132,6 +1139,45 @@ def process_event(
     )
 
 
+def confirm_prompt_submission(
+    *,
+    workspace_uuid: str,
+    hook_source: str,
+    since: str,
+    timeout_seconds: float = 10.0,
+) -> int:
+    """Fail closed unless at least one UserPromptSubmit landed after dispatch.
+
+    Workspace-scoped: callers dispatch one frontier turn at a time per fleet,
+    so any matching submission after `since` confirms the physical transfer.
+    Multiple submissions stay guarded by the completion-side
+    frontier_session_binding_ambiguous check.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        count = 0
+        for event in audit_events():
+            if event.get("name") != "agent.hook.UserPromptSubmit":
+                continue
+            payload = event.get("payload") or {}
+            if payload.get("phase") != "received":
+                continue
+            if event.get("source") != hook_source or payload.get("_source") != hook_source:
+                continue
+            if str(event.get("workspace_id") or "").upper() != workspace_uuid.upper():
+                continue
+            if str(event.get("occurred_at") or "") < since:
+                continue
+            count += 1
+        if count >= 1:
+            return count
+        if time.monotonic() >= deadline:
+            raise FrontierError(
+                "no UserPromptSubmit observed after dispatch; prompt transfer unconfirmed"
+            )
+        time.sleep(0.25)
+
+
 def audit_events() -> list[dict[str, Any]]:
     configured = os.environ.get("CMUX_EVENTS_LOG")
     current = Path(configured).expanduser() if configured else Path.home() / ".cmuxterm/events.jsonl"
@@ -1332,6 +1378,11 @@ def _parser() -> argparse.ArgumentParser:
     indeterminate.add_argument("runs_dir")
     for name in ("feature", "instance", "run-id", "reason"):
         indeterminate.add_argument(f"--{name}", required=True)
+    confirm = sub.add_parser("confirm-submit")
+    confirm.add_argument("runs_dir")
+    for name in ("workspace-uuid", "hook-source", "since"):
+        confirm.add_argument(f"--{name}", required=True)
+    confirm.add_argument("--timeout", type=float, default=10.0)
     return parser
 
 
@@ -1362,6 +1413,15 @@ def main() -> int:
                 run_id=args.run_id,
                 reason=args.reason,
             )
+        elif args.command == "confirm-submit":
+            result = {
+                "confirmed_submissions": confirm_prompt_submission(
+                    workspace_uuid=args.workspace_uuid,
+                    hook_source=args.hook_source,
+                    since=args.since,
+                    timeout_seconds=args.timeout,
+                )
+            }
         else:
             result = mark_indeterminate(
                 runs_dir,

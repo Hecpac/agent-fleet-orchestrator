@@ -1388,6 +1388,83 @@ class FleetFrontierTests(unittest.TestCase):
         events = [json.loads(line) for line in ledger.read_text().splitlines()]
         self.assertEqual(events[-1]["status"], "abandoned")
 
+    def test_prepare_persists_prompt_file_for_pointer_dispatch(self) -> None:
+        lease = self.runs / "locks" / "frontier.agent.lock"
+        with mock.patch.object(fleet_frontier, "acquire_frontier", return_value=lease):
+            with mock.patch.object(
+                fleet_frontier,
+                "event_ack",
+                return_value={
+                    "boot_id": "boot-test",
+                    "resume": {"latest_seq": 42, "oldest_seq": 1},
+                },
+            ):
+                prepared = fleet_frontier.prepare_run(
+                    self.runs,
+                    feature="frontier",
+                    instance="agent",
+                    role="minimax",
+                    phase="CHALLENGE",
+                    task="line one\nline two",
+                    workspace_uuid=WORKSPACE_UUID,
+                    surface_uuid=SURFACE_UUID,
+                    provider="minimax",
+                    model="MiniMax-M3",
+                    hook_source="opencode",
+                    variant="none",
+                )
+        prompt_path = Path(prepared["prompt_path"])
+        self.assertEqual(
+            prompt_path,
+            self.runs / "prompts" / "frontier" / f"{prepared['run_id']}.txt",
+        )
+        self.assertEqual(prompt_path.read_text(encoding="utf-8"), prepared["prompt"])
+        self.assertIn(f"FLEET_RESULT:{prepared['run_id']}:<STATUS>", prepared["prompt"])
+
+    def test_confirm_submit_requires_matching_post_dispatch_submission(self) -> None:
+        def seed(occurred_at: str, source: str = "opencode", workspace: str = WORKSPACE_UUID) -> None:
+            event = {
+                "id": f"evt-{occurred_at}-{source}-{workspace[:8]}",
+                "type": "event",
+                "name": "agent.hook.UserPromptSubmit",
+                "source": source,
+                "workspace_id": workspace,
+                "occurred_at": occurred_at,
+                "seq": 7,
+                "boot_id": "boot-test",
+                "payload": {"phase": "received", "_source": source, "session_id": "ses_x"},
+            }
+            with self.events_log.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event) + "\n")
+
+        with self.assertRaisesRegex(fleet_frontier.FrontierError, "transfer unconfirmed"):
+            fleet_frontier.confirm_prompt_submission(
+                workspace_uuid=WORKSPACE_UUID,
+                hook_source="opencode",
+                since="2026-07-13T00:00:00",
+                timeout_seconds=0,
+            )
+        seed("2026-07-12T23:59:59.000Z")
+        seed("2026-07-13T00:00:01.000Z", source="codex")
+        seed("2026-07-13T00:00:01.000Z", workspace="11111111-1111-1111-1111-111111111111")
+        with self.assertRaisesRegex(fleet_frontier.FrontierError, "transfer unconfirmed"):
+            fleet_frontier.confirm_prompt_submission(
+                workspace_uuid=WORKSPACE_UUID,
+                hook_source="opencode",
+                since="2026-07-13T00:00:00",
+                timeout_seconds=0,
+            )
+        seed("2026-07-13T00:00:02.000Z")
+        self.assertEqual(
+            fleet_frontier.confirm_prompt_submission(
+                workspace_uuid=WORKSPACE_UUID,
+                hook_source="opencode",
+                since="2026-07-13T00:00:00",
+                timeout_seconds=0,
+            ),
+            1,
+        )
+
     def test_prepare_rejects_legacy_manifest_identity_before_ledger_write(self) -> None:
         with self.assertRaisesRegex(
             fleet_frontier.FrontierError, "provider, model, and hook source"

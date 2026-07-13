@@ -85,7 +85,7 @@ elif command == "rename-tab":
 elif (
     command == "send"
     and os.environ.get("CMUX_FAIL_PROTOCOL_SURFACE") == arg_value("--surface")
-    and "Fleet completion protocol" in args[-1]
+    and args[-1].startswith("FLEET_RUN ")
 ):
     raise SystemExit(1)
 elif command == "send-key" and os.environ.get("CMUX_FAIL_SEND_KEY") == "1":
@@ -168,17 +168,44 @@ class FleetUpTests(unittest.TestCase):
         self.make_executable("opencode", "#!/bin/sh\nexit 0\n")
         self.make_executable("ollama", "#!/bin/sh\nexit 0\n")
         self.make_executable("ps", "#!/bin/sh\necho codex claude opencode\n")
+        self.events_log = self.tmp / "events.jsonl"
+        self.events_log.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "id": f"seed-{source}",
+                        "type": "event",
+                        "name": "agent.hook.UserPromptSubmit",
+                        "source": source,
+                        "workspace_id": "00000000-0000-0000-0000-000000000001",
+                        "occurred_at": "2099-01-01T00:00:00.000Z",
+                        "seq": index + 1,
+                        "boot_id": "boot-test",
+                        "payload": {
+                            "phase": "received",
+                            "_source": source,
+                            "session_id": "ses_seed",
+                        },
+                    }
+                )
+                + "\n"
+                for index, source in enumerate(("codex", "opencode", "claude"))
+            ),
+            encoding="utf-8",
+        )
         self.env = os.environ.copy()
         self.env.update(
             {
                 "PATH": f"{self.bin}:{self.env['PATH']}",
                 "CMUX_STATE": str(self.state),
                 "CMUX_LOG": str(self.log),
+                "CMUX_EVENTS_LOG": str(self.events_log),
                 "FLEET_RUNS_DIR": str(self.runs),
                 "FLEET_ROUTER_PATH": str(ROUTER),
                 "FLEET_BOOT_WAIT_ATTEMPTS": "1",
                 "FLEET_BOOT_WAIT_DELAY": "0",
                 "FLEET_SEND_KEY_DELAY": "0",
+                "FLEET_CONFIRM_SUBMIT_TIMEOUT": "1",
                 "ZHIPU_API_KEY": "test-only",
             }
         )
@@ -433,7 +460,18 @@ class FleetUpTests(unittest.TestCase):
         lock = self.runs / "locks" / "frontier-send.agent.lock"
         self.assertEqual(json.loads((lock / "lease.json").read_text())["run_id"], run_id)
         sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
-        self.assertTrue(any(f"FLEET_RESULT:{run_id}:<STATUS>" in payload for payload in sends))
+        pointers = [
+            payload for payload in sends if payload.startswith(f"FLEET_RUN {run_id}: ")
+        ]
+        self.assertEqual(len(pointers), 1)
+        pointer = pointers[0]
+        self.assertNotIn("\n", pointer)
+        self.assertNotIn("\\", pointer)
+        prompt_path = Path(re.search(r"open the file (\S+) ", pointer).group(1))
+        self.assertTrue(prompt_path.is_file())
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+        self.assertIn(f"FLEET_RESULT:{run_id}:<STATUS>", prompt_text)
+        self.assertNotIn(f"FLEET_RESULT:{run_id}:<STATUS>", pointer)
 
         duplicate = subprocess.run(
             ["bash", str(FLEET_SEND), "frontier-send", "agent", "second task"],
