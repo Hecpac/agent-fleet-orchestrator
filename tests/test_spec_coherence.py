@@ -94,6 +94,15 @@ class SpecCoherenceTests(unittest.TestCase):
         self.assertIn("variant: none", checker_agent)
         self.assertNotIn("\nmodel:", reviewer)
         self.assertNotIn("\nvariant:", reviewer)
+        for hardened in (
+            "HARD OUTPUT CONTRACT",
+            "exactly one JSON object",
+            "FORBIDDEN anywhere before, between, or after",
+            "One stray visible word outside the JSON invalidates",
+            "Do not waste your token budget narrating",
+        ):
+            with self.subTest(hardened=hardened):
+                self.assertIn(hardened, checker_agent)
 
         controller = FDP2_CONTROLLER.read_text(encoding="utf-8")
         for contract in (
