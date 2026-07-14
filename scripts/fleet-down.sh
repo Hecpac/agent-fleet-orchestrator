@@ -25,6 +25,10 @@ manifest="$runs_dir/fleet-$feature.manifest"
 identity="$repo_root/scripts/fleet_identity.py"
 leases="$repo_root/scripts/fleet_leases.py"
 dialogue_controller="$repo_root/scripts/fleet_dialogue_controller.py"
+assurance_controller="$repo_root/scripts/fleet_assurance_controller.py"
+audit_client="$repo_root/scripts/fleet_audit_client.py"
+archive_client="$repo_root/scripts/fleet_archive.py"
+control_client="$repo_root/scripts/fleet_control_service.py"
 export CMUX_QUIET=1
 
 manifest_value() {
@@ -92,6 +96,16 @@ fi
 ws_ref="$(grep '^workspace=' "$manifest" | cut -d= -f2)"
 preset="$(manifest_value preset)"
 verification_receipt="${manifest%.manifest}.verification-receipt.json"
+assurance_receipt="${manifest%.manifest}.assurance-receipt.json"
+state_file="${manifest%.manifest}.state.json"
+active_phase=""
+if [[ -f "$state_file" ]]; then
+  active_phase="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("active_phase", ""))' "$state_file")"
+fi
+assurance_required=0
+if [[ "$preset" == "fleet_dialogue" && ( "$active_phase" == "CHALLENGE" || "$active_phase" == "VERIFY" ) ]]; then
+  assurance_required=1
+fi
 if [[ "$preset" == "fleet_dialogue" ]]; then
   if (( workspace_already_absent == 1 )); then
     if [[ ! -s "$verification_receipt" ]]; then
@@ -102,6 +116,22 @@ if [[ "$preset" == "fleet_dialogue" ]]; then
     python3 "$dialogue_controller" verify "$runs_dir" --feature "$feature" \
       --require-terminal --write-receipt "$verification_receipt" >/dev/null
   fi
+fi
+if (( assurance_required == 1 )); then
+  if (( workspace_already_absent == 1 )); then
+    if [[ ! -s "$assurance_receipt" ]]; then
+      echo "Refusing FDP-3 recovery: live assurance receipt is absent." >&2
+      exit 75
+    fi
+  else
+    python3 "$assurance_controller" verify "$runs_dir" --feature "$feature" \
+      --require-terminal --write-receipt "$assurance_receipt" >/dev/null
+  fi
+fi
+mission_id="$(manifest_value mission_id)"
+audit_required=0
+if [[ "$(manifest_value mode)" == "assured" && -n "$mission_id" ]]; then
+  audit_required=1
 fi
 
 # Writer worktrees must be reconciled before the fleet disappears: uncommitted
@@ -150,6 +180,35 @@ for entry in ${worktree_entries[@]+"${worktree_entries[@]}"}; do
   worktree_bases+=("$base_sha")
 done
 
+# Mission-bound fleets must freeze and verify their portable archive while the
+# writer worktree and (for assured missions) AuditService are still available.
+if [[ -n "$mission_id" && -d "$runs_dir/missions/$mission_id" ]]; then
+  mission_status="$(PYTHONPATH="$repo_root/scripts" python3 -c '
+import pathlib, sys
+import fleet_mission
+print(fleet_mission.load_state(pathlib.Path(sys.argv[1]), sys.argv[2])["status"])
+' "$runs_dir" "$mission_id")"
+  case "$mission_status" in
+    succeeded|failed|blocked|abandoned|indeterminate) ;;
+    *)
+      echo "Refusing teardown: mission $mission_id is not terminal (status=$mission_status)." >&2
+      exit 75
+      ;;
+  esac
+  control_lifecycle="$runs_dir/missions/$mission_id/control/lifecycle.json"
+  if [[ -f "$control_lifecycle" ]] && \
+      [[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("stopped_at") or "")' "$control_lifecycle")" == "" ]]; then
+    python3 "$control_client" --runs-dir "$runs_dir" --mission-id "$mission_id" stop >/dev/null
+  fi
+  mission_archive="$runs_dir/missions/$mission_id/archive"
+  python3 "$archive_client" create --runs-dir "$runs_dir" --mission-id "$mission_id" \
+    --manifest "$manifest" --output "$mission_archive" >/dev/null
+  python3 "$archive_client" verify "$mission_archive" --repo "$target_repo" >/dev/null
+fi
+if (( audit_required == 1 )); then
+  python3 "$audit_client" --runs-dir "$runs_dir" --mission-id "$mission_id" verify >/dev/null
+fi
+
 if (( workspace_already_absent == 0 )); then
   cmux close-workspace --workspace "$ws_ref" >/dev/null
 fi
@@ -159,6 +218,10 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   identity_rc=$?
   set -e
   if (( identity_rc == 1 )); then
+    if (( assurance_required == 1 )); then
+      python3 "$assurance_controller" verify "$runs_dir" --feature "$feature" \
+        --cleanup-snapshots >/dev/null
+    fi
     for ((i=0; i<${#worktree_paths[@]}; i++)); do
       instance="${worktree_instances[$i]}"
       wt="${worktree_paths[$i]}"
@@ -190,11 +253,13 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
         exit 75
       fi
     done
+    if (( audit_required == 1 )); then
+      python3 "$audit_client" --runs-dir "$runs_dir" --mission-id "$mission_id" stop >/dev/null
+    fi
     archive="$runs_dir/archive/$feature-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$archive"
     chmod 700 "$runs_dir/archive" "$archive"
     mv "$manifest" "$archive/manifest"
-    state_file="${manifest%.manifest}.state.json"
     [[ -f "$state_file" ]] && mv "$state_file" "$archive/state.json"
     ledger_file="${manifest%.manifest}.ledger.jsonl"
     [[ -f "$ledger_file" ]] && mv "$ledger_file" "$archive/ledger.jsonl"
@@ -202,9 +267,14 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     [[ -f "$dialogue_ledger" ]] && mv "$dialogue_ledger" "$archive/dialogue.jsonl"
     dialogue_control="${manifest%.manifest}.dialogue-control.jsonl"
     [[ -f "$dialogue_control" ]] && mv "$dialogue_control" "$archive/dialogue-control.jsonl"
+    assurance_control="${manifest%.manifest}.assurance-control.jsonl"
+    [[ -f "$assurance_control" ]] && mv "$assurance_control" "$archive/assurance-control.jsonl"
     [[ -f "$verification_receipt" ]] && mv "$verification_receipt" "$archive/verification-receipt.json"
+    [[ -f "$assurance_receipt" ]] && mv "$assurance_receipt" "$archive/assurance-receipt.json"
     dialogue_store="$runs_dir/dialogue/$feature"
     [[ -d "$dialogue_store" ]] && mv "$dialogue_store" "$archive/dialogue"
+    assurance_store="$runs_dir/assurance/$feature"
+    [[ -d "$assurance_store" ]] && mv "$assurance_store" "$archive/assurance"
     echo "closed $ws_ref (fleet-$feature)"
     exit 0
   fi

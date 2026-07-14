@@ -83,6 +83,15 @@ agentes. Cada práctica de abajo tiene un incidente o evidencia detrás.
     candidato, nunca una verdad verificada.
 18. **Teardown reconciliado.** Rechaza leases activos, confirma que el UUID ya
     desapareció y archiva manifest/state/ledger en vez de borrarlos.
+19. **Autonomía proporcional.** `just dan` entrega la misión completa al lead y
+    abre todas las fases del roster; no exige `advance` ni aprobación rutinaria.
+    El lead escala únicamente efectos externos, riesgo alto o decisiones de
+    negocio ausentes. `fleet_dialogue` conserva los gates para esos casos.
+20. **Roster disponible ≠ roster usado.** El lead decide qué panes aportan valor.
+    Arrancar capacidad visible no obliga a gastar tokens en cada agente.
+21. **Colaboración por resultados rastreados.** Comparte `result_file` y `run_id`
+    en un turno posterior; no inyectes un segundo prompt crudo en un agente con
+    run activo, porque destruye la atribución de completion.
 
 ## Antipatrones
 
@@ -92,3 +101,5 @@ agentes. Cada práctica de abajo tiene un incidente o evidencia detrás.
 - Sleeps calibrados a mano en lugar de eventos.
 - Un workspace eterno con misiones mezcladas.
 - Confiar el merge/deploy al fleet sin gate humano.
+- Convertir al humano o a CONTROL en un stepper de acciones rutinarias.
+- Ejecutar el pipeline completo cuando el lead ya tiene evidencia suficiente.

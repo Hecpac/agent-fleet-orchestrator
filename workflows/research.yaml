@@ -1,11 +1,31 @@
-name: research-team
-description: Resolve the canonical research roster from orchestration/router.yaml.
-preset: research
-router: orchestration/router.yaml
-
-success_criteria:
-  - claims are separated from assumptions
-  - sources or evidence are listed
-  - unresolved questions are explicit
-
-timeout_minutes: 20
+{
+  "schema_version": 1,
+  "name": "research",
+  "description": "Parallel evidence gathering with a heterogeneous challenge",
+  "preset": "research",
+  "autonomy": {
+    "owner": "lead",
+    "allow_parallel": true,
+    "allow_subdelegation": true,
+    "max_delegation_depth": 2
+  },
+  "capabilities": {
+    "available": ["recon", "challenge"],
+    "required_outcomes": ["lead_result"],
+    "writer": "none"
+  },
+  "risk": {"minimum": "low", "allow_lead_escalation": true, "high_action": "confirm_assured"},
+  "assurance": {
+    "profile": "proportional",
+    "preset": "fleet_dialogue",
+    "minimum_gates": ["fdp2", "human_build_exit", "fdp3"]
+  },
+  "audit": {"mode": "signed", "worm_required_for": ["private_data", "regulated"]},
+  "archive": {
+    "mode": "incremental",
+    "content_policy": "redacted",
+    "include_final_tree": false,
+    "include_git_delta": false
+  },
+  "limits": {"deadline_seconds": 3600, "token_budget": 0, "budget_mode": "soft"}
+}

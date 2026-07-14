@@ -119,7 +119,7 @@
       "provider": "anthropic",
       "model": "claude-fable-5",
       "hook_source": "claude",
-      "command": ["claude", "--model", "claude-fable-5"],
+      "command": ["claude", "--model", "claude-fable-5", "--no-chrome"],
       "healthcheck": ["claude", "auth", "status"],
       "ready_pattern": "^[[:space:]]*❯[[:space:]]*$|new task\\?",
       "enabled": true,
@@ -254,6 +254,17 @@
     }
   },
   "presets": {
+    "dan": {
+      "description": "Dan+ autonomous visible team: one lead dynamically delegates to heterogeneous specialists and owns synthesis.",
+      "mode": "autonomous",
+      "include_lead": true,
+      "instances": [
+        {"instance_id": "scout", "role_type": "codex_candidate", "display_rank": 20, "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read"]},
+        {"instance_id": "builder", "role_type": "codex"},
+        {"instance_id": "challenger", "role_type": "glm"},
+        {"instance_id": "verifier", "role_type": "claude_reviewer"}
+      ]
+    },
     "small": {
       "description": "One frontier lead for a bounded sequential task.",
       "include_lead": true,
@@ -287,6 +298,7 @@
     },
     "fleet_dialogue": {
       "description": "Bounded CONTROL-stepped Maker/Checker dialogue followed by independent challenge and verification.",
+      "mode": "assured",
       "include_lead": true,
       "instances": [
         {"instance_id": "maker", "role_type": "codex"},

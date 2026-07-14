@@ -84,7 +84,20 @@ DO IT YOURSELF (delegating is waste):
 Always: workers generate, YOU verify claims against source before adopting
 them (small models mark DONE optimistically), and you own the synthesis.
 
-Boot a team from the capability router. The default `small` preset creates a
+For an end-to-end open mission, prefer Dan+:
+
+```bash
+just dan <feature> "<complete objective>" --target-repo <repo>
+```
+
+This boots the `dan` preset in `autonomous` mode and gives the full mission to
+the lead. The lead chooses specialists, dispatches independent work before
+waiting, cross-feeds durable results, verifies proportionally, and returns one
+exact tracked result. Routine work needs no phase advance or human approval.
+Use `fleet_dialogue` when production, money, secrets, destructive actions, or a
+known high-risk boundary requires the assured FDP-2/FDP-3 path.
+
+For lower-level/manual operation, boot a team from the capability router. The default `small` preset creates a
 Codex lead; Claude is an enabled fallback candidate (`first_available` walks
 `lead.candidates` in order). Panes render by rank: CONTROL → RECON → BUILD → CHALLENGE → VERIFY.
 
@@ -105,10 +118,16 @@ An `instance_id` is addressable in the manifest and points to a reusable
 and the supported wrappers now enforce important parts of them: interactive
 agents inherit an environment allowlist; advisory Codex runs read-only;
 OpenCode challengers and Claude verification use plan/read-only modes; local
-dispatch uses instance/heavy leases. Direct manual `cmux send` remains an
-emergency bypass, so keep one writer and use `fleet-send.sh` normally.
+dispatch uses instance/heavy leases. Direct manual `cmux send` can change the
+visible pane but cannot bind a contract-v2 tracked run; keep one writer and use
+`fleet-send.sh` for every authoritative turn.
 The CONTROL lead alone uses `danger-full-access` so it can reach the cmux Unix
 socket; its environment is still allowlisted.
+Mission-bound read-only Codex specialists use an ephemeral Codex home with a
+named profile that extends `:read-only` and permits only the mission's exact
+Fleet Control socket. Existing authentication is copied and CMUX hooks are
+installed through a fixed controller-owned bridge; unrelated hook commands and
+broad controller sandbox settings are not copied.
 Pass `--target-repo <path>` to `fleet-up` and each write-authority instance
 gets a dedicated `fleet/<feature>/<instance>` branch and worktree at the target
 repo's current `HEAD`. Existing branches fail closed; teardown removes only an
@@ -133,8 +152,10 @@ Roles come in two kinds:
   `minimax` (opencode -m minimax/MiniMax-M3, needs `MINIMAX_API_KEY`),
   `glm` (opencode -m zai/glm-5.2, needs `ZHIPU_API_KEY`).
 
-Fleet Codex roles use the official hooks and authentication from `~/.codex`,
-but the router pins `gpt-5.6-sol`; personal model defaults are not inherited.
+Unbound Fleet Codex roles use the official hooks and authentication from
+`~/.codex`; mission-bound read-only specialists use the filtered ephemeral
+home above. The router pins `gpt-5.6-sol`; personal model defaults are not
+inherited.
 
 Frontier panes are interactive agents: after sending a prompt, wait for their
 hook event and then `read-screen`. `fleet-up` preflights executables, keys,
@@ -142,6 +163,11 @@ models, and lead health before creating the workspace; an unavailable member
 fails closed instead of leaving a shell that can mistake a prompt for a command.
 
 `fleet-up.sh` writes `orchestration/runs/fleet-<feature>.manifest`:
+
+- `manifest_contract_version=2`, `execution_profile`, and
+  `tracking_protocol=control-v1` describe enforcement without changing the
+  router's declared capabilities. Legacy manifests normalize to `native` plus
+  `legacy-cmux` and may be inspected/migrated with `fleet_manifest.py`.
 
 ```
 schema_version=3
@@ -195,7 +221,8 @@ cmux read-screen --surface <its surface> --workspace <ws> --lines 50
 `result_file`; pass `--json` for canonical JSONL. Exit codes are 0 succeeded,
 1 failed, 2 usage/identity/protocol, 3 blocked, 4 abandoned, 5 indeterminate,
 and 124 deadline. Every local or frontier instance requires `--run`. Frontier
-`UserPromptSubmit` binds session/surface; completed Stop only wakes exact
+CONTROL authorizes one exact `UserPromptSubmit` event ID/boot/sequence before
+it can bind session/surface; completed Stop only wakes exact
 `FLEET_RESULT:<run_id>:<STATUS>` verification. Missing or ambiguous evidence is
 indeterminate, never success. The sentinel must be the final non-empty line and
 the Stop must follow the single bound submit. A replay gap attempts catch-up
@@ -254,8 +281,10 @@ available for inspection and teardown.
 ### Fleet etiquette
 
 - One workspace per team/feature; never mix teams in one workspace.
-- Communication is flat: any pane may `cmux send` to any other pane, but keep
-  synthesis/decisions in the lead.
+- In `autonomous` mode, collaboration is lateral but tracked: route a worker's
+  exact durable result to any peer in a later `fleet-send` turn. Never inject a
+  raw second prompt into a pane with an active run. In `assured` mode, CONTROL
+  mediates the fixed dialogue protocol.
 - On finishing a major task, emit `cmux notify --title "fleet-<feature>" --body
   "<result>"` so the human sees it without watching.
 - Tear down with `just fleet-down <feature>` when work is merged/abandoned.

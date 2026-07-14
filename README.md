@@ -77,6 +77,80 @@ Terminal orchestration is wired through the cmux CLI. The canonical roster,
 capabilities, launch commands, display ranks, limits, and presets live in
 `orchestration/router.yaml` (JSON-compatible YAML, parsed with Python stdlib).
 
+### Mission Control (canonical entry point)
+
+Mission Control compiles a typed workflow, creates a durable `mission_id`,
+boots the visible fleet, lets the Lead choose its delegation graph, pauses
+before high/unknown-risk effects, archives the evidence, and can resume without
+replaying an acknowledged effect:
+
+```bash
+just mission <feature> "<complete objective>" \
+  --workflow implementation --target-repo <repo> --teardown
+just mission-dry <feature> "<objective>" --workflow implementation --target-repo <repo>
+just mission-show <mission_id>
+just mission-resume <mission_id>
+just mission-approve <mission_id> <target-repo> --idempotency-key <key>
+```
+
+`--execution-profile native` is the default and preserves the current provider
+tools. `sandboxed` moves temporary/cache/runtime state inside the worker's
+private ephemeral home and declares provider-managed network perimeter without
+changing router `tool_access`. `regulated` adds CONTROL-only effect policy and
+requires a mission identity. Select either strict profile explicitly:
+
+```bash
+just mission <feature> "<objective>" --execution-profile sandboxed --target-repo <repo>
+```
+
+Fresh manifests use `manifest_contract_version=2` and
+`tracking_protocol=control-v1`. Legacy manifests are read as `native` plus
+`legacy-cmux`; migration never invents stronger provenance for an already-live
+fleet:
+
+```bash
+just manifest-inspect orchestration/runs/fleet-<feature>.manifest
+just manifest-migrate orchestration/runs/fleet-<feature>.manifest --in-place
+```
+
+### Dan+ autonomous mode (recommended product path)
+
+Dan+ keeps Dan's visible, programmable fleet but removes routine phase driving.
+One command boots a heterogeneous team, gives the complete mission to the lead,
+lets that lead choose the task graph, and waits for its exact durable result:
+
+```bash
+just dan <feature> "<complete objective>" --target-repo <repo>
+```
+
+The `dan` preset creates a visible CONTROL lead plus `scout`, `builder`,
+`challenger`, and `verifier` panes. It is `mode=autonomous`: every roster phase
+is dispatchable without `advance` or routine human approval. The lead decides
+which specialists are useful, dispatches independent runs before waiting,
+cross-feeds durable results when another perspective is valuable, verifies in
+proportion to risk, and reports the writer branch/HEAD. A successful mission is
+still bound to an exact lead `run_id`, provider/model evidence, and durable
+`result_file`; autonomy does not fall back to screen scraping.
+
+`fleet-run.py` leaves the workspace visible by default. Add `--teardown` only
+when you want automatic cleanup. It refuses a dirty target checkout unless
+`--allow-dirty-baseline` explicitly acknowledges that writer worktrees start
+from committed `HEAD`. Preview the exact lead mission without CMUX effects:
+
+```bash
+just dan-dry <feature> "<objective>" --target-repo <repo>
+```
+
+Execution modes are intentionally separate:
+
+| Mode | Entry point | Control owner | Use for |
+|---|---|---|---|
+| `autonomous` | `just dan` | Lead LLM dynamically decides/delegates | open-ended coding, research, diagnosis |
+| `guided` | `just fleet[-preset]` | Operator/lead advances explicit phases | manual experiments and narrow workflows |
+| `assured` | preset `fleet_dialogue` | FDP-2/FDP-3 state machines + human BUILD exit | production, money, secrets, destructive or high-risk work |
+
+The design rationale and source research live in `docs/dan-plus.md`.
+
 Boot a team:
 
 ```bash
@@ -99,23 +173,31 @@ Panes are ordered by capability rank rather than argument accident:
 `role_type`, so `triage_scope=triage triage_sources=triage` is valid and each
 worker remains independently addressable.
 
-Current enforcement boundary: `authority`, `tool_access`, and resource classes
-are validated declarations that the supported wrappers now enforce. Every
+Current enforcement boundary: `authority`, `tool_access`, resource classes,
+execution profile, and tracked-input protocol are validated contracts. Every
 consumer (`fleet-send`, `fleet-dispatch`, `fleet-wait`, `fleet-race`,
 `fleet-down`) validates durable UUIDs before acting; dispatch acquires
 instance/heavy/slot leases so local concurrency limits hold at runtime;
 interactive agents launch through an environment allowlist
 (`run-interactive-agent.sh`), with per-authority Codex sandbox levels
-(writer → `workspace-write`, non-writer → `read-only`, CONTROL alone →
-`danger-full-access` to reach the cmux socket). What remains out of scope:
-OS-level process sandboxing. Direct manual `cmux send` bypasses the wrappers,
-so keep one writer and use the scripts. `fleet-race` returns the first
-successful completion as a candidate; it is not an acceptance gate.
+(writer → `workspace-write`, CONTROL → `danger-full-access`). Mission-bound
+read-only Codex specialists use an ephemeral Codex home and a named permission
+profile that extends `:read-only` while allowing only the mission's exact Fleet
+Control Unix socket. Existing Codex authentication is copied into it; hook
+commands come from a fixed controller-owned CMUX bridge, never arbitrary user
+hook text. Optional strict profiles narrow process-owned runtime paths; a
+general OS/network sandbox remains provider- and
+platform-specific. Direct manual `cmux send` may change a visible pane, but it
+cannot create or bind a `control-v1` tracked result: CONTROL must durably
+authorize the exact `UserPromptSubmit` event first. `fleet-race` returns the
+first successful completion as a candidate; it is not an acceptance gate.
 
 Write isolation: pass `--target-repo <path>` (or set `FLEET_TARGET_REPO`) to
 `fleet-up` and every write-authority instance gets a dedicated
 `fleet/<feature>/<instance>` branch and worktree, based on the target repo's
-current `HEAD`. Existing branch names fail closed. `fleet-down` refuses
+current `HEAD`. Writer worktrees live under `/tmp/fleet_workspaces` by default
+(override with `FLEET_WORKTREES_DIR`) so agent-visible paths do not disclose the
+controller's home directory. Existing branch names fail closed. `fleet-down` refuses
 uncommitted changes, records the final SHA, preserves branches with commits,
 and removes branches that never advanced beyond their base SHA.
 
@@ -127,9 +209,11 @@ already-concurrent runs may overshoot it. `fleet-wait` fires a `cmux notify`
 escalation (title `ESCALATION: ...`) naming the stuck instances when its
 deadline expires.
 
-Human-in-the-loop: advancing the durable phase gate out of BUILD requires
-`--approved-by <human>` in addition to `--evidence`; the approver is recorded
-in the state history.
+Human-in-the-loop: in `guided` and `assured` modes, advancing the durable phase
+gate out of BUILD requires `--approved-by <human>` in addition to `--evidence`;
+the approver is recorded in the state history. `autonomous` fleets do not need
+phase advances: all manifest instances are dispatchable, and the lead escalates
+only risk-significant decisions defined by the Dan+ mission contract.
 
 `scripts/fleet-up.sh` resolves and validates the complete plan before touching
 cmux, creates workspace `fleet-<feature>`, verifies the rendered pane order,
@@ -144,7 +228,8 @@ with age — check it whenever you return to the machine.
 Coordination is event-driven, not polled: both `fleet-dispatch` and `fleet-send`
 return a durable `run_id`; pass every one back as `--run instance=run_id` to
 `fleet-wait`. Local notifications are wake-ups only. Frontier
-`UserPromptSubmit` binds the exact session/surface and a completed `Stop` only
+CONTROL first authorizes one exact `UserPromptSubmit` event ID/boot/sequence;
+only that event may bind the exact session/surface, and a completed `Stop` only
 wakes verification of the run-specific `FLEET_RESULT` sentinel; Stop by itself
 is never success. The sentinel must be the final non-empty line and the Stop
 must follow the single bound submit. Replay is boot-scoped, and gaps attempt
@@ -161,9 +246,11 @@ Catch-up requires the recorded baseline and continuous boot-scoped audit
 sequence; truncated or corrupt audit evidence is rejected. Event ACKs are
 schema-validated before readiness is published.
 Local and frontier dispatch leases are owner-checked; frontier exclusivity is
-enforced by surface UUID across manifest aliases. Fleet Codex workers use the
-default `~/.codex` configuration so cmux's official hooks remain active, while
-the router pins `gpt-5.6-sol` independently of the user's configured model.
+enforced by surface UUID across manifest aliases. Unbound Fleet Codex workers
+use the default `~/.codex` configuration so cmux's official hooks remain active;
+mission-bound read-only specialists use the filtered ephemeral configuration
+described above. The router pins `gpt-5.6-sol` independently of the user's
+configured model.
 Teardown publishes an atomic closing owner so new dispatches cannot enter
 after its lease check.
 If a hard-killed runner leaves leases while its pane is still alive, automatic
@@ -178,7 +265,41 @@ interrupts retain the lease under the same rule.
 `fleet-send` and `fleet-dispatch` accept `--json` for callers such as
 `fleet-race`; machine ownership never depends on parsing human-readable output.
 
-Fleet dialogue is durable and mediated by CONTROL. It does not let workers send
+Mission-bound fleets also expose a private Unix Fleet Control socket. The
+kernel-authenticated peer UID is checked for every connection. Operational MCP
+requests additionally require the exact Lead run identity or a specialist run
+plus its ledger-bound capability token; specialists cannot call `complete`,
+cancel arbitrary work, escape capability scope, or subdelegate to the writer.
+CONTROL preassigns and token-binds a specialist `run_id` before transferring its
+prompt, so a fast tool call cannot race delegation registration. OpenCode result
+extraction tolerates only a bounded database-visibility delay and otherwise
+fails closed.
+The service is reconciled across Mission runner restarts and stopped before
+teardown. Health and lifecycle commands are:
+
+```bash
+just mission-control-health <mission_id>
+just mission-control-start <mission_id>   # idempotent recovery
+just mission-control-stop <mission_id>
+```
+
+After completion, `just mission-report <mission_id>`,
+`just mission-trace <mission_id>`, and
+`just mission-archive-verify <archive>` read durable evidence only. Reports and
+exporters never decide completion. Assured workflows require
+signed audit; a workflow declaring WORM fails closed unless a real S3 Object
+Lock COMPLIANCE sink supplies versioned, verifiable anchor receipts.
+Use `--workflow regulated --execution-profile regulated` for that path; its
+backend configuration is preflighted before any CMUX fleet is created.
+If a workflow declares `credentials` or `private_data` and requests a `full`
+archive, CONTROL must first record a separate, scoped, expiring approval:
+
+```bash
+just mission-approve-archive <mission_id> <target-repo> \
+  --idempotency-key <unique-archive-approval-key>
+```
+
+In the `assured` `fleet_dialogue` preset, dialogue is durable and mediated by CONTROL. It does not let workers send
 direct peer traffic and publishing a message never dispatches the recipient.
 Only the byte-exact `result_file` of an exact terminal `succeeded` run can be
 published; the command copies at most 1 MiB into a SHA-256-addressed payload
@@ -281,6 +402,54 @@ python3 scripts/fleet_state.py advance \
 live verification receipt and archives the control hash chain, task spec,
 prompts, FDP-1 ledger, and payloads. The archive remains independently
 verifiable with `fleet_dialogue_controller.py verify --archive <archive>`.
+
+### FDP-3 sequential assurance
+
+After FDP-2 reaches `accepted` and a human advances BUILD to CHALLENGE, FDP-3
+runs one independent GLM challenge followed by one Claude verification. It has
+its own hash-chained controller ledger and never reopens Maker automatically.
+Start it only from the exact clean FDP-2 accepted HEAD:
+
+```bash
+python3 scripts/fleet_assurance_controller.py start orchestration/runs \
+  --feature <feature> --idempotency-key <stable-start-key>
+```
+
+Start copies and hashes the FDP-2 task spec, bound messages, and lifecycle
+context, then creates separate detached worktrees for GLM and Claude at the
+accepted commit. Both roles remain read-only. As in FDP-2, CONTROL executes
+each returned action explicitly:
+
+- `action=dispatch`: send the exact `prompt_file` to the named instance, wait
+  for the exact `run_id`, then use `step --run-id`.
+- `action=publish`: relay the exact result with `fleet_dialogue.py publish`,
+  then use `step --message-id`.
+- `action=advance_phase`: advance CHALLENGE to VERIFY with the returned exact
+  `evidence` hash, then acknowledge it with `step --phase-advanced`.
+- `action=terminal`: stop. Terminal assurance is immutable.
+
+```bash
+python3 scripts/fleet_state.py advance \
+  orchestration/runs/fleet-<feature>.manifest VERIFY \
+  --evidence <fdp3-control-head>
+python3 scripts/fleet_assurance_controller.py step orchestration/runs \
+  --feature <feature> --phase-advanced --idempotency-key <stable-key>
+```
+
+GLM returns findings only. Claude must independently adjudicate every GLM
+finding and returns exactly `VERIFIED` or `REJECTED`; malformed JSON, identity
+drift, a 30-minute run timeout, or the two-hour absolute deadline closes
+fail-closed. There are no retries or provider fallbacks.
+
+`fleet-down` requires terminal FDP-3 whenever the fleet reached CHALLENGE or
+VERIFY. It writes a separate assurance receipt, refuses dirty or drifted
+snapshots, removes only clean exact detached worktrees, and archives the copied
+context, prompts, lifecycle, messages, and both control ledgers. Verify that
+archive offline with:
+
+```bash
+python3 scripts/fleet_assurance_controller.py verify --archive <archive>
+```
 
 The orchestration playbook (mental model, verbs, wait rules, memory budget)
 lives in both `.agents/skills/cmux/SKILL.md` and `.claude/skills/cmux/SKILL.md`;

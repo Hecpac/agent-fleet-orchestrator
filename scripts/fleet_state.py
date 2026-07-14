@@ -85,6 +85,9 @@ def main() -> int:
         if not phase:
             print(f"unknown instance phase: {instance}", file=sys.stderr)
             return 2
+        if manifest.get("mode", "guided") == "autonomous":
+            print(f"autonomous mode open: {instance} ({phase})")
+            return 0
         if phase != "CONTROL" and phase != state["active_phase"]:
             print(
                 f"phase gate closed: {instance} is {phase}, active phase is {state['active_phase']}",
@@ -108,7 +111,7 @@ def main() -> int:
     if not args.evidence:
         print("phase transition requires --evidence <path|sha|gate-id>", file=sys.stderr)
         return 2
-    if current == "BUILD" and not args.approved_by:
+    if current == "BUILD" and manifest.get("mode", "guided") != "autonomous" and not args.approved_by:
         print(
             "leaving BUILD requires --approved-by <human>: "
             "a person signs off on the writer's diff before it becomes a candidate",
@@ -122,6 +125,19 @@ def main() -> int:
             accepted_build_gate(manifest_path.parent, manifest.get("feature", ""), manifest)
         except ControllerError as exc:
             print(f"FDP-2 BUILD gate closed: {exc}", file=sys.stderr)
+            return 3
+    if current == "CHALLENGE" and manifest.get("preset") == "fleet_dialogue":
+        try:
+            from fleet_assurance_controller import AssuranceError, challenge_phase_gate
+
+            challenge_phase_gate(
+                manifest_path.parent,
+                manifest.get("feature", ""),
+                manifest,
+                args.evidence,
+            )
+        except AssuranceError as exc:
+            print(f"FDP-3 CHALLENGE gate closed: {exc}", file=sys.stderr)
             return 3
     state["active_phase"] = requested
     entry = {

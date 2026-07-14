@@ -4,6 +4,20 @@ set -euo pipefail
 # Launch an interactive agent with an explicit environment allowlist.
 # Secrets are inherited only when the role declares them in requires_env.
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+controller_home="${HOME:?HOME must be set by CONTROL}"
+controller_user="${USER:-fleet_controller}"
+controller_user_sha256="$(printf '%s' "$controller_user" | shasum -a 256 | awk '{print $1}')"
+execution_profile="${FLEET_EXECUTION_PROFILE:-native}"
+
+case "$execution_profile" in
+  native|sandboxed|regulated) ;;
+  *)
+    echo "Unsupported FLEET_EXECUTION_PROFILE: $execution_profile" >&2
+    exit 2
+    ;;
+esac
+
 role_type="${1:-}"
 authority="${2:-}"
 required_csv="${3:-}"
@@ -14,22 +28,171 @@ if [[ -z "$role_type" || -z "$authority" || $# -eq 0 ]]; then
   exit 2
 fi
 
+isolated_home="$(mktemp -d /tmp/fleet_home.XXXXXX)"
+chmod 700 "$isolated_home"
+umask 077
+process_home="$isolated_home"
+process_user="fleet_worker"
+process_logname="fleet_worker"
+effective_model=""
+command_args=("$@")
+for ((index=0; index<${#command_args[@]}; index++)); do
+  if [[ "${command_args[$index]}" == "--model" && $((index + 1)) -lt ${#command_args[@]} ]]; then
+    effective_model="${command_args[$((index + 1))]}"
+    break
+  fi
+done
+cleanup() {
+  rm -rf -- "$isolated_home"
+}
+trap cleanup EXIT HUP INT TERM
+
 keep=()
-for name in HOME PATH USER LOGNAME SHELL TERM COLORTERM LANG LC_ALL LC_CTYPE TMPDIR \
+for name in PATH SHELL TERM COLORTERM LANG LC_ALL LC_CTYPE TMPDIR \
   CLAUDE_CODE_NO_FLICKER HOMEBREW_PREFIX HOMEBREW_CELLAR HOMEBREW_REPOSITORY \
-  FLEET_RUNS_DIR; do
+  FLEET_RUNS_DIR FLEET_MISSION_ID FLEET_CONTROL_SOCKET; do
   if [[ -n "${!name:-}" ]]; then
     keep+=("$name=${!name}")
   fi
 done
 
-# Fleet Codex workers must use the default ~/.codex configuration where cmux
-# installs its official hooks. Other interactive providers keep the caller's
-# CODEX_HOME unchanged for backward compatibility.
+keep+=(
+  "FLEET_HOME=$isolated_home"
+  "FLEET_EXECUTION_PROFILE=$execution_profile"
+  "FLEET_HUMAN_UID=sha256:$controller_user_sha256"
+  "CMUX_HOOK_DIR=${CMUX_HOOK_DIR:-$controller_home/.cmuxterm}"
+  "CMUX_EVENTS_LOG=${CMUX_EVENTS_LOG:-$controller_home/.cmuxterm/events.jsonl}"
+  "GIT_AUTHOR_NAME=FleetMaker"
+  "GIT_AUTHOR_EMAIL=maker@fleet.local"
+  "GIT_COMMITTER_NAME=FleetMaker"
+  "GIT_COMMITTER_EMAIL=maker@fleet.local"
+)
+[[ -z "$effective_model" ]] || keep+=("LLM_MODEL=$effective_model")
+
+# Strict profiles narrow process-owned temporary/cache state without editing
+# the router's declared tool_access. Provider sandboxes continue to enforce the
+# role-specific read/write authority selected by the compiled roster.
+if [[ "$execution_profile" != "native" ]]; then
+  mkdir -p "$isolated_home/tmp" "$isolated_home/cache" "$isolated_home/runtime"
+  chmod 700 "$isolated_home/tmp" "$isolated_home/cache" "$isolated_home/runtime"
+  keep+=(
+    "TMPDIR=$isolated_home/tmp"
+    "XDG_CACHE_HOME=$isolated_home/cache"
+    "XDG_RUNTIME_DIR=$isolated_home/runtime"
+    "FLEET_FILESYSTEM_PERIMETER=isolated-runtime"
+    "FLEET_NETWORK_PERIMETER=provider-managed"
+  )
+fi
+if [[ "$execution_profile" == "regulated" ]]; then
+  [[ -n "${FLEET_MISSION_ID:-}" ]] || {
+    echo "regulated execution requires FLEET_MISSION_ID" >&2
+    exit 2
+  }
+  keep+=(
+    "FLEET_MISSION_ID=$FLEET_MISSION_ID"
+    "FLEET_EFFECT_POLICY=control-only"
+  )
+fi
+
+# Provider configuration is explicit: HOME never grants implicit access to
+# CONTROL's dotfiles. Claude receives a minimal hardened configuration and an
+# tool environment; Claude's CLI bootstrap is handled explicitly below. Codex
+# and OpenCode retain only the roots their existing hooks/databases require.
 case "$role_type" in
-  codex|codex_candidate) ;;
-  *) [[ -n "${CODEX_HOME:-}" ]] && keep+=("CODEX_HOME=$CODEX_HOME") ;;
+  claude|claude_reviewer)
+    claude_config="$isolated_home/.claude"
+    mkdir -p "$claude_config"
+    chmod 700 "$claude_config"
+    command -v jq >/dev/null 2>&1 || {
+      echo "jq is required to provision isolated Claude settings" >&2
+      exit 2
+    }
+    jq --arg home "$isolated_home" '
+      .env = ((.env // {}) + {
+        HOME: $home,
+        USER: "fleet_worker",
+        LOGNAME: "fleet_worker",
+        GIT_AUTHOR_NAME: "FleetMaker",
+        GIT_AUTHOR_EMAIL: "maker@fleet.local",
+        GIT_COMMITTER_NAME: "FleetMaker",
+        GIT_COMMITTER_EMAIL: "maker@fleet.local"
+      }) |
+      .permissions.deny += [
+        ("Edit(/" + $home + "/.claude/**)"),
+        ("Write(/" + $home + "/.claude/**)")
+      ] |
+      .sandbox.filesystem.denyWrite += [($home + "/.claude")]
+    ' "$repo_root/orchestration/claude-fleet-settings.json" > "$claude_config/settings.json"
+    chmod 600 "$claude_config/settings.json"
+    jq -n '{mcpServers: {}}' > "$claude_config/mcp.json"
+    chmod 600 "$claude_config/mcp.json"
+    # Claude OAuth is stored in the macOS Keychain under the controller USER
+    # and HOME. Keep those values only for CLI bootstrap; the additional
+    # settings above replace them for the session and all tool subprocesses.
+    process_home="$controller_home"
+    process_user="$controller_user"
+    process_logname="${LOGNAME:-$controller_user}"
+    if [[ "$(basename "$1")" == "claude" ]]; then
+      set -- "$1" --setting-sources "" --settings "$claude_config/settings.json" \
+        --strict-mcp-config --mcp-config "$claude_config/mcp.json" "${@:2}"
+    fi
+    ;;
+  codex|codex_candidate)
+    controller_codex_home="${CODEX_HOME:-$controller_home/.codex}"
+    if [[ -n "${FLEET_MISSION_ID:-}" && -n "${FLEET_CONTROL_SOCKET:-}" \
+      && "$authority" != "write" && "$authority" != "control" ]]; then
+      # A controller config may still declare legacy sandbox_mode, which takes
+      # precedence over permission profiles. Use an ephemeral Codex home for
+      # mission specialists and copy authentication plus the existing trusted
+      # hook contract, but not the controller's general config, so the
+      # fleet_control least-privilege profile selected by fleet-up is actually
+      # enforceable and CMUX can still bind UserPromptSubmit/Stop evidence.
+      [[ -f "$controller_codex_home/auth.json" ]] || {
+        echo "Mission-bound Codex specialist requires $controller_codex_home/auth.json" >&2
+        exit 2
+      }
+      specialist_codex_home="$isolated_home/.codex"
+      mkdir -p "$specialist_codex_home"
+      chmod 700 "$specialist_codex_home"
+      cp "$controller_codex_home/auth.json" "$specialist_codex_home/auth.json"
+      chmod 600 "$specialist_codex_home/auth.json"
+      hook_bridge="$(printf '%q' "$repo_root/scripts/cmux-codex-hook.sh")"
+      jq -n --arg bridge "$hook_bridge" '
+        def binding($event): [{
+          hooks: [{
+            type: "command",
+            command: ("/bin/bash " + $bridge + " " + $event)
+          }]
+        }];
+        {hooks: {
+          SessionStart: binding("SessionStart"),
+          UserPromptSubmit: binding("UserPromptSubmit"),
+          Stop: binding("Stop")
+        }}
+      ' > "$specialist_codex_home/hooks.json"
+      chmod 600 "$specialist_codex_home/hooks.json"
+      printf '[features]\nhooks = true\n' > "$specialist_codex_home/config.toml"
+      chmod 600 "$specialist_codex_home/config.toml"
+      keep+=("CODEX_HOME=$specialist_codex_home")
+    else
+      keep+=("CODEX_HOME=$controller_codex_home")
+    fi
+    ;;
+  glm|minimax|minimax_checker)
+    [[ -d "$controller_home/.config" ]] && keep+=("XDG_CONFIG_HOME=$controller_home/.config")
+    [[ -d "$controller_home/.local/share" ]] && keep+=("XDG_DATA_HOME=$controller_home/.local/share")
+    [[ -d "$controller_home/.local/state" ]] && keep+=("XDG_STATE_HOME=$controller_home/.local/state")
+    ;;
+  *)
+    [[ -n "${CODEX_HOME:-}" ]] && keep+=("CODEX_HOME=$CODEX_HOME")
+    ;;
 esac
+
+keep+=(
+  "HOME=$process_home"
+  "USER=$process_user"
+  "LOGNAME=$process_logname"
+)
 
 # Preserve only the observed cmux identity/hook variables. Future CMUX-prefixed
 # values are not inherited automatically.
@@ -44,14 +207,16 @@ for name in CMUX_BUNDLE_ID CMUX_BUNDLED_CLI_PATH CMUX_CLAUDE_WRAPPER_SHIM \
   fi
 done
 
-if [[ "$authority" == "control" || "$authority" == "write" ]]; then
-  [[ -n "${SSH_AUTH_SOCK:-}" ]] && keep+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
-fi
-
 if [[ -n "$required_csv" && "$required_csv" != "-" ]]; then
   old_ifs="$IFS"
   IFS=','
   for name in $required_csv; do
+    case "$name" in
+      SSH_AUTH_SOCK|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|AWS_PROFILE|AWS_SHARED_CREDENTIALS_FILE|AWS_CONFIG_FILE|ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|OPENAI_API_KEY|GITHUB_TOKEN|GH_TOKEN)
+        echo "Forbidden credential variable for isolated role $role_type: $name" >&2
+        exit 2
+        ;;
+    esac
     if [[ -z "${!name:-}" ]]; then
       echo "Missing required environment variable for $role_type: $name" >&2
       exit 2
@@ -61,4 +226,8 @@ if [[ -n "$required_csv" && "$required_csv" != "-" ]]; then
   IFS="$old_ifs"
 fi
 
-exec /usr/bin/env -i "${keep[@]}" "$@"
+set +e
+/usr/bin/env -i "${keep[@]}" "$@"
+rc=$?
+set -e
+exit "$rc"

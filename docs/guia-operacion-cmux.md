@@ -21,11 +21,25 @@ pendiente, no de los agentes. Cierra workspaces zombis que ya no tengan misión
 
 - **"Haz esto"** (tarea acotada, secuencial, verificable con un test) →
   sesión normal de Claude, sin fleet. Es el ~95% de los casos.
+- **"Resuelve esto de punta a punta"** (cambio abierto, varias perspectivas,
+  implementación + verificación) → `just dan`: lead autónomo y fleet visible.
 - **"¿Qué se me escapa?"** (auditoría, review pre-merge, diagnóstico raro,
   varias subtareas independientes) → fleet.
 - **"Producción rota, necesito la respuesta YA"** → carrera (`just race`).
 
 ## 2 · Bootea el equipo (1 comando)
+
+Camino recomendado para una misión autónoma completa:
+
+```bash
+just dan <nombre> "<objetivo completo>" --target-repo <repo>
+```
+
+El preset `dan` abre lead, scout, builder, challenger y verifier. El lead decide
+cuáles usar; no hay que avanzar fases ni aprobar transiciones rutinarias. La
+flota queda visible al terminar salvo que pases `--teardown`.
+
+Para operar las primitivas manualmente:
 
 ```bash
 just fleet <nombre> [instance=role...]
@@ -44,10 +58,10 @@ Roles frontier: `codex` · `minimax` (MiniMax-M3) · `glm` (GLM-5.2)
 Roles locales prompt-only: `code_worker` · `triage` · `light_code` · `reviewer` · `general_worker`
 Límite de RAM: **un solo rol local pesado en ejecución** y máximo tres locales concurrentes.
 
-Nota de enforcement: `authority`, `tool_access` y `resource_class` son hoy
-declaraciones validadas, no sandboxes ni leases. Hasta el siguiente slice de
-seguridad: un solo writer, pesados secuenciales, `tree` antes de cada acción y
-la primera finalización de una race se trata únicamente como candidato.
+Nota de enforcement: los wrappers validan UUID, identidad, autoridad, sandbox,
+leases y finalización por `run_id`. En `autonomous`, el gate de fase está abierto
+para todo el roster; en `guided`/`assured` conserva las transiciones explícitas.
+En todos los modos hay un solo writer y una race entrega un candidato, no verdad.
 
 Qué pasa solo: el plan completo se valida antes de tocar cmux, los panes quedan
 ordenados `CONTROL → RECON → BUILD → CHALLENGE → VERIFY`, se verifican contra

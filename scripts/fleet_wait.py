@@ -20,6 +20,9 @@ from fleet_frontier import (
     validate_event_ack,
 )
 from fleet_ledger import TERMINAL_STATUSES, latest_event
+from fleet_ledger import events_for_run
+import fleet_tracking
+import fleet_manifest
 
 
 STATUS_CODES = {
@@ -66,11 +69,7 @@ def parse_args(argv: list[str]) -> tuple[str, str, int, bool, bool, dict[str, st
 
 
 def read_manifest(path: str) -> dict[str, str]:
-    return dict(
-        line.strip().split("=", 1)
-        for line in Path(path).read_text(encoding="utf-8").splitlines()
-        if "=" in line
-    )
+    return fleet_manifest.load(Path(path))
 
 
 def emit_result(
@@ -121,7 +120,7 @@ def signal_ready(frame: dict[str, Any]) -> bool:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-    except OSError as exc:
+    except (OSError, fleet_manifest.ManifestError) as exc:
         print(f"cannot publish event subscription readiness: {exc}", file=sys.stderr)
         return False
     return True
@@ -237,7 +236,19 @@ def main(argv: list[str] | None = None) -> int:
                 instance=role,
             )
             if event and event.get("status") in TERMINAL_STATUSES:
-                records.append((role, event))
+                try:
+                    verified = fleet_tracking.verify_run_events(
+                        events_for_run(ledger, run_id=str(metadata["run_id"]), instance=role),
+                        required_protocol=manifest.get("tracking_protocol", "legacy-cmux"),
+                    )
+                except fleet_tracking.TrackingError as exc:
+                    verified = {
+                        **event,
+                        "status": "indeterminate",
+                        "exit_code": STATUS_CODES["indeterminate"],
+                        "reason": f"tracking_provenance_invalid:{exc}",
+                    }
+                records.append((role, verified))
         records.sort(key=lambda item: completion_key(item[0], item[1]))
         return records
 

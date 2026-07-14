@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""Idempotently drive existing FDP-2/FDP-3 controllers for one Mission."""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+from typing import Any
+
+import fleet_assurance_controller as fdp3
+import fleet_audit_client
+import fleet_dialogue
+import fleet_dialogue_controller as fdp2
+import fleet_mission
+import fleet_mission_state as mission_state
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class AssuredRunnerError(RuntimeError):
+    """The assured action stream cannot be reconciled safely."""
+
+
+def run_process(
+    command: list[str], *, runs_dir: Path, timeout: int | None = None
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            command,
+            cwd=ROOT,
+            env={**os.environ, "FLEET_RUNS_DIR": str(runs_dir)},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AssuredRunnerError(f"command failed: {Path(command[0]).name}: {exc}") from exc
+
+
+def json_objects(text: str) -> list[dict[str, Any]]:
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, dict):
+        return [value]
+    values: list[dict[str, Any]] = []
+    for raw in text.splitlines():
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            values.append(value)
+    return values
+
+
+def parse_manifest(path: Path) -> dict[str, str]:
+    try:
+        return dict(
+            line.split("=", 1)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if "=" in line
+        )
+    except OSError as exc:
+        raise AssuredRunnerError(f"cannot read assured manifest: {exc}") from exc
+
+
+class AssuredRunner:
+    def __init__(self, runs_dir: Path, mission_id: str) -> None:
+        self.runs_dir = runs_dir.resolve()
+        self.mission_id = mission_state.normalize_uuid(mission_id, "mission_id")
+        self.mission = fleet_mission.load_state(self.runs_dir, self.mission_id)
+        self.feature = self.mission["feature"]
+        self.root = mission_state.mission_root(self.runs_dir, self.mission_id)
+        self.manifest_path = self.runs_dir / f"fleet-{self.feature}.manifest"
+        self.manifest = parse_manifest(self.manifest_path)
+        if self.manifest.get("mission_id") != self.mission_id:
+            raise AssuredRunnerError("assured manifest mission_id mismatch")
+        if self.manifest.get("preset") != "fleet_dialogue" or self.manifest.get("mode") != "assured":
+            raise AssuredRunnerError("assured runner requires preset=fleet_dialogue mode=assured")
+        if Path(self.manifest.get("target_repo", "")).resolve() != Path(
+            self.mission["target_repo"]
+        ).resolve():
+            raise AssuredRunnerError("assured manifest target repository mismatch")
+        self.audit = fleet_audit_client.AuditLifecycle(self.runs_dir, self.mission_id)
+        self.audit.health()
+
+    def _events(self) -> list[dict[str, Any]]:
+        return mission_state.read_events(
+            mission_state.ledger_path(self.runs_dir, self.mission_id),
+            expected_mission_id=self.mission_id,
+        )
+
+    def _record(self, kind: str, key: str, payload: dict[str, Any]) -> None:
+        event, _ = mission_state.append_event(
+            self.runs_dir,
+            self.mission_id,
+            kind=kind,
+            actor="ASSURED",
+            idempotency_key=key,
+            payload=payload,
+        )
+        self.audit.record_control_event(
+            event_type="MissionEvent",
+            subject_id=event["event_id"],
+            subject_sha256=event["event_sha256"],
+            metadata={"kind": kind, "sequence": event["sequence"]},
+            idempotency_key=f"mission-event:{event['event_id']}",
+        )
+
+    def _approval(self) -> dict[str, Any]:
+        current = fleet_mission.load_state(self.runs_dir, self.mission_id)
+        approval = current.get("approval")
+        if not isinstance(approval, dict):
+            raise AssuredRunnerError("assured mission lacks scoped human approval")
+        if approval["workflow_digest"] != current["workflow_digest"]:
+            raise AssuredRunnerError("approval workflow digest drift")
+        if Path(approval["scope"]).resolve() != Path(current["target_repo"]).resolve():
+            raise AssuredRunnerError("approval scope drift")
+        try:
+            expires = datetime.fromisoformat(approval["expires_at"].replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise AssuredRunnerError("approval expiry is invalid") from exc
+        if expires <= datetime.now(timezone.utc):
+            raise AssuredRunnerError("scoped human approval expired")
+        return approval
+
+    def _legacy_events(self) -> list[dict[str, Any]]:
+        path = self.runs_dir / f"fleet-{self.feature}.ledger.jsonl"
+        try:
+            rows = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        events: list[dict[str, Any]] = []
+        for number, raw in enumerate(rows, 1):
+            try:
+                value = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise AssuredRunnerError(f"legacy fleet ledger is corrupt at line {number}") from exc
+            if not isinstance(value, dict):
+                raise AssuredRunnerError("legacy fleet ledger row is not an object")
+            events.append(value)
+        return events
+
+    def _reconcile_run(self, instance: str, prompt_sha256: str) -> str | None:
+        runs = {
+            str(event.get("run_id"))
+            for event in self._legacy_events()
+            if event.get("instance") == instance and event.get("task_sha256") == prompt_sha256
+        }
+        runs.discard("None")
+        if len(runs) > 1:
+            raise AssuredRunnerError("multiple runs match one assured dispatch action")
+        return next(iter(runs), None)
+
+    def _dispatch(self, action: dict[str, Any], action_key: str) -> str:
+        instance = str(action["instance"])
+        prompt_path = Path(str(action["prompt_file"]))
+        try:
+            info = prompt_path.lstat()
+            prompt = prompt_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise AssuredRunnerError("assured prompt file is unavailable") from exc
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise AssuredRunnerError("assured prompt must be a regular file")
+        prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        if prompt_sha != action["prompt_sha256"]:
+            raise AssuredRunnerError("assured prompt hash changed before dispatch")
+        intent = {
+            "action": "dispatch",
+            "instance": instance,
+            "prompt_sha256": prompt_sha,
+            "controller_sequence": action_key,
+        }
+        self._record("assured_action_intent", f"{action_key}:intent", intent)
+        run_id = self._reconcile_run(instance, prompt_sha)
+        if run_id is None:
+            runner = self.manifest.get(f"{instance}.runner")
+            wrapper = {"interactive": "fleet-send.sh", "local": "fleet-dispatch.sh"}.get(runner)
+            if wrapper is None:
+                raise AssuredRunnerError(f"unsupported assured runner: {instance}={runner}")
+            result = run_process(
+                [str(ROOT / "scripts" / wrapper), self.feature, instance, prompt, "--json"],
+                runs_dir=self.runs_dir,
+                timeout=120,
+            )
+            values = json_objects(result.stdout)
+            if result.returncode != 0 or len(values) != 1:
+                detail = result.stderr.strip() or "ambiguous dispatch response"
+                raise AssuredRunnerError(f"assured dispatch failed: {detail}")
+            run_id = str(values[0].get("run_id", ""))
+        if not run_id:
+            raise AssuredRunnerError("assured dispatch returned no run_id")
+        self._record(
+            "assured_action_completed",
+            f"{action_key}:dispatched",
+            {**intent, "run_id": run_id},
+        )
+        return run_id
+
+    def _wait(self, action: dict[str, Any], run_id: str, action_key: str) -> None:
+        instance = str(action["instance"])
+        timeout_seconds = int(action["timeout_seconds"])
+        intent = {
+            "action": "wait",
+            "instance": instance,
+            "run_id": run_id,
+            "timeout_seconds": timeout_seconds,
+            "controller_sequence": action_key,
+        }
+        self._record("assured_action_intent", f"{action_key}:wait:intent", intent)
+        result = run_process(
+            [
+                str(ROOT / "scripts" / "fleet-wait.sh"), self.feature, instance,
+                "--run", f"{instance}={run_id}", "--timeout", str(timeout_seconds), "--json",
+            ],
+            runs_dir=self.runs_dir,
+            timeout=timeout_seconds + 30,
+        )
+        values = json_objects(result.stdout)
+        exact = next((value for value in values if value.get("run_id") == run_id), None)
+        if exact is None:
+            raise AssuredRunnerError("assured wait returned no exact run evidence")
+        self._record(
+            "assured_action_completed",
+            f"{action_key}:wait:completed",
+            {**intent, "status": str(exact.get("status", "indeterminate")), "exit_code": result.returncode},
+        )
+
+    def _publish(self, action: dict[str, Any], action_key: str) -> str:
+        request = {
+            field: action[field]
+            for field in (
+                "kind", "recipient", "source_instance", "source_run_id", "reply_to"
+            )
+        }
+        self._record(
+            "assured_action_intent",
+            f"{action_key}:publish:intent",
+            {"action": "publish", **request, "payload_sha256": action["payload_sha256"]},
+        )
+        message = fleet_dialogue.publish(
+            self.runs_dir,
+            feature=self.feature,
+            idempotency_key=f"runner:{action_key}:publish",
+            **request,
+        )
+        if message["payload_sha256"] != action["payload_sha256"]:
+            raise AssuredRunnerError("published payload hash differs from controller action")
+        self._record(
+            "assured_action_completed",
+            f"{action_key}:publish:completed",
+            {"action": "publish", "message_id": message["message_id"], "payload_sha256": message["payload_sha256"]},
+        )
+        return str(message["message_id"])
+
+    def _phase(self) -> str:
+        path = self.manifest_path.with_suffix(".state.json")
+        try:
+            return str(json.loads(path.read_text(encoding="utf-8"))["active_phase"])
+        except (OSError, json.JSONDecodeError, KeyError) as exc:
+            raise AssuredRunnerError("cannot read assured fleet phase") from exc
+
+    def _advance(self, phase: str, evidence: str, *, approved_by: str | None = None) -> None:
+        current = self._phase()
+        if current == phase:
+            return
+        command = [
+            "python3", str(ROOT / "scripts" / "fleet_state.py"), "advance",
+            str(self.manifest_path), phase, "--evidence", evidence,
+        ]
+        if approved_by:
+            command += ["--approved-by", approved_by]
+        result = run_process(command, runs_dir=self.runs_dir, timeout=60)
+        if result.returncode != 0:
+            raise AssuredRunnerError(result.stderr.strip() or "assured phase advance failed")
+
+    @staticmethod
+    def _action_key(prefix: str, event: dict[str, Any]) -> str:
+        return f"runner:{prefix}:{event['sequence']}:{event['event_sha256'][:16]}"
+
+    def _drive_fdp2(self, event: dict[str, Any]) -> dict[str, Any]:
+        if "next_action" not in event:
+            event = fdp2.public_event(event)
+        while True:
+            action = event["next_action"]
+            if action["action"] == "terminal":
+                if action["status"] != "accepted":
+                    raise AssuredRunnerError(
+                        f"FDP-2 terminal {action['status']}: {action.get('reason', '')}"
+                    )
+                return event
+            key = self._action_key("fdp2", event)
+            if action["action"] == "dispatch":
+                run_id = self._dispatch(action, key)
+                self._wait(action, run_id, key)
+                event = fdp2.step(
+                    self.runs_dir, feature=self.feature,
+                    idempotency_key=f"{key}:step", run_id=run_id,
+                )
+            elif action["action"] == "publish":
+                message_id = self._publish(action, key)
+                event = fdp2.step(
+                    self.runs_dir, feature=self.feature,
+                    idempotency_key=f"{key}:step", message_id=message_id,
+                )
+            else:
+                raise AssuredRunnerError(f"unsupported FDP-2 action: {action['action']}")
+            if "next_action" not in event:
+                event = fdp2.public_event(event)
+
+    def _drive_fdp3(self, event: dict[str, Any]) -> dict[str, Any]:
+        if "next_action" not in event:
+            event = fdp3.public_event(event)
+        while True:
+            action = event["next_action"]
+            if action["action"] == "terminal":
+                if action["status"] != "verified":
+                    raise AssuredRunnerError(
+                        f"FDP-3 terminal {action['status']}: {action.get('reason', '')}"
+                    )
+                return event
+            key = self._action_key("fdp3", event)
+            if action["action"] == "dispatch":
+                run_id = self._dispatch(action, key)
+                self._wait(action, run_id, key)
+                event = fdp3.step(
+                    self.runs_dir, feature=self.feature,
+                    idempotency_key=f"{key}:step", run_id=run_id,
+                )
+            elif action["action"] == "publish":
+                message_id = self._publish(action, key)
+                event = fdp3.step(
+                    self.runs_dir, feature=self.feature,
+                    idempotency_key=f"{key}:step", message_id=message_id,
+                )
+            elif action["action"] == "advance_phase":
+                self._advance("VERIFY", event["event_sha256"])
+                event = fdp3.step(
+                    self.runs_dir, feature=self.feature,
+                    idempotency_key=f"{key}:step", phase_advanced=True,
+                )
+            else:
+                raise AssuredRunnerError(f"unsupported FDP-3 action: {action['action']}")
+            if "next_action" not in event:
+                event = fdp3.public_event(event)
+
+    def _synthesize(self, accepted: dict[str, Any], verified: dict[str, Any]) -> dict[str, Any]:
+        prompt = (
+            f"MISSION_ID={self.mission_id}\n"
+            "Synthesize the completed assured mission from durable FDP-2/FDP-3 evidence. "
+            "Do not dispatch more work or modify the repository. Report STATUS, DECISION, "
+            "ARTIFACTS, VERIFICATION, RISKS, and NEXT_ACTION.\n"
+            f"FDP2_CONTROL_HEAD={accepted['event_sha256']}\n"
+            f"FDP2_ACCEPTED_HEAD={accepted['snapshot']['accepted_head_sha']}\n"
+            f"FDP3_CONTROL_HEAD={verified['event_sha256']}\n"
+            f"FDP3_STATUS={verified['snapshot']['status']}\n"
+        )
+        prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        run_id = self._reconcile_run("lead", prompt_sha)
+        if run_id is None:
+            result = run_process(
+                [str(ROOT / "scripts" / "fleet-send.sh"), self.feature, "lead", prompt, "--json"],
+                runs_dir=self.runs_dir,
+                timeout=120,
+            )
+            values = json_objects(result.stdout)
+            if result.returncode != 0 or len(values) != 1:
+                raise AssuredRunnerError("failed to dispatch assured synthesis to Lead")
+            run_id = str(values[0].get("run_id", ""))
+        wait = run_process(
+            [
+                str(ROOT / "scripts" / "fleet-wait.sh"), self.feature, "lead",
+                "--run", f"lead={run_id}", "--timeout", "1800", "--json",
+            ],
+            runs_dir=self.runs_dir,
+            timeout=1830,
+        )
+        exact = next((item for item in json_objects(wait.stdout) if item.get("run_id") == run_id), None)
+        if wait.returncode != 0 or exact is None or exact.get("status") != "succeeded":
+            raise AssuredRunnerError("assured Lead synthesis did not succeed")
+        result_file = Path(str(exact.get("result_file", "")))
+        expected_result = self.runs_dir / "results" / self.feature / f"{run_id}.txt"
+        try:
+            info = result_file.lstat()
+            if result_file.resolve(strict=True) != expected_result.resolve(strict=True):
+                raise AssuredRunnerError("assured Lead result is outside the exact result store")
+        except OSError as exc:
+            raise AssuredRunnerError("assured Lead synthesis lacks a result file") from exc
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise AssuredRunnerError("assured Lead result must be a regular file")
+        lifecycle = [
+            event for event in self._legacy_events()
+            if event.get("instance") == "lead" and event.get("run_id") == run_id
+        ]
+        if not lifecycle or lifecycle[-1].get("status") != "succeeded":
+            raise AssuredRunnerError("assured Lead lifecycle evidence is incomplete")
+        if (
+            lifecycle[-1].get("provider") != self.manifest.get("lead.provider")
+            or lifecycle[-1].get("model") != self.manifest.get("lead.model")
+        ):
+            raise AssuredRunnerError("assured Lead provider/model identity drift")
+        return {"run_id": run_id, "result_file": str(result_file), "prompt_sha256": prompt_sha}
+
+    def drive(self, spec_file: Path, *, synthesize: bool = True) -> dict[str, Any]:
+        approval = self._approval()
+        phase = self._phase()
+        if phase == "CONTROL":
+            self._advance("BUILD", approval["request_event_sha256"])
+            phase = "BUILD"
+        dialogue_path = self.runs_dir / f"fleet-{self.feature}.dialogue-control.jsonl"
+        if dialogue_path.exists():
+            dialogue = fdp2.show(self.runs_dir, feature=self.feature)
+        else:
+            dialogue = fdp2.start(
+                self.runs_dir,
+                feature=self.feature,
+                idempotency_key=f"runner:{self.mission_id}:fdp2:start",
+                spec_file=spec_file.resolve(),
+            )
+        accepted = self._drive_fdp2(dialogue)
+        self.audit.record_control_event(
+            event_type="ControllerReceipt",
+            subject_id=accepted["conversation_id"],
+            subject_sha256=accepted["event_sha256"],
+            metadata={"controller": "fdp2", "status": accepted["snapshot"]["status"]},
+            idempotency_key=f"fdp2:{accepted['event_sha256']}",
+        )
+        approval = self._approval()
+        self._advance(
+            "CHALLENGE",
+            accepted["event_sha256"],
+            approved_by=f"sha256:{approval['approved_by_sha256']}",
+        )
+        assurance_path = self.runs_dir / f"fleet-{self.feature}.assurance-control.jsonl"
+        if assurance_path.exists():
+            assurance = fdp3.show(self.runs_dir, feature=self.feature)
+        else:
+            assurance = fdp3.start(
+                self.runs_dir,
+                feature=self.feature,
+                idempotency_key=f"runner:{self.mission_id}:fdp3:start",
+            )
+        verified = self._drive_fdp3(assurance)
+        self.audit.record_control_event(
+            event_type="ControllerReceipt",
+            subject_id=verified["assurance_id"],
+            subject_sha256=verified["event_sha256"],
+            metadata={"controller": "fdp3", "status": verified["snapshot"]["status"]},
+            idempotency_key=f"fdp3:{verified['event_sha256']}",
+        )
+        synthesis = self._synthesize(accepted, verified) if synthesize else None
+        return {
+            "mission_id": self.mission_id,
+            "feature": self.feature,
+            "status": "verified",
+            "accepted_head_sha": accepted["snapshot"]["accepted_head_sha"],
+            "fdp2_event_sha256": accepted["event_sha256"],
+            "fdp3_event_sha256": verified["event_sha256"],
+            "synthesis": synthesis,
+        }
+
+    def advisory(
+        self,
+        *,
+        instance: str,
+        objective: str,
+        idempotency_key: str,
+        timeout_seconds: int = 1800,
+    ) -> dict[str, Any]:
+        if not objective.strip():
+            raise AssuredRunnerError("advisory objective must be non-empty")
+        if not mission_state.SAFE_KEY.fullmatch(idempotency_key):
+            raise AssuredRunnerError("invalid advisory idempotency key")
+        if timeout_seconds < 1:
+            raise AssuredRunnerError("advisory timeout must be positive")
+        if instance not in self.manifest or instance == "lead":
+            raise AssuredRunnerError("unknown advisory instance")
+        if self.manifest.get(f"{instance}.authority") in {"write", "control"}:
+            raise AssuredRunnerError("additional advisory turns cannot grant writer authority")
+        phase = self.manifest.get(f"{instance}.phase")
+        if phase != self._phase():
+            raise AssuredRunnerError("advisory instance phase is not active")
+        prompt = (
+            f"MISSION_ID={self.mission_id}\nADVISORY_ONLY=true\n"
+            f"ACTIVE_PHASE={phase}\n\n{objective}\n\n"
+            "Return read-only analysis with exact evidence. Do not modify the repository."
+        )
+        prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        prompt_path = self.root / "advisory" / f"{prompt_sha}.txt"
+        content = prompt.encode("utf-8")
+        if prompt_path.exists():
+            if prompt_path.is_symlink() or prompt_path.read_bytes() != content:
+                raise AssuredRunnerError("durable advisory prompt conflicts")
+        else:
+            mission_state.atomic_write(prompt_path, content)
+        key = f"runner:advisory:{idempotency_key}"
+        action = {
+            "instance": instance,
+            "prompt_file": str(prompt_path),
+            "prompt_sha256": prompt_sha,
+            "timeout_seconds": timeout_seconds,
+        }
+        run_id = self._dispatch(action, key)
+        self._wait(action, run_id, key)
+        lifecycle = [
+            event for event in self._legacy_events()
+            if event.get("instance") == instance and event.get("run_id") == run_id
+        ]
+        if not lifecycle or lifecycle[-1].get("status") != "succeeded":
+            raise AssuredRunnerError("additional advisory turn did not succeed")
+        result_path = Path(str(lifecycle[-1].get("result_file", "")))
+        expected = self.runs_dir / "results" / self.feature / f"{run_id}.txt"
+        try:
+            if result_path.resolve(strict=True) != expected.resolve(strict=True):
+                raise AssuredRunnerError("advisory result is outside the exact result store")
+        except OSError as exc:
+            raise AssuredRunnerError("advisory result file is missing") from exc
+        return {
+            "mission_id": self.mission_id,
+            "instance": instance,
+            "run_id": run_id,
+            "result_file": str(result_path),
+            "prompt_sha256": prompt_sha,
+            "status": "succeeded",
+        }
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runs-dir", required=True)
+    parser.add_argument("--mission-id", required=True)
+    commands = parser.add_subparsers(dest="command", required=True)
+    drive = commands.add_parser("drive")
+    drive.add_argument("--spec-file", required=True)
+    drive.add_argument("--no-synthesis", action="store_true")
+    advisory = commands.add_parser("advisory")
+    advisory.add_argument("--instance", required=True)
+    advisory.add_argument("--objective", required=True)
+    advisory.add_argument("--idempotency-key", required=True)
+    advisory.add_argument("--timeout", type=int, default=1800)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parser().parse_args(argv)
+    try:
+        runner = AssuredRunner(Path(args.runs_dir), args.mission_id)
+        if args.command == "drive":
+            value = runner.drive(Path(args.spec_file), synthesize=not args.no_synthesis)
+        else:
+            value = runner.advisory(
+                instance=args.instance,
+                objective=args.objective,
+                idempotency_key=args.idempotency_key,
+                timeout_seconds=args.timeout,
+            )
+        print(json.dumps(value, sort_keys=True))
+        return 0
+    except (
+        AssuredRunnerError,
+        fleet_audit_client.AuditClientError,
+        fdp2.ControllerError,
+        fdp3.AssuranceError,
+        fleet_dialogue.DialogueError,
+        mission_state.MissionStateError,
+        OSError,
+        json.JSONDecodeError,
+    ) as exc:
+        print(f"assured-runner: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

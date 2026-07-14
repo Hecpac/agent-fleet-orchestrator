@@ -22,6 +22,10 @@ from typing import Any, Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+import fleet_providers
+
 DEFAULT_ROUTER = ROOT / "orchestration" / "router.yaml"
 IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
@@ -30,6 +34,7 @@ RUNNERS = {"interactive", "local"}
 AUTHORITIES = {"control", "write", "advisory", "verification"}
 RESOURCE_CLASSES = {"remote", "local_light", "local_heavy"}
 PHASES = {"CONTROL", "RECON", "BUILD", "CHALLENGE", "VERIFY"}
+EXECUTION_MODES = {"autonomous", "guided", "assured"}
 US = "\x1f"
 OPENCODE_AGENTS_DIR = ROOT / ".opencode" / "agents"
 OPENCODE_AGENT_IDENTITY_RE = re.compile(r"^(model|variant):[ \t]*(\S(?:.*\S)?)[ \t]*$")
@@ -420,6 +425,25 @@ def validate_router(config: dict[str, Any]) -> None:
             if role["resource_class"] == "remote":
                 raise RouterError(f"router.roles.{role_type} local role cannot use resource_class remote")
 
+        try:
+            provider_identity = fleet_providers.identity(
+                str(role["provider"]),
+                str(role["model"]),
+                role.get("variant"),
+                str(role.get("hook_source", "")),
+            )
+            adapter = fleet_providers.DEFAULT_REGISTRY.resolve(
+                hook_source=provider_identity.hook_source,
+                provider=provider_identity.provider,
+            )
+            adapter.validate_configuration(
+                provider_identity,
+                command=list(role["command"]) if role["runner"] == "interactive" else None,
+                runner=str(role["runner"]),
+            )
+        except fleet_providers.ProviderError as exc:
+            raise RouterError(f"router.roles.{role_type} provider adapter: {exc}") from exc
+
     for role_type in race_roles:
         if role_type not in roles:
             raise RouterError(f"router.defaults.race_roles references unknown role: {role_type}")
@@ -470,7 +494,7 @@ def validate_router(config: dict[str, Any]) -> None:
         _expect_keys(
             preset,
             required={"description", "include_lead", "instances"},
-            optional={"lead_provider"},
+            optional={"lead_provider", "mode"},
             where=f"router.presets.{preset_name}",
         )
         if not isinstance(preset["description"], str) or not preset["description"]:
@@ -479,6 +503,10 @@ def validate_router(config: dict[str, Any]) -> None:
             raise RouterError(f"router.presets.{preset_name}.include_lead must be boolean")
         if "lead_provider" in preset and preset["lead_provider"] not in candidates:
             raise RouterError(f"router.presets.{preset_name}.lead_provider is not a lead candidate")
+        if preset.get("mode", "guided") not in EXECUTION_MODES:
+            raise RouterError(
+                f"router.presets.{preset_name}.mode must be one of {sorted(EXECUTION_MODES)}"
+            )
         if not isinstance(preset["instances"], list):
             raise RouterError(f"router.presets.{preset_name}.instances must be a list")
         _validate_instances(config, preset["instances"], f"router.presets.{preset_name}.instances")
@@ -660,6 +688,7 @@ def build_plan(
         instances = parse_instance_specs(config, specs)
         include_lead = True
         preset_lead = None
+        execution_mode = "guided"
     else:
         source = preset_name or config["defaults"]["preset"]
         if source not in config["presets"]:
@@ -669,6 +698,7 @@ def build_plan(
         instances = copy.deepcopy(preset["instances"])
         include_lead = preset["include_lead"]
         preset_lead = preset.get("lead_provider")
+        execution_mode = preset.get("mode", "guided")
 
     lead = None
     if include_lead and not no_lead:
@@ -695,6 +725,7 @@ def build_plan(
     return {
         "schema_version": config["schema_version"],
         "preset": source,
+        "mode": execution_mode,
         "lead": lead,
         "instances": resolved,
         "limits": copy.deepcopy(config["limits"]),
@@ -703,7 +734,9 @@ def build_plan(
 
 
 def _records(plan: dict[str, Any]) -> str:
-    lines = [US.join(["META", str(plan["schema_version"]), plan["preset"]])]
+    lines = [
+        US.join(["META", str(plan["schema_version"]), plan["preset"], plan["mode"]])
+    ]
     if plan["lead"]:
         lead = plan["lead"]
         lines.append(

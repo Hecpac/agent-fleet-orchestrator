@@ -8,12 +8,20 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 ROUTER = ROOT / "orchestration" / "router.yaml"
+FLEET_VALIDATION_PROMPT = ROOT / "orchestration" / "prompts" / "fleet_validation.md"
 FDP2_PROMPTS = (
     ROOT / "orchestration" / "prompts" / "fdp2_maker_proposal.md",
     ROOT / "orchestration" / "prompts" / "fdp2_checker.md",
     ROOT / "orchestration" / "prompts" / "fdp2_maker_revision.md",
 )
 FDP2_CONTROLLER = ROOT / "scripts" / "fleet_dialogue_controller.py"
+FDP3_PROMPTS = (
+    ROOT / "orchestration" / "prompts" / "fdp3_glm_challenge.md",
+    ROOT / "orchestration" / "prompts" / "fdp3_claude_verify.md",
+)
+FDP3_CONTROLLER = ROOT / "scripts" / "fleet_assurance_controller.py"
+FLEET_STATE = ROOT / "scripts" / "fleet_state.py"
+FLEET_DOWN = ROOT / "scripts" / "fleet-down.sh"
 INTERNAL_WIRING = ROOT / "orchestration" / "INTERNAL_WIRING.md"
 README = ROOT / "README.md"
 FLEET_REVIEWER = ROOT / ".opencode" / "agents" / "fleet-reviewer.md"
@@ -47,6 +55,40 @@ class SpecCoherenceTests(unittest.TestCase):
                     router_version,
                     f"{path} shows schema_version={version}; router.yaml is {router_version}",
                 )
+
+    def test_fleet_validation_prompt_locks_exact_fail_closed_lifecycle(self) -> None:
+        router = json.loads(ROUTER.read_text(encoding="utf-8"))
+        prompt = FLEET_VALIDATION_PROMPT.read_text(encoding="utf-8")
+        audit_instances = router["presets"]["audit"]["instances"]
+
+        self.assertEqual(
+            [instance["instance_id"] for instance in audit_instances],
+            ["analysis", "challenge", "verify"],
+        )
+        for instance in audit_instances:
+            self.assertIn(f"`{instance['instance_id']}`", prompt)
+
+        required_contracts = (
+            "EXPECTED_INSTANCES=<instance_id separados por espacios, sin incluir CONTROL>",
+            "./scripts/fleet-send.sh <feature> <instance> \"<task>\" --json",
+            "./scripts/fleet-dispatch.sh <feature> <instance> \"<evidence-pack-and-task>\" --json",
+            "--run <instance>=<run_id>",
+            "para un worker local, `result_file` real, no vacío",
+            "para un agente frontier, evento terminal y transcript estructurado",
+            "STATUS: DONE",
+            "blocked`, `failed`, `abandoned`, `indeterminate",
+            "git diff --exit-code",
+            "just fleet-down <feature>",
+            "OPEN_LANES:",
+            "EXPECTED_INSTANCES=analysis challenge verify",
+        )
+        for contract in required_contracts:
+            with self.subTest(contract=contract):
+                self.assertIn(contract, prompt)
+
+        self.assertIn("Cualquier condición ausente produce FAIL", prompt)
+        self.assertIn("No uses polling ni sleeps", prompt)
+        self.assertNotIn("STATUS: PASS | PARTIAL", prompt)
 
     def test_fdp2_contract_and_documentation_remain_aligned(self) -> None:
         router = json.loads(ROUTER.read_text(encoding="utf-8"))
@@ -185,6 +227,53 @@ class SpecCoherenceTests(unittest.TestCase):
         ):
             with self.subTest(documented=documented):
                 self.assertIn(documented, readme)
+
+    def test_fdp3_contract_and_documentation_remain_aligned(self) -> None:
+        controller = FDP3_CONTROLLER.read_text(encoding="utf-8")
+        glm_prompt, claude_prompt = (
+            path.read_text(encoding="utf-8") for path in FDP3_PROMPTS
+        )
+        state = FLEET_STATE.read_text(encoding="utf-8")
+        teardown = FLEET_DOWN.read_text(encoding="utf-8")
+        wiring = INTERNAL_WIRING.read_text(encoding="utf-8")
+        readme = README.read_text(encoding="utf-8")
+
+        for contract in (
+            'RUN_TIMEOUT_SECONDS = 30 * 60',
+            'ASSURANCE_DEADLINE_SECONDS = 2 * 60 * 60',
+            '"awaiting_phase_advance"',
+            '"verified"',
+            '"rejected"',
+            '("start", "step", "show", "verify", "abandon")',
+            'step requires exactly one of run_id, message_id, or phase_advanced',
+            'FDP-3 CHALLENGE gate evidence is not the exact control head',
+            'fleet-down refuses an active FDP-3 assurance',
+        ):
+            with self.subTest(contract=contract):
+                self.assertIn(contract, controller)
+
+        self.assertIn('"summary": "resumen no vacío', glm_prompt)
+        self.assertIn('no emitas `ACCEPT`, `REJECT`, `VERIFIED`', glm_prompt)
+        self.assertIn('"verdict": "VERIFIED|REJECTED"', claude_prompt)
+        self.assertIn('cada `finding_id` de GLM exactamente una vez', claude_prompt)
+        self.assertIn('El primer carácter visible debe ser `{`', glm_prompt)
+        self.assertIn('El primer carácter visible debe ser `{`', claude_prompt)
+        self.assertIn('challenge_phase_gate', state)
+        self.assertIn('--cleanup-snapshots', teardown)
+        self.assertIn('assurance-receipt.json', teardown)
+        self.assertIn(
+            'rule: sequential_assurance_is_context_bound_phase_gated_and_fail_closed',
+            wiring,
+        )
+        for documented in (
+            'FDP-3 sequential assurance',
+            'step --phase-advanced',
+            'fleet_assurance_controller.py verify --archive <archive>',
+            'There are no retries or provider fallbacks',
+        ):
+            with self.subTest(documented=documented):
+                self.assertIn(documented, readme)
+
 
 if __name__ == "__main__":
     unittest.main()

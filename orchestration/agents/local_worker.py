@@ -6,10 +6,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 import urllib.error
 import urllib.request
 import re
+
+
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+import fleet_providers
 
 
 STATUS_CONTRACT = """Return your final answer in this format.
@@ -78,13 +85,20 @@ def main() -> int:
     parser.add_argument("--usage-file", help="write prompt/eval token counts as JSON")
     args = parser.parse_args()
 
+    identity = fleet_providers.identity("ollama", args.model)
+    adapter = fleet_providers.adapter_for(identity)
+    adapter.validate_configuration(identity, runner="local")
+    submission = adapter.prepare_submission(
+        identity, args.prompt, "local-worker", Path("/ollama-api")
+    )
+
     worker_prompt = "\n\n".join(
         [
             f"Role type: {args.role}",
             args.instruction,
             STATUS_CONTRACT,
             "Task:",
-            args.prompt,
+            submission["payload"],
         ]
     )
     body = call_ollama(args.host, args.model, worker_prompt, args.temperature, args.num_predict)
@@ -92,6 +106,12 @@ def main() -> int:
         # Record spend even when the status contract check below fails.
         write_usage_file(args.usage_file, body)
     cleaned = body.get("response", "").strip()
+    adapter.verify_identity(
+        identity,
+        fleet_providers.ProviderEvidence(
+            cleaned or "empty-response", "ollama", str(body.get("model") or args.model)
+        ),
+    )
     sys.stdout.write(cleaned + "\n")
     statuses = re.findall(r"(?m)^STATUS: (DONE|BLOCKED|FAILED)\s*$", cleaned)
     required_headers = ("SUMMARY:", "EVIDENCE:", "RISKS:", "NEXT_ACTION:")

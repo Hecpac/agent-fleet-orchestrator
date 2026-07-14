@@ -1621,7 +1621,13 @@ def _verify_message_bindings(
         for event in events
         if event["snapshot"].get("last_message_id") is not None
     }
-    actual = {message["message_id"] for message in messages}
+    # FDP-1 is shared plumbing. FDP-2 owns only Maker/Checker publications;
+    # later assurance slices bind their own Challenge/Verify messages.
+    actual = {
+        message["message_id"]
+        for message in messages
+        if message.get("source_instance") in {MAKER_INSTANCE, CHECKER_INSTANCE}
+    }
     if bound != actual:
         raise ControllerError("FDP-2 controller/message bindings are incomplete")
 

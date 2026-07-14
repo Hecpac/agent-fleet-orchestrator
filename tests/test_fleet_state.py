@@ -73,6 +73,22 @@ class FleetStateTests(unittest.TestCase):
         self.assertEqual(state["active_phase"], "VERIFY")
         self.assertEqual(state["history"][-1]["approved_by"], "hector")
 
+    def test_autonomous_mode_opens_all_roster_phases_without_approval(self) -> None:
+        with self.manifest.open("a", encoding="utf-8") as handle:
+            handle.write("mode=autonomous\n")
+        self.assertEqual(self.run_state("init").returncode, 0)
+        self.assertEqual(self.run_state("check", "build").returncode, 0)
+        self.assertEqual(self.run_state("check", "verify").returncode, 0)
+        self.assertEqual(
+            self.run_state("advance", "BUILD", "--evidence", "lead-started").returncode,
+            0,
+        )
+        advanced = self.run_state("advance", "VERIFY", "--evidence", "lead-verified")
+        self.assertEqual(advanced.returncode, 0, advanced.stderr)
+        state = json.loads(self.manifest.with_suffix(".state.json").read_text())
+        self.assertEqual(state["active_phase"], "VERIFY")
+        self.assertNotIn("approved_by", state["history"][-1])
+
     def test_skipping_configured_phase_is_rejected(self) -> None:
         self.assertEqual(self.run_state("init").returncode, 0)
         skipped = self.run_state("advance", "VERIFY", "--evidence", "bad")

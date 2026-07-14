@@ -1,11 +1,31 @@
-name: hotfix-race
-description: Resolve the canonical hotfix roster from orchestration/router.yaml.
-preset: hotfix_validated
-router: orchestration/router.yaml
-
-success_criteria:
-  - at least one candidate fix includes evidence
-  - reviewer identifies no blocker
-  - tests or smoke commands are specified
-
-timeout_minutes: 30
+{
+  "schema_version": 1,
+  "name": "hotfix",
+  "description": "Parallel candidate analysis followed by deterministic verification",
+  "preset": "hotfix_validated",
+  "autonomy": {
+    "owner": "lead",
+    "allow_parallel": true,
+    "allow_subdelegation": false,
+    "max_delegation_depth": 0
+  },
+  "capabilities": {
+    "available": ["candidate_generation", "verify"],
+    "required_outcomes": ["lead_result"],
+    "writer": "none"
+  },
+  "risk": {"minimum": "medium", "allow_lead_escalation": true, "high_action": "confirm_assured"},
+  "assurance": {
+    "profile": "proportional",
+    "preset": "fleet_dialogue",
+    "minimum_gates": ["fdp2", "human_build_exit", "fdp3"]
+  },
+  "audit": {"mode": "signed", "worm_required_for": ["production", "destructive"]},
+  "archive": {
+    "mode": "incremental",
+    "content_policy": "full",
+    "include_final_tree": true,
+    "include_git_delta": true
+  },
+  "limits": {"deadline_seconds": 3600, "token_budget": 0, "budget_mode": "soft"}
+}

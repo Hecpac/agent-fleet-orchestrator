@@ -78,6 +78,7 @@ class FleetFrontierTests(unittest.TestCase):
         opencode: bool = False,
         hook_source: str = "codex",
         variant: str = "",
+        tracking: bool = False,
     ):
         lease = fleet_leases.acquire_frontier(
             self.runs,
@@ -118,8 +119,62 @@ class FleetFrontierTests(unittest.TestCase):
         }
         if variant:
             event["variant"] = variant
+        if tracking:
+            event["tracking_protocol"] = "control-v1"
         append_event(self.runs / "fleet-frontier.ledger.jsonl", event)
         return event, lease
+
+    def test_control_authorization_prevents_raw_cmux_submit_from_binding_tracked_run(self) -> None:
+        run_id = "run-control-authorized"
+        state, lease = self.seed_run(run_id, tracking=True)
+        raw_submit = self.hook_event("agent.hook.UserPromptSubmit", 101)
+        with self.events_log.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(raw_submit) + "\n")
+
+        # A raw pane submit is visible but has no CONTROL authorization yet.
+        self.assertIsNone(
+            fleet_frontier.process_event(
+                self.runs, state, raw_submit,
+                workspace_ref="workspace:1", surface_ref="surface:1",
+            )
+        )
+        self.assertIsNone(state.get("session_id"))
+
+        authorization = fleet_frontier.authorize_prompt_submission(
+            self.runs,
+            feature="frontier",
+            instance="agent",
+            run_id=run_id,
+            workspace_uuid=WORKSPACE_UUID,
+            hook_source="codex",
+            since="2026-07-12T00:00:00",
+            timeout_seconds=0,
+        )
+        self.assertEqual(authorization["submission_event_id"], raw_submit["id"])
+        authorized_state = fleet_frontier.frontier_state(
+            self.runs / "fleet-frontier.ledger.jsonl",
+            run_id=run_id,
+            instance="agent",
+        )
+        self.assertIsNone(
+            fleet_frontier.process_event(
+                self.runs, authorized_state, raw_submit,
+                workspace_ref="workspace:1", surface_ref="surface:1",
+            )
+        )
+        self.assertEqual(authorized_state["session_id"], CODEX_SESSION_ID)
+
+        unrelated_raw = self.hook_event(
+            "agent.hook.UserPromptSubmit", 102,
+            occurred_at="2026-07-12T00:00:02+00:00",
+        )
+        self.assertIsNone(
+            fleet_frontier.process_event(
+                self.runs, authorized_state, unrelated_raw,
+                workspace_ref="workspace:1", surface_ref="surface:1",
+            )
+        )
+        self.assertTrue(lease.exists())
 
     @staticmethod
     def hook_event(
@@ -1170,6 +1225,40 @@ class FleetFrontierTests(unittest.TestCase):
         self.assertEqual(terminal["status"], "indeterminate")
         self.assertEqual(terminal["reason"], "frontier_opencode_evidence_unavailable")
         self.assertTrue(lease.exists())
+
+    def test_opencode_retries_bounded_database_visibility_race(self) -> None:
+        run_id = "run-opencode-db-retry"
+        state, lease = self.seed_run(run_id, opencode=True)
+        fleet_frontier.process_event(
+            self.runs,
+            state,
+            self.hook_event("agent.hook.UserPromptSubmit", 101, source="opencode"),
+            workspace_ref="workspace:1",
+            surface_ref="surface:1",
+        )
+        final = self.hook_event(
+            "agent.hook.Stop", 102, phase="completed", source="opencode",
+            final_opencode_stop=True,
+        )
+        evidence = (
+            f"answer\nFLEET_RESULT:{run_id}:DONE",
+            "minimax",
+            "MiniMax-M3",
+            None,
+        )
+        with mock.patch.object(
+            fleet_frontier,
+            "opencode_turn_evidence",
+            side_effect=[fleet_frontier.FrontierError("database not flushed"), evidence],
+        ) as reader, mock.patch.object(fleet_frontier.time, "sleep") as sleep:
+            terminal = fleet_frontier.process_event(
+                self.runs, state, final,
+                workspace_ref="workspace:1", surface_ref="surface:1",
+            )
+        self.assertEqual(terminal["status"], "succeeded")
+        self.assertEqual(reader.call_count, 2)
+        sleep.assert_called_once_with(fleet_frontier.TRANSCRIPT_EVIDENCE_RETRY_SECONDS)
+        self.assertFalse(lease.exists())
 
     def test_opencode_turn_evidence_binds_full_final_message_before_stop(self) -> None:
         run_id = "run-db-evidence"

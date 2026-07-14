@@ -33,6 +33,7 @@ class RouterConfigTests(unittest.TestCase):
         self.assertEqual(
             set(self.config["presets"]),
             {
+                "dan",
                 "small",
                 "audit",
                 "frontier_verification",
@@ -65,6 +66,7 @@ class RouterConfigTests(unittest.TestCase):
 
     def test_preset_order_is_capability_first(self) -> None:
         expected = {
+            "dan": ["scout", "builder", "challenger", "verifier"],
             "small": [],
             "audit": ["analysis", "challenge", "verify"],
             "frontier_verification": ["build", "challenge", "verify"],
@@ -80,6 +82,29 @@ class RouterConfigTests(unittest.TestCase):
                     run_healthcheck=False,
                 )
                 self.assertEqual([item["instance_id"] for item in plan["instances"]], instance_ids)
+
+    def test_execution_modes_separate_autonomy_from_assurance(self) -> None:
+        dan = router_config.build_plan(
+            self.config, preset_name="dan", run_healthcheck=False
+        )
+        assured = router_config.build_plan(
+            self.config, preset_name="fleet_dialogue", run_healthcheck=False
+        )
+        custom = router_config.build_plan(
+            self.config, instance_specs=["triage"], run_healthcheck=False
+        )
+        self.assertEqual(dan["mode"], "autonomous")
+        self.assertEqual(assured["mode"], "assured")
+        self.assertEqual(custom["mode"], "guided")
+        self.assertEqual(
+            [item["instance_id"] for item in dan["instances"]],
+            ["scout", "builder", "challenger", "verifier"],
+        )
+
+        config = copy.deepcopy(self.config)
+        config["presets"]["dan"]["mode"] = "ceremonial"
+        with self.assertRaisesRegex(router_config.RouterError, "mode must be one of"):
+            router_config.load_router(self.write_config(config))
 
     def test_non_writer_codex_is_read_only(self) -> None:
         plan = router_config.build_plan(self.config, preset_name="audit", run_healthcheck=False)

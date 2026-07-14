@@ -1,0 +1,111 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//Users/hector/Projects/agent-fleet-orchestrator/orchestration/runs/prompts/**)"
+    ],
+    "deny": [
+      "Bash(sudo *)",
+      "Bash(* sudo *)",
+      "Bash(ssh *)",
+      "WebFetch",
+      "WebSearch",
+      "Agent",
+      "SendMessage",
+      "PushNotification",
+      "RemoteTrigger",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "Read(//tmp/fleet_audits/**)",
+      "Edit(//tmp/fleet_audits/**)",
+      "Write(//tmp/fleet_audits/**)",
+      "Read(//Users/hector/.ssh/**)",
+      "Edit(//Users/hector/.ssh/**)",
+      "Write(//Users/hector/.ssh/**)",
+      "Read(//Users/hector/.aws/**)",
+      "Edit(//Users/hector/.aws/**)",
+      "Write(//Users/hector/.aws/**)",
+      "Read(//Users/hector/.codex/**)",
+      "Edit(//Users/hector/.codex/**)",
+      "Write(//Users/hector/.codex/**)",
+      "Read(//Users/hector/.claude/**)",
+      "Edit(//Users/hector/.claude/**)",
+      "Write(//Users/hector/.claude/**)",
+      "Read(//Users/hector/.claude.json)",
+      "Edit(//Users/hector/.claude.json)",
+      "Write(//Users/hector/.claude.json)"
+    ],
+    "defaultMode": "default",
+    "disableBypassPermissionsMode": "disable"
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "autoAllowBashIfSandboxed": false,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": [
+        "/tmp/fleet_audits",
+        "/Users/hector/.ssh",
+        "/Users/hector/.aws",
+        "/Users/hector/.codex",
+        "/Users/hector/.claude",
+        "/Users/hector/.claude.json"
+      ],
+      "denyWrite": [
+        "/tmp/fleet_audits",
+        "/Users/hector/.ssh",
+        "/Users/hector/.aws",
+        "/Users/hector/.codex",
+        "/Users/hector/.claude",
+        "/Users/hector/.claude.json"
+      ]
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/hector/.claude/hooks/pre_tool.sh"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/hector/.claude/hooks/pre_tool.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/hector/.claude/hooks/post_tool.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /Users/hector/.claude/hooks/post_tool.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
