@@ -90,9 +90,24 @@ since="$(date -u +%Y-%m-%dT%H:%M:%S)"
 cmux send --surface "$surface" --workspace "$workspace" "$payload" >/dev/null
 [[ "${FLEET_SEND_KEY_DELAY:-0.2}" == "0" ]] || sleep "${FLEET_SEND_KEY_DELAY:-0.2}"
 cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
-python3 "$frontier" confirm-submit "$runs_dir" \
-  --workspace-uuid "$workspace_uuid" --hook-source "$hook_source" \
-  --since "$since" --timeout "${FLEET_CONFIRM_SUBMIT_TIMEOUT:-10}" >/dev/null
+# Some TUIs (codex) intermittently swallow the first Enter, leaving the
+# payload queued in the composer. Re-press Enter only while zero submissions
+# have been observed, so a slow-but-submitted turn is never double-entered.
+confirmed=0
+for _attempt in 1 2 3; do
+  if python3 "$frontier" confirm-submit "$runs_dir" \
+    --workspace-uuid "$workspace_uuid" --hook-source "$hook_source" \
+    --since "$since" --timeout "${FLEET_CONFIRM_SUBMIT_TIMEOUT:-6}" >/dev/null 2>&1; then
+    confirmed=1
+    break
+  fi
+  cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
+done
+if (( confirmed == 0 )); then
+  python3 "$frontier" confirm-submit "$runs_dir" \
+    --workspace-uuid "$workspace_uuid" --hook-source "$hook_source" \
+    --since "$since" --timeout 4 >/dev/null
+fi
 entered=1
 if [[ "$output_mode" == "--json" ]]; then
   cmux read-screen --surface "$surface" --workspace "$workspace" --lines 8 >/dev/null || true
