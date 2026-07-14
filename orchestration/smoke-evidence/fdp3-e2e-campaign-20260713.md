@@ -185,3 +185,41 @@ finding-3 decision; all other fleets torn down clean; maker branches cleaned
 (`f2bbcae` recorded for e2e6). The hardened Claude verify leg and the
 `verified` terminal remain the open lanes, now blocked only on opencode
 transport reliability under system load.
+
+## Addendum 3 — post-reset cycles e2e8–e2e10 and the isolated Claude proof
+
+**Hardened Claude verifier: PROVEN LIVE** (probe fleet
+`claude-verify-probe-20260714`, run `d8d0d6ff`): a verify-shaped contract
+turn with tool-use triggers (git rev-parse + README read) returned one
+minified JSON — `schema_version:1`, `verdict:"VERIFIED"`, correct HEAD sha
+and heading in the summary, per-finding adjudication — first visible
+character `{`, exact sentinel, zero prose/tool-availability notes. The
+pointer transport binds claude evidence correctly. With this, every leg of
+the FDP-2→FDP-3 flow is individually live-proven; only the single-run
+`verified` terminal remains unobserved end-to-end.
+
+Cycle findings (all fail-closed correct):
+
+- e2e8: FDP-2 accepted cleanly post-reset; GLM challenge was schema-valid
+  but cited `scripts/fleet_assurance_controller.py` as file evidence —
+  which does not exist at the accepted head because the FDP-3
+  implementation is UNCOMMITTED. **Self-referential smoke trap**: while
+  FDP-3's code stays uncommitted, its own challenge leg dice-rolls on
+  whether GLM cites untracked files (`invalid_challenge_contract:file
+  evidence does not exist at accepted head`).
+- e2e9: checker sentinel glued (`frontier_sentinel_missing`), then the
+  reused-pane multi-submit reproduced on a fresh system AND on a manually
+  relaunched opencode session (2/2 relaunch failures total) — only
+  fleet-up-booted panes give clean first turns (6/7).
+- e2e10: codex swallowed the first Enter (confirm-submit caught it in 10 s;
+  fix `7e5793a` adds a zero-submission-guarded Enter retry); the retried
+  maker run succeeded but its proposal body failed the one-JSON contract
+  (`invalid_proposal_contract`) — a new maker-side format die — and the
+  operator error recurred a third time (sequential script lines without
+  set -e published an orphan after the failed step).
+
+**Poisoned-store zombies now number three** (e2e3 ws:50-old, e2e5
+ws:52-old, e2e10 workspace:7): all from unbound publications that finding 3
+(orphan-publish gap) would have refused. Full-cycle e2e attempts are
+HALTED until that guard lands: the missing `publish` gate converts every
+operator slip into an unrecoverable feature.
