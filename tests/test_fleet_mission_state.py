@@ -176,8 +176,51 @@ class MissionStateTests(unittest.TestCase):
                 "variant": None,
             },
         )
+        second_delegation = str(uuid.uuid4())
+        second_run = str(uuid.uuid4())
+        state.append_event(
+            self.runs,
+            self.mission_id,
+            kind="delegation_registered",
+            actor="lead",
+            idempotency_key="delegation:2",
+            payload={
+                "delegation_id": second_delegation,
+                "mission_id": self.mission_id,
+                "run_id": second_run,
+                "parent_run_id": None,
+                "delegated_by": "lead",
+                "recipient_instance": "challenger",
+                "capability": "challenge",
+                "objective_sha256": state.artifact_id("challenge"),
+                "input_artifact_ids": [],
+                "expected_output_contract": {"type": "text"},
+                "deadline": "2026-07-14T01:00:00Z",
+                "provider": "anthropic",
+                "model": "claude-test",
+                "variant": None,
+                "depth": 1,
+                "token_id": None,
+            },
+        )
+        state.append_event(
+            self.runs,
+            self.mission_id,
+            kind="result_recorded",
+            actor="CONTROL",
+            idempotency_key="result:2",
+            payload={
+                "run_id": second_run,
+                "delegation_id": second_delegation,
+                "artifact_id": artifact,
+                "provider": "anthropic",
+                "model": "claude-test",
+                "variant": None,
+            },
+        )
         current = mission.load_state(self.runs, self.mission_id)
-        self.assertEqual(current["results"][artifact]["run_id"], run_id)
+        self.assertEqual(current["results"][delegation_id]["run_id"], run_id)
+        self.assertEqual(current["results"][second_delegation]["run_id"], second_run)
 
     def test_first_terminal_is_immutable_and_success_requires_archive(self) -> None:
         before = mission.load_state(self.runs, self.mission_id)["last_sequence"]
@@ -268,7 +311,7 @@ class MissionStateTests(unittest.TestCase):
                 "workflow_digest": self.compiled["workflow_digest"],
                 "scope": str(self.target.resolve()),
                 "risk": "high",
-                "expires_at": "2026-07-15T00:00:00Z",
+                "expires_at": "2099-07-15T00:00:00Z",
                 "approved_by_sha256": "c" * 64,
                 "decision": "approved",
             },
@@ -294,6 +337,58 @@ class MissionStateTests(unittest.TestCase):
             },
         )
         self.assertEqual(mission.load_state(self.runs, self.mission_id)["status"], "assured_running")
+
+    def test_assurance_request_types_and_expired_boot_fail_closed(self) -> None:
+        before = mission.load_state(self.runs, self.mission_id)["last_sequence"]
+        with self.assertRaisesRegex(state.MissionStateError, "categories"):
+            state.append_event(
+                self.runs, self.mission_id, kind="assurance_requested", actor="CONTROL",
+                idempotency_key="bad:categories",
+                payload={
+                    "risk": "high", "categories": [{}], "scope": str(self.target.resolve()),
+                    "workflow_digest": self.compiled["workflow_digest"],
+                },
+            )
+        self.assertEqual(mission.load_state(self.runs, self.mission_id)["last_sequence"], before)
+
+        state.append_event(
+            self.runs, self.mission_id, kind="risk_escalated", actor="CONTROL",
+            idempotency_key="expired:risk",
+            payload={
+                "from": "low", "to": "high", "categories": ["production"],
+                "reason": "exercise expiry",
+            },
+        )
+        request, _ = state.append_event(
+            self.runs, self.mission_id, kind="assurance_requested", actor="CONTROL",
+            idempotency_key="expired:request",
+            payload={
+                "risk": "high", "categories": ["production"],
+                "scope": str(self.target.resolve()),
+                "workflow_digest": self.compiled["workflow_digest"],
+            },
+        )
+        approval, _ = state.append_event(
+            self.runs, self.mission_id, kind="assurance_approved", actor="HUMAN",
+            idempotency_key="expired:approval",
+            payload={
+                "approval_id": str(uuid.uuid4()),
+                "request_event_sha256": request["event_sha256"],
+                "workflow_digest": self.compiled["workflow_digest"],
+                "scope": str(self.target.resolve()), "risk": "high",
+                "expires_at": "2000-01-01T00:00:00Z",
+                "approved_by_sha256": "d" * 64, "decision": "approved",
+            },
+        )
+        with self.assertRaisesRegex(state.MissionStateError, "expired before boot"):
+            state.append_event(
+                self.runs, self.mission_id, kind="assurance_boot_started", actor="CONTROL",
+                idempotency_key="expired:boot",
+                payload={
+                    "preset": "fleet_dialogue",
+                    "approval_event_sha256": approval["event_sha256"],
+                },
+            )
 
 
 if __name__ == "__main__":

@@ -176,6 +176,28 @@ class FleetFrontierTests(unittest.TestCase):
         )
         self.assertTrue(lease.exists())
 
+    def test_control_authorization_filters_other_surface_before_ambiguity(self) -> None:
+        run_id = "run-control-surface-filter"
+        self.seed_run(run_id, tracking=True)
+        other_session = "codex-other-surface"
+        self.write_session(other_session, "00000000-0000-0000-0000-000000000999")
+        events = [
+            self.hook_event("agent.hook.UserPromptSubmit", 101),
+            self.hook_event(
+                "agent.hook.UserPromptSubmit", 102, session_id=other_session,
+                occurred_at="2026-07-12T00:00:02+00:00",
+            ),
+        ]
+        self.events_log.write_text(
+            "".join(json.dumps(event) + "\n" for event in events), encoding="utf-8"
+        )
+        authorized = fleet_frontier.authorize_prompt_submission(
+            self.runs, feature="frontier", instance="agent", run_id=run_id,
+            workspace_uuid=WORKSPACE_UUID, hook_source="codex",
+            since="2026-07-12T00:00:00", timeout_seconds=0,
+        )
+        self.assertEqual(authorized["submission_event_id"], events[0]["id"])
+
     @staticmethod
     def hook_event(
         name: str,
@@ -1476,6 +1498,25 @@ class FleetFrontierTests(unittest.TestCase):
                 )
         events = [json.loads(line) for line in ledger.read_text().splitlines()]
         self.assertEqual(events[-1]["status"], "abandoned")
+
+    def test_prepare_rejects_reused_durable_run_id_before_append(self) -> None:
+        run_id = "00000000-0000-4000-8000-000000000099"
+        append_event(
+            self.runs / "fleet-frontier.ledger.jsonl",
+            {"run_id": run_id, "instance": "agent", "status": "preparing"},
+        )
+        with self.assertRaisesRegex(fleet_frontier.FrontierError, "already durable"):
+            fleet_frontier.prepare_run(
+                self.runs, feature="frontier", instance="agent", role="minimax",
+                phase="CHALLENGE", task="task", workspace_uuid=WORKSPACE_UUID,
+                surface_uuid=SURFACE_UUID, provider="minimax", model="MiniMax-M3",
+                hook_source="opencode", variant="none", run_id=run_id,
+            )
+        events = [
+            json.loads(line)
+            for line in (self.runs / "fleet-frontier.ledger.jsonl").read_text().splitlines()
+        ]
+        self.assertEqual(len(events), 1)
 
     def test_prepare_persists_prompt_file_for_pointer_dispatch(self) -> None:
         lease = self.runs / "locks" / "frontier.agent.lock"

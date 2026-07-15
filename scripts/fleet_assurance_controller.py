@@ -486,7 +486,7 @@ def _validate_snapshot_worktree(path: Path, head_sha: str) -> None:
     attached = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     if attached.returncode == 0:
         raise AssuranceContractError(f"assurance snapshot is not detached: {path}")
-    if _git(path, "status", "--porcelain").stdout.strip():
+    if _git(path, "status", "--porcelain", "--ignored").stdout.strip():
         raise AssuranceContractError(f"assurance snapshot is dirty: {path}")
 
 
@@ -1631,6 +1631,8 @@ def challenge_phase_gate(
     except fdp2.ControllerError as exc:
         raise AssuranceError(str(exc)) from exc
     with coordinator(runs_dir):
+        events = load_events(runs_dir, feature)
+        _expire_locked(runs_dir, feature, events)
         events = load_events(runs_dir, feature)
         if not events:
             raise AssuranceError("FDP-3 CHALLENGE gate requires an assurance ledger")

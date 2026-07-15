@@ -12,6 +12,9 @@ import subprocess
 import sys
 from typing import Any
 
+import fleet_artifacts
+import fleet_manifest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNS_DIR = ROOT / "orchestration" / "runs"
@@ -25,12 +28,8 @@ class MissionError(RuntimeError):
 
 def parse_manifest(path: Path) -> dict[str, str]:
     try:
-        return dict(
-            line.split("=", 1)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if "=" in line
-        )
-    except OSError as exc:
+        return fleet_manifest.load(path)
+    except (OSError, fleet_manifest.ManifestError) as exc:
         raise MissionError(f"cannot read fleet manifest {path}: {exc}") from exc
 
 
@@ -260,10 +259,10 @@ def main(argv: list[str] | None = None) -> int:
         if wait_value.get("status") != "succeeded":
             raise MissionError(f"lead ended with status={wait_value.get('status', 'unknown')}")
         result_file = Path(str(wait_value.get("result_file", "")))
-        if not result_file.is_file():
-            raise MissionError("lead succeeded without a durable result file")
-
-        result_text = result_file.read_text(encoding="utf-8")
+        try:
+            result_text = fleet_artifacts.read_regular(result_file).decode("utf-8")
+        except (fleet_artifacts.ArtifactError, UnicodeDecodeError) as exc:
+            raise MissionError(f"cannot safely read durable lead result: {exc}") from exc
         cmux_signal(
             manifest,
             state="complete",

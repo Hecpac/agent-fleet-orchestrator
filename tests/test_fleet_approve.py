@@ -75,6 +75,42 @@ class FleetApproveTests(unittest.TestCase):
                 idempotency_key="human:wrong",
             )
 
+    def test_idempotent_replay_rejects_a_new_assurance_request(self) -> None:
+        approved = fleet_approve.approve_mission(
+            self.runs, self.mission_id, scope=str(self.target), expires_in=600,
+            idempotency_key="human:replay",
+        )
+        state.append_event(
+            self.runs, self.mission_id, kind="assurance_boot_started", actor="CONTROL",
+            idempotency_key="replay:boot",
+            payload={
+                "preset": "fleet_dialogue",
+                "approval_event_sha256": approved["event"]["event_sha256"],
+            },
+        )
+        state.append_event(
+            self.runs, self.mission_id, kind="assurance_started", actor="CONTROL",
+            idempotency_key="replay:started",
+            payload={
+                "manifest": str(self.runs / "fleet-approve.manifest"),
+                "approval_event_sha256": approved["event"]["event_sha256"],
+            },
+        )
+        state.append_event(
+            self.runs, self.mission_id, kind="assurance_requested", actor="CONTROL",
+            idempotency_key="replay:new-request",
+            payload={
+                "risk": "high", "categories": ["production", "credentials"],
+                "scope": str(self.target.resolve()),
+                "workflow_digest": self.compiled["workflow_digest"],
+            },
+        )
+        with self.assertRaisesRegex(RuntimeError, "replay identity conflicts"):
+            fleet_approve.approve_mission(
+                self.runs, self.mission_id, scope=str(self.target), expires_in=600,
+                idempotency_key="human:replay",
+            )
+
     def test_sensitive_full_archive_approval_is_scoped_and_idempotent(self) -> None:
         # The assurance request made this mission high risk; add the independent
         # data category that specifically gates a full archive.

@@ -20,11 +20,17 @@ class CodexAdapter(BaseAdapter):
         value = super().validate_configuration(identity, command=command, runner=runner)
         if identity.variant is not None:
             raise ProviderError("Codex does not accept OpenCode variant identity")
-        if command is not None and (
-            command[0] != "codex"
-            or "--model" not in command
-            or command.index("--model") + 1 >= len(command)
-            or command[command.index("--model") + 1] != identity.model
-        ):
-            raise ProviderError("Codex launch command does not bind the configured model")
+        if command is not None:
+            models: list[str] = []
+            for index, argument in enumerate(command):
+                if argument == "--model":
+                    if index + 1 >= len(command):
+                        raise ProviderError(
+                            "Codex launch command does not bind the configured model"
+                        )
+                    models.append(command[index + 1])
+                elif argument.startswith("--model="):
+                    models.append(argument.partition("=")[2])
+            if command[0] != "codex" or models != [identity.model]:
+                raise ProviderError("Codex launch command does not bind the configured model")
         return value

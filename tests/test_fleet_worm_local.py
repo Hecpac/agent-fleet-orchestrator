@@ -94,6 +94,7 @@ class FleetWormLocalTests(unittest.TestCase):
         (state_dir / local_worm.STATE_FILE).write_text(
             json.dumps(state), encoding="utf-8"
         )
+        (state_dir / local_worm.STATE_FILE).chmod(0o600)
         commands: list[list[str]] = []
 
         def fake_run(command, *, timeout=180):
@@ -109,6 +110,42 @@ class FleetWormLocalTests(unittest.TestCase):
         ):
             local_worm.teardown(state_dir)
         self.assertFalse(any("rm" in command for command in commands))
+
+    def test_state_loader_rejects_symlink_and_broad_permissions(self) -> None:
+        state_dir = self.root / "private-state"
+        state_dir.mkdir(mode=0o700)
+        state_file = state_dir / local_worm.STATE_FILE
+        state_file.write_text("{}", encoding="utf-8")
+        state_file.chmod(0o644)
+        with self.assertRaisesRegex(local_worm.LocalWormError, "private regular file"):
+            local_worm._load_state(state_dir)
+        state_file.unlink()
+        outside = self.root / "outside-state"
+        outside.write_text("{}", encoding="utf-8")
+        state_file.symlink_to(outside)
+        with self.assertRaisesRegex(local_worm.LocalWormError, "private regular file"):
+            local_worm._load_state(state_dir)
+
+    def test_failed_cleanup_retains_the_only_ownership_state(self) -> None:
+        state_dir = self.root / "retained-state"
+        with (
+            mock.patch.object(local_worm, "_run", return_value=mock.Mock(stdout="")),
+            mock.patch.object(local_worm, "_docker_exists", return_value=False),
+            mock.patch.object(local_worm, "_generate_certificates"),
+            mock.patch.object(local_worm, "_write") as write,
+            mock.patch.object(local_worm, "_remove_owned_quietly", return_value=False),
+            self.assertRaisesRegex(local_worm.LocalWormError, "state retained"),
+        ):
+            def persist_state(path, content, mode):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+                path.chmod(mode)
+
+            write.side_effect = persist_state
+            # Fail after the ownership token has been persisted.
+            local_worm._run.side_effect = [mock.Mock(stdout=""), RuntimeError("pull failed")]
+            local_worm.setup(state_dir, 9443)
+        self.assertTrue((state_dir / local_worm.STATE_FILE).exists())
 
     def test_generated_custom_ca_is_valid_for_sink_preflight(self) -> None:
         certs = self.root / "certs"

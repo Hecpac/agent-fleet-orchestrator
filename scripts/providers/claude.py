@@ -20,18 +20,26 @@ class ClaudeAdapter(BaseAdapter):
         value = super().validate_configuration(identity, command=command, runner=runner)
         if identity.variant is not None:
             raise ProviderError("Claude does not accept OpenCode variant identity")
-        if command is not None and (
-            command[0] != "claude"
-            or "--model" not in command
-            or command.index("--model") + 1 >= len(command)
-            or command[command.index("--model") + 1] != identity.model
-        ):
-            raise ProviderError("Claude launch command does not bind the configured model")
+        if command is not None:
+            models: list[str] = []
+            for index, argument in enumerate(command):
+                if argument == "--model":
+                    if index + 1 >= len(command):
+                        raise ProviderError(
+                            "Claude launch command does not bind the configured model"
+                        )
+                    models.append(command[index + 1])
+                elif argument.startswith("--model="):
+                    models.append(argument.partition("=")[2])
+            if command[0] != "claude" or models != [identity.model]:
+                raise ProviderError("Claude launch command does not bind the configured model")
         return value
 
     def observe(self, event: dict[str, Any], state: dict[str, Any]) -> str:
         value = super().observe(event, state)
-        payload = event.get("payload") or {}
+        payload = event.get("payload")
+        if not isinstance(payload, dict):
+            return value
         if (
             value == "ignore"
             and event.get("source") == self.hook_source

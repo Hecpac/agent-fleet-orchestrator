@@ -97,6 +97,24 @@ class FleetAuditIntegrationTests(unittest.TestCase):
         self.assertEqual(offline["trust_scope"], "local-development")
         self.assertNotIn("control-hmac", self.lifecycle.receipt_path.read_text(encoding="utf-8"))
 
+    def test_stop_does_not_claim_success_while_service_remains_alive(self) -> None:
+        self.lifecycle.start(self.manifest)
+        with (
+            mock.patch.object(self.lifecycle, "verify", return_value={"valid": True}),
+            mock.patch.object(self.lifecycle, "health", return_value={"status": "ok"}),
+            mock.patch.object(self.lifecycle, "_pid_alive", return_value=True),
+            mock.patch.object(self.lifecycle, "_process", None),
+            mock.patch.dict(client._LIVE_PROCESSES, {}, clear=True),
+            mock.patch.object(client.os, "kill") as kill,
+            mock.patch.object(client.time, "monotonic", side_effect=[0.0, 6.0]),
+            self.assertRaisesRegex(client.AuditClientError, "did not stop"),
+        ):
+            self.lifecycle.stop()
+        kill.assert_any_call(mock.ANY, signal.SIGTERM)
+        kill.assert_any_call(mock.ANY, signal.SIGKILL)
+        lifecycle = json.loads(self.lifecycle.lifecycle_path.read_text(encoding="utf-8"))
+        self.assertIsNone(lifecycle["stopped_at"])
+
     def test_raw_metadata_is_rejected_and_tampering_breaks_offline_verify(self) -> None:
         self.lifecycle.start(self.manifest)
         secret = "raw-secret-value"
@@ -245,6 +263,9 @@ class FleetAuditIntegrationTests(unittest.TestCase):
             "backend": "s3-object-lock-compliance",
             "trust_scope": "external-compliance",
             "public_key_sha256": client.audit.file_sha256(self.lifecycle.public_key),
+            "anchor_receipts_sha256": client._anchor_envelope(
+                rows, self.lifecycle.anchor_receipts
+            )[1],
             "verified_at": "2026-07-14T00:00:00Z",
         }
         receipt["ed25519_signature"] = client._sign_receipt(self.lifecycle.private_key, receipt)
@@ -268,6 +289,16 @@ class FleetAuditIntegrationTests(unittest.TestCase):
         last_anchor_path.write_text(
             json.dumps(last_anchor, sort_keys=True) + "\n", encoding="utf-8"
         )
+        receipt["anchor_receipts_sha256"] = client._anchor_envelope(
+            rows, self.lifecycle.anchor_receipts
+        )[1]
+        receipt["ed25519_signature"] = client._sign_receipt(
+            self.lifecycle.private_key, receipt
+        )
+        self.lifecycle.receipt_path.write_text(
+            json.dumps(receipt, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
         with self.assertRaisesRegex(client.AuditClientError, "incomplete"):
             client.verify_offline(
                 ledger,
@@ -287,7 +318,7 @@ class FleetAuditIntegrationTests(unittest.TestCase):
         anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
         anchor["trust_scope"] = "external-compliance"
         anchor_path.write_text(json.dumps(anchor, sort_keys=True) + "\n", encoding="utf-8")
-        with self.assertRaisesRegex(client.AuditClientError, "differs from ledger"):
+        with self.assertRaisesRegex(client.AuditClientError, "envelope hash mismatch"):
             client.verify_offline(
                 ledger,
                 self.lifecycle.receipt_path,
@@ -296,6 +327,26 @@ class FleetAuditIntegrationTests(unittest.TestCase):
                 require_worm=False,
                 required_trust_scope="local-development",
             )
+
+    def test_live_verification_receipt_advances_with_a_valid_ledger_prefix(self) -> None:
+        self.lifecycle.start(self.manifest)
+        first = self.lifecycle.verify()
+        prior = json.loads(self.lifecycle.receipt_path.read_text(encoding="utf-8"))
+        self.lifecycle.record_control_event(
+            event_type="MissionEvent",
+            subject_id=self.mission_id,
+            subject_sha256="e" * 64,
+            metadata={"kind": "advanced", "sequence": 3},
+            idempotency_key="receipt:advance",
+        )
+        second = self.lifecycle.verify()
+        current = json.loads(self.lifecycle.receipt_path.read_text(encoding="utf-8"))
+        self.assertGreater(second["records"], first["records"])
+        self.assertGreater(current["records"], prior["records"])
+        self.assertNotEqual(current["head_sha256"], prior["head_sha256"])
+        self.assertNotEqual(
+            current["anchor_receipts_sha256"], prior["anchor_receipts_sha256"]
+        )
 
     def test_external_compliance_preflight_rejects_loopback_without_state(self) -> None:
         workflow_value = json.loads((ROOT / "workflows" / "regulated.yaml").read_text())

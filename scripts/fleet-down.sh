@@ -108,8 +108,9 @@ if [[ "$preset" == "fleet_dialogue" && ( "$active_phase" == "CHALLENGE" || "$act
 fi
 if [[ "$preset" == "fleet_dialogue" ]]; then
   if (( workspace_already_absent == 1 )); then
-    if [[ ! -s "$verification_receipt" ]]; then
-      echo "Refusing FDP-2 recovery: live verification receipt is absent." >&2
+    if ! python3 "$dialogue_controller" verify "$runs_dir" --feature "$feature" \
+      --require-terminal --write-receipt "$verification_receipt" >/dev/null; then
+      echo "Refusing FDP-2 recovery: live verification receipt is absent or invalid." >&2
       exit 75
     fi
   else
@@ -119,8 +120,9 @@ if [[ "$preset" == "fleet_dialogue" ]]; then
 fi
 if (( assurance_required == 1 )); then
   if (( workspace_already_absent == 1 )); then
-    if [[ ! -s "$assurance_receipt" ]]; then
-      echo "Refusing FDP-3 recovery: live assurance receipt is absent." >&2
+    if ! python3 "$assurance_controller" verify "$runs_dir" --feature "$feature" \
+      --require-terminal --write-receipt "$assurance_receipt" >/dev/null; then
+      echo "Refusing FDP-3 recovery: live assurance receipt is absent or invalid." >&2
       exit 75
     fi
   else
@@ -182,7 +184,11 @@ done
 
 # Mission-bound fleets must freeze and verify their portable archive while the
 # writer worktree and (for assured missions) AuditService are still available.
-if [[ -n "$mission_id" && -d "$runs_dir/missions/$mission_id" ]]; then
+if [[ -n "$mission_id" && ! -d "$runs_dir/missions/$mission_id" ]]; then
+  echo "Refusing teardown: mission directory is absent for $mission_id." >&2
+  exit 75
+fi
+if [[ -n "$mission_id" ]]; then
   mission_status="$(PYTHONPATH="$repo_root/scripts" python3 -c '
 import pathlib, sys
 import fleet_mission

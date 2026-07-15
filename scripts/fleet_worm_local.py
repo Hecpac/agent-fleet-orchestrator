@@ -12,6 +12,7 @@ from pathlib import Path
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -117,22 +118,30 @@ def _assert_docker_owner(kind: str, name: str, owner: str) -> None:
         )
 
 
-def _remove_owned_quietly(kind: str, name: str, owner: str) -> None:
+def _remove_owned_quietly(kind: str, name: str, owner: str) -> bool:
     try:
-        if not _docker_exists(kind, name) or _docker_owner(kind, name) != owner:
-            return
+        if not _docker_exists(kind, name):
+            return True
+        if _docker_owner(kind, name) != owner:
+            return False
     except LocalWormError:
-        return
+        return False
     command = ["docker", kind, "rm"]
     if kind == "container":
         command.append("--force")
     command.append(name)
-    subprocess.run(
+    result = subprocess.run(
         command,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         check=False,
     )
+    if result.returncode != 0:
+        return False
+    try:
+        return not _docker_exists(kind, name)
+    except LocalWormError:
+        return False
 
 
 def _public_state(state: dict[str, Any]) -> dict[str, Any]:
@@ -152,7 +161,27 @@ def _public_state(state: dict[str, Any]) -> dict[str, Any]:
 def _load_state(state_dir: Path) -> dict[str, Any]:
     path = state_dir / STATE_FILE
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        directory_info = state_dir.lstat()
+        file_info = path.lstat()
+        if (
+            not stat.S_ISDIR(directory_info.st_mode)
+            or stat.S_ISLNK(directory_info.st_mode)
+            or directory_info.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_info.st_mode) != 0o700
+        ):
+            raise LocalWormError("local WORM state directory is not private")
+        if (
+            not stat.S_ISREG(file_info.st_mode)
+            or stat.S_ISLNK(file_info.st_mode)
+            or file_info.st_uid != os.geteuid()
+            or stat.S_IMODE(file_info.st_mode) != 0o600
+        ):
+            raise LocalWormError("local WORM state file is not a private regular file")
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except LocalWormError:
+        raise
     except (OSError, json.JSONDecodeError) as exc:
         raise LocalWormError(f"local WORM state is missing or invalid: {path}") from exc
     required = {
@@ -410,10 +439,14 @@ def setup(state_dir: Path, port: int) -> dict[str, Any]:
         _wait_for_tls(state)
         _initialize_bucket(state)
         return _public_state(state)
-    except Exception:
+    except Exception as exc:
         if objects_prechecked:
-            _remove_owned_quietly("container", container, docker_owner)
-            _remove_owned_quietly("volume", volume, docker_owner)
+            removed_container = _remove_owned_quietly("container", container, docker_owner)
+            removed_volume = _remove_owned_quietly("volume", volume, docker_owner)
+            if not (removed_container and removed_volume):
+                raise LocalWormError(
+                    f"setup failed and owned Docker cleanup is unconfirmed; state retained at {state_dir}"
+                ) from exc
         shutil.rmtree(state_dir, ignore_errors=True)
         raise
 

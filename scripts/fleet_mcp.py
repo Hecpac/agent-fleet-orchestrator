@@ -148,7 +148,9 @@ TOOLS = [
 ]
 
 
-def call_tool(control: FleetControl, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def call_tool(
+    control: FleetControl, name: str, arguments: dict[str, Any], *, actor: str = "lead"
+) -> dict[str, Any]:
     if not isinstance(arguments, dict):
         raise FleetControlError("tool arguments must be an object")
     if name == "dispatch":
@@ -164,7 +166,7 @@ def call_tool(control: FleetControl, name: str, arguments: dict[str, Any]) -> di
     if name == "relay_result":
         return control.relay_result(**arguments)
     if name == "request_assurance":
-        return control.request_assurance(**arguments)
+        return control.request_assurance(**arguments, actor=actor)
     if name == "request_human":
         return control.request_human(**arguments)
     if name == "inspect_roster":
@@ -191,7 +193,9 @@ def response(identifier: Any, *, result: Any = None, error: dict[str, Any] | Non
     return value
 
 
-def handle(control: FleetControl, request: Any) -> dict[str, Any] | None:
+def handle(
+    control: FleetControl, request: Any, *, actor: str = "lead"
+) -> dict[str, Any] | None:
     if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
         return response(None, error={"code": -32600, "message": "Invalid Request"})
     identifier = request.get("id")
@@ -216,7 +220,9 @@ def handle(control: FleetControl, request: Any) -> dict[str, Any] | None:
         if not isinstance(params, dict):
             return response(identifier, error={"code": -32602, "message": "Invalid params"})
         try:
-            value = call_tool(control, str(params.get("name", "")), params.get("arguments") or {})
+            value = call_tool(
+                control, str(params.get("name", "")), params.get("arguments") or {}, actor=actor
+            )
             return response(
                 identifier,
                 result={
@@ -363,7 +369,10 @@ def handle_socket_envelope(control: FleetControl, envelope: Any) -> dict[str, An
     if not isinstance(request, dict):
         raise FleetControlError("control socket request must be an object")
     identity = _validate_socket_caller(control, envelope["caller"], request)
-    result = handle(control, request)
+    result = handle(
+        control, request,
+        actor=f"specialist:{identity['instance']}:{identity['run_id']}",
+    )
     return {"identity": {key: identity[key] for key in ("kind", "instance", "run_id")}, "response": result}
 
 

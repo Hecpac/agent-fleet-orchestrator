@@ -236,8 +236,9 @@ def reconcile_lead_run(
     feature: str,
     prompt_sha256: str,
 ) -> dict[str, Any] | None:
-    latest: dict[str, dict[str, Any]] = {}
-    for event in legacy_events(runs_dir, feature):
+    events = legacy_events(runs_dir, feature)
+    candidates: set[str] = set()
+    for event in events:
         if event.get("instance") != "lead" or event.get("task_sha256") != prompt_sha256:
             continue
         run_id = str(event.get("run_id", ""))
@@ -245,10 +246,24 @@ def reconcile_lead_run(
             uuid.UUID(run_id)
         except ValueError:
             raise MissionRunError("legacy lead run has invalid run_id")
-        latest[run_id] = event
-    if len(latest) > 1:
+        candidates.add(run_id)
+    if len(candidates) > 1:
         raise MissionRunError("multiple legacy lead runs match one mission dispatch intent")
-    return next(iter(latest.values()), None)
+    if not candidates:
+        return None
+    run_id = next(iter(candidates))
+    matches = [
+        event for event in events
+        if event.get("instance") == "lead" and event.get("run_id") == run_id
+    ]
+    manifest = parse_manifest(runs_dir / f"fleet-{feature}.manifest")
+    try:
+        return fleet_tracking.verify_run_events(
+            matches,
+            required_protocol=manifest.get("tracking_protocol", "legacy-cmux"),
+        )
+    except fleet_tracking.TrackingError as exc:
+        raise MissionRunError(f"reconciled lead provenance invalid: {exc}") from exc
 
 
 def exact_legacy_run(runs_dir: Path, feature: str, run_id: str) -> dict[str, Any]:
@@ -346,6 +361,12 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                     control_lifecycle.stop()
             if options.get("teardown") and manifest_path.exists():
                 require_success([str(ROOT / "scripts" / "fleet-down.sh"), feature], timeout=180)
+            else:
+                audit_lifecycle = fleet_audit_client.AuditLifecycle(runs_dir, mission_id)
+                if audit_lifecycle.lifecycle_path.exists():
+                    lifecycle = load_json(audit_lifecycle.lifecycle_path)
+                    if lifecycle.get("stopped_at") is None:
+                        audit_lifecycle.stop()
             result_path = root / "lead-result.txt"
             return {
                 "mission_id": mission_id,
@@ -361,6 +382,7 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                 workflow_minimum=compiled["workflow"]["risk"]["minimum"],
                 objective=objective,
                 target=str(target_repo),
+                repository_root=str(target_repo),
                 override=str(options.get("risk_override", "auto")),
             )
             enforce_audit_trust(compiled, list(assessment["categories"]), execution_profile)
@@ -581,16 +603,24 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                 continue
 
             if current["lead_result"] is None:
-                wait = run_process(
-                    [
-                        str(ROOT / "scripts" / "fleet-wait.sh"), feature, "lead",
-                        "--run", f"lead={current['lead_run_id']}",
-                        "--timeout", str(timeout_seconds), "--json",
-                    ],
-                    timeout=timeout_seconds + 30,
-                    env={**os.environ, "FLEET_RUNS_DIR": str(runs_dir)},
-                )
-                wait_value = last_json_object(wait.stdout, "fleet-wait")
+                try:
+                    wait = run_process(
+                        [
+                            str(ROOT / "scripts" / "fleet-wait.sh"), feature, "lead",
+                            "--run", f"lead={current['lead_run_id']}",
+                            "--timeout", str(timeout_seconds), "--json",
+                        ],
+                        timeout=timeout_seconds + 30,
+                        env={**os.environ, "FLEET_RUNS_DIR": str(runs_dir)},
+                    )
+                    wait_value = last_json_object(wait.stdout, "fleet-wait")
+                except MissionRunError as exc:
+                    mission_state.append_terminal(
+                        runs_dir, mission_id, status="indeterminate",
+                        reason=f"fleet-wait evidence unavailable: {exc}",
+                        idempotency_key="controller:terminal:lead",
+                    )
+                    continue
                 status_value = str(wait_value.get("status", "indeterminate"))
                 if wait.returncode != 0 or status_value != "succeeded":
                     terminal = status_value if status_value in mission_state.TERMINAL_STATUSES else "indeterminate"
@@ -830,6 +860,7 @@ def dry_run(
         workflow_minimum=compiled["workflow"]["risk"]["minimum"],
         objective=objective,
         target=str(target_repo),
+        repository_root=str(target_repo),
         override=risk_override,
     )
     enforce_audit_trust(compiled, list(assessment["categories"]), execution_profile)

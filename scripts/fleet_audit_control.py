@@ -533,25 +533,32 @@ class S3ObjectLockSink:
         )
         headers = {
             "content-type": "application/json",
+            "if-none-match": "*",
             "x-amz-object-lock-mode": "COMPLIANCE",
             "x-amz-object-lock-retain-until-date": retain_until,
             "x-amz-meta-event-sha256": event_sha256,
         }
         request = self._signed_request("PUT", object_key, payload, headers)
+        recovered = False
         try:
             with self._open(request, timeout=30) as response:
                 version_id = response.headers.get("x-amz-version-id", "")
                 if not version_id or version_id == "null":
                     raise RuntimeError("S3 Object Lock response lacks version id")
         except urllib.error.HTTPError as exc:
-            try:
-                detail = exc.read(2048).decode("utf-8", "replace")
-            finally:
+            if exc.code == 412:
+                recovered = True
                 exc.close()
-            raise RuntimeError(f"S3 Object Lock PUT failed: {exc.code} {detail}") from exc
+                version_id = ""
+            else:
+                try:
+                    detail = exc.read(2048).decode("utf-8", "replace")
+                finally:
+                    exc.close()
+                raise RuntimeError(f"S3 Object Lock PUT failed: {exc.code} {detail}") from exc
 
         head = self._signed_request(
-            "HEAD", object_key, b"", {}, (("versionId", version_id),)
+            "HEAD", object_key, b"", {}, (("versionId", version_id),) if version_id else ()
         )
         try:
             with self._open(head, timeout=30) as response:
@@ -562,16 +569,33 @@ class S3ObjectLockSink:
         except urllib.error.HTTPError as exc:
             exc.close()
             raise RuntimeError(f"S3 Object Lock HEAD failed: {exc.code}") from exc
+        if recovered:
+            version_id = stored_version_id
+            get = self._signed_request(
+                "GET", object_key, b"", {}, (("versionId", version_id),)
+            )
+            try:
+                with self._open(get, timeout=30) as response:
+                    recovered_payload = response.read(len(payload) + 1)
+            except urllib.error.HTTPError as exc:
+                exc.close()
+                raise RuntimeError(f"S3 Object Lock GET failed: {exc.code}") from exc
+            if recovered_payload != payload:
+                raise RuntimeError("existing S3 Object Lock object differs from pending event")
         try:
             retained_at = datetime.fromisoformat(retained.replace("Z", "+00:00"))
             if retained_at.tzinfo is None:
                 raise ValueError("retention timestamp lacks timezone")
         except ValueError:
             retained_at = datetime.min.replace(tzinfo=timezone.utc)
+        required_retention = (
+            datetime.now(timezone.utc).replace(microsecond=0)
+            if recovered else retain_until_at.replace(microsecond=0)
+        )
         if (
             stored_version_id != version_id
             or mode != "COMPLIANCE"
-            or retained_at < retain_until_at.replace(microsecond=0)
+            or retained_at < required_retention
             or stored_digest != event_sha256
         ):
             raise RuntimeError("S3 object did not retain required COMPLIANCE metadata")
@@ -600,6 +624,17 @@ class AuditLedger:
         if receipt_root is not None:
             receipt_root.mkdir(parents=True, exist_ok=True, mode=0o700)
             secure_directory(receipt_root, owner_uid=os.geteuid(), mode=0o700)
+        elif sink.compliance_mode:
+            raise RuntimeError("WORM audit ledger requires a durable anchor receipt root")
+
+    def _fsync_receipt_root(self) -> None:
+        if self.receipt_root is None:
+            return
+        directory_fd = os.open(self.receipt_root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
     def _write_receipt(self, event_id: str, receipt: dict[str, Any]) -> None:
         if self.receipt_root is None:
@@ -620,6 +655,58 @@ class AuditLedger:
             os.fsync(fd)
         finally:
             os.close(fd)
+        self._fsync_receipt_root()
+
+    def _pending_path(self, event_id: str) -> Path | None:
+        if self.receipt_root is None:
+            return None
+        return self.receipt_root / f".{event_id}.pending.json"
+
+    def _persist_pending(self, event_id: str, value: dict[str, Any]) -> Path | None:
+        path = self._pending_path(event_id)
+        if path is None:
+            return None
+        encoded = canonical(value) + b"\n"
+        if path.exists():
+            if path.is_symlink() or path.read_bytes() != encoded:
+                raise RuntimeError("audit pending anchor conflicts")
+            return path
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            os.write(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        self._fsync_receipt_root()
+        return path
+
+    def _complete_existing_pending(self, event: dict[str, Any]) -> None:
+        path = self._pending_path(str(event["event_id"]))
+        if path is None or not path.exists():
+            return
+        assert self.receipt_root is not None
+        expected = {
+            "schema_version": 1,
+            "event_id": event["event_id"],
+            "object_key": event["worm_object_key"],
+            "event_sha256": event["event_sha256"],
+            "payload_sha256": hashlib.sha256(canonical(event) + b"\n").hexdigest(),
+        }
+        try:
+            pending = json.loads(path.read_bytes())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("durable audit pending anchor is invalid") from exc
+        if pending != expected:
+            raise RuntimeError("durable audit pending anchor conflicts with ledger")
+        receipt = self.receipt_root / f"{event['event_id']}.json"
+        if not receipt.is_file() or receipt.is_symlink():
+            raise RuntimeError("durable audit event lacks its anchor receipt")
+        path.unlink()
+        self._fsync_receipt_root()
 
     def _run_directory(self, run_id: str) -> Path:
         try:
@@ -691,6 +778,7 @@ class AuditLedger:
                     if existing is not None:
                         if any(existing.get(key) != value for key, value in payload.items()):
                             raise RuntimeError("audit event_id conflicts with existing payload")
+                        self._complete_existing_pending(existing)
                         return existing
                 sequence = len(events) + 1
                 event = dict(payload)
@@ -712,6 +800,16 @@ class AuditLedger:
                     self.key, "event-signature", canonical(event)
                 )
                 encoded = canonical(event) + b"\n"
+                pending = self._persist_pending(
+                    event_id,
+                    {
+                        "schema_version": 1,
+                        "event_id": event_id,
+                        "object_key": object_key,
+                        "event_sha256": event["event_sha256"],
+                        "payload_sha256": hashlib.sha256(encoded).hexdigest(),
+                    },
+                )
                 receipt = self.sink.anchor(object_key, encoded, event["event_sha256"])
                 if not isinstance(receipt, dict):
                     raise RuntimeError("audit sink returned no anchor receipt")
@@ -720,6 +818,9 @@ class AuditLedger:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+                if pending is not None:
+                    pending.unlink()
+                    self._fsync_receipt_root()
                 fcntl.flock(handle, fcntl.LOCK_UN)
                 return event
         finally:
@@ -956,6 +1057,7 @@ class AuditRequestHandler(socketserver.StreamRequestHandler):
 
     def handle(self) -> None:
         try:
+            self.request.settimeout(5.0)
             raw = self.rfile.readline(MAX_REQUEST_BYTES + 1)
             if not raw or len(raw) > MAX_REQUEST_BYTES or not raw.endswith(b"\n"):
                 raise RuntimeError("invalid or oversized request")
@@ -980,6 +1082,7 @@ class AuditUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
 
 def send_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(5.0)
         client.connect(str(socket_path))
         client.sendall(canonical(request) + b"\n")
         response_file = client.makefile("rb")

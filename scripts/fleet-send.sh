@@ -66,9 +66,9 @@ prepare_args=(prepare "$runs_dir" \
   --variant "$variant")
 [[ -z "$run_id_override" ]] || prepare_args+=(--run-id "$run_id_override")
 prepared="$(python3 "$frontier" "${prepare_args[@]}")"
-run_id="$(jq -r '.run_id' <<< "$prepared")"
-prompt="$(jq -r '.prompt' <<< "$prepared")"
-payload="$(jq -r '.submission_payload' <<< "$prepared")"
+run_id="$(jq -er '.run_id // empty' <<< "$prepared")" || exit 75
+prompt="$(jq -er '.prompt // empty' <<< "$prepared")" || exit 75
+payload="$(jq -er '.submission_payload // empty' <<< "$prepared")" || exit 75
 send_attempted=0
 entered=0
 cleanup_untransferred() {
@@ -90,7 +90,7 @@ trap cleanup_untransferred EXIT
 # The provider adapter chooses an identity-bound transport while the composed
 # prompt remains durable on disk. CONTROL still performs the existing cmux
 # side effect and requires a UserPromptSubmit before trusting transfer.
-prompt_path="$(jq -r '.prompt_path' <<< "$prepared")"
+prompt_path="$(jq -er '.prompt_path // empty' <<< "$prepared")" || exit 75
 [[ -n "$prompt_path" && -n "$prompt" && -n "$payload" ]] || exit 75
 send_attempted=1
 since="$(date -u +%Y-%m-%dT%H:%M:%S)"

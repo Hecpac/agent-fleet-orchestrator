@@ -147,6 +147,34 @@ class FleetProviderTests(unittest.TestCase):
                 ),
             )
 
+    def test_provider_commands_bind_exactly_one_configured_model(self) -> None:
+        cases = (
+            ("openai", "gpt-test", "codex", ["codex", "--model", "gpt-test", "--model", "other"]),
+            ("anthropic", "claude-test", "claude", ["claude", "--model", "claude-test", "--model", "other"]),
+            ("ollama", "local-test", "", ["ollama", "run", "other"]),
+        )
+        for provider, model, source, command in cases:
+            with self.subTest(provider=provider), self.assertRaises(fleet_providers.ProviderError):
+                identity = fleet_providers.identity(provider, model, None, source)
+                fleet_providers.adapter_for(identity).validate_configuration(
+                    identity, command=command, runner="local" if provider == "ollama" else "interactive"
+                )
+        for provider, executable, source in (
+            ("openai", "codex", "codex"),
+            ("anthropic", "claude", "claude"),
+        ):
+            identity = fleet_providers.identity(provider, "model", None, source)
+            for command in (
+                [executable, "--model", "model", "--model"],
+                [executable, "--model", "model", "--model=other"],
+            ):
+                with self.subTest(provider=provider, command=command), self.assertRaises(
+                    fleet_providers.ProviderError
+                ):
+                    fleet_providers.adapter_for(identity).validate_configuration(
+                        identity, command=command, runner="interactive"
+                    )
+
     def test_provider_cli_is_machine_readable(self) -> None:
         result = subprocess.run(
             ["python3", str(ROOT / "scripts" / "fleet_providers.py"), "list"],

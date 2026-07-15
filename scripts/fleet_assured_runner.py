@@ -265,16 +265,33 @@ class AssuredRunner:
         )
         return str(message["message_id"])
 
-    def _phase(self) -> str:
+    def _phase_state(self) -> dict[str, Any]:
         path = self.manifest_path.with_suffix(".state.json")
         try:
-            return str(json.loads(path.read_text(encoding="utf-8"))["active_phase"])
-        except (OSError, json.JSONDecodeError, KeyError) as exc:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
             raise AssuredRunnerError("cannot read assured fleet phase") from exc
+        if not isinstance(value, dict) or not isinstance(value.get("active_phase"), str):
+            raise AssuredRunnerError("cannot read assured fleet phase")
+        return value
+
+    def _phase(self) -> str:
+        return str(self._phase_state()["active_phase"])
 
     def _advance(self, phase: str, evidence: str, *, approved_by: str | None = None) -> None:
-        current = self._phase()
+        state = self._phase_state()
+        current = str(state["active_phase"])
         if current == phase:
+            history = state.get("history")
+            latest = history[-1] if isinstance(history, list) and history else None
+            if not isinstance(latest, dict) or any(
+                (
+                    latest.get("phase") != phase,
+                    latest.get("evidence") != evidence,
+                    latest.get("approved_by") != approved_by,
+                )
+            ):
+                raise AssuredRunnerError("persisted phase binding differs from requested advance")
             return
         command = [
             "python3", str(ROOT / "scripts" / "fleet_state.py"), "advance",
@@ -520,9 +537,25 @@ class AssuredRunner:
         ]
         if not lifecycle or lifecycle[-1].get("status") != "succeeded":
             raise AssuredRunnerError("additional advisory turn did not succeed")
-        result_path = Path(str(lifecycle[-1].get("result_file", "")))
+        terminal = lifecycle[-1]
+        expected_identity = {
+            "phase": phase,
+            "role": self.manifest.get(f"{instance}.role_type"),
+            "task_sha256": prompt_sha,
+            "provider": self.manifest.get(f"{instance}.provider"),
+            "model": self.manifest.get(f"{instance}.model"),
+        }
+        if any(terminal.get(field) != value for field, value in expected_identity.items()):
+            raise AssuredRunnerError("additional advisory result provenance differs from dispatch")
+        expected_variant = self.manifest.get(f"{instance}.variant")
+        if terminal.get("variant") != expected_variant:
+            raise AssuredRunnerError("additional advisory result variant differs from dispatch")
+        result_path = Path(str(terminal.get("result_file", "")))
         expected = self.runs_dir / "results" / self.feature / f"{run_id}.txt"
         try:
+            info = result_path.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise AssuredRunnerError("advisory result is not a regular file")
             if result_path.resolve(strict=True) != expected.resolve(strict=True):
                 raise AssuredRunnerError("advisory result is outside the exact result store")
         except OSError as exc:

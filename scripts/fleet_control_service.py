@@ -221,6 +221,20 @@ class ControlLifecycle:
                 process.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
                 pass
+        if self._pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if process is not None:
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        if self._pid_alive(pid):
+            raise ControlServiceError(
+                "Fleet Control did not stop before the shutdown deadline"
+            )
         _LIVE_PROCESSES.pop(pid, None)
         self.socket_path.unlink(missing_ok=True)
         lifecycle["stopped_at"] = datetime.now(timezone.utc).isoformat()

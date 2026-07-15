@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import copy
 import json
 from pathlib import Path
+import sys
 import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ORCHESTRATION = ROOT / "orchestration"
 FIXTURES = ROOT / "tests" / "fixtures" / "mission_control"
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import fleet_mission  # noqa: E402
+import workflow_config  # noqa: E402
 
 
 def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -75,6 +81,17 @@ class MissionSchemaContractTests(unittest.TestCase):
         self.assertEqual(set(shell) - root_allowed, {"command"})
         capabilities_allowed = set(schema["properties"]["capabilities"]["properties"])
         self.assertEqual(set(authority["capabilities"]) - capabilities_allowed, {"authority"})
+
+    def test_digest_valid_compiled_workflow_still_requires_risk_minimum(self) -> None:
+        compiled = copy.deepcopy(
+            workflow_config.compile_path(ROOT / "workflows" / "implementation.yaml")
+        )
+        del compiled["workflow"]["risk"]["minimum"]
+        compiled["workflow_digest"] = fleet_mission.state.sha256(compiled["workflow"])
+        unsigned = {key: value for key, value in compiled.items() if key != "compiled_digest"}
+        compiled["compiled_digest"] = fleet_mission.state.sha256(unsigned)
+        with self.assertRaisesRegex(fleet_mission.MissionError, "risk.minimum"):
+            fleet_mission.validate_compiled(compiled)
 
 
 if __name__ == "__main__":

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,6 +36,9 @@ class FleetAssuranceControllerTests(unittest.TestCase):
         self.manifest = self.fdp2.manifest
         self.now = self.fdp2.now
         self.accepted, self.accepted_head = self.fdp2.accept_conversation()
+        # Keep deterministic control deadlines safely ahead of wall-clock time;
+        # expiry behavior is exercised explicitly below with a patched clock.
+        self.now = datetime(2099, 7, 13, 16, 0, tzinfo=timezone.utc)
         advanced = self.run_state(
             "advance",
             "CHALLENGE",
@@ -371,6 +375,36 @@ class FleetAssuranceControllerTests(unittest.TestCase):
             self.run_state("advance", "VERIFY", "--evidence", gate["event_sha256"]).returncode,
             0,
         )
+
+    def test_phase_gate_materializes_expired_assurance_before_verify(self) -> None:
+        gate = self.challenge_to_gate()
+        with mock.patch.object(
+            assurance, "utc_now", return_value=self.now + timedelta(days=2)
+        ), self.assertRaisesRegex(assurance.AssuranceError, "valid published GLM challenge"):
+            assurance.challenge_phase_gate(
+                self.runs, self.feature, self.manifest_values(), gate["event_sha256"]
+            )
+        self.assertEqual(
+            assurance.load_events(self.runs, self.feature)[-1]["snapshot"]["status"],
+            "indeterminate",
+        )
+
+    def test_snapshot_validation_rejects_ignored_residue(self) -> None:
+        repo = self.fdp2.tmp / "ignored-snapshot"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        (repo / ".gitignore").write_text("ignored.tmp\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", ".gitignore"], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "base"], check=True)
+        head = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"], text=True
+        ).strip()
+        subprocess.run(["git", "-C", str(repo), "checkout", "--detach", "-q"], check=True)
+        (repo / "ignored.tmp").write_text("residue", encoding="utf-8")
+        with self.assertRaisesRegex(assurance.AssuranceContractError, "dirty"):
+            assurance._validate_snapshot_worktree(repo, head)
 
     def test_dirty_snapshot_cleanup_fails_and_retains_both(self) -> None:
         started = self.start_assurance()

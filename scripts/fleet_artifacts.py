@@ -26,6 +26,10 @@ def store_path(runs_dir: Path, mission_id: str) -> Path:
     return mission_state.mission_root(runs_dir, mission_id) / "artifacts"
 
 
+def lock_path(runs_dir: Path, mission_id: str) -> Path:
+    return mission_state.mission_root(runs_dir, mission_id) / ".artifacts.lock"
+
+
 def artifact_path(runs_dir: Path, mission_id: str, artifact_id: str) -> Path:
     if not mission_state.SHA256.fullmatch(artifact_id):
         raise ArtifactError("invalid artifact_id")
@@ -65,11 +69,12 @@ def put_bytes(runs_dir: Path, mission_id: str, content: bytes) -> dict[str, Any]
         raise ArtifactError(f"artifact exceeds {MAX_ARTIFACT_BYTES} bytes")
     digest = hashlib.sha256(content).hexdigest()
     path = artifact_path(runs_dir, mission_id, digest)
-    if path.exists():
-        if path.is_symlink() or read_regular(path) != content:
-            raise ArtifactError("content-addressed artifact conflicts with stored bytes")
-    else:
-        mission_state.atomic_write(path, content)
+    with mission_state.exclusive_lock(lock_path(runs_dir, mission_id)):
+        if path.exists():
+            if path.is_symlink() or read_regular(path) != content:
+                raise ArtifactError("content-addressed artifact conflicts with stored bytes")
+        else:
+            mission_state.atomic_write(path, content)
     return {"artifact_id": digest, "bytes": len(content), "path": str(path)}
 
 
@@ -86,19 +91,21 @@ def get_bytes(runs_dir: Path, mission_id: str, artifact_id: str) -> bytes:
 
 
 def verify_store(runs_dir: Path, mission_id: str) -> dict[str, Any]:
-    root = store_path(runs_dir, mission_id)
-    if not root.exists():
-        return {"mission_id": mission_id, "artifacts": 0, "bytes": 0, "valid": True}
-    if root.is_symlink() or not root.is_dir():
-        raise ArtifactError("artifact store is not a safe directory")
-    count = 0
-    total = 0
-    for path in sorted(root.iterdir()):
-        if path.name.startswith("."):
-            raise ArtifactError("artifact store contains unexpected hidden entry")
-        content = get_bytes(runs_dir, mission_id, path.name)
-        count += 1
-        total += len(content)
+    mission_id = mission_state.normalize_uuid(mission_id, "mission_id")
+    with mission_state.exclusive_lock(lock_path(runs_dir, mission_id)):
+        root = store_path(runs_dir, mission_id)
+        if not root.exists():
+            return {"mission_id": mission_id, "artifacts": 0, "bytes": 0, "valid": True}
+        if root.is_symlink() or not root.is_dir():
+            raise ArtifactError("artifact store is not a safe directory")
+        count = 0
+        total = 0
+        for path in sorted(root.iterdir()):
+            if path.name.startswith("."):
+                raise ArtifactError("artifact store contains unexpected hidden entry")
+            content = get_bytes(runs_dir, mission_id, path.name)
+            count += 1
+            total += len(content)
     return {"mission_id": mission_id, "artifacts": count, "bytes": total, "valid": True}
 
 

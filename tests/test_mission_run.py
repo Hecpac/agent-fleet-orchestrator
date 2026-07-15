@@ -209,6 +209,94 @@ class MissionRunTests(unittest.TestCase):
         self.assertEqual(state["lead_result"]["provider"], "openai")
         self.assertEqual(state["lead_result"]["model"], "gpt-test")
 
+    def test_wait_failure_without_json_is_durably_indeterminate(self) -> None:
+        calls, runtime = self.fake_runtime()
+
+        def fail_wait(command, *, timeout=None, env=None):
+            if Path(command[0]).name == "fleet-wait.sh":
+                return subprocess.CompletedProcess(command, 5, "", "timeout without JSON")
+            return runtime(command, timeout=timeout, env=env)
+
+        with mock.patch.object(mission_run, "run_process", side_effect=fail_wait), \
+             mock.patch.object(mission_run, "cmux_signal"):
+            value = mission_run.create_and_drive(
+                self.runs, feature="wait-no-json",
+                objective="implement and verify the parser",
+                workflow_name="implementation", target_repo=self.target.resolve(),
+                risk_override="auto", timeout_seconds=300,
+                allow_dirty_baseline=False, teardown=False,
+            )
+        self.assertEqual(value["status"], "indeterminate")
+        events = mission_run.mission_state.read_events(
+            mission_run.mission_state.ledger_path(self.runs, value["mission_id"]),
+            expected_mission_id=value["mission_id"],
+        )
+        self.assertEqual(events[-1]["kind"], "mission_terminal")
+        self.assertIn("fleet-wait evidence unavailable", events[-1]["payload"]["reason"])
+
+    def test_terminal_teardown_keeps_audit_live_until_fleet_down(self) -> None:
+        compiled = mission_run.workflow_config.compile_path(
+            ROOT / "workflows" / "implementation.yaml"
+        )
+        mission_id, _ = mission_run.fleet_mission.create_mission(
+            self.runs,
+            compiled=compiled,
+            feature="terminal-down",
+            objective="verify teardown ordering",
+            target_repo=self.target.resolve(),
+            base_sha=self.base_sha,
+            idempotency_key="create:terminal-down",
+        )
+        root = self.runs / "missions" / mission_id
+        (root / "objective.txt").write_text("verify teardown ordering\n", encoding="utf-8")
+        (root / "runtime-options.json").write_text(
+            json.dumps({"teardown": True, "execution_profile": "native"}) + "\n",
+            encoding="utf-8",
+        )
+        mission_run.mission_state.append_terminal(
+            self.runs,
+            mission_id,
+            status="failed",
+            reason="synthetic terminal",
+            idempotency_key="test:terminal",
+        )
+        manifest = self.runs / "fleet-terminal-down.manifest"
+        manifest.write_text(f"feature=terminal-down\nmission_id={mission_id}\n", encoding="utf-8")
+        audit_lifecycle = root / "audit" / "lifecycle.json"
+        audit_lifecycle.parent.mkdir(parents=True)
+        audit_lifecycle.write_text('{"stopped_at":null}\n', encoding="utf-8")
+        calls: list[str] = []
+
+        class FakeControlLifecycle:
+            def __init__(inner_self, runs_dir, actual_mission_id):
+                inner_self.lifecycle_path = root / "control" / "lifecycle.json"
+
+        class FakeAuditLifecycle:
+            def __init__(inner_self, runs_dir, actual_mission_id):
+                inner_self.lifecycle_path = audit_lifecycle
+
+            def stop(inner_self):
+                calls.append("audit-stop")
+
+        def fake_require(command, *, timeout=None, env=None):
+            self.assertEqual(Path(command[0]).name, "fleet-down.sh")
+            self.assertNotIn("audit-stop", calls)
+            calls.append("fleet-down")
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with (
+            mock.patch.object(
+                mission_run.fleet_control_service, "ControlLifecycle", FakeControlLifecycle
+            ),
+            mock.patch.object(
+                mission_run.fleet_audit_client, "AuditLifecycle", FakeAuditLifecycle
+            ),
+            mock.patch.object(mission_run, "require_success", side_effect=fake_require),
+        ):
+            result = mission_run.drive_mission(self.runs, mission_id)
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(calls, ["fleet-down"])
+
     def test_resume_adopts_exact_legacy_lead_run_without_redispatch(self) -> None:
         calls, fake = self.fake_runtime()
         original_append = mission_run.mission_state.append_event
@@ -333,12 +421,19 @@ class MissionRunTests(unittest.TestCase):
             def __init__(inner_self, runs_dir, actual_mission_id):
                 self.assertEqual(runs_dir, self.runs)
                 self.assertEqual(actual_mission_id, mission_id)
+                inner_self.lifecycle_path = (
+                    self.runs / "missions" / mission_id / "audit" / "lifecycle.json"
+                )
 
             def preflight(inner_self):
                 return {"mode": "signed", "configured": True}
 
             def start(inner_self, manifest_path):
                 self.assertEqual(manifest_path, self.runs / "fleet-assured.manifest")
+                inner_self.lifecycle_path.parent.mkdir(parents=True, exist_ok=True)
+                inner_self.lifecycle_path.write_text(
+                    json.dumps({"stopped_at": None}) + "\n", encoding="utf-8"
+                )
                 return {"started": True}
 
             def record_control_event(inner_self, **kwargs):
@@ -347,6 +442,13 @@ class MissionRunTests(unittest.TestCase):
 
             def verify(inner_self):
                 return {"valid": True, "worm": False}
+
+            def stop(inner_self):
+                inner_self.lifecycle_path.write_text(
+                    json.dumps({"stopped_at": "2099-01-01T00:00:00Z"}) + "\n",
+                    encoding="utf-8",
+                )
+                return {"stopped": True}
 
         class FakeArchiveBuilder:
             def __init__(inner_self, runs_dir, actual_mission_id):

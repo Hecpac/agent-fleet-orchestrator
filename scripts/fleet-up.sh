@@ -14,7 +14,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 router="$repo_root/scripts/router_config.py"
 runs_dir="${FLEET_RUNS_DIR:-$repo_root/orchestration/runs}"
-worktrees_root="${FLEET_WORKTREES_DIR:-/tmp/fleet_workspaces}"
+worktrees_root="${FLEET_WORKTREES_DIR:-/tmp/fleet_workspaces-$(id -u)}"
 mission_id="${FLEET_MISSION_ID:-}"
 execution_profile="${FLEET_EXECUTION_PROFILE:-native}"
 control_socket=""
@@ -438,6 +438,18 @@ trap cleanup_on_exit EXIT
 # named branch and dedicated worktree of the target repo, then starts inside it.
 worktrees=()
 if [[ -n "$target_repo" ]]; then
+  python3 -c '
+import os, stat, sys
+from pathlib import Path
+path = Path(sys.argv[1]).expanduser()
+if path.exists() or path.is_symlink():
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
+        raise SystemExit("unsafe fleet worktree root")
+else:
+    path.mkdir(parents=True, mode=0o700)
+os.chmod(path, 0o700)
+' "$worktrees_root" || { echo "Refusing unsafe worktree root: $worktrees_root" >&2; exit 2; }
   for ((i=0; i<${#instance_ids[@]}; i++)); do
     worktrees[$i]=""
     if [[ "${authorities[$i]}" == "write" ]]; then
@@ -448,8 +460,6 @@ if [[ -n "$target_repo" ]]; then
         echo "Worktree path already exists: $wt" >&2
         exit 2
       fi
-      mkdir -p "$worktrees_root"
-      chmod 700 "$worktrees_root"
       if ! git -C "$target_repo" branch "$branch" "$base_sha" >/dev/null 2>&1; then
         echo "Could not create writer branch $branch; it may have been created concurrently." >&2
         exit 2
@@ -517,8 +527,9 @@ for ((i=${#instance_ids[@]}-1; i>=0; i--)); do
       # commits are the designed durable output, so grant exactly that dir.
       if [[ "${providers[$i]}" == "openai" ]]; then
         writer_git_dir="$(git -C "$target_repo" rev-parse --path-format=absolute --git-common-dir)"
+        writer_git_dir_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$writer_git_dir")"
         codex_project_policy="$(python3 -c 'import json, sys; print(f"projects={{{json.dumps(sys.argv[1])}={{trust_level=\"untrusted\"}}}}")' "$target_repo")"
-        launch_command="$launch_command$(printf ' -c %q' "sandbox_workspace_write.writable_roots=[\"$writer_git_dir\"]")"
+        launch_command="$launch_command$(printf ' -c %q' "sandbox_workspace_write.writable_roots=[$writer_git_dir_json]")"
         launch_command="$launch_command$(printf ' -c %q' "$codex_project_policy")"
       fi
       launch_command="$(printf 'cd %q && ' "${worktrees[$i]}")$launch_command"

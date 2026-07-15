@@ -188,6 +188,12 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         required = {"risk", "categories", "scope", "workflow_digest"}
         if set(payload) != required or payload["risk"] not in {"high", "unknown"}:
             raise MissionStateError("assurance request payload is invalid")
+        if not isinstance(payload["categories"], list) or not all(
+            isinstance(item, str) and item for item in payload["categories"]
+        ):
+            raise MissionStateError("assurance categories must be a string list")
+        if not isinstance(payload["scope"], str) or not payload["scope"]:
+            raise MissionStateError("assurance scope must be non-empty")
         if not SHA256.fullmatch(str(payload["workflow_digest"])):
             raise MissionStateError("assurance workflow_digest is invalid")
     elif kind == "assurance_approved":
@@ -376,6 +382,10 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
             }:
                 raise MissionStateError("assurance request requires compiled or running state")
             if kind == "assurance_requested":
+                if not isinstance(payload["categories"], list) or not all(
+                    isinstance(item, str) and item for item in payload["categories"]
+                ) or not isinstance(payload["scope"], str) or not payload["scope"]:
+                    raise MissionStateError("assurance request scope or categories are invalid")
                 result["risk_categories"] = sorted(
                     set(result["risk_categories"]) | set(payload["categories"])
                 )
@@ -398,6 +408,14 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                     raise MissionStateError("assurance boot requires approval")
                 if payload["approval_event_sha256"] != result["approval"]["event_sha256"]:
                     raise MissionStateError("assurance boot approval reference mismatch")
+                expires = datetime.fromisoformat(
+                    result["approval"]["expires_at"].replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+                started = datetime.fromisoformat(
+                    event["timestamp"].replace("Z", "+00:00")
+                ).astimezone(timezone.utc)
+                if started >= expires:
+                    raise MissionStateError("assurance approval expired before boot")
             if kind == "assurance_started":
                 if result["status"] != "assured_booting" or result["approval"] is None:
                     raise MissionStateError("assurance start requires assured boot state")
@@ -442,7 +460,7 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
             delegation = result["delegations"][payload["delegation_id"]]
             if payload["run_id"] != delegation["run_id"]:
                 raise MissionStateError("result run_id does not match delegation")
-            result["results"][payload["artifact_id"]] = payload
+            result["results"][payload["delegation_id"]] = payload
         elif kind == "mission_terminal":
             if payload["status"] == "succeeded" and result["status"] != "archived":
                 raise MissionStateError("succeeded terminal requires archived state")

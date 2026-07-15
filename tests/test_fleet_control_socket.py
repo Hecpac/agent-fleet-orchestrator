@@ -127,6 +127,28 @@ class FleetControlSocketTests(unittest.TestCase):
         self.assertFalse(wrong_scope["ok"])
         self.assertIn("exceeds token", wrong_scope["error"])
 
+        escalated = self.request(
+            caller,
+            "tools/call",
+            params={
+                "name": "request_assurance",
+                "arguments": {
+                    "risk": "high",
+                    "categories": ["production"],
+                    "reason": "specialist observed a production effect",
+                    "idempotency_key": "socket:assurance",
+                },
+            },
+        )
+        self.assertTrue(escalated["ok"], escalated)
+        actor = f"specialist:scout:{delegated['run_id']}"
+        assurance_events = [
+            event for event in self.control.events()
+            if event["kind"] in {"risk_escalated", "assurance_requested"}
+        ]
+        self.assertTrue(assurance_events)
+        self.assertTrue(all(event["actor"] == actor for event in assurance_events))
+
     def test_socket_permissions_and_health_are_kernel_scoped(self) -> None:
         self.assertEqual(self.lifecycle.socket_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.lifecycle.root.stat().st_mode & 0o777, 0o700)

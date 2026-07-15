@@ -195,7 +195,7 @@ first successful completion as a candidate; it is not an acceptance gate.
 Write isolation: pass `--target-repo <path>` (or set `FLEET_TARGET_REPO`) to
 `fleet-up` and every write-authority instance gets a dedicated
 `fleet/<feature>/<instance>` branch and worktree, based on the target repo's
-current `HEAD`. Writer worktrees live under `/tmp/fleet_workspaces` by default
+current `HEAD`. Writer worktrees live under `/tmp/fleet_workspaces-<uid>` by default
 (override with `FLEET_WORKTREES_DIR`) so agent-visible paths do not disclose the
 controller's home directory. Existing branch names fail closed. `fleet-down` refuses
 uncommitted changes, records the final SHA, preserves branches with commits,

@@ -18,6 +18,7 @@ class FleetRiskTests(unittest.TestCase):
             workflow_minimum="low",
             objective="refactor the parser and run tests",
             target="/tmp/repository",
+            repository_root="/tmp/repository",
         )
         self.assertEqual(local["level"], "low")
         self.assertFalse(local["requires_confirmation"])
@@ -25,6 +26,7 @@ class FleetRiskTests(unittest.TestCase):
             workflow_minimum="medium",
             objective="inspect documentation",
             target="/tmp/repository",
+            repository_root="/tmp/repository",
         )
         self.assertEqual(medium["level"], "medium")
 
@@ -39,7 +41,10 @@ class FleetRiskTests(unittest.TestCase):
         ):
             with self.subTest(category=category):
                 result = risk.assess(
-                    workflow_minimum="low", objective=phrase, target="/tmp/repository"
+                    workflow_minimum="low",
+                    objective=phrase,
+                    target="/tmp/repository",
+                    repository_root="/tmp/repository",
                 )
                 self.assertEqual(result["level"], "high")
                 self.assertIn(category, result["categories"])
@@ -50,11 +55,24 @@ class FleetRiskTests(unittest.TestCase):
             workflow_minimum="low",
             objective="inspect files",
             target="/tmp/repository",
+            repository_root="/tmp/repository",
             override="unknown",
         )
         self.assertEqual(result["level"], "unknown")
         with self.assertRaisesRegex(risk.RiskError, "cannot decrease"):
             risk.escalate("high", "medium")
+
+    def test_absolute_target_outside_authorized_repository_is_external(self) -> None:
+        inside = risk.classify_categories(
+            "inspect files", "/tmp/repository/src", "/tmp/repository"
+        )
+        outside = risk.classify_categories(
+            "inspect files", "/etc/hosts", "/tmp/repository"
+        )
+        self.assertIn("repository_local", inside)
+        self.assertNotIn("external_side_effect", inside)
+        self.assertIn("external_side_effect", outside)
+        self.assertNotIn("repository_local", outside)
 
 
 if __name__ == "__main__":

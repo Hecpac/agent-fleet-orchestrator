@@ -22,8 +22,11 @@ class OllamaAdapter(BaseAdapter):
             raise ProviderError("Ollama adapter supports only local or API runners")
         if identity.variant is not None:
             raise ProviderError("Ollama does not accept OpenCode variant identity")
-        if command is not None and command[0] != "ollama":
-            raise ProviderError("Ollama direct launch command must run ollama")
+        if command is not None and (
+            command[0] != "ollama" or len(command) != 3
+            or command[1] != "run" or command[2] != identity.model
+        ):
+            raise ProviderError("Ollama direct launch command must bind the configured model")
         return value
 
     def prepare_submission(

@@ -84,8 +84,12 @@ if [[ "$execution_profile" != "native" ]]; then
   )
 fi
 if [[ "$execution_profile" == "regulated" ]]; then
-  [[ -n "${FLEET_MISSION_ID:-}" ]] || {
-    echo "regulated execution requires FLEET_MISSION_ID" >&2
+  [[ "${FLEET_MISSION_ID:-}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]] || {
+    echo "regulated execution requires a canonical FLEET_MISSION_ID" >&2
+    exit 2
+  }
+  [[ "${FLEET_CONTROL_SOCKET:-}" == /* && -S "${FLEET_CONTROL_SOCKET:-}" ]] || {
+    echo "regulated execution requires an active absolute FLEET_CONTROL_SOCKET" >&2
     exit 2
   }
   keep+=(
@@ -187,9 +191,29 @@ case "$role_type" in
     fi
     ;;
   glm|minimax|minimax_checker)
-    [[ -d "$controller_home/.config" ]] && keep+=("XDG_CONFIG_HOME=$controller_home/.config")
-    [[ -d "$controller_home/.local/share" ]] && keep+=("XDG_DATA_HOME=$controller_home/.local/share")
-    [[ -d "$controller_home/.local/state" ]] && keep+=("XDG_STATE_HOME=$controller_home/.local/state")
+    xdg_config="$isolated_home/xdg/config"
+    xdg_data="$isolated_home/xdg/data"
+    xdg_state="$isolated_home/xdg/state"
+    mkdir -p "$xdg_config" "$xdg_data" "$xdg_state"
+    for mapping in \
+      "$controller_home/.config/opencode:$xdg_config" \
+      "$controller_home/.local/share/opencode:$xdg_data" \
+      "$controller_home/.local/state/opencode:$xdg_state"; do
+      source_dir="${mapping%%:*}"
+      destination_root="${mapping#*:}"
+      if [[ -d "$source_dir" ]]; then
+        if [[ -n "$(find "$source_dir" -type l -print -quit)" ]]; then
+          echo "OpenCode provider state must not contain symlinks: $source_dir" >&2
+          exit 2
+        fi
+        cp -R "$source_dir" "$destination_root/"
+      fi
+    done
+    keep+=(
+      "XDG_CONFIG_HOME=$xdg_config"
+      "XDG_DATA_HOME=$xdg_data"
+      "XDG_STATE_HOME=$xdg_state"
+    )
     ;;
   *)
     [[ -n "${CODEX_HOME:-}" ]] && keep+=("CODEX_HOME=$CODEX_HOME")

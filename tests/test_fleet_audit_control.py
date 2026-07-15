@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -230,6 +231,7 @@ class FleetAuditControlTests(unittest.TestCase):
         self.assertEqual(put_headers["x-amz-object-lock-mode"], "COMPLIANCE")
         self.assertIn("x-amz-object-lock-retain-until-date", put_headers)
         self.assertEqual(put_headers["x-amz-meta-event-sha256"], "a" * 64)
+        self.assertEqual(put_headers["if-none-match"], "*")
         self.assertIn("AWS4-HMAC-SHA256", put_headers["authorization"])
         self.assertNotIn("not-a-real-secret", put_headers["authorization"])
         self.assertEqual(
@@ -238,6 +240,94 @@ class FleetAuditControlTests(unittest.TestCase):
         )
         self.assertEqual(receipt["version_id"], "version-1")
         self.assertEqual(receipt["trust_scope"], "external-compliance")
+
+    def test_s3_anchor_recovers_exact_conditional_object_without_new_version(self) -> None:
+        addresses = [
+            (audit.socket.AF_INET, audit.socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))
+        ]
+        with mock.patch.object(audit.socket, "getaddrinfo", return_value=addresses):
+            sink = audit.S3ObjectLockSink(
+                "bucket", "us-east-1", audit.S3Credentials("AKIATEST", "secret"),
+                "https://storage.example", 1, "external-compliance",
+            )
+        payload = b'{"durable":true}\n'
+        requests = []
+
+        class Response:
+            def __init__(self, headers=None, body=b""):
+                self.headers = headers or {}
+                self.body = body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, size=-1):
+                return self.body[:size]
+
+        def fake_open(_sink, request, *, timeout):
+            self.assertEqual(timeout, 30)
+            requests.append(request)
+            if request.method == "PUT":
+                raise audit.urllib.error.HTTPError(
+                    request.full_url, 412, "Precondition Failed", {}, io.BytesIO()
+                )
+            if request.method == "HEAD":
+                return Response({
+                    "x-amz-version-id": "version-existing",
+                    "x-amz-object-lock-mode": "COMPLIANCE",
+                    "x-amz-object-lock-retain-until-date": "2099-01-01T00:00:00Z",
+                    "x-amz-meta-event-sha256": "a" * 64,
+                })
+            return Response(body=payload)
+
+        with (
+            mock.patch.object(audit.socket, "getaddrinfo", return_value=addresses),
+            mock.patch.object(audit.S3ObjectLockSink, "_open", fake_open),
+        ):
+            receipt = sink.anchor("fleet-audits/run/1.json", payload, "a" * 64)
+        self.assertEqual([request.method for request in requests], ["PUT", "HEAD", "GET"])
+        self.assertEqual(receipt["version_id"], "version-existing")
+
+    def test_anchor_journal_recovers_crash_between_sink_and_ledger_append(self) -> None:
+        receipts = Path(self.temp.name) / "receipts"
+        object_store = Path(self.temp.name) / "objects"
+        object_store.mkdir(mode=0o700)
+        delegate = audit.DirectoryTestSink(object_store)
+
+        class CrashOnceSink:
+            backend_name = delegate.backend_name
+            compliance_mode = delegate.compliance_mode
+            trust_scope = delegate.trust_scope
+            retention_mode = delegate.retention_mode
+
+            def __init__(self):
+                self.crashed = False
+
+            def object_key(self, run_id, sequence, event_id):
+                return delegate.object_key(run_id, sequence, event_id)
+
+            def anchor(self, object_key, payload, event_sha256):
+                receipt = delegate.anchor(object_key, payload, event_sha256)
+                if not self.crashed:
+                    self.crashed = True
+                    raise RuntimeError("crash after durable anchor")
+                return receipt
+
+        ledger = audit.AuditLedger(
+            self.root, self.key, CrashOnceSink(), receipt_root=receipts
+        )
+        event_id = str(uuid.uuid4())
+        payload = {"event_id": event_id, "event_type": "RunStarted"}
+        with self.assertRaisesRegex(RuntimeError, "crash after durable anchor"):
+            ledger.append(self.run_id, payload)
+        self.assertEqual(len(list(receipts.glob(".*.pending.json"))), 1)
+        recovered = ledger.append(self.run_id, payload)
+        self.assertEqual(recovered["event_id"], event_id)
+        self.assertEqual(len(ledger.read_verified(self.run_id)), 1)
+        self.assertEqual(list(receipts.glob(".*.pending.json")), [])
 
     def test_endpoint_trust_scopes_validate_resolved_addresses_not_hostname_text(self) -> None:
         credentials = audit.S3Credentials("AKIATEST", "not-a-real-secret")

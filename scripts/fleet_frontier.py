@@ -749,6 +749,8 @@ def prepare_run(
         run_id = str(uuid.uuid4())
     task_sha256 = hashlib.sha256(task.encode("utf-8")).hexdigest()
     ledger = ledger_path(runs_dir, feature)
+    if events_for_run(ledger, run_id=run_id):
+        raise FrontierError(f"frontier run_id is already durable: {run_id}")
     preparing_at = utc_now()
     preparing = {
         "timestamp": preparing_at,
@@ -1231,6 +1233,7 @@ def authorize_prompt_submission(
         matches: list[dict[str, Any]] = []
         for event in audit_events():
             payload = event.get("payload") or {}
+            session_id = str(payload.get("session_id") or "")
             if (
                 event.get("name") == "agent.hook.UserPromptSubmit"
                 and payload.get("phase") == "received"
@@ -1239,18 +1242,18 @@ def authorize_prompt_submission(
                 and str(event.get("workspace_id") or "").upper() == workspace_uuid.upper()
                 and str(event.get("occurred_at") or "") >= since
                 and _event_after_dispatch(state, event, allow_cross_boot=True)
+                and session_id
+                and session_matches(
+                    session_id,
+                    workspace_uuid=str(state["workspace_uuid"]),
+                    surface_uuid=str(state["surface_uuid"]),
+                    hook_source=hook_source,
+                )
             ):
                 matches.append(event)
         if len(matches) == 1:
             event = matches[0]
             session_id = str((event.get("payload") or {}).get("session_id") or "")
-            if not session_id or not session_matches(
-                session_id,
-                workspace_uuid=str(state["workspace_uuid"]),
-                surface_uuid=str(state["surface_uuid"]),
-                hook_source=hook_source,
-            ):
-                raise FrontierError("submitted session does not match prepared surface identity")
             authorized = {
                 **_common_event(state),
                 "timestamp": utc_now(),

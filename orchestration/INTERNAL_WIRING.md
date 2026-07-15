@@ -57,7 +57,9 @@ lock, gives the event a monotonic sequence and previous hash, and fsyncs before
 returning. A retry with the same key and request returns the original event; a
 different request conflicts. State, lineage, risk, resume action, and terminal
 are re-derived after process death, tampering fails verification, risk cannot
-decrease, and no event may follow the first terminal.
+decrease, and no event may follow the first terminal. Results are keyed by
+`delegation_id`, so two delegations that produce identical content retain both
+lineage records instead of collapsing behind one content hash.
 
 ## Canonical missions reconcile effects and pause high risk
 
@@ -624,7 +626,11 @@ read-only, phase-scoped, and cannot target the writer.
 - `tests/test_fleet_audit_control.py::FleetAuditControlTests::test_peer_uid_contract_fails_closed`
 - `tests/test_fleet_audit_control.py::FleetAuditControlTests::test_tampering_breaks_signature_verification`
 - `tests/test_fleet_audit_control.py::FleetAuditControlTests::test_s3_anchor_requires_compliance_headers_and_versioned_receipt`
+- `tests/test_fleet_audit_control.py::FleetAuditControlTests::test_s3_anchor_recovers_exact_conditional_object_without_new_version`
+- `tests/test_fleet_audit_control.py::FleetAuditControlTests::test_anchor_journal_recovers_crash_between_sink_and_ledger_append`
 - `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_signed_lifecycle_is_idempotent_and_verifies_offline`
+- `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_live_verification_receipt_advances_with_a_valid_ledger_prefix`
+- `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_stop_does_not_claim_success_while_service_remains_alive`
 - `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_raw_metadata_is_rejected_and_tampering_breaks_offline_verify`
 - `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_worm_profile_fails_closed_without_compliance_configuration`
 - `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_offline_worm_verification_rejects_partial_anchor_receipt`
@@ -640,7 +646,13 @@ receipt is signed with Ed25519 so offline verification needs only the public
 key, never the CONTROL HMAC or private signing key. `signed` explicitly records
 `worm=false`; `worm` requires S3 Object Lock COMPLIANCE metadata, exact version
 IDs, and one complete receipt per event. Every ledger event and receipt binds
-the backend, object key, digest, and `trust_scope`; observational WORM trace
+the backend, object key, digest, and `trust_scope`; the aggregate Ed25519
+receipt binds the exact ordered anchor-receipt envelope and may advance only
+from a verified ledger/anchor prefix. Anchoring uses conditional object create
+plus a synced pending journal, so a lost response or process death is reconciled
+without creating a second immutable object version or appending an unanchored
+local event. Service shutdown is not recorded until the process is confirmed
+dead. Observational WORM trace
 spans preserve those verified trust attributes. `local-development` accepts
 only an HTTPS endpoint resolving entirely to loopback through a validated CA;
 `external-compliance` accepts only public-global DNS answers and connects only
@@ -675,8 +687,10 @@ hash drift, patch drift, tree drift, or unreachable commits. Redacted and
 hash-only omissions remain explicit. Assured archives exclude HMAC/private
 keys and bind their non-audit content root to the signed audit ledger before
 teardown, so neither a mutable CMUX surface nor an unsigned directory listing
-can be mistaken for portable closure evidence. A workflow that combines a
-`full` archive with `credentials` or `private_data` must also carry a separate,
+can be mistaken for portable closure evidence. The archive receipt explicitly
+binds whether audit evidence was required and the exact signed audit receipt
+digest; a missing or replaced required receipt fails verification. A workflow
+that combines a `full` archive with `credentials` or `private_data` must carry a separate,
 unexpired archive approval bound to mission, workflow digest, scope, and risk
 categories; normal assurance approval is deliberately insufficient.
 

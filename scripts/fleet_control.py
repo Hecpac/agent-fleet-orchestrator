@@ -530,9 +530,13 @@ class FleetControl:
                 except OSError as exc:
                     raise FleetControlError("result_file is missing") from exc
                 artifact = fleet_artifacts.put_file(self.runs_dir, self.mission_id, expected)
-                provider = str(legacy.get("provider") or delegation["provider"])
-                model = str(legacy.get("model") or delegation["model"])
-                variant = legacy.get("variant", delegation.get("variant"))
+                provider = legacy.get("provider")
+                model = legacy.get("model")
+                variant = legacy.get("variant")
+                if not isinstance(provider, str) or not provider:
+                    raise FleetControlError("specialist result lacks provider evidence")
+                if not isinstance(model, str) or not model:
+                    raise FleetControlError("specialist result lacks model evidence")
                 try:
                     expected_provider = fleet_providers.identity(
                         delegation["provider"], delegation["model"],
@@ -632,11 +636,20 @@ class FleetControl:
         return {"event": event, "appended": appended}
 
     def request_assurance(
-        self, *, risk: str, categories: list[str], reason: str, idempotency_key: str
+        self, *, risk: str, categories: list[str], reason: str, idempotency_key: str,
+        actor: str = "lead",
     ) -> dict[str, Any]:
         current = self.state()
         if risk not in {"high", "unknown"}:
             raise FleetControlError("assurance risk must be high or unknown")
+        if not isinstance(categories, list) or not all(
+            isinstance(item, str) and item for item in categories
+        ):
+            raise FleetControlError("assurance categories must be a string list")
+        if not isinstance(reason, str) or not reason:
+            raise FleetControlError("assurance reason must be non-empty")
+        if not mission_state.SAFE_ACTOR.fullmatch(actor):
+            raise FleetControlError("assurance actor identity is invalid")
         if mission_state.RISK_ORDER[risk] < mission_state.RISK_ORDER[current["risk"]]:
             raise FleetControlError("assurance request cannot decrease risk")
         if risk != current["risk"]:
@@ -644,7 +657,7 @@ class FleetControl:
                 self.runs_dir,
                 self.mission_id,
                 kind="risk_escalated",
-                actor="lead",
+                actor=actor,
                 idempotency_key=f"{idempotency_key}:risk",
                 payload={"from": current["risk"], "to": risk, "categories": categories, "reason": reason},
             )
@@ -653,7 +666,7 @@ class FleetControl:
             self.runs_dir,
             self.mission_id,
             kind="assurance_requested",
-            actor="lead",
+            actor=actor,
             idempotency_key=f"{idempotency_key}:request",
             payload={
                 "risk": risk,

@@ -38,6 +38,10 @@ def validate_compiled(value: Any) -> dict[str, Any]:
         raise MissionError("compiled workflow digest mismatch")
     if state.sha256(value["workflow"]) != value["workflow_digest"]:
         raise MissionError("workflow digest mismatch")
+    workflow = value["workflow"]
+    risk = workflow.get("risk") if isinstance(workflow, dict) else None
+    if not isinstance(risk, dict) or risk.get("minimum") not in state.RISK_ORDER:
+        raise MissionError("compiled workflow risk.minimum is invalid")
     return value
 
 

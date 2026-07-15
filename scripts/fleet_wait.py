@@ -120,7 +120,7 @@ def signal_ready(frame: dict[str, Any]) -> bool:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-    except (OSError, fleet_manifest.ManifestError) as exc:
+    except OSError as exc:
         print(f"cannot publish event subscription readiness: {exc}", file=sys.stderr)
         return False
     return True
@@ -149,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         manifest = read_manifest(manifest_path)
-    except OSError as exc:
+    except (OSError, fleet_manifest.ManifestError) as exc:
         print(f"cannot read manifest: {exc}", file=sys.stderr)
         return 2
 

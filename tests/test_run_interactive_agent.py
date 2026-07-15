@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import json
+import socket
 import subprocess
 import tempfile
 import unittest
@@ -290,18 +291,58 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
     def test_regulated_profile_requires_mission_identity(self) -> None:
         missing = self.run_role("codex", profile="regulated")
         self.assertEqual(missing.returncode, 2)
-        self.assertIn("regulated execution requires FLEET_MISSION_ID", missing.stderr)
+        self.assertIn("regulated execution requires a canonical FLEET_MISSION_ID", missing.stderr)
         mission_id = "12345678-1234-4234-9234-123456789abc"
-        values = self.parse(
-            self.run_role(
-                "codex",
-                profile="regulated",
-                extra_env={"FLEET_MISSION_ID": mission_id},
-                expression="{'mission': os.environ.get('FLEET_MISSION_ID'), "
-                "'policy': os.environ.get('FLEET_EFFECT_POLICY')}",
+        with tempfile.TemporaryDirectory() as directory:
+            socket_path = str(Path(directory) / "control.sock")
+            codex_home = Path(directory) / "codex"
+            codex_home.mkdir()
+            (codex_home / "auth.json").write_text(
+                '{"test":"authentication-placeholder"}\n', encoding="utf-8"
             )
-        )
+            control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(control_socket.close)
+            control_socket.bind(socket_path)
+            control_socket.listen(1)
+            values = self.parse(
+                self.run_role(
+                    "codex",
+                    profile="regulated",
+                    extra_env={
+                        "FLEET_MISSION_ID": mission_id,
+                        "FLEET_CONTROL_SOCKET": socket_path,
+                        "CODEX_HOME": str(codex_home),
+                    },
+                    expression="{'mission': os.environ.get('FLEET_MISSION_ID'), "
+                    "'policy': os.environ.get('FLEET_EFFECT_POLICY')}",
+                )
+            )
         self.assertEqual(values, {"mission": mission_id, "policy": "control-only"})
+
+    def test_opencode_receives_only_isolated_provider_xdg_subtrees(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            for relative in (
+                ".config/opencode", ".local/share/opencode", ".local/state/opencode"
+            ):
+                path = home / relative
+                path.mkdir(parents=True)
+                (path / "provider.json").write_text("{}\n", encoding="utf-8")
+            unrelated = home / ".config" / "other-app"
+            unrelated.mkdir()
+            (unrelated / "secret").write_text("must-not-copy", encoding="utf-8")
+            values = self.parse(self.run_role(
+                "glm",
+                extra_env={"HOME": str(home)},
+                expression="{key: {'root': os.environ.get(key), "
+                "'opencode': os.path.isfile(os.environ[key] + '/opencode/provider.json'), "
+                "'other': os.path.exists(os.environ[key] + '/other-app')} "
+                "for key in ('XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_STATE_HOME')}",
+            ))
+        for value in values.values():
+            self.assertIn("/tmp/fleet_home.", value["root"])
+            self.assertTrue(value["opencode"])
+            self.assertFalse(value["other"])
 
     def test_forbidden_required_credentials_fail_closed(self) -> None:
         for name in (

@@ -504,6 +504,14 @@ class ArchiveBuilder:
                 )
                 lifecycle.verify()
             self._collect_audit(temporary)
+            audit_receipt_path = temporary / "audit" / "audit-verification.json"
+            audit_required = self.state.get("approval") is not None
+            if audit_required and not audit_receipt_path.is_file():
+                raise ArchiveError("assured archive requires signed audit evidence")
+            audit_receipt_sha256 = (
+                hashlib.sha256(_regular_bytes(audit_receipt_path)).hexdigest()
+                if audit_receipt_path.exists() else None
+            )
             index = {
                 "schema_version": 1,
                 "mission_id": self.mission_id,
@@ -523,6 +531,8 @@ class ArchiveBuilder:
                 "content_root_sha256": content_root,
                 "entry_count": len(index["entries"]),
                 "created_at": index["created_at"],
+                "audit_required": audit_required,
+                "audit_receipt_sha256": audit_receipt_sha256,
             }
             _write(
                 temporary / "archive-receipt.json",
@@ -609,11 +619,21 @@ def verify_archive(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         missing = sorted(expected_physical - actual_files)
         raise ArchiveError(f"archive physical file set mismatch extra={extra} missing={missing}")
     index_bytes = _regular_bytes(index_path)
+    archive_events = mission_state.read_events(
+        root / "mission.jsonl", expected_mission_id=index["mission_id"]
+    )
+    archived_state = mission_state.derive_state(archive_events)
+    audit_required = archived_state.get("approval") is not None
+    audit_receipt_path = root / "audit" / "audit-verification.json"
+    audit_receipt_sha256 = (
+        hashlib.sha256(_regular_bytes(audit_receipt_path)).hexdigest()
+        if audit_receipt_path.exists() else None
+    )
     if (
         not isinstance(receipt, dict)
         or set(receipt) != {
             "schema_version", "mission_id", "index_sha256", "content_root_sha256",
-            "entry_count", "created_at",
+            "entry_count", "created_at", "audit_required", "audit_receipt_sha256",
         }
         or receipt["schema_version"] != 1
         or receipt["mission_id"] != index["mission_id"]
@@ -623,6 +643,8 @@ def verify_archive(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         or receipt["content_root_sha256"] != mission_state.sha256(
             sorted(non_audit, key=lambda item: item["path"])
         )
+        or receipt["audit_required"] is not audit_required
+        or receipt["audit_receipt_sha256"] != audit_receipt_sha256
     ):
         raise ArchiveError("archive receipt does not match index")
     commits_path = root / "writer" / "commits.json"
@@ -653,6 +675,8 @@ def verify_archive(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
             if expected_patch != _regular_bytes(patch_path):
                 raise ArchiveError("binary patch does not match base/final commits")
     audit_ledger = root / "audit" / "ledgers" / index["mission_id"] / "a2a_ledger.jsonl"
+    if audit_required and not audit_ledger.exists():
+        raise ArchiveError("assured archive is missing required signed audit evidence")
     if audit_ledger.exists():
         compiled = json.loads(_regular_bytes(root / "compiled-workflow.json"))
         try:

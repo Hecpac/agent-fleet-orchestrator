@@ -14,7 +14,7 @@ partial result into PASS.
 
 - Feature: `fleet-template-audit-20260713`
 - Preset: `audit`
-- Target repository: `/Users/hector/Projects/agent-fleet-orchestrator`
+- Target repository: `<target-repo>`
 - Base/final branch: `main`
 - Base/final HEAD: `9f9df28da2b387feba96f2c69991f15b2f8aa25d`
 - Read-only sources:

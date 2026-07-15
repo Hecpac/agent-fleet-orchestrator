@@ -29,6 +29,11 @@ import fleet_mission_state as mission_state
 
 ROOT = Path(__file__).resolve().parents[1]
 _LIVE_PROCESSES: dict[int, subprocess.Popen[bytes]] = {}
+AUDIT_RECEIPT_FIELDS = {
+    "schema_version", "mission_id", "records", "head_sha256", "ledger_sha256",
+    "worm", "backend", "trust_scope", "public_key_sha256", "verified_at",
+    "anchor_receipts_sha256", "ed25519_signature",
+}
 
 
 class AuditClientError(RuntimeError):
@@ -43,6 +48,33 @@ def _load_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AuditClientError("audit lifecycle file must contain an object")
     return value
+
+
+def _anchor_envelope(
+    events: list[dict[str, Any]], anchor_receipts: Path, *, exact: bool = True
+) -> tuple[list[dict[str, Any]], str]:
+    try:
+        root_info = anchor_receipts.lstat()
+    except OSError as exc:
+        raise AuditClientError("audit anchor receipt directory is missing") from exc
+    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
+        raise AuditClientError("audit anchor receipt directory is unsafe")
+    expected_names = {f"{event['event_id']}.json" for event in events}
+    if exact:
+        actual_names = {path.name for path in anchor_receipts.iterdir()}
+        if actual_names != expected_names:
+            raise AuditClientError("audit anchor receipt set differs from ledger")
+    envelope: list[dict[str, Any]] = []
+    for event in events:
+        path = anchor_receipts / f"{event['event_id']}.json"
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise AuditClientError("audit anchor receipt is missing") from exc
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise AuditClientError("audit anchor receipt is not a regular file")
+        envelope.append({"event_id": event["event_id"], "receipt": _load_json(path)})
+    return envelope, mission_state.sha256(envelope)
 
 
 def _run(command: list[str], *, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
@@ -183,12 +215,7 @@ def verify_offline(
 ) -> dict[str, Any]:
     events = _chain_without_secret(ledger_path)
     receipt = _load_json(receipt_path)
-    required = {
-        "schema_version", "mission_id", "records", "head_sha256", "ledger_sha256",
-        "worm", "backend", "trust_scope", "public_key_sha256", "verified_at",
-        "ed25519_signature",
-    }
-    if set(receipt) != required or receipt["schema_version"] != 1:
+    if set(receipt) != AUDIT_RECEIPT_FIELDS or receipt["schema_version"] != 1:
         raise AuditClientError("audit verification receipt fields are invalid")
     if receipt["records"] != len(events) or receipt["head_sha256"] != events[-1]["event_sha256"]:
         raise AuditClientError("audit verification receipt chain summary mismatch")
@@ -200,6 +227,9 @@ def verify_offline(
     if receipt["public_key_sha256"] != audit.file_sha256(public_key):
         raise AuditClientError("audit verification public key hash mismatch")
     _verify_signature(public_key, receipt)
+    envelope, envelope_sha256 = _anchor_envelope(events, anchor_receipts)
+    if receipt["anchor_receipts_sha256"] != envelope_sha256:
+        raise AuditClientError("audit verification anchor envelope hash mismatch")
     compliance = all(event.get("worm_compliance_mode") is True for event in events)
     if any(event.get("worm_compliance_mode") is not compliance for event in events):
         raise AuditClientError("audit ledger mixes WORM compliance modes")
@@ -224,9 +254,8 @@ def verify_offline(
         )
     if trust_scope == "external-compliance" and not compliance:
         raise AuditClientError("external-compliance trust requires WORM compliance")
-    for event in events:
-        receipt_file = anchor_receipts / f"{event['event_id']}.json"
-        anchor = _load_json(receipt_file)
+    for event, envelope_item in zip(events, envelope, strict=True):
+        anchor = envelope_item["receipt"]
         anchor_required = {
             "schema_version", "worm", "backend", "trust_scope", "object_key",
             "event_sha256",
@@ -292,6 +321,49 @@ def verify_offline(
     }
 
 
+def _validate_prior_receipt(
+    prior: dict[str, Any],
+    events: list[dict[str, Any]],
+    ledger_path: Path,
+    public_key: Path,
+    anchor_receipts: Path,
+    *,
+    mission_id: str,
+    compliance: bool,
+    backend: str,
+    trust_scope: str,
+) -> int:
+    if set(prior) != AUDIT_RECEIPT_FIELDS or prior.get("schema_version") != 1:
+        raise AuditClientError("prior audit verification receipt fields are invalid")
+    _verify_signature(public_key, prior)
+    records = prior.get("records")
+    if isinstance(records, bool) or not isinstance(records, int) or not 1 <= records <= len(events):
+        raise AuditClientError("prior audit verification receipt length is invalid")
+    prefix = events[:records]
+    if any(
+        (
+            prior.get("mission_id") != mission_id,
+            prior.get("head_sha256") != prefix[-1]["event_sha256"],
+            prior.get("worm") is not compliance,
+            prior.get("backend") != backend,
+            prior.get("trust_scope") != trust_scope,
+            prior.get("public_key_sha256") != audit.file_sha256(public_key),
+        )
+    ):
+        raise AuditClientError("prior audit verification receipt identity conflicts")
+    try:
+        ledger_rows = ledger_path.read_bytes().splitlines(keepends=True)
+    except OSError as exc:
+        raise AuditClientError("signed audit ledger is missing") from exc
+    prefix_sha256 = hashlib.sha256(b"".join(ledger_rows[:records])).hexdigest()
+    if prior.get("ledger_sha256") != prefix_sha256:
+        raise AuditClientError("prior audit verification receipt is not a ledger prefix")
+    _, anchors_sha256 = _anchor_envelope(prefix, anchor_receipts, exact=False)
+    if prior.get("anchor_receipts_sha256") != anchors_sha256:
+        raise AuditClientError("prior audit receipt anchor prefix conflicts")
+    return records
+
+
 class AuditLifecycle:
     def __init__(self, runs_dir: Path, mission_id: str) -> None:
         self.runs_dir = runs_dir.resolve()
@@ -348,6 +420,16 @@ class AuditLifecycle:
         ):
             raise AuditClientError("AuditService health identity mismatch")
         return result
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
     def preflight(self) -> dict[str, Any]:
         """Validate an audit backend before any fleet or key side effect."""
@@ -560,6 +642,7 @@ class AuditLifecycle:
         if not require_worm and compliance:
             raise AuditClientError("signed profile unexpectedly claims WORM")
         ledger_path = self.ledger_root / self.mission_id / "a2a_ledger.jsonl"
+        _, anchor_receipts_sha256 = _anchor_envelope(events, self.anchor_receipts)
         receipt: dict[str, Any] = {
             "schema_version": 1,
             "mission_id": self.mission_id,
@@ -570,19 +653,30 @@ class AuditLifecycle:
             "backend": events[-1]["worm_backend"],
             "trust_scope": events[-1]["worm_trust_scope"],
             "public_key_sha256": audit.file_sha256(self.public_key),
+            "anchor_receipts_sha256": anchor_receipts_sha256,
             "verified_at": datetime.now(timezone.utc).isoformat(),
         }
         receipt["ed25519_signature"] = _sign_receipt(self.private_key, receipt)
         content = mission_state.canonical_bytes(receipt) + b"\n"
         if self.receipt_path.exists():
             prior = _load_json(self.receipt_path)
+            prior_records = _validate_prior_receipt(
+                prior, events, ledger_path, self.public_key, self.anchor_receipts,
+                mission_id=self.mission_id, compliance=compliance,
+                backend=str(events[-1]["worm_backend"]),
+                trust_scope=str(events[-1]["worm_trust_scope"]),
+            )
             stable = {key: value for key, value in receipt.items() if key in {
                 "schema_version", "mission_id", "records", "head_sha256", "ledger_sha256",
                 "worm", "backend", "trust_scope", "public_key_sha256",
+                "anchor_receipts_sha256",
             }}
-            if any(prior.get(key) != value for key, value in stable.items()):
-                raise AuditClientError("audit verification receipt conflicts with current chain")
-            receipt = prior
+            if prior_records == len(events) and all(
+                prior.get(key) == value for key, value in stable.items()
+            ):
+                receipt = prior
+            else:
+                mission_state.atomic_write(self.receipt_path, content)
         else:
             mission_state.atomic_write(self.receipt_path, content)
         return verify_offline(
@@ -597,22 +691,39 @@ class AuditLifecycle:
             return {"stopped": False, "verified": verified}
         self.health()
         pid = int(lifecycle["pid"])
+        if not self._pid_alive(pid):
+            raise AuditClientError("AuditService process disappeared before stop")
         try:
             os.kill(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+        process = self._process or _LIVE_PROCESSES.get(pid)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if process is not None and process.poll() is not None:
+                break
+            if not self._pid_alive(pid):
                 break
             time.sleep(0.05)
-        if self._process is not None:
+        if process is not None:
             try:
-                self._process.wait(timeout=0.5)
+                process.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
                 pass
+        if self._pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            if process is not None:
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
+        if self._pid_alive(pid):
+            raise AuditClientError(
+                "AuditService did not stop before the shutdown deadline"
+            )
         _LIVE_PROCESSES.pop(pid, None)
         self.socket_path.unlink(missing_ok=True)
         lifecycle["stopped_at"] = datetime.now(timezone.utc).isoformat()

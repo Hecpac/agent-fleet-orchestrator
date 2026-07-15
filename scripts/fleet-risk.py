@@ -47,7 +47,9 @@ def max_risk(*levels: str) -> str:
     return max(levels, key=RISK_ORDER.__getitem__)
 
 
-def classify_categories(objective: str, target: str) -> list[str]:
+def classify_categories(
+    objective: str, target: str, repository_root: str | None = None
+) -> list[str]:
     if not isinstance(objective, str) or not objective.strip():
         raise RiskError("objective must be non-empty")
     categories = {
@@ -56,8 +58,14 @@ def classify_categories(objective: str, target: str) -> list[str]:
         if pattern.search(objective) or pattern.search(target)
     }
     target_path = Path(target).expanduser()
+    root = Path(repository_root).expanduser().resolve() if repository_root else None
     if target_path.is_absolute() or target.startswith("."):
-        categories.add("repository_local")
+        try:
+            resolved = target_path.resolve()
+            contained = root is not None and (resolved == root or root in resolved.parents)
+        except OSError:
+            contained = False
+        categories.add("repository_local" if contained else "external_side_effect")
     elif re.match(r"^(?:https?|ssh|s3)://|^[^/]+@[^:]+:", target):
         categories.add("external_side_effect")
     if not categories:
@@ -70,13 +78,14 @@ def assess(
     workflow_minimum: str,
     objective: str,
     target: str,
+    repository_root: str | None = None,
     override: str = "auto",
 ) -> dict[str, Any]:
     if workflow_minimum not in RISK_ORDER:
         raise RiskError("invalid workflow minimum risk")
     if override != "auto" and override not in RISK_ORDER:
         raise RiskError("invalid risk override")
-    categories = classify_categories(objective, target)
+    categories = classify_categories(objective, target, repository_root)
     category_level = max_risk(*(CATEGORY_RISK[item] for item in categories))
     levels = [workflow_minimum, category_level]
     if override != "auto":
@@ -104,6 +113,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workflow-minimum", required=True, choices=sorted(RISK_ORDER))
     parser.add_argument("--objective", required=True)
     parser.add_argument("--target", required=True)
+    parser.add_argument("--repository-root", required=True)
     parser.add_argument("--override", default="auto", choices=("auto", *RISK_ORDER))
     args = parser.parse_args(argv)
     try:
@@ -113,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
                     workflow_minimum=args.workflow_minimum,
                     objective=args.objective,
                     target=args.target,
+                    repository_root=args.repository_root,
                     override=args.override,
                 ),
                 sort_keys=True,

@@ -45,23 +45,34 @@ def approve_mission(
     events = mission_state.read_events(
         mission_state.ledger_path(runs_dir, mission_id), expected_mission_id=mission_id
     )
+    current = mission_state.derive_state(events)
+    request = next(
+        (event for event in reversed(events) if event["kind"] == "assurance_requested"), None
+    )
+    if request is None:
+        raise RuntimeError("mission lacks an assurance request")
+    if Path(scope).expanduser().resolve() != Path(current["target_repo"]).resolve():
+        raise RuntimeError("approval scope does not match the mission target")
     existing = next(
         (event for event in events if event["idempotency_key"] == idempotency_key), None
     )
     if existing is not None:
         if existing["kind"] != "assurance_approved":
             raise RuntimeError("approval idempotency key is already used")
+        payload = existing["payload"]
+        if any(
+            (
+                payload.get("request_event_sha256") != request["event_sha256"],
+                payload.get("workflow_digest") != current["workflow_digest"],
+                Path(str(payload.get("scope", ""))).resolve()
+                != Path(current["target_repo"]).resolve(),
+                payload.get("risk") != request["payload"].get("risk"),
+            )
+        ):
+            raise RuntimeError("approval idempotent replay identity conflicts")
         return {"event": existing, "appended": False}
-    current = mission_state.derive_state(events)
     if current["status"] != "awaiting_assurance_confirmation":
         raise RuntimeError("mission is not awaiting assurance confirmation")
-    if Path(scope).expanduser().resolve() != Path(current["target_repo"]).resolve():
-        raise RuntimeError("approval scope does not match the mission target")
-    request = next(
-        (event for event in reversed(events) if event["kind"] == "assurance_requested"), None
-    )
-    if request is None:
-        raise RuntimeError("mission lacks an assurance request")
     actor = os.environ.get("USER", "fleet_controller")
     actor_sha256 = hashlib.sha256(actor.encode("utf-8")).hexdigest()
     approval_id = str(

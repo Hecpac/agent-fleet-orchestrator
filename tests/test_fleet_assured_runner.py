@@ -51,6 +51,9 @@ class FleetAssuredRunnerTests(unittest.TestCase):
             "verify.runner": "interactive",
             "verify.authority": "verification",
             "verify.phase": "VERIFY",
+            "verify.role_type": "verifier",
+            "verify.provider": "anthropic",
+            "verify.model": "claude-fable-5",
         }
 
     def test_dispatch_retry_reconciles_the_same_run_without_resend(self) -> None:
@@ -152,11 +155,21 @@ class FleetAssuredRunnerTests(unittest.TestCase):
             self.runner._wait(action, "expected", "action:wait")
 
     def test_advance_is_noop_after_kill_between_advance_and_ack(self) -> None:
-        with mock.patch.object(self.runner, "_phase", return_value="VERIFY"), mock.patch.object(
-            assured, "run_process"
-        ) as run:
+        state_path = self.runner.manifest_path.with_suffix(".state.json")
+        state_path.write_text(json.dumps({
+            "active_phase": "VERIFY",
+            "history": [{"phase": "VERIFY", "evidence": "evidence"}],
+        }), encoding="utf-8")
+        with mock.patch.object(assured, "run_process") as run:
             self.runner._advance("VERIFY", "evidence")
         run.assert_not_called()
+
+        state_path.write_text(json.dumps({
+            "active_phase": "VERIFY",
+            "history": [{"phase": "VERIFY", "evidence": "other"}],
+        }), encoding="utf-8")
+        with self.assertRaisesRegex(assured.AssuredRunnerError, "binding differs"):
+            self.runner._advance("VERIFY", "evidence")
 
     def test_additional_advisory_is_phase_scoped_and_never_writer(self) -> None:
         with mock.patch.object(self.runner, "_phase", return_value="BUILD"), self.assertRaisesRegex(
@@ -172,7 +185,15 @@ class FleetAssuredRunnerTests(unittest.TestCase):
         result.write_text("read-only evidence", encoding="utf-8")
         lifecycle = [{
             "instance": "verify", "run_id": run_id, "status": "succeeded",
-            "result_file": str(result),
+            "result_file": str(result), "phase": "VERIFY", "role": "verifier",
+            "task_sha256": hashlib.sha256(
+                (
+                    f"MISSION_ID={self.runner.mission_id}\nADVISORY_ONLY=true\n"
+                    "ACTIVE_PHASE=VERIFY\n\nreview exact evidence\n\n"
+                    "Return read-only analysis with exact evidence. Do not modify the repository."
+                ).encode("utf-8")
+            ).hexdigest(),
+            "provider": "anthropic", "model": "claude-fable-5", "variant": None,
         }]
         with mock.patch.object(self.runner, "_phase", return_value="VERIFY"), \
              mock.patch.object(self.runner, "_dispatch", return_value=run_id), \
@@ -184,6 +205,32 @@ class FleetAssuredRunnerTests(unittest.TestCase):
             )
         self.assertEqual(value["status"], "succeeded")
         self.assertEqual(value["result_file"], str(result))
+
+        lifecycle[0]["model"] = "unbound-model"
+        with mock.patch.object(self.runner, "_phase", return_value="VERIFY"), \
+             mock.patch.object(self.runner, "_dispatch", return_value=run_id), \
+             mock.patch.object(self.runner, "_wait"), \
+             mock.patch.object(self.runner, "_legacy_events", return_value=lifecycle), \
+             self.assertRaisesRegex(assured.AssuredRunnerError, "provenance"):
+            self.runner.advisory(
+                instance="verify", objective="review exact evidence",
+                idempotency_key="extra:verify-drift",
+            )
+
+        lifecycle[0]["model"] = "claude-fable-5"
+        target = self.tmp / "outside-advisory.txt"
+        target.write_text("untrusted target", encoding="utf-8")
+        result.unlink()
+        result.symlink_to(target)
+        with mock.patch.object(self.runner, "_phase", return_value="VERIFY"), \
+             mock.patch.object(self.runner, "_dispatch", return_value=run_id), \
+             mock.patch.object(self.runner, "_wait"), \
+             mock.patch.object(self.runner, "_legacy_events", return_value=lifecycle), \
+             self.assertRaisesRegex(assured.AssuredRunnerError, "regular file"):
+            self.runner.advisory(
+                instance="verify", objective="review exact evidence",
+                idempotency_key="extra:verify-symlink",
+            )
 
 
 if __name__ == "__main__":
