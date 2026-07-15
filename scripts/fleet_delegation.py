@@ -196,6 +196,7 @@ def validate_for_subdelegation(
     token_id: str,
     parent_run_id: str,
     capability: str,
+    requested_budget: int,
     requested_delegation_id: str | None = None,
 ) -> dict[str, Any]:
     parent_run_id = mission_state.normalize_uuid(parent_run_id, "parent_run_id")
@@ -206,6 +207,12 @@ def validate_for_subdelegation(
         raise DelegationError("capability is outside delegated scope")
     if token["current_depth"] >= token["max_depth"]:
         raise DelegationError("maximum delegation depth reached")
+    if isinstance(requested_budget, bool) or not isinstance(requested_budget, int):
+        raise DelegationError("requested budget must be an integer")
+    if requested_budget < 1:
+        raise DelegationError("requested budget must be at least 1")
+    if requested_budget > token["remaining_budget"]:
+        raise DelegationError("requested budget exceeds delegated budget")
     if token["remaining_budget"] <= 0:
         raise DelegationError("delegated budget is exhausted")
     events = mission_state.read_events(

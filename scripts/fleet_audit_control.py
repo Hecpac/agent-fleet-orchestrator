@@ -21,6 +21,7 @@ import socket
 import socketserver
 import ssl
 import stat
+import struct
 import sys
 from typing import Any, BinaryIO, Protocol
 import urllib.error
@@ -167,11 +168,21 @@ def load_control_key(path: Path) -> bytes:
 
 
 def peer_credentials(connection: socket.socket) -> tuple[int, int]:
-    """Return BSD peer euid/egid without trusting request-supplied identity."""
+    """Return kernel-authenticated peer euid/egid on BSD/macOS or Linux."""
+    if hasattr(connection, "getpeereid"):
+        uid, gid = connection.getpeereid()  # type: ignore[attr-defined]
+        return int(uid), int(gid)
+    if hasattr(socket, "SO_PEERCRED"):
+        raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
+        _, uid, gid = struct.unpack("3i", raw)
+        return int(uid), int(gid)
     libc = ctypes.CDLL(None, use_errno=True)
+    function = getattr(libc, "getpeereid", None)
+    if function is None:
+        raise OSError("platform cannot authenticate Unix socket peers")
     uid = ctypes.c_uint()
     gid = ctypes.c_uint()
-    result = libc.getpeereid(
+    result = function(
         ctypes.c_int(connection.fileno()), ctypes.byref(uid), ctypes.byref(gid)
     )
     if result != 0:

@@ -165,10 +165,11 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
         self.assertEqual(
             values["allow"],
             [
-                "Read(//Users/hector/Projects/agent-fleet-orchestrator/"
-                "orchestration/runs/prompts/**)"
+                f"Read(/{ROOT}/orchestration/runs/prompts/**)"
             ],
         )
+        template = (ROOT / "orchestration" / "claude-fleet-settings.json").read_text()
+        self.assertNotIn("/Users/hector", template)
         self.assertEqual(values["disable_bypass"], "disable")
         self.assertTrue(values["sandbox_enabled"])
         self.assertTrue(values["sandbox_fail_closed"])

@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Read(//Users/hector/Projects/agent-fleet-orchestrator/orchestration/runs/prompts/**)"
+      "Read(/__FLEET_REPO_ROOT__/orchestration/runs/prompts/**)"
     ],
     "deny": [
       "Bash(sudo *)",
@@ -19,21 +19,21 @@
       "Read(//tmp/fleet_audits/**)",
       "Edit(//tmp/fleet_audits/**)",
       "Write(//tmp/fleet_audits/**)",
-      "Read(//Users/hector/.ssh/**)",
-      "Edit(//Users/hector/.ssh/**)",
-      "Write(//Users/hector/.ssh/**)",
-      "Read(//Users/hector/.aws/**)",
-      "Edit(//Users/hector/.aws/**)",
-      "Write(//Users/hector/.aws/**)",
-      "Read(//Users/hector/.codex/**)",
-      "Edit(//Users/hector/.codex/**)",
-      "Write(//Users/hector/.codex/**)",
-      "Read(//Users/hector/.claude/**)",
-      "Edit(//Users/hector/.claude/**)",
-      "Write(//Users/hector/.claude/**)",
-      "Read(//Users/hector/.claude.json)",
-      "Edit(//Users/hector/.claude.json)",
-      "Write(//Users/hector/.claude.json)"
+      "Read(/__FLEET_CONTROLLER_HOME__/.ssh/**)",
+      "Edit(/__FLEET_CONTROLLER_HOME__/.ssh/**)",
+      "Write(/__FLEET_CONTROLLER_HOME__/.ssh/**)",
+      "Read(/__FLEET_CONTROLLER_HOME__/.aws/**)",
+      "Edit(/__FLEET_CONTROLLER_HOME__/.aws/**)",
+      "Write(/__FLEET_CONTROLLER_HOME__/.aws/**)",
+      "Read(/__FLEET_CONTROLLER_HOME__/.codex/**)",
+      "Edit(/__FLEET_CONTROLLER_HOME__/.codex/**)",
+      "Write(/__FLEET_CONTROLLER_HOME__/.codex/**)",
+      "Read(/__FLEET_CONTROLLER_HOME__/.claude/**)",
+      "Edit(/__FLEET_CONTROLLER_HOME__/.claude/**)",
+      "Write(/__FLEET_CONTROLLER_HOME__/.claude/**)",
+      "Read(/__FLEET_CONTROLLER_HOME__/.claude.json)",
+      "Edit(/__FLEET_CONTROLLER_HOME__/.claude.json)",
+      "Write(/__FLEET_CONTROLLER_HOME__/.claude.json)"
     ],
     "defaultMode": "default",
     "disableBypassPermissionsMode": "disable"
@@ -46,19 +46,19 @@
     "filesystem": {
       "denyRead": [
         "/tmp/fleet_audits",
-        "/Users/hector/.ssh",
-        "/Users/hector/.aws",
-        "/Users/hector/.codex",
-        "/Users/hector/.claude",
-        "/Users/hector/.claude.json"
+        "__FLEET_CONTROLLER_HOME__/.ssh",
+        "__FLEET_CONTROLLER_HOME__/.aws",
+        "__FLEET_CONTROLLER_HOME__/.codex",
+        "__FLEET_CONTROLLER_HOME__/.claude",
+        "__FLEET_CONTROLLER_HOME__/.claude.json"
       ],
       "denyWrite": [
         "/tmp/fleet_audits",
-        "/Users/hector/.ssh",
-        "/Users/hector/.aws",
-        "/Users/hector/.codex",
-        "/Users/hector/.claude",
-        "/Users/hector/.claude.json"
+        "__FLEET_CONTROLLER_HOME__/.ssh",
+        "__FLEET_CONTROLLER_HOME__/.aws",
+        "__FLEET_CONTROLLER_HOME__/.codex",
+        "__FLEET_CONTROLLER_HOME__/.claude",
+        "__FLEET_CONTROLLER_HOME__/.claude.json"
       ]
     }
   },
@@ -69,7 +69,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/hector/.claude/hooks/pre_tool.sh"
+            "command": "bash __FLEET_CONTROLLER_HOME__/.claude/hooks/pre_tool.sh"
           }
         ]
       }
@@ -80,7 +80,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/hector/.claude/hooks/pre_tool.sh"
+            "command": "bash __FLEET_CONTROLLER_HOME__/.claude/hooks/pre_tool.sh"
           }
         ]
       }
@@ -91,7 +91,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/hector/.claude/hooks/post_tool.sh"
+            "command": "bash __FLEET_CONTROLLER_HOME__/.claude/hooks/post_tool.sh"
           }
         ]
       }
@@ -102,7 +102,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash /Users/hector/.claude/hooks/post_tool.sh"
+            "command": "bash __FLEET_CONTROLLER_HOME__/.claude/hooks/post_tool.sh"
           }
         ]
       }

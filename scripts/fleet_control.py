@@ -251,6 +251,7 @@ class FleetControl:
                 token_id=token_id,
                 parent_run_id=parent_run_id,
                 capability=capability,
+                requested_budget=remaining_budget if can_delegate else 1,
                 requested_delegation_id=delegation_id,
             )
             depth = int(parent_token["current_depth"]) + 1

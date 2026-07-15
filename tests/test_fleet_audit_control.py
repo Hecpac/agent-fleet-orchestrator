@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
@@ -131,6 +132,13 @@ class FleetAuditControlTests(unittest.TestCase):
                 },
                 os.geteuid(),
             )
+
+    def test_peer_credentials_support_linux_so_peercred(self) -> None:
+        connection = mock.Mock(spec=["getsockopt"])
+        connection.getsockopt.return_value = struct.pack("3i", 321, 654, 987)
+        with mock.patch.object(audit.socket, "SO_PEERCRED", 17, create=True):
+            self.assertEqual(audit.peer_credentials(connection), (654, 987))
+        connection.getsockopt.assert_called_once_with(audit.socket.SOL_SOCKET, 17, 12)
 
     def test_tampering_breaks_signature_verification(self) -> None:
         self.start_run()

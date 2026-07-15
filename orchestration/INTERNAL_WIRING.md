@@ -135,6 +135,7 @@ tracked mission, preventing boot guidance or CLI-update flows from racing its
 - `tests/test_fleet_manifest.py::FleetManifestTests::test_duplicates_unknown_profiles_and_false_legacy_claim_fail_closed`
 - `tests/test_run_interactive_agent.py::InteractiveAgentEnvironmentTests::test_sandboxed_profile_narrows_runtime_perimeter_without_changing_role`
 - `tests/test_run_interactive_agent.py::InteractiveAgentEnvironmentTests::test_regulated_profile_requires_mission_identity`
+- `tests/test_run_interactive_agent.py::InteractiveAgentEnvironmentTests::test_claude_receives_minimal_hardened_configuration`
 - `tests/test_fleet_up.py::FleetUpTests::test_execution_profiles_are_manifested_without_changing_declared_tools`
 - `tests/test_fleet_up.py::FleetUpTests::test_regulated_profile_rejects_unbound_legacy_boot`
 
@@ -145,9 +146,11 @@ Sandboxed moves process-owned temporary/cache/runtime state inside the private
 ephemeral home; regulated additionally requires Mission identity and declares
 CONTROL-only effects. Neither rewrites router `tool_access`. Strict parsing
 rejects duplicate keys, unsafe controls, unknown profiles, and false legacy
-claims. A legacy manifest normalizes to native plus `legacy-cmux`; in-place
-migration records those honest defaults and never claims `control-v1` for
-events created before that enforcement existed.
+claims. Claude's isolated settings expand the actual controller home and repo
+root at runtime, so secret-path denies and audit hooks do not depend on one
+developer's absolute paths. A legacy manifest normalizes to native plus
+`legacy-cmux`; in-place migration records those honest defaults and never claims
+`control-v1` for events created before that enforcement existed.
 
 ## Fleet Control socket authenticates durable caller identity
 
@@ -202,6 +205,7 @@ without being relabeled as control-authorized.
 
 - `tests/test_fleet_audit_control.py::FleetAuditControlTests::test_control_writer_hashes_payloads_and_signs_complete_chain`
 - `tests/test_fleet_audit_control.py::FleetAuditControlTests::test_peer_uid_contract_fails_closed`
+- `tests/test_fleet_audit_control.py::FleetAuditControlTests::test_peer_credentials_support_linux_so_peercred`
 - `tests/test_fleet_audit_control.py::FleetAuditControlTests::test_tampering_breaks_signature_verification`
 - `tests/test_fleet_audit_control.py::FleetAuditControlTests::test_s3_anchor_requires_compliance_headers_and_versioned_receipt`
 

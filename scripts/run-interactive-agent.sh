@@ -107,7 +107,15 @@ case "$role_type" in
       echo "jq is required to provision isolated Claude settings" >&2
       exit 2
     }
-    jq --arg home "$isolated_home" '
+    jq --arg home "$isolated_home" \
+      --arg controller_home "$controller_home" \
+      --arg repo_root "$repo_root" '
+      walk(
+        if type == "string" then
+          (split("__FLEET_CONTROLLER_HOME__") | join($controller_home)
+          | split("__FLEET_REPO_ROOT__") | join($repo_root))
+        else . end
+      ) |
       .env = ((.env // {}) + {
         HOME: $home,
         USER: "fleet_worker",

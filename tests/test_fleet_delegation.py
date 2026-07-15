@@ -54,6 +54,7 @@ class FleetDelegationTests(unittest.TestCase):
             token_id=token["token_id"],
             parent_run_id=child_run,
             capability="challenge",
+            requested_budget=1,
         )
         self.assertEqual(verified["writer_instance"], "builder")
         with self.assertRaisesRegex(fleet_delegation.DelegationError, "outside delegated scope"):
@@ -63,6 +64,17 @@ class FleetDelegationTests(unittest.TestCase):
                 token_id=token["token_id"],
                 parent_run_id=child_run,
                 capability="build",
+                requested_budget=1,
+            )
+
+        with self.assertRaisesRegex(fleet_delegation.DelegationError, "exceeds delegated"):
+            fleet_delegation.validate_for_subdelegation(
+                self.runs,
+                self.mission_id,
+                token_id=token["token_id"],
+                parent_run_id=child_run,
+                capability="challenge",
+                requested_budget=2,
             )
 
     def test_token_tampering_is_rejected_even_if_file_remains_valid_json(self) -> None:
@@ -78,6 +90,7 @@ class FleetDelegationTests(unittest.TestCase):
                 token_id=token["token_id"],
                 parent_run_id=child_run,
                 capability="build",
+                requested_budget=1,
             )
 
 

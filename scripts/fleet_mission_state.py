@@ -129,7 +129,7 @@ def atomic_write(path: Path, content: bytes, *, mode: int = 0o600) -> None:
     finally:
         os.close(fd)
     try:
-        if path.exists() and path.is_symlink():
+        if path.is_symlink():
             raise MissionStateError(f"refusing symlink target: {path}")
         os.replace(temporary, path)
         os.chmod(path, mode)

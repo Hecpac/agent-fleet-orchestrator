@@ -65,6 +65,16 @@ class MissionStateTests(unittest.TestCase):
         self.assertFalse(created)
         self.assertEqual(mission.load_state(self.runs, recovered)["status"], "compiled")
 
+    def test_atomic_write_rejects_broken_symlink_target(self) -> None:
+        path = self.tmp / "private" / "state.json"
+        path.parent.mkdir(mode=0o700)
+        missing = self.tmp / "missing.json"
+        path.symlink_to(missing)
+        with self.assertRaisesRegex(state.MissionStateError, "refusing symlink"):
+            state.atomic_write(path, b"{}\n")
+        self.assertTrue(path.is_symlink())
+        self.assertFalse(missing.exists())
+
     def test_create_key_with_different_payload_conflicts(self) -> None:
         with self.assertRaisesRegex(state.MissionConflict, "conflicts"):
             self.create_again(objective="different objective")

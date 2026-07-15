@@ -201,6 +201,17 @@ class FleetControlTests(unittest.TestCase):
                 allowed_capabilities=["challenge", "build"],
                 remaining_budget=2,
             )
+            with self.assertRaisesRegex(RuntimeError, "exceeds delegated budget"):
+                self.control.dispatch(
+                    recipient_instance="challenger",
+                    capability="challenge",
+                    objective="amplify the delegated budget",
+                    idempotency_key="child:amplify",
+                    parent_run_id=scout["run_id"],
+                    token_id=scout["token_id"],
+                    can_delegate=True,
+                    remaining_budget=3,
+                )
             child = self.control.dispatch(
                 recipient_instance="challenger",
                 capability="challenge",

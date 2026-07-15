@@ -11,8 +11,8 @@ import unittest
 import uuid
 
 
-PRE_HOOK = Path("/Users/hector/.claude/hooks/pre_tool.sh")
-POST_HOOK = Path("/Users/hector/.claude/hooks/post_tool.sh")
+PRE_HOOK = Path.home() / ".claude" / "hooks" / "pre_tool.sh"
+POST_HOOK = Path.home() / ".claude" / "hooks" / "post_tool.sh"
 GENESIS = "0" * 64
 
 

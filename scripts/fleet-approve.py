@@ -18,7 +18,7 @@ import fleet_mission_state as mission_state
 import fleet_mission
 
 
-AUDIT_COMMON = Path("/Users/hector/.claude/hooks/audit_common.py")
+AUDIT_COMMON = Path.home() / ".claude" / "hooks" / "audit_common.py"
 ARCHIVE_APPROVAL_FILE = "archive-approval.json"
 
 
