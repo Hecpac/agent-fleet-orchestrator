@@ -193,6 +193,9 @@ class FleetReportTests(unittest.TestCase):
             "event_id": str(uuid.uuid4()), "sequence": 1,
             "timestamp": "2026-07-14T00:00:25Z", "event_sha256": "9" * 64,
             "worm_backend": "s3-object-lock", "worm_compliance_mode": True,
+            "worm_trust_scope": "local-development",
+            "worm_retention_mode": "COMPLIANCE",
+            "worm_object_key": "fleet-audits/mission/event.json",
         }
         envelope = fleet_export_trace.trace_envelope(events, [audit_event])
         spans = envelope["spans"]
@@ -207,6 +210,15 @@ class FleetReportTests(unittest.TestCase):
                 "worm_backend"
             ],
             "s3-object-lock",
+        )
+        worm_attributes = next(
+            span for span in spans if span["name"] == "worm_anchor"
+        )["attributes"]
+        self.assertEqual(worm_attributes["worm_trust_scope"], "local-development")
+        self.assertTrue(worm_attributes["worm_compliance_mode"])
+        self.assertEqual(worm_attributes["worm_retention_mode"], "COMPLIANCE")
+        self.assertEqual(
+            worm_attributes["worm_object_key"], "fleet-audits/mission/event.json"
         )
         self.assertNotIn("must-not-export", json.dumps(envelope))
         with tempfile.TemporaryDirectory() as temporary, mock.patch(

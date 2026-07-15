@@ -14,7 +14,8 @@ rustfs/rustfs:1.0.0-beta.3@sha256:378642b05b7dcb4849fb77ebe6aca4ced1c3f66e7e5042
 ```
 
 By default it owns only `/tmp/agent-fleet-worm-local-$UID`, one Docker container,
-and one Docker volume whose names are derived from that path. The directory is
+and one Docker volume whose names are derived from that path and bound to a
+random ownership label stored in the private state. The directory is
 mode `0700`; generated credentials, CA private key, server private key, state,
 and environment files are mode `0600`. Nothing under that directory is
 versioned.
@@ -87,7 +88,8 @@ FLEET_WORM_BACKEND_NAME=rustfs:1.0.0-beta.3
 Do not copy the generated access or secret key into the repository. Omitting a
 custom CA uses the system trust store; configuring a missing, unreadable,
 symlinked, empty, or invalid CA fails closed. HTTP and disabled certificate
-verification are unsupported.
+verification are unsupported. Each request revalidates DNS and connects only to
+the validated numeric loopback address while preserving TLS hostname checks.
 
 ## Run the real local-WORM smoke
 
@@ -129,8 +131,9 @@ retention evidence.
 
 ## Teardown
 
-The teardown checks the state marker and exact derived Docker object names
-before removal:
+The teardown checks the state marker, exact derived Docker object names, and
+the random ownership label on both objects before any removal. A missing or
+mismatched label fails closed without deleting either object:
 
 ```bash
 just worm-local-teardown

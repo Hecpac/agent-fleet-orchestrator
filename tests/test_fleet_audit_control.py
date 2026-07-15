@@ -192,8 +192,8 @@ class FleetAuditControlTests(unittest.TestCase):
             def __exit__(self, exc_type, exc, traceback) -> None:
                 return None
 
-        def fake_urlopen(request, timeout, context):
-            self.assertIsNotNone(context)
+        def fake_open(_sink, request, *, timeout):
+            self.assertEqual(timeout, 30)
             requests.append(request)
             if request.method == "PUT":
                 return Response({"x-amz-version-id": "version-1"})
@@ -213,7 +213,7 @@ class FleetAuditControlTests(unittest.TestCase):
 
         with (
             mock.patch.object(audit.socket, "getaddrinfo", return_value=addresses),
-            mock.patch.object(audit.urllib.request, "urlopen", fake_urlopen),
+            mock.patch.object(audit.S3ObjectLockSink, "_open", fake_open),
         ):
             receipt = sink.anchor("fleet-audits/run/1.json", b"{}", "a" * 64)
 
@@ -321,11 +321,21 @@ class FleetAuditControlTests(unittest.TestCase):
             )
         with (
             mock.patch.object(audit.socket, "getaddrinfo", return_value=changed),
-            mock.patch.object(audit.urllib.request, "urlopen") as urlopen,
+            mock.patch.object(audit.urllib.request, "build_opener") as build_opener,
             self.assertRaisesRegex(RuntimeError, "DNS addresses changed"),
         ):
             sink.anchor("fleet-audits/run/1.json", b"{}", "a" * 64)
-        urlopen.assert_not_called()
+        build_opener.assert_not_called()
+
+    def test_https_transport_connects_only_to_prevalidated_numeric_address(self) -> None:
+        connection = mock.Mock()
+        with (
+            mock.patch.object(audit.socket, "getaddrinfo", side_effect=AssertionError("no DNS")),
+            mock.patch.object(audit.socket, "socket", return_value=connection),
+        ):
+            result = audit._connect_pinned(("8.8.8.8",), 443, 5.0, None)
+        self.assertIs(result, connection)
+        connection.connect.assert_called_once_with(("8.8.8.8", 443))
 
     def test_s3_anchor_rejects_missing_version_retention_or_digest(self) -> None:
         addresses = [
@@ -365,7 +375,9 @@ class FleetAuditControlTests(unittest.TestCase):
                 self.subTest(missing=message, head=head_headers),
                 mock.patch.object(audit.socket, "getaddrinfo", return_value=addresses),
                 mock.patch.object(
-                    audit.urllib.request, "urlopen", side_effect=lambda *args, **kwargs: next(responses)
+                    audit.S3ObjectLockSink,
+                    "_open",
+                    side_effect=lambda *args, **kwargs: next(responses),
                 ),
                 self.assertRaisesRegex(RuntimeError, message),
             ):

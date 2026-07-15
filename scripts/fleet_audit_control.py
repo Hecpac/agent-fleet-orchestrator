@@ -10,6 +10,7 @@ import ctypes
 import fcntl
 import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import os
@@ -34,6 +35,82 @@ SAFE_AUDIT_EVENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 SAFE_METADATA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 FORBIDDEN_METADATA = {"prompt", "payload", "content", "secret", "credential", "environment", "raw"}
 TRUST_SCOPES = {"local-development", "external-compliance"}
+
+
+def _connect_pinned(
+    addresses: tuple[str, ...],
+    port: int,
+    timeout: float | object,
+    source_address: tuple[str, int] | None,
+) -> socket.socket:
+    """Connect only to prevalidated numeric addresses without another DNS lookup."""
+    last_error: OSError | None = None
+    for address in addresses:
+        parsed = ipaddress.ip_address(address)
+        family = socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
+        connection = socket.socket(family, socket.SOCK_STREAM)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:
+                connection.settimeout(timeout)
+            if source_address is not None:
+                connection.bind(source_address)
+            target: tuple[Any, ...]
+            if parsed.version == 6:
+                target = (address, port, 0, 0)
+            else:
+                target = (address, port)
+            connection.connect(target)
+            return connection
+        except OSError as exc:
+            last_error = exc
+            connection.close()
+    if last_error is not None:
+        raise last_error
+    raise OSError("no validated endpoint addresses are available")
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    def __init__(
+        self,
+        host: str,
+        *,
+        pinned_addresses: tuple[str, ...],
+        pinned_port: int,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(host, **kwargs)
+        self._create_connection = lambda _target, timeout, source_address: _connect_pinned(
+            pinned_addresses, pinned_port, timeout, source_address
+        )
+
+
+class _PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(
+        self,
+        context: ssl.SSLContext,
+        addresses: tuple[str, ...],
+        port: int,
+    ) -> None:
+        super().__init__(context=context)
+        self.addresses = addresses
+        self.port = port
+
+    def https_open(self, request: urllib.request.Request):
+        def connection(host: str, **kwargs: Any) -> _PinnedHTTPSConnection:
+            return _PinnedHTTPSConnection(
+                host,
+                pinned_addresses=self.addresses,
+                pinned_port=self.port,
+                **kwargs,
+            )
+
+        return self.do_open(connection, request, context=self._context)
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, message, headers, new_url):
+        del request, fp, code, message, headers, new_url
+        return None
 
 
 def utc_now() -> str:
@@ -340,6 +417,24 @@ class S3ObjectLockSink:
             raise RuntimeError("FLEET_WORM_ENDPOINT DNS addresses changed after preflight")
         return self._ssl_context()
 
+    def _open(self, request: urllib.request.Request, *, timeout: float):
+        endpoint = urllib.parse.urlsplit(self.endpoint)
+        requested = urllib.parse.urlsplit(request.full_url)
+        endpoint_port = endpoint.port or 443
+        if (
+            requested.scheme != "https"
+            or requested.hostname != endpoint.hostname
+            or (requested.port or 443) != endpoint_port
+        ):
+            raise RuntimeError("S3 request URL differs from the validated endpoint")
+        context = self._request_context()
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            _NoRedirectHandler(),
+            _PinnedHTTPSHandler(context, self.resolved_addresses, endpoint_port),
+        )
+        return opener.open(request, timeout=timeout)
+
     def object_key(self, run_id: str, sequence: int, event_id: str) -> str:
         return f"{self.prefix}/{run_id}/{sequence:012d}-{event_id}.json"
 
@@ -433,9 +528,7 @@ class S3ObjectLockSink:
         }
         request = self._signed_request("PUT", object_key, payload, headers)
         try:
-            with urllib.request.urlopen(
-                request, timeout=30, context=self._request_context()
-            ) as response:
+            with self._open(request, timeout=30) as response:
                 version_id = response.headers.get("x-amz-version-id", "")
                 if not version_id or version_id == "null":
                     raise RuntimeError("S3 Object Lock response lacks version id")
@@ -450,9 +543,7 @@ class S3ObjectLockSink:
             "HEAD", object_key, b"", {}, (("versionId", version_id),)
         )
         try:
-            with urllib.request.urlopen(
-                head, timeout=30, context=self._request_context()
-            ) as response:
+            with self._open(head, timeout=30) as response:
                 stored_version_id = response.headers.get("x-amz-version-id", "")
                 mode = response.headers.get("x-amz-object-lock-mode", "")
                 retained = response.headers.get("x-amz-object-lock-retain-until-date", "")

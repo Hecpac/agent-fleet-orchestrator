@@ -131,6 +131,10 @@ def events_to_spans(
                 "attributes": {
                     "event_sha256": event.get("event_sha256"),
                     "worm_backend": event.get("worm_backend"),
+                    "worm_compliance_mode": event.get("worm_compliance_mode"),
+                    "worm_trust_scope": event.get("worm_trust_scope"),
+                    "worm_retention_mode": event.get("worm_retention_mode"),
+                    "worm_object_key": event.get("worm_object_key"),
                 },
             }
         )

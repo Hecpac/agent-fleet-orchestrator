@@ -36,6 +36,7 @@ IMAGE_TAG = "rustfs/rustfs:1.0.0-beta.3"
 IMAGE_DIGEST = "sha256:378642b05b7dcb4849fb77ebe6aca4ced1c3f66e7e504247df95a5c9018d3358"
 IMAGE = f"{IMAGE_TAG}@{IMAGE_DIGEST}"
 BACKEND_NAME = "rustfs:1.0.0-beta.3"
+DOCKER_OWNER_LABEL = "io.agent-fleet-orchestrator.local-worm-owner"
 DEFAULT_STATE = Path(f"/tmp/agent-fleet-worm-local-{os.getuid()}")
 STATE_FILE = "state.json"
 EVIDENCE_FILE = "latest-smoke.json"
@@ -91,6 +92,49 @@ def _docker_exists(kind: str, name: str) -> bool:
     raise LocalWormError(f"cannot inspect Docker {kind}: {result.stderr.strip()}")
 
 
+def _docker_owner(kind: str, name: str) -> str:
+    if kind not in {"container", "volume"}:
+        raise LocalWormError("unsupported Docker object kind")
+    label_path = ".Config.Labels" if kind == "container" else ".Labels"
+    result = _run(
+        [
+            "docker",
+            kind,
+            "inspect",
+            name,
+            "--format",
+            f'{{{{ index {label_path} "{DOCKER_OWNER_LABEL}" }}}}',
+        ],
+        timeout=30,
+    )
+    return result.stdout.strip()
+
+
+def _assert_docker_owner(kind: str, name: str, owner: str) -> None:
+    if _docker_owner(kind, name) != owner:
+        raise LocalWormError(
+            f"refusing to use or remove Docker {kind} without matching ownership label"
+        )
+
+
+def _remove_owned_quietly(kind: str, name: str, owner: str) -> None:
+    try:
+        if not _docker_exists(kind, name) or _docker_owner(kind, name) != owner:
+            return
+    except LocalWormError:
+        return
+    command = ["docker", kind, "rm"]
+    if kind == "container":
+        command.append("--force")
+    command.append(name)
+    subprocess.run(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
 def _public_state(state: dict[str, Any]) -> dict[str, Any]:
     return {
         "backend": state["backend_name"],
@@ -114,7 +158,7 @@ def _load_state(state_dir: Path) -> dict[str, Any]:
     required = {
         "schema_version", "marker", "state_dir", "container", "volume", "image",
         "backend_name", "endpoint", "bucket", "region", "access_key", "secret_key",
-        "ca_file", "retention_days",
+        "ca_file", "retention_days", "docker_owner",
     }
     if (
         not isinstance(value, dict)
@@ -197,9 +241,7 @@ def _s3_call(
     payload: bytes = b"",
 ) -> tuple[int, dict[str, str], bytes]:
     request = sink._signed_request(method, object_key, payload, headers or {}, query)
-    with urllib.request.urlopen(
-        request, timeout=30, context=sink._request_context()
-    ) as response:
+    with sink._open(request, timeout=30) as response:
         return (
             int(response.status),
             {key.lower(): value for key, value in response.headers.items()},
@@ -257,9 +299,7 @@ def _wait_for_tls(state: dict[str, Any]) -> None:
     while time.monotonic() < deadline:
         try:
             request = urllib.request.Request(str(state["endpoint"]) + "/", method="GET")
-            with urllib.request.urlopen(
-                request, timeout=2, context=sink._request_context()
-            ):
+            with sink._open(request, timeout=2):
                 return
         except urllib.error.HTTPError as exc:
             exc.close()
@@ -276,6 +316,13 @@ def setup(state_dir: Path, port: int) -> dict[str, Any]:
         raise LocalWormError("port must be between 1024 and 65535")
     if (state_dir / STATE_FILE).exists():
         state = _load_state(state_dir)
+        container = str(state["container"])
+        volume = str(state["volume"])
+        owner = str(state["docker_owner"])
+        if not _docker_exists("container", container) or not _docker_exists("volume", volume):
+            raise LocalWormError("owned Docker container or volume is missing")
+        _assert_docker_owner("container", container, owner)
+        _assert_docker_owner("volume", volume, owner)
         _bucket_status(state)
         return _public_state(state)
     if state_dir.exists() and any(state_dir.iterdir()):
@@ -286,6 +333,7 @@ def setup(state_dir: Path, port: int) -> dict[str, Any]:
     certs = state_dir / "certs"
     access_key = "fleetlocal" + secrets.token_hex(6)
     secret_key = secrets.token_urlsafe(32)
+    docker_owner = secrets.token_hex(32)
     state: dict[str, Any] = {
         "schema_version": 1,
         "marker": "agent-fleet-local-worm",
@@ -301,6 +349,7 @@ def setup(state_dir: Path, port: int) -> dict[str, Any]:
         "secret_key": secret_key,
         "ca_file": str(certs / "ca.pem"),
         "retention_days": 1,
+        "docker_owner": docker_owner,
     }
     objects_prechecked = False
     try:
@@ -342,9 +391,14 @@ def setup(state_dir: Path, port: int) -> dict[str, Any]:
             0o600,
         )
         _run(["docker", "pull", IMAGE], timeout=300)
-        _run(["docker", "volume", "create", volume])
+        _run([
+            "docker", "volume", "create", "--label",
+            f"{DOCKER_OWNER_LABEL}={docker_owner}", volume,
+        ])
+        _assert_docker_owner("volume", volume, docker_owner)
         _run([
             "docker", "run", "--detach", "--name", container,
+            "--label", f"{DOCKER_OWNER_LABEL}={docker_owner}",
             "--publish", f"127.0.0.1:{port}:9000",
             "--env-file", str(docker_env),
             "--volume", f"{volume}:/data",
@@ -352,23 +406,14 @@ def setup(state_dir: Path, port: int) -> dict[str, Any]:
             IMAGE, "server", "--address", ":9000", "--tls-path", "/certs",
             "--region", "us-east-1", "/data",
         ])
+        _assert_docker_owner("container", container, docker_owner)
         _wait_for_tls(state)
         _initialize_bucket(state)
         return _public_state(state)
     except Exception:
         if objects_prechecked:
-            subprocess.run(
-                ["docker", "rm", "--force", container],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            subprocess.run(
-                ["docker", "volume", "rm", volume],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
+            _remove_owned_quietly("container", container, docker_owner)
+            _remove_owned_quietly("volume", volume, docker_owner)
         shutil.rmtree(state_dir, ignore_errors=True)
         raise
 
@@ -622,13 +667,20 @@ def teardown(state_dir: Path) -> dict[str, Any]:
     state = _load_state(state_dir)
     container = str(state["container"])
     volume = str(state["volume"])
+    owner = str(state["docker_owner"])
     expected_container, expected_volume = _names(state_dir)
     if container != expected_container or volume != expected_volume:
         raise LocalWormError("refusing teardown because Docker object identity differs")
     _run(["docker", "version", "--format", "{{.Server.Version}}"], timeout=30)
-    if _docker_exists("container", container):
+    container_exists = _docker_exists("container", container)
+    volume_exists = _docker_exists("volume", volume)
+    if container_exists:
+        _assert_docker_owner("container", container, owner)
+    if volume_exists:
+        _assert_docker_owner("volume", volume, owner)
+    if container_exists:
         _run(["docker", "rm", "--force", container], timeout=60)
-    if _docker_exists("volume", volume):
+    if volume_exists:
         _run(["docker", "volume", "rm", volume], timeout=60)
     shutil.rmtree(state_dir)
     return {

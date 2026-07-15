@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -60,6 +61,54 @@ class FleetWormLocalTests(unittest.TestCase):
             self.assertRaisesRegex(local_worm.LocalWormError, "permission denied"),
         ):
             local_worm._docker_exists("container", "owned")
+
+    def test_cleanup_and_teardown_refuse_foreign_docker_objects(self) -> None:
+        with (
+            mock.patch.object(local_worm, "_docker_exists", return_value=True),
+            mock.patch.object(local_worm, "_docker_owner", return_value="foreign"),
+            mock.patch.object(local_worm.subprocess, "run") as run,
+        ):
+            local_worm._remove_owned_quietly("container", "same-name", "expected")
+        run.assert_not_called()
+
+        state_dir = self.root / "state"
+        state_dir.mkdir(mode=0o700)
+        container, volume = local_worm._names(state_dir)
+        state = {
+            "schema_version": 1,
+            "marker": "agent-fleet-local-worm",
+            "state_dir": str(state_dir),
+            "container": container,
+            "volume": volume,
+            "image": local_worm.IMAGE,
+            "backend_name": local_worm.BACKEND_NAME,
+            "endpoint": "https://localhost:9443",
+            "bucket": "fleet-worm-local",
+            "region": "us-east-1",
+            "access_key": "local",
+            "secret_key": "local-secret",
+            "ca_file": str(state_dir / "ca.pem"),
+            "retention_days": 1,
+            "docker_owner": "expected",
+        }
+        (state_dir / local_worm.STATE_FILE).write_text(
+            json.dumps(state), encoding="utf-8"
+        )
+        commands: list[list[str]] = []
+
+        def fake_run(command, *, timeout=180):
+            del timeout
+            commands.append(command)
+            return mock.Mock(stdout="")
+
+        with (
+            mock.patch.object(local_worm, "_run", side_effect=fake_run),
+            mock.patch.object(local_worm, "_docker_exists", return_value=True),
+            mock.patch.object(local_worm, "_docker_owner", return_value="foreign"),
+            self.assertRaisesRegex(local_worm.LocalWormError, "ownership label"),
+        ):
+            local_worm.teardown(state_dir)
+        self.assertFalse(any("rm" in command for command in commands))
 
     def test_generated_custom_ca_is_valid_for_sink_preflight(self) -> None:
         certs = self.root / "certs"

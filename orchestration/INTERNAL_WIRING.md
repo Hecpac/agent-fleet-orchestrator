@@ -635,10 +635,13 @@ receipt is signed with Ed25519 so offline verification needs only the public
 key, never the CONTROL HMAC or private signing key. `signed` explicitly records
 `worm=false`; `worm` requires S3 Object Lock COMPLIANCE metadata, exact version
 IDs, and one complete receipt per event. Every ledger event and receipt binds
-the backend, object key, digest, and `trust_scope`. `local-development` accepts
+the backend, object key, digest, and `trust_scope`; observational WORM trace
+spans preserve those verified trust attributes. `local-development` accepts
 only an HTTPS endpoint resolving entirely to loopback through a validated CA;
-`external-compliance` accepts only public-global DNS answers and can never fall
-back to local or signed evidence. Missing service, corrupt chain, unsafe raw
+`external-compliance` accepts only public-global DNS answers and connects only
+to those prevalidated numeric addresses, so a later DNS answer cannot redirect
+the request to a weaker network boundary. It can never fall back to local or
+signed evidence. Missing service, corrupt chain, unsafe raw
 metadata, wrong UID, absent compliance configuration, or a partial receipt
 blocks Mission success and mission-bound assured teardown.
 
