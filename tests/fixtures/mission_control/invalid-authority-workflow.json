@@ -7,7 +7,7 @@
   "capabilities": {"available": ["build"], "required_outcomes": ["lead_result"], "writer": "build", "authority": "control"},
   "risk": {"minimum": "low", "allow_lead_escalation": true, "high_action": "confirm_assured"},
   "assurance": {"profile": "proportional", "preset": "fleet_dialogue", "minimum_gates": []},
-  "audit": {"mode": "signed", "worm_required_for": []},
+  "audit": {"mode": "signed", "trust_scope": "local-development", "worm_required_for": []},
   "archive": {"mode": "incremental", "content_policy": "full", "include_final_tree": true, "include_git_delta": true},
   "limits": {"deadline_seconds": 3600, "token_budget": 0, "budget_mode": "soft"}
 }

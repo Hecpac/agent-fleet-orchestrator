@@ -85,6 +85,44 @@ class MissionRunTests(unittest.TestCase):
         self.assertIn("production", value["categories"])
         self.assertFalse((self.runs / "fleet-high-risk.manifest").exists())
 
+    def test_local_worm_cannot_satisfy_regulated_profile_or_risk(self) -> None:
+        for objective, profile in (
+            ("inspect a local audit", "regulated"),
+            ("prepare a HIPAA regulated archive", "native"),
+        ):
+            with self.subTest(objective=objective, profile=profile):
+                result = subprocess.run(
+                    [
+                        "python3", str(SCRIPT), "--runs-dir", str(self.runs), "dry",
+                        "local-worm-negative", objective, "--workflow", "local-worm",
+                        "--target-repo", str(self.target),
+                        "--execution-profile", profile, "--json",
+                    ],
+                    cwd=ROOT,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("external-compliance trust", result.stderr)
+
+    def test_declared_worm_category_rejects_signed_workflow(self) -> None:
+        result = subprocess.run(
+            [
+                "python3", str(SCRIPT), "--runs-dir", str(self.runs), "dry",
+                "research-private", "analyze private customer data",
+                "--workflow", "research", "--target-repo", str(self.target), "--json",
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("requires WORM audit", result.stderr)
+
     def fake_runtime(self):
         calls: list[str] = []
         run_id = str(uuid.uuid4())

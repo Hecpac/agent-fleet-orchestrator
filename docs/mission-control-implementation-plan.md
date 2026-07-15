@@ -46,7 +46,7 @@ las misiones autónomas.
 | D6 | Subdelegación | Permitida mediante capacidades delegadas y trazables. No se limita al Lead si éste concede can_delegate al run hijo. |
 | D7 | Riesgo | El workflow/CLI establece un piso determinista. El Lead puede elevarlo en cualquier momento; el riesgo es monotónico dentro de la misión. |
 | D8 | Assured | FDP-2/FDP-3 son mínimos obligatorios, no el máximo de agentes permitido. El Lead puede añadir investigación o revisión antes, entre o después de los gates. |
-| D9 | Auditoría | Ledger firmado por CONTROL obligatorio en assured; WORM obligatorio sólo cuando audit.mode=worm. |
+| D9 | Auditoría | Ledger firmado por CONTROL obligatorio en assured; WORM obligatorio sólo cuando audit.mode=worm. `trust_scope` separa evidencia local de cumplimiento externo. |
 | D10 | Archivo | Paquete incremental con evidencia, snapshot final del escritor y delta base_sha a final_sha. |
 | D11 | Framework externo | No introducir LangGraph, AutoGen o Temporal en el kernel inicial. Se adoptan sus patrones detrás de interfaces propias. |
 | D12 | CMUX | Plano visible y programable; nunca fuente de verdad de completion. |
@@ -166,6 +166,7 @@ Ejemplo canónico:
       },
       "audit": {
         "mode": "signed",
+        "trust_scope": "local-development",
         "worm_required_for": ["regulated"]
       },
       "archive": {
@@ -352,6 +353,10 @@ Con audit.mode=worm:
 - el version ID y headers de retención se guardan en el receipt;
 - un fallo de anclaje bloquea el terminal accepted/verified;
 - la verificación offline comprueba cadena, firmas y receipts WORM.
+- `trust_scope=local-development` exige HTTPS con CA validada y resolución
+  exclusivamente loopback; nunca satisface un requisito regulado;
+- `trust_scope=external-compliance` rechaza loopback, link-local, redes privadas
+  y DNS ambiguo, y es obligatorio para el workflow/perfil/riesgo regulated.
 
 Con audit.mode=signed:
 

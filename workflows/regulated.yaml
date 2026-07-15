@@ -26,6 +26,7 @@
   },
   "audit": {
     "mode": "worm",
+    "trust_scope": "external-compliance",
     "worm_required_for": [
       "regulated", "production", "money", "credentials", "private_data", "destructive"
     ]

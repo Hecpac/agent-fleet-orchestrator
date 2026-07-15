@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "name": "implementation",
-  "description": "Autonomous implementation with proportional assurance",
+  "name": "local-worm",
+  "description": "Local development workflow with HTTPS S3-compatible Object Lock audit",
   "preset": "dan",
   "autonomy": {
     "owner": "lead",
@@ -25,9 +25,9 @@
     "minimum_gates": ["fdp2", "human_build_exit", "fdp3"]
   },
   "audit": {
-    "mode": "signed",
+    "mode": "worm",
     "trust_scope": "local-development",
-    "worm_required_for": ["regulated"]
+    "worm_required_for": []
   },
   "archive": {
     "mode": "incremental",
@@ -35,9 +35,5 @@
     "include_final_tree": true,
     "include_git_delta": true
   },
-  "limits": {
-    "deadline_seconds": 7200,
-    "token_budget": 0,
-    "budget_mode": "soft"
-  }
+  "limits": {"deadline_seconds": 7200, "token_budget": 0, "budget_mode": "soft"}
 }

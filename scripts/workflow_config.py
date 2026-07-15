@@ -214,12 +214,29 @@ def validate_workflow(value: Any) -> None:
         raise WorkflowError("assurance profile none cannot declare gates")
 
     audit = _object(workflow["audit"], "workflow.audit")
-    _keys(audit, {"mode", "worm_required_for"}, "workflow.audit")
-    _enum(audit["mode"], {"signed", "worm"}, "workflow.audit.mode")
+    _keys(audit, {"mode", "trust_scope", "worm_required_for"}, "workflow.audit")
+    audit_mode = _enum(audit["mode"], {"signed", "worm"}, "workflow.audit.mode")
+    trust_scope = _enum(
+        audit["trust_scope"],
+        {"local-development", "external-compliance"},
+        "workflow.audit.trust_scope",
+    )
     worm_for = _names(audit["worm_required_for"], "workflow.audit.worm_required_for", allow_empty=True)
     unknown_categories = sorted(set(worm_for) - WORM_CATEGORIES)
     if unknown_categories:
         raise WorkflowError(f"workflow.audit.worm_required_for unknown values: {', '.join(unknown_categories)}")
+    if audit_mode == "signed" and trust_scope != "local-development":
+        raise WorkflowError("signed audit cannot claim external-compliance trust")
+    if workflow["name"] == "regulated" and (
+        audit_mode != "worm" or trust_scope != "external-compliance"
+    ):
+        raise WorkflowError(
+            "regulated workflow requires worm mode and external-compliance trust"
+        )
+    if "regulated" in worm_for and audit_mode == "worm" and trust_scope != "external-compliance":
+        raise WorkflowError(
+            "regulated WORM requirements need external-compliance trust"
+        )
 
     archive = _object(workflow["archive"], "workflow.archive")
     _keys(

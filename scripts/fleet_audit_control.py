@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import ctypes
 import fcntl
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,7 @@ import pwd
 import re
 import socket
 import socketserver
+import ssl
 import stat
 import sys
 from typing import Any, BinaryIO, Protocol
@@ -31,6 +33,7 @@ MAX_REQUEST_BYTES = 2_000_000
 SAFE_AUDIT_EVENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 SAFE_METADATA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 FORBIDDEN_METADATA = {"prompt", "payload", "content", "secret", "credential", "environment", "raw"}
+TRUST_SCOPES = {"local-development", "external-compliance"}
 
 
 def utc_now() -> str:
@@ -103,6 +106,8 @@ def peer_credentials(connection: socket.socket) -> tuple[int, int]:
 class WormSink(Protocol):
     compliance_mode: bool
     backend_name: str
+    trust_scope: str
+    retention_mode: str | None
 
     def object_key(self, run_id: str, sequence: int, event_id: str) -> str: ...
 
@@ -115,6 +120,16 @@ class SignedLocalSink:
 
     compliance_mode: bool = False
     backend_name: str = "signed-local"
+    trust_scope: str = "local-development"
+    retention_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.compliance_mode
+            or self.trust_scope != "local-development"
+            or self.retention_mode is not None
+        ):
+            raise RuntimeError("signed-local sink cannot claim WORM or external trust")
 
     def object_key(self, run_id: str, sequence: int, event_id: str) -> str:
         del run_id, sequence, event_id
@@ -126,6 +141,8 @@ class SignedLocalSink:
             "schema_version": 1,
             "worm": False,
             "backend": self.backend_name,
+            "trust_scope": self.trust_scope,
+            "object_key": "",
             "event_sha256": event_sha256,
         }
 
@@ -137,6 +154,16 @@ class DirectoryTestSink:
     root: Path
     compliance_mode: bool = False
     backend_name: str = "directory-test-only"
+    trust_scope: str = "local-development"
+    retention_mode: str | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            self.compliance_mode
+            or self.trust_scope != "local-development"
+            or self.retention_mode is not None
+        ):
+            raise RuntimeError("directory test sink cannot claim WORM or external trust")
 
     def object_key(self, run_id: str, sequence: int, event_id: str) -> str:
         return f"{run_id}/{sequence:012d}-{event_id}.json"
@@ -151,6 +178,7 @@ class DirectoryTestSink:
                 "schema_version": 1,
                 "worm": False,
                 "backend": self.backend_name,
+                "trust_scope": self.trust_scope,
                 "object_key": object_key,
                 "event_sha256": event_sha256,
             }
@@ -170,6 +198,7 @@ class DirectoryTestSink:
             "schema_version": 1,
             "worm": False,
             "backend": self.backend_name,
+            "trust_scope": self.trust_scope,
             "object_key": object_key,
             "event_sha256": event_sha256,
         }
@@ -189,12 +218,29 @@ class S3ObjectLockSink:
     credentials: S3Credentials
     endpoint: str
     retention_days: int
+    trust_scope: str
+    ca_file: Path | None = None
     prefix: str = "fleet-audits"
     compliance_mode: bool = True
     backend_name: str = "s3-object-lock-compliance"
+    retention_mode: str | None = "COMPLIANCE"
+    resolved_addresses: tuple[str, ...] = field(init=False, default=())
+
+    def __post_init__(self) -> None:
+        if self.trust_scope not in TRUST_SCOPES:
+            raise RuntimeError(f"unsupported audit trust scope: {self.trust_scope}")
+        if self.retention_days < 1:
+            raise RuntimeError("FLEET_WORM_RETENTION_DAYS must be positive")
+        if not self.compliance_mode or self.retention_mode != "COMPLIANCE":
+            raise RuntimeError("S3 Object Lock sink must enforce COMPLIANCE retention")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", self.backend_name):
+            raise RuntimeError("FLEET_WORM_BACKEND_NAME is invalid")
+        addresses = self._validated_endpoint_addresses()
+        object.__setattr__(self, "resolved_addresses", addresses)
+        self._ssl_context()
 
     @classmethod
-    def from_environment(cls) -> "S3ObjectLockSink":
+    def from_environment(cls, trust_scope: str) -> "S3ObjectLockSink":
         required = {
             "FLEET_WORM_BUCKET": os.environ.get("FLEET_WORM_BUCKET", ""),
             "FLEET_WORM_REGION": os.environ.get("FLEET_WORM_REGION", "")
@@ -223,8 +269,76 @@ class S3ObjectLockSink:
             ),
             endpoint=endpoint,
             retention_days=retention_days,
+            trust_scope=trust_scope,
+            ca_file=Path(os.environ["FLEET_WORM_CA_FILE"]).expanduser()
+            if os.environ.get("FLEET_WORM_CA_FILE")
+            else None,
             prefix=os.environ.get("FLEET_WORM_PREFIX", "fleet-audits").strip("/"),
+            backend_name=os.environ.get(
+                "FLEET_WORM_BACKEND_NAME", "s3-object-lock-compliance"
+            ),
         )
+
+    def _validated_endpoint_addresses(self) -> tuple[str, ...]:
+        parsed = urllib.parse.urlsplit(self.endpoint)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise RuntimeError("FLEET_WORM_ENDPOINT must be an uncredentialed HTTPS endpoint")
+        try:
+            results = socket.getaddrinfo(
+                parsed.hostname,
+                parsed.port or 443,
+                type=socket.SOCK_STREAM,
+            )
+            addresses = tuple(
+                sorted({str(ipaddress.ip_address(item[4][0].split("%", 1)[0])) for item in results})
+            )
+        except (OSError, ValueError) as exc:
+            raise RuntimeError("FLEET_WORM_ENDPOINT DNS resolution failed") from exc
+        if not addresses:
+            raise RuntimeError("FLEET_WORM_ENDPOINT DNS resolution is empty")
+        parsed_addresses = tuple(ipaddress.ip_address(item) for item in addresses)
+        if self.trust_scope == "local-development":
+            if not all(item.is_loopback for item in parsed_addresses):
+                raise RuntimeError(
+                    "local-development WORM endpoint must resolve only to loopback addresses"
+                )
+        elif parsed.hostname.rstrip(".").lower() == "localhost" or not all(
+            item.is_global and not item.is_multicast and not item.is_unspecified
+            for item in parsed_addresses
+        ):
+            raise RuntimeError(
+                "external-compliance WORM endpoint must resolve only to public global addresses"
+            )
+        return addresses
+
+    def _ssl_context(self) -> ssl.SSLContext:
+        if self.ca_file is None:
+            return ssl.create_default_context()
+        try:
+            info = self.ca_file.lstat()
+            if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                raise RuntimeError("FLEET_WORM_CA_FILE must be a regular non-symlink file")
+            with self.ca_file.open("rb") as handle:
+                if not handle.read(1):
+                    raise RuntimeError("FLEET_WORM_CA_FILE is empty")
+            return ssl.create_default_context(cafile=str(self.ca_file))
+        except RuntimeError:
+            raise
+        except (OSError, ssl.SSLError) as exc:
+            raise RuntimeError("FLEET_WORM_CA_FILE is missing, unreadable, or invalid") from exc
+
+    def _request_context(self) -> ssl.SSLContext:
+        current = self._validated_endpoint_addresses()
+        if current != self.resolved_addresses:
+            raise RuntimeError("FLEET_WORM_ENDPOINT DNS addresses changed after preflight")
+        return self._ssl_context()
 
     def object_key(self, run_id: str, sequence: int, event_id: str) -> str:
         return f"{self.prefix}/{run_id}/{sequence:012d}-{event_id}.json"
@@ -232,20 +346,28 @@ class S3ObjectLockSink:
     def _signed_request(
         self,
         method: str,
-        object_key: str,
+        object_key: str | None,
         payload: bytes,
         extra_headers: dict[str, str],
+        query: tuple[tuple[str, str], ...] = (),
     ) -> urllib.request.Request:
         parsed = urllib.parse.urlsplit(self.endpoint)
         if parsed.scheme != "https" or not parsed.hostname:
             raise RuntimeError("FLEET_WORM_ENDPOINT must be an HTTPS endpoint")
-        encoded_key = "/".join(
-            urllib.parse.quote(part, safe="-_.~") for part in object_key.split("/")
-        )
         base_path = parsed.path.rstrip("/")
-        canonical_uri = f"{base_path}/{urllib.parse.quote(self.bucket, safe='-_.~')}/{encoded_key}"
+        bucket_path = f"{base_path}/{urllib.parse.quote(self.bucket, safe='-_.~')}"
+        if object_key is None:
+            canonical_uri = bucket_path
+        else:
+            encoded_key = "/".join(
+                urllib.parse.quote(part, safe="-_.~") for part in object_key.split("/")
+            )
+            canonical_uri = f"{bucket_path}/{encoded_key}"
+        canonical_query = urllib.parse.urlencode(
+            sorted(query), quote_via=urllib.parse.quote, safe="-_.~"
+        )
         request_url = urllib.parse.urlunsplit(
-            (parsed.scheme, parsed.netloc, canonical_uri, "", "")
+            (parsed.scheme, parsed.netloc, canonical_uri, canonical_query, "")
         )
         now = datetime.now(timezone.utc)
         amz_date = now.strftime("%Y%m%dT%H%M%SZ")
@@ -262,7 +384,7 @@ class S3ObjectLockSink:
         signed_names = ";".join(sorted(headers))
         canonical_headers = "".join(f"{name}:{headers[name]}\n" for name in sorted(headers))
         canonical_request = "\n".join(
-            [method, canonical_uri, "", canonical_headers, signed_names, payload_hash]
+            [method, canonical_uri, canonical_query, canonical_headers, signed_names, payload_hash]
         )
         scope = f"{date_stamp}/{self.region}/s3/aws4_request"
         string_to_sign = "\n".join(
@@ -293,15 +415,16 @@ class S3ObjectLockSink:
         request_headers["authorization"] = authorization
         return urllib.request.Request(
             request_url,
-            data=payload if method != "HEAD" else None,
+            data=payload if method in {"POST", "PUT"} else None,
             headers=request_headers,
             method=method,
         )
 
     def anchor(self, object_key: str, payload: bytes, event_sha256: str) -> dict[str, Any]:
-        retain_until = (
-            datetime.now(timezone.utc) + timedelta(days=self.retention_days)
-        ).isoformat(timespec="seconds").replace("+00:00", "Z")
+        retain_until_at = datetime.now(timezone.utc) + timedelta(days=self.retention_days)
+        retain_until = retain_until_at.isoformat(timespec="seconds").replace(
+            "+00:00", "Z"
+        )
         headers = {
             "content-type": "application/json",
             "x-amz-object-lock-mode": "COMPLIANCE",
@@ -310,28 +433,51 @@ class S3ObjectLockSink:
         }
         request = self._signed_request("PUT", object_key, payload, headers)
         try:
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with urllib.request.urlopen(
+                request, timeout=30, context=self._request_context()
+            ) as response:
                 version_id = response.headers.get("x-amz-version-id", "")
-                if not version_id:
+                if not version_id or version_id == "null":
                     raise RuntimeError("S3 Object Lock response lacks version id")
         except urllib.error.HTTPError as exc:
-            detail = exc.read(2048).decode("utf-8", "replace")
+            try:
+                detail = exc.read(2048).decode("utf-8", "replace")
+            finally:
+                exc.close()
             raise RuntimeError(f"S3 Object Lock PUT failed: {exc.code} {detail}") from exc
 
-        head = self._signed_request("HEAD", object_key, b"", {})
+        head = self._signed_request(
+            "HEAD", object_key, b"", {}, (("versionId", version_id),)
+        )
         try:
-            with urllib.request.urlopen(head, timeout=30) as response:
+            with urllib.request.urlopen(
+                head, timeout=30, context=self._request_context()
+            ) as response:
+                stored_version_id = response.headers.get("x-amz-version-id", "")
                 mode = response.headers.get("x-amz-object-lock-mode", "")
                 retained = response.headers.get("x-amz-object-lock-retain-until-date", "")
                 stored_digest = response.headers.get("x-amz-meta-event-sha256", "")
         except urllib.error.HTTPError as exc:
+            exc.close()
             raise RuntimeError(f"S3 Object Lock HEAD failed: {exc.code}") from exc
-        if mode != "COMPLIANCE" or not retained or stored_digest != event_sha256:
+        try:
+            retained_at = datetime.fromisoformat(retained.replace("Z", "+00:00"))
+            if retained_at.tzinfo is None:
+                raise ValueError("retention timestamp lacks timezone")
+        except ValueError:
+            retained_at = datetime.min.replace(tzinfo=timezone.utc)
+        if (
+            stored_version_id != version_id
+            or mode != "COMPLIANCE"
+            or retained_at < retain_until_at.replace(microsecond=0)
+            or stored_digest != event_sha256
+        ):
             raise RuntimeError("S3 object did not retain required COMPLIANCE metadata")
         return {
             "schema_version": 1,
             "worm": True,
             "backend": self.backend_name,
+            "trust_scope": self.trust_scope,
             "object_key": object_key,
             "event_sha256": event_sha256,
             "version_id": version_id,
@@ -456,6 +602,8 @@ class AuditLedger:
                 object_key = self.sink.object_key(run_id, sequence, event_id)
                 event["worm_backend"] = self.sink.backend_name
                 event["worm_compliance_mode"] = self.sink.compliance_mode
+                event["worm_trust_scope"] = self.sink.trust_scope
+                event["worm_retention_mode"] = self.sink.retention_mode
                 event["worm_object_key"] = object_key
                 event["event_sha256"] = digest(event)
                 event["control_signature"] = hmac_hex(
@@ -686,6 +834,7 @@ class AuditService:
                 "maker_uid": self.maker_uid,
                 "mode": self.mode,
                 "backend": self.ledger.sink.backend_name,
+                "trust_scope": self.ledger.sink.trust_scope,
             }
         if operation == "verify":
             if peer_uid != self.control_uid:
@@ -751,7 +900,7 @@ def serve(args: argparse.Namespace) -> int:
     elif args.mode == "signed":
         sink = SignedLocalSink()
     else:
-        sink = S3ObjectLockSink.from_environment()
+        sink = S3ObjectLockSink.from_environment(args.trust_scope)
     ledger = AuditLedger(
         root,
         key,
@@ -794,6 +943,9 @@ def main() -> int:
     serve_parser.add_argument("--key", required=True)
     serve_parser.add_argument("--maker-user", default="_fleet_maker")
     serve_parser.add_argument("--mode", choices=("signed", "worm", "test"), default="worm")
+    serve_parser.add_argument(
+        "--trust-scope", choices=tuple(sorted(TRUST_SCOPES)), default="local-development"
+    )
     serve_parser.add_argument("--receipt-root", default="")
     serve_parser.add_argument("--allow-local-test", action="store_true")
     serve_parser.add_argument("--test-anchor-root", default="")

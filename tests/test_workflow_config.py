@@ -26,13 +26,17 @@ class WorkflowConfigTests(unittest.TestCase):
         self.router = workflow_config.router_config.load_router()
 
     def test_repository_workflows_compile_against_router(self) -> None:
-        expected = {"hotfix", "implementation", "regulated", "research"}
+        expected = {"hotfix", "implementation", "local-worm", "regulated", "research"}
         paths = sorted((ROOT / "workflows").glob("*.yaml"))
         compiled = [workflow_config.compile_path(path) for path in paths]
         self.assertEqual({item["workflow"]["name"] for item in compiled}, expected)
         implementation = next(item for item in compiled if item["workflow"]["name"] == "implementation")
         self.assertEqual(implementation["resolved"]["writer_instance"], "builder")
         self.assertEqual(implementation["resolved"]["mode"], "autonomous")
+        local_worm = next(item for item in compiled if item["workflow"]["name"] == "local-worm")
+        self.assertEqual(local_worm["workflow"]["audit"], {
+            "mode": "worm", "trust_scope": "local-development", "worm_required_for": [],
+        })
 
     def test_compile_is_canonical_deterministic_and_has_no_cmux_effects(self) -> None:
         with mock.patch.object(
@@ -82,6 +86,27 @@ class WorkflowConfigTests(unittest.TestCase):
         invalid["autonomy"]["allow_subdelegation"] = False
         with self.assertRaisesRegex(workflow_config.WorkflowError, "must be 0"):
             workflow_config.validate_workflow(invalid)
+
+    def test_audit_trust_scope_contract_fails_closed(self) -> None:
+        invalid = copy.deepcopy(self.workflow)
+        invalid["audit"].pop("trust_scope")
+        with self.assertRaisesRegex(workflow_config.WorkflowError, "missing fields: trust_scope"):
+            workflow_config.validate_workflow(invalid)
+
+        invalid = copy.deepcopy(self.workflow)
+        invalid["audit"]["trust_scope"] = "external-compliance"
+        with self.assertRaisesRegex(workflow_config.WorkflowError, "signed audit cannot claim"):
+            workflow_config.validate_workflow(invalid)
+
+        invalid = copy.deepcopy(self.workflow)
+        invalid["audit"]["trust_scope"] = "ambiguous"
+        with self.assertRaisesRegex(workflow_config.WorkflowError, "must be one of"):
+            workflow_config.validate_workflow(invalid)
+
+        regulated = workflow_config.load_workflow(ROOT / "workflows" / "regulated.yaml")
+        regulated["audit"]["trust_scope"] = "local-development"
+        with self.assertRaisesRegex(workflow_config.WorkflowError, "regulated workflow requires"):
+            workflow_config.validate_workflow(regulated)
 
     def test_cli_validate_show_and_compile(self) -> None:
         script = SCRIPTS / "workflow_config.py"

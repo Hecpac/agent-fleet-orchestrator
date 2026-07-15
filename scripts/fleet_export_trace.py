@@ -35,8 +35,19 @@ def verified_audit_events(root: Path, mission_id: str) -> list[dict[str, Any]]:
         return []
     if not receipt.is_file() or not public_key.is_file() or not anchors.is_dir():
         raise TraceExportError("audit trace lacks a complete public verification envelope")
+    try:
+        compiled = json.loads((root / "compiled-workflow.json").read_text(encoding="utf-8"))
+        require_worm = compiled["workflow"]["audit"]["mode"] == "worm"
+        required_trust_scope = compiled["workflow"]["audit"]["trust_scope"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise TraceExportError("audit trace lacks a valid compiled trust policy") from exc
     fleet_audit_client.verify_offline(
-        ledger, receipt, public_key, anchors, require_worm=False
+        ledger,
+        receipt,
+        public_key,
+        anchors,
+        require_worm=require_worm,
+        required_trust_scope=required_trust_scope,
     )
     return fleet_audit_client.read_verified_public_chain(ledger)
 

@@ -623,14 +623,22 @@ read-only, phase-scoped, and cannot target the writer.
 - `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_raw_metadata_is_rejected_and_tampering_breaks_offline_verify`
 - `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_worm_profile_fails_closed_without_compliance_configuration`
 - `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_offline_worm_verification_rejects_partial_anchor_receipt`
+- `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_offline_receipts_must_match_ledger_backend_scope_and_object`
+- `tests/test_fleet_audit_integration.py::FleetAuditIntegrationTests::test_external_compliance_preflight_rejects_loopback_without_state`
+- `tests/test_mission_run.py::MissionRunTests::test_local_worm_cannot_satisfy_regulated_profile_or_risk`
+- `tests/test_mission_run.py::MissionRunTests::test_declared_worm_category_rejects_signed_workflow`
 
 `why:` Every Mission-bound assured fleet starts or reconciles a CONTROL-owned
 AuditService before FDP actions. The live ledger is HMAC-authenticated, chained,
 peer-UID checked, and accepts only hashes plus bounded metadata. Its final root
 receipt is signed with Ed25519 so offline verification needs only the public
 key, never the CONTROL HMAC or private signing key. `signed` explicitly records
-`worm=false`; `worm` requires S3 Object Lock COMPLIANCE metadata, version IDs,
-and one complete receipt per event. Missing service, corrupt chain, unsafe raw
+`worm=false`; `worm` requires S3 Object Lock COMPLIANCE metadata, exact version
+IDs, and one complete receipt per event. Every ledger event and receipt binds
+the backend, object key, digest, and `trust_scope`. `local-development` accepts
+only an HTTPS endpoint resolving entirely to loopback through a validated CA;
+`external-compliance` accepts only public-global DNS answers and can never fall
+back to local or signed evidence. Missing service, corrupt chain, unsafe raw
 metadata, wrong UID, absent compliance configuration, or a partial receipt
 blocks Mission success and mission-bound assured teardown.
 

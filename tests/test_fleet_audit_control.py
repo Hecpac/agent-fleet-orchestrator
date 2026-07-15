@@ -103,6 +103,10 @@ class FleetAuditControlTests(unittest.TestCase):
         self.assertIn("response_sha256", events[2])
         self.assertTrue(all(item["control_signature"] for item in events))
         self.assertTrue(all(item["worm_compliance_mode"] is False for item in events))
+        self.assertTrue(
+            all(item["worm_trust_scope"] == "local-development" for item in events)
+        )
+        self.assertTrue(all(item["worm_retention_mode"] is None for item in events))
         self.assertNotIn(secret, (self.root / self.run_id / "a2a_ledger.jsonl").read_text())
         anchor_text = "".join(path.read_text() for path in self.anchor.rglob("*.json"))
         self.assertNotIn(secret, anchor_text)
@@ -157,20 +161,25 @@ class FleetAuditControlTests(unittest.TestCase):
         previous = {name: os.environ.pop(name, None) for name in names}
         try:
             with self.assertRaisesRegex(RuntimeError, "missing S3 Object Lock"):
-                audit.S3ObjectLockSink.from_environment()
+                audit.S3ObjectLockSink.from_environment("local-development")
         finally:
             for name, value in previous.items():
                 if value is not None:
                     os.environ[name] = value
 
     def test_s3_anchor_requires_compliance_headers_and_versioned_receipt(self) -> None:
-        sink = audit.S3ObjectLockSink(
-            bucket="audit-bucket",
-            region="us-east-1",
-            credentials=audit.S3Credentials("AKIATEST", "not-a-real-secret"),
-            endpoint="https://s3.us-east-1.amazonaws.com",
-            retention_days=30,
-        )
+        addresses = [
+            (audit.socket.AF_INET, audit.socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))
+        ]
+        with mock.patch.object(audit.socket, "getaddrinfo", return_value=addresses):
+            sink = audit.S3ObjectLockSink(
+                bucket="audit-bucket",
+                region="us-east-1",
+                credentials=audit.S3Credentials("AKIATEST", "not-a-real-secret"),
+                endpoint="https://s3.us-east-1.amazonaws.com",
+                retention_days=30,
+                trust_scope="external-compliance",
+            )
         requests = []
 
         class Response:
@@ -183,20 +192,30 @@ class FleetAuditControlTests(unittest.TestCase):
             def __exit__(self, exc_type, exc, traceback) -> None:
                 return None
 
-        def fake_urlopen(request, timeout):
+        def fake_urlopen(request, timeout, context):
+            self.assertIsNotNone(context)
             requests.append(request)
             if request.method == "PUT":
                 return Response({"x-amz-version-id": "version-1"})
+            retained_until = next(
+                value
+                for name, value in requests[0].headers.items()
+                if name.lower() == "x-amz-object-lock-retain-until-date"
+            )
             return Response(
                 {
                     "x-amz-object-lock-mode": "COMPLIANCE",
-                    "x-amz-object-lock-retain-until-date": "2030-01-01T00:00:00Z",
+                    "x-amz-object-lock-retain-until-date": retained_until,
                     "x-amz-meta-event-sha256": "a" * 64,
+                    "x-amz-version-id": "version-1",
                 }
             )
 
-        with mock.patch.object(audit.urllib.request, "urlopen", fake_urlopen):
-            sink.anchor("fleet-audits/run/1.json", b"{}", "a" * 64)
+        with (
+            mock.patch.object(audit.socket, "getaddrinfo", return_value=addresses),
+            mock.patch.object(audit.urllib.request, "urlopen", fake_urlopen),
+        ):
+            receipt = sink.anchor("fleet-audits/run/1.json", b"{}", "a" * 64)
 
         self.assertEqual([request.method for request in requests], ["PUT", "HEAD"])
         put_headers = {name.lower(): value for name, value in requests[0].headers.items()}
@@ -205,6 +224,152 @@ class FleetAuditControlTests(unittest.TestCase):
         self.assertEqual(put_headers["x-amz-meta-event-sha256"], "a" * 64)
         self.assertIn("AWS4-HMAC-SHA256", put_headers["authorization"])
         self.assertNotIn("not-a-real-secret", put_headers["authorization"])
+        self.assertEqual(
+            audit.urllib.parse.parse_qs(audit.urllib.parse.urlsplit(requests[1].full_url).query),
+            {"versionId": ["version-1"]},
+        )
+        self.assertEqual(receipt["version_id"], "version-1")
+        self.assertEqual(receipt["trust_scope"], "external-compliance")
+
+    def test_endpoint_trust_scopes_validate_resolved_addresses_not_hostname_text(self) -> None:
+        credentials = audit.S3Credentials("AKIATEST", "not-a-real-secret")
+
+        def result(*addresses: str):
+            return [
+                (audit.socket.AF_INET, audit.socket.SOCK_STREAM, 6, "", (address, 443))
+                for address in addresses
+            ]
+
+        cases = (
+            ("local-development", ("127.0.0.1",), True),
+            ("local-development", ("8.8.8.8",), False),
+            ("external-compliance", ("8.8.8.8",), True),
+            ("external-compliance", ("127.0.0.1",), False),
+            ("external-compliance", ("10.0.0.10",), False),
+            ("external-compliance", ("169.254.1.1",), False),
+            ("external-compliance", ("224.0.0.1",), False),
+            ("external-compliance", ("8.8.8.8", "10.0.0.10"), False),
+        )
+        for trust_scope, addresses, accepted in cases:
+            with self.subTest(trust_scope=trust_scope, addresses=addresses), mock.patch.object(
+                audit.socket, "getaddrinfo", return_value=result(*addresses)
+            ):
+                if accepted:
+                    sink = audit.S3ObjectLockSink(
+                        "bucket", "us-east-1", credentials, "https://storage.example",
+                        1, trust_scope,
+                    )
+                    self.assertEqual(sink.resolved_addresses, tuple(sorted(addresses)))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, "resolve only"):
+                        audit.S3ObjectLockSink(
+                            "bucket", "us-east-1", credentials,
+                            "https://storage.example", 1, trust_scope,
+                        )
+
+        with mock.patch.object(
+            audit.socket, "getaddrinfo", return_value=result("8.8.8.8")
+        ), self.assertRaisesRegex(RuntimeError, "public global"):
+            audit.S3ObjectLockSink(
+                "bucket", "us-east-1", credentials, "https://localhost", 1,
+                "external-compliance",
+            )
+
+    def test_endpoint_and_ca_validation_fail_closed(self) -> None:
+        credentials = audit.S3Credentials("AKIATEST", "not-a-real-secret")
+        addresses = [
+            (audit.socket.AF_INET, audit.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))
+        ]
+        with self.assertRaisesRegex(RuntimeError, "HTTPS"):
+            audit.S3ObjectLockSink(
+                "bucket", "us-east-1", credentials, "http://localhost:9000", 1,
+                "local-development",
+            )
+        missing = Path(self.temp.name) / "missing-ca.pem"
+        with mock.patch.object(audit.socket, "getaddrinfo", return_value=addresses):
+            with self.assertRaisesRegex(RuntimeError, "missing, unreadable, or invalid"):
+                audit.S3ObjectLockSink(
+                    "bucket", "us-east-1", credentials, "https://localhost:9443", 1,
+                    "local-development", ca_file=missing,
+                )
+            invalid = Path(self.temp.name) / "invalid-ca.pem"
+            invalid.write_text("not a certificate\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "missing, unreadable, or invalid"):
+                audit.S3ObjectLockSink(
+                    "bucket", "us-east-1", credentials, "https://localhost:9443", 1,
+                    "local-development", ca_file=invalid,
+                )
+            unreadable = Path(self.temp.name) / "unreadable-ca.pem"
+            unreadable.write_text("placeholder\n", encoding="utf-8")
+            with (
+                mock.patch.object(Path, "open", side_effect=PermissionError("denied")),
+                self.assertRaisesRegex(RuntimeError, "missing, unreadable, or invalid"),
+            ):
+                audit.S3ObjectLockSink(
+                    "bucket", "us-east-1", credentials, "https://localhost:9443", 1,
+                    "local-development", ca_file=unreadable,
+                )
+
+    def test_dns_drift_after_preflight_is_rejected_before_put(self) -> None:
+        credentials = audit.S3Credentials("AKIATEST", "not-a-real-secret")
+        first = [(audit.socket.AF_INET, audit.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+        changed = [(audit.socket.AF_INET, audit.socket.SOCK_STREAM, 6, "", ("127.0.0.2", 443))]
+        with mock.patch.object(audit.socket, "getaddrinfo", return_value=first):
+            sink = audit.S3ObjectLockSink(
+                "bucket", "us-east-1", credentials, "https://localhost:9443", 1,
+                "local-development",
+            )
+        with (
+            mock.patch.object(audit.socket, "getaddrinfo", return_value=changed),
+            mock.patch.object(audit.urllib.request, "urlopen") as urlopen,
+            self.assertRaisesRegex(RuntimeError, "DNS addresses changed"),
+        ):
+            sink.anchor("fleet-audits/run/1.json", b"{}", "a" * 64)
+        urlopen.assert_not_called()
+
+    def test_s3_anchor_rejects_missing_version_retention_or_digest(self) -> None:
+        addresses = [
+            (audit.socket.AF_INET, audit.socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))
+        ]
+        with mock.patch.object(audit.socket, "getaddrinfo", return_value=addresses):
+            sink = audit.S3ObjectLockSink(
+                "bucket", "us-east-1",
+                audit.S3Credentials("AKIATEST", "not-a-real-secret"),
+                "https://storage.example", 30, "external-compliance",
+            )
+
+        class Response:
+            def __init__(self, headers: dict[str, str]) -> None:
+                self.headers = headers
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback) -> None:
+                return None
+
+        valid_head = {
+            "x-amz-version-id": "version-1",
+            "x-amz-object-lock-mode": "COMPLIANCE",
+            "x-amz-object-lock-retain-until-date": "2030-01-01T00:00:00Z",
+            "x-amz-meta-event-sha256": "a" * 64,
+        }
+        cases = (
+            ({}, valid_head, "lacks version id"),
+            ({"x-amz-version-id": "version-1"}, {key: value for key, value in valid_head.items() if key != "x-amz-object-lock-retain-until-date"}, "did not retain"),
+            ({"x-amz-version-id": "version-1"}, {key: value for key, value in valid_head.items() if key != "x-amz-meta-event-sha256"}, "did not retain"),
+        )
+        for put_headers, head_headers, message in cases:
+            responses = iter((Response(put_headers), Response(head_headers)))
+            with (
+                self.subTest(missing=message, head=head_headers),
+                mock.patch.object(audit.socket, "getaddrinfo", return_value=addresses),
+                mock.patch.object(
+                    audit.urllib.request, "urlopen", side_effect=lambda *args, **kwargs: next(responses)
+                ),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                sink.anchor("fleet-audits/run/1.json", b"{}", "a" * 64)
 
 
 if __name__ == "__main__":

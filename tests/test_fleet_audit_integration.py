@@ -94,6 +94,7 @@ class FleetAuditIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(offline["records"], 3)
         self.assertFalse(offline["worm"])
+        self.assertEqual(offline["trust_scope"], "local-development")
         self.assertNotIn("control-hmac", self.lifecycle.receipt_path.read_text(encoding="utf-8"))
 
     def test_raw_metadata_is_rejected_and_tampering_breaks_offline_verify(self) -> None:
@@ -124,10 +125,45 @@ class FleetAuditIntegrationTests(unittest.TestCase):
                 require_worm=False,
             )
 
+    def test_initial_anchor_failure_cleans_service_socket_and_lifecycle(self) -> None:
+        live_before = set(client._LIVE_PROCESSES)
+        real_send = client.audit.send_request
+
+        def fail_run_started(socket_path, request):
+            if request.get("operation") == "run_started":
+                raise RuntimeError("synthetic anchor failure")
+            return real_send(socket_path, request)
+
+        with (
+            mock.patch.object(client.audit, "send_request", side_effect=fail_run_started),
+            self.assertRaisesRegex(client.AuditClientError, "synthetic anchor failure"),
+        ):
+            self.lifecycle.start(self.manifest)
+        self.assertFalse(self.lifecycle.socket_path.exists())
+        self.assertFalse(self.lifecycle.lifecycle_path.exists())
+        self.assertEqual(set(client._LIVE_PROCESSES), live_before)
+
+    def test_second_anchor_failure_also_cleans_service_state(self) -> None:
+        live_before = set(client._LIVE_PROCESSES)
+        real_send = client.audit.send_request
+
+        def fail_control_event(socket_path, request):
+            if request.get("operation") == "control_event":
+                raise RuntimeError("synthetic second anchor failure")
+            return real_send(socket_path, request)
+
+        with (
+            mock.patch.object(client.audit, "send_request", side_effect=fail_control_event),
+            self.assertRaisesRegex(client.AuditClientError, "second anchor failure"),
+        ):
+            self.lifecycle.start(self.manifest)
+        self.assertFalse(self.lifecycle.socket_path.exists())
+        self.assertFalse(self.lifecycle.lifecycle_path.exists())
+        self.assertEqual(set(client._LIVE_PROCESSES), live_before)
+
     def test_worm_profile_fails_closed_without_compliance_configuration(self) -> None:
-        workflow_value = json.loads((ROOT / "workflows" / "implementation.yaml").read_text())
+        workflow_value = json.loads((ROOT / "workflows" / "local-worm.yaml").read_text())
         workflow_value["name"] = "worm-test"
-        workflow_value["audit"]["mode"] = "worm"
         path = self.tmp / "worm.yaml"
         path.write_text(json.dumps(workflow_value), encoding="utf-8")
         compiled = workflow_config.compile_path(path)
@@ -170,6 +206,8 @@ class FleetAuditIntegrationTests(unittest.TestCase):
         for index, event in enumerate(rows, 1):
             event["worm_compliance_mode"] = True
             event["worm_backend"] = "s3-object-lock-compliance"
+            event["worm_trust_scope"] = "external-compliance"
+            event["worm_retention_mode"] = "COMPLIANCE"
             event["worm_object_key"] = f"fleet-audits/{self.mission_id}/{index}.json"
             event["previous_event_sha256"] = previous
             unsigned = {
@@ -183,10 +221,12 @@ class FleetAuditIntegrationTests(unittest.TestCase):
                 "schema_version": 1,
                 "worm": True,
                 "backend": "s3-object-lock-compliance",
+                "trust_scope": "external-compliance",
                 "object_key": event["worm_object_key"],
                 "event_sha256": event["event_sha256"],
                 "retention_mode": "COMPLIANCE",
                 "retained_until": "2030-01-01T00:00:00Z",
+                "version_id": f"version-{index}",
             }
             (self.lifecycle.anchor_receipts / f"{event['event_id']}.json").write_text(
                 json.dumps(anchor, sort_keys=True) + "\n", encoding="utf-8"
@@ -203,6 +243,7 @@ class FleetAuditIntegrationTests(unittest.TestCase):
             "ledger_sha256": client.audit.file_sha256(ledger),
             "worm": True,
             "backend": "s3-object-lock-compliance",
+            "trust_scope": "external-compliance",
             "public_key_sha256": client.audit.file_sha256(self.lifecycle.public_key),
             "verified_at": "2026-07-14T00:00:00Z",
         }
@@ -211,6 +252,22 @@ class FleetAuditIntegrationTests(unittest.TestCase):
             json.dumps(receipt, separators=(",", ":"), sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        verified = client.verify_offline(
+            ledger,
+            self.lifecycle.receipt_path,
+            self.lifecycle.public_key,
+            self.lifecycle.anchor_receipts,
+            require_worm=True,
+            required_trust_scope="external-compliance",
+        )
+        self.assertTrue(verified["worm"])
+        self.assertEqual(verified["trust_scope"], "external-compliance")
+        last_anchor_path = self.lifecycle.anchor_receipts / f"{rows[-1]['event_id']}.json"
+        last_anchor = json.loads(last_anchor_path.read_text(encoding="utf-8"))
+        last_anchor.pop("version_id")
+        last_anchor_path.write_text(
+            json.dumps(last_anchor, sort_keys=True) + "\n", encoding="utf-8"
+        )
         with self.assertRaisesRegex(client.AuditClientError, "incomplete"):
             client.verify_offline(
                 ledger,
@@ -218,7 +275,61 @@ class FleetAuditIntegrationTests(unittest.TestCase):
                 self.lifecycle.public_key,
                 self.lifecycle.anchor_receipts,
                 require_worm=True,
+                required_trust_scope="external-compliance",
             )
+
+    def test_offline_receipts_must_match_ledger_backend_scope_and_object(self) -> None:
+        self.lifecycle.start(self.manifest)
+        self.lifecycle.verify()
+        ledger = self.lifecycle.ledger_root / self.mission_id / "a2a_ledger.jsonl"
+        events = client.read_verified_public_chain(ledger)
+        anchor_path = self.lifecycle.anchor_receipts / f"{events[0]['event_id']}.json"
+        anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+        anchor["trust_scope"] = "external-compliance"
+        anchor_path.write_text(json.dumps(anchor, sort_keys=True) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(client.AuditClientError, "differs from ledger"):
+            client.verify_offline(
+                ledger,
+                self.lifecycle.receipt_path,
+                self.lifecycle.public_key,
+                self.lifecycle.anchor_receipts,
+                require_worm=False,
+                required_trust_scope="local-development",
+            )
+
+    def test_external_compliance_preflight_rejects_loopback_without_state(self) -> None:
+        workflow_value = json.loads((ROOT / "workflows" / "regulated.yaml").read_text())
+        workflow_value["name"] = "external-test"
+        path = self.tmp / "external.yaml"
+        path.write_text(json.dumps(workflow_value), encoding="utf-8")
+        compiled = workflow_config.compile_path(path)
+        mission_id, _ = fleet_mission.create_mission(
+            self.runs,
+            compiled=compiled,
+            feature="audit-external",
+            objective="reject local endpoint for external trust",
+            target_repo=self.target.resolve(),
+            base_sha="a" * 40,
+            idempotency_key="create:audit-external",
+        )
+        lifecycle = client.AuditLifecycle(self.runs, mission_id)
+        env = {
+            "FLEET_WORM_BUCKET": "bucket",
+            "FLEET_WORM_REGION": "us-east-1",
+            "FLEET_WORM_ENDPOINT": "https://localhost:9443",
+            "AWS_ACCESS_KEY_ID": "ephemeral-access",
+            "AWS_SECRET_ACCESS_KEY": "ephemeral-secret",
+        }
+        loopback = [
+            (client.audit.socket.AF_INET, client.audit.socket.SOCK_STREAM, 6, "", ("127.0.0.1", 9443))
+        ]
+        with (
+            mock.patch.dict(os.environ, env),
+            mock.patch.object(client.audit.socket, "getaddrinfo", return_value=loopback),
+            self.assertRaisesRegex(client.AuditClientError, "public global"),
+        ):
+            lifecycle.preflight()
+        self.assertFalse(lifecycle.root.exists(), "rejected trust must not create audit state")
 
 
 if __name__ == "__main__":

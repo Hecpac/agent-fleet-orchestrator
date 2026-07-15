@@ -20,7 +20,11 @@
     "preset": "fleet_dialogue",
     "minimum_gates": ["fdp2", "human_build_exit", "fdp3"]
   },
-  "audit": {"mode": "signed", "worm_required_for": ["private_data", "regulated"]},
+  "audit": {
+    "mode": "signed",
+    "trust_scope": "local-development",
+    "worm_required_for": ["private_data", "regulated"]
+  },
   "archive": {
     "mode": "incremental",
     "content_policy": "redacted",

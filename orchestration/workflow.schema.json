@@ -70,9 +70,10 @@
     "audit": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["mode", "worm_required_for"],
+      "required": ["mode", "trust_scope", "worm_required_for"],
       "properties": {
         "mode": {"enum": ["signed", "worm"]},
+        "trust_scope": {"enum": ["local-development", "external-compliance"]},
         "worm_required_for": {
           "type": "array",
           "items": {"enum": ["regulated", "production", "money", "credentials", "private_data", "destructive"]},

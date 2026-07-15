@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import pwd
+import re
 import secrets
 import signal
 import stat
@@ -178,32 +179,76 @@ def verify_offline(
     anchor_receipts: Path,
     *,
     require_worm: bool,
+    required_trust_scope: str | None = None,
 ) -> dict[str, Any]:
     events = _chain_without_secret(ledger_path)
     receipt = _load_json(receipt_path)
     required = {
         "schema_version", "mission_id", "records", "head_sha256", "ledger_sha256",
-        "worm", "backend", "public_key_sha256", "verified_at", "ed25519_signature",
+        "worm", "backend", "trust_scope", "public_key_sha256", "verified_at",
+        "ed25519_signature",
     }
     if set(receipt) != required or receipt["schema_version"] != 1:
         raise AuditClientError("audit verification receipt fields are invalid")
     if receipt["records"] != len(events) or receipt["head_sha256"] != events[-1]["event_sha256"]:
         raise AuditClientError("audit verification receipt chain summary mismatch")
+    run_ids = {event.get("run_id") for event in events}
+    if len(run_ids) != 1 or receipt["mission_id"] not in run_ids:
+        raise AuditClientError("audit verification receipt mission differs from ledger")
     if receipt["ledger_sha256"] != audit.file_sha256(ledger_path):
         raise AuditClientError("audit verification receipt ledger hash mismatch")
     if receipt["public_key_sha256"] != audit.file_sha256(public_key):
         raise AuditClientError("audit verification public key hash mismatch")
     _verify_signature(public_key, receipt)
     compliance = all(event.get("worm_compliance_mode") is True for event in events)
-    if bool(receipt["worm"]) != compliance:
+    if any(event.get("worm_compliance_mode") is not compliance for event in events):
+        raise AuditClientError("audit ledger mixes WORM compliance modes")
+    backends = {event.get("worm_backend") for event in events}
+    trust_scopes = {event.get("worm_trust_scope") for event in events}
+    if len(backends) != 1 or receipt["backend"] not in backends:
+        raise AuditClientError("audit receipt backend differs from ledger")
+    if not isinstance(receipt["backend"], str) or not receipt["backend"]:
+        raise AuditClientError("audit receipt backend is invalid")
+    if len(trust_scopes) != 1 or receipt["trust_scope"] not in trust_scopes:
+        raise AuditClientError("audit receipt trust scope differs from ledger")
+    trust_scope = str(receipt["trust_scope"])
+    if trust_scope not in audit.TRUST_SCOPES:
+        raise AuditClientError("audit receipt trust scope is invalid")
+    if not isinstance(receipt["worm"], bool) or receipt["worm"] != compliance:
         raise AuditClientError("audit receipt WORM claim differs from ledger")
     if require_worm and not compliance:
         raise AuditClientError("workflow requires WORM compliance")
+    if required_trust_scope is not None and trust_scope != required_trust_scope:
+        raise AuditClientError(
+            f"workflow requires {required_trust_scope} trust, receipt has {trust_scope}"
+        )
+    if trust_scope == "external-compliance" and not compliance:
+        raise AuditClientError("external-compliance trust requires WORM compliance")
     for event in events:
         receipt_file = anchor_receipts / f"{event['event_id']}.json"
         anchor = _load_json(receipt_file)
-        if anchor.get("event_sha256") != event["event_sha256"]:
-            raise AuditClientError("audit anchor receipt event hash mismatch")
+        anchor_required = {
+            "schema_version", "worm", "backend", "trust_scope", "object_key",
+            "event_sha256",
+        }
+        if compliance:
+            worm_fields = {"retention_mode", "retained_until", "version_id"}
+            if not worm_fields.issubset(anchor):
+                raise AuditClientError("WORM anchor receipt is incomplete")
+            anchor_required |= worm_fields
+        if set(anchor) != anchor_required or anchor.get("schema_version") != 1:
+            raise AuditClientError("audit anchor receipt fields are invalid")
+        exact_fields = {
+            "event_sha256": "event_sha256",
+            "backend": "worm_backend",
+            "trust_scope": "worm_trust_scope",
+            "object_key": "worm_object_key",
+            "worm": "worm_compliance_mode",
+        }
+        if compliance:
+            exact_fields["retention_mode"] = "worm_retention_mode"
+        if any(anchor.get(receipt_key) != event.get(event_key) for receipt_key, event_key in exact_fields.items()):
+            raise AuditClientError("audit anchor receipt differs from ledger")
         if compliance and (
             anchor.get("worm") is not True
             or anchor.get("retention_mode") != "COMPLIANCE"
@@ -213,11 +258,36 @@ def verify_offline(
             raise AuditClientError("WORM anchor receipt is incomplete")
         if not compliance and anchor.get("worm") is not False:
             raise AuditClientError("signed audit receipt makes a WORM claim")
+        if not isinstance(anchor["object_key"], str) or not isinstance(
+            anchor["event_sha256"], str
+        ):
+            raise AuditClientError("audit anchor receipt identity is invalid")
+        if compliance and (
+            not anchor["object_key"]
+            or not isinstance(anchor["version_id"], str)
+            or anchor["version_id"] in {"", "null"}
+            or not isinstance(anchor["retained_until"], str)
+            or not anchor["retained_until"]
+        ):
+            raise AuditClientError("WORM anchor receipt identity is invalid")
+        if not re.fullmatch(r"[0-9a-f]{64}", anchor["event_sha256"]):
+            raise AuditClientError("audit anchor receipt digest is invalid")
+        if compliance:
+            try:
+                retained_at = datetime.fromisoformat(
+                    anchor["retained_until"].replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise AuditClientError("WORM retain-until is invalid") from exc
+            if retained_at.tzinfo is None:
+                raise AuditClientError("WORM retain-until must include a timezone")
     return {
         "mission_id": receipt["mission_id"],
         "records": len(events),
         "head_sha256": events[-1]["event_sha256"],
         "worm": compliance,
+        "backend": receipt["backend"],
+        "trust_scope": trust_scope,
         "valid": True,
     }
 
@@ -256,6 +326,12 @@ class AuditLifecycle:
             raise AuditClientError(f"unsupported Mission audit mode: {mode}")
         return mode
 
+    def _trust_scope(self) -> str:
+        trust_scope = str(self._compiled()["workflow"]["audit"]["trust_scope"])
+        if trust_scope not in audit.TRUST_SCOPES:
+            raise AuditClientError(f"unsupported Mission audit trust scope: {trust_scope}")
+        return trust_scope
+
     def _lifecycle(self) -> dict[str, Any]:
         return _load_json(self.lifecycle_path)
 
@@ -265,27 +341,34 @@ class AuditLifecycle:
         except (OSError, RuntimeError, json.JSONDecodeError) as exc:
             raise AuditClientError(f"AuditService health failed: {exc}") from exc
         lifecycle = self._lifecycle()
-        if result.get("status") != "ok" or result.get("mode") != lifecycle.get("mode"):
+        if (
+            result.get("status") != "ok"
+            or result.get("mode") != lifecycle.get("mode")
+            or result.get("trust_scope") != lifecycle.get("trust_scope")
+        ):
             raise AuditClientError("AuditService health identity mismatch")
         return result
 
     def preflight(self) -> dict[str, Any]:
         """Validate an audit backend before any fleet or key side effect."""
         mode = self._mode()
+        trust_scope = self._trust_scope()
         if mode == "worm":
             try:
-                sink = audit.S3ObjectLockSink.from_environment()
+                sink = audit.S3ObjectLockSink.from_environment(trust_scope)
             except (RuntimeError, ValueError) as exc:
                 raise AuditClientError(f"WORM audit preflight failed: {exc}") from exc
             return {
                 "mode": mode,
                 "backend": sink.backend_name,
+                "trust_scope": sink.trust_scope,
                 "compliance_mode": sink.compliance_mode,
                 "configured": True,
             }
         return {
             "mode": mode,
             "backend": "signed-local",
+            "trust_scope": trust_scope,
             "compliance_mode": False,
             "configured": True,
         }
@@ -293,6 +376,11 @@ class AuditLifecycle:
     def start(self, manifest_path: Path) -> dict[str, Any]:
         if self.lifecycle_path.exists():
             existing = self._lifecycle()
+            if (
+                existing.get("mode") != self._mode()
+                or existing.get("trust_scope") != self._trust_scope()
+            ):
+                raise AuditClientError("AuditService lifecycle differs from compiled policy")
             if existing.get("stopped_at") is not None:
                 raise AuditClientError("AuditService was already stopped for this mission")
             try:
@@ -315,13 +403,15 @@ class AuditLifecycle:
         mission_state.ensure_private_directory(self.anchor_receipts)
         hmac_key, private_key, public_key = _generate_keys(self.root)
         mode = self._mode()
+        trust_scope = self._trust_scope()
         log_out = self.root / "service.stdout.log"
         log_err = self.root / "service.stderr.log"
         command = [
             "python3", str(ROOT / "scripts" / "fleet_audit_control.py"), "serve",
             "--socket", str(self.socket_path), "--root", str(self.ledger_root),
             "--key", str(hmac_key), "--maker-user", pwd.getpwuid(os.geteuid()).pw_name,
-            "--mode", mode, "--receipt-root", str(self.anchor_receipts),
+            "--mode", mode, "--trust-scope", trust_scope,
+            "--receipt-root", str(self.anchor_receipts),
         ]
         with log_out.open("ab") as stdout, log_err.open("ab") as stderr:
             process = subprocess.Popen(
@@ -338,6 +428,7 @@ class AuditLifecycle:
             "schema_version": 1,
             "mission_id": self.mission_id,
             "mode": mode,
+            "trust_scope": trust_scope,
             "pid": process.pid,
             "socket": str(self.socket_path),
             "ledger_root": str(self.ledger_root),
@@ -393,15 +484,28 @@ class AuditLifecycle:
                     "artifacts": artifacts,
                 },
             )
-        except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+            self.record_control_event(
+                event_type="MissionAuditStarted",
+                subject_id=self.mission_id,
+                subject_sha256=state["head_sha256"],
+                metadata={
+                    "audit_mode": mode,
+                    "trust_scope": trust_scope,
+                    "mission_status": state["status"],
+                },
+                idempotency_key="audit:mission-started",
+            )
+        except (AuditClientError, OSError, RuntimeError, json.JSONDecodeError) as exc:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+            _LIVE_PROCESSES.pop(process.pid, None)
+            self.lifecycle_path.unlink(missing_ok=True)
+            self.socket_path.unlink(missing_ok=True)
             raise AuditClientError(f"cannot start signed audit run: {exc}") from exc
-        self.record_control_event(
-            event_type="MissionAuditStarted",
-            subject_id=self.mission_id,
-            subject_sha256=state["head_sha256"],
-            metadata={"audit_mode": mode, "mission_status": state["status"]},
-            idempotency_key="audit:mission-started",
-        )
         return {"started": True, "run_started": started, "health": self.health(), "lifecycle": lifecycle}
 
     def record_control_event(
@@ -444,7 +548,13 @@ class AuditLifecycle:
         if not events:
             raise AuditClientError("assured audit chain is empty")
         compliance = all(event.get("worm_compliance_mode") is True for event in events)
-        require_worm = lifecycle["mode"] == "worm"
+        require_worm = self._mode() == "worm"
+        required_trust_scope = self._trust_scope()
+        if (
+            lifecycle.get("mode") != self._mode()
+            or lifecycle.get("trust_scope") != required_trust_scope
+        ):
+            raise AuditClientError("audit lifecycle differs from compiled policy")
         if require_worm and not compliance:
             raise AuditClientError("workflow requires WORM but audit chain is non-compliant")
         if not require_worm and compliance:
@@ -458,6 +568,7 @@ class AuditLifecycle:
             "ledger_sha256": audit.file_sha256(ledger_path),
             "worm": compliance,
             "backend": events[-1]["worm_backend"],
+            "trust_scope": events[-1]["worm_trust_scope"],
             "public_key_sha256": audit.file_sha256(self.public_key),
             "verified_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -467,7 +578,7 @@ class AuditLifecycle:
             prior = _load_json(self.receipt_path)
             stable = {key: value for key, value in receipt.items() if key in {
                 "schema_version", "mission_id", "records", "head_sha256", "ledger_sha256",
-                "worm", "backend", "public_key_sha256",
+                "worm", "backend", "trust_scope", "public_key_sha256",
             }}
             if any(prior.get(key) != value for key, value in stable.items()):
                 raise AuditClientError("audit verification receipt conflicts with current chain")
@@ -476,7 +587,7 @@ class AuditLifecycle:
             mission_state.atomic_write(self.receipt_path, content)
         return verify_offline(
             ledger_path, self.receipt_path, self.public_key, self.anchor_receipts,
-            require_worm=require_worm,
+            require_worm=require_worm, required_trust_scope=required_trust_scope,
         )
 
     def stop(self) -> dict[str, Any]:
@@ -533,6 +644,9 @@ def _parser() -> argparse.ArgumentParser:
     offline.add_argument("--public-key", required=True)
     offline.add_argument("--anchor-receipts", required=True)
     offline.add_argument("--require-worm", action="store_true")
+    offline.add_argument(
+        "--require-trust-scope", choices=tuple(sorted(audit.TRUST_SCOPES))
+    )
     return parser
 
 
@@ -543,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
             value = verify_offline(
                 Path(args.ledger), Path(args.receipt), Path(args.public_key),
                 Path(args.anchor_receipts), require_worm=args.require_worm,
+                required_trust_scope=args.require_trust_scope,
             )
             print(json.dumps(value, sort_keys=True))
             return 0

@@ -657,6 +657,7 @@ def verify_archive(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
         compiled = json.loads(_regular_bytes(root / "compiled-workflow.json"))
         try:
             require_worm = compiled["workflow"]["audit"]["mode"] == "worm"
+            required_trust_scope = compiled["workflow"]["audit"]["trust_scope"]
         except (KeyError, TypeError) as exc:
             raise ArchiveError("archived audit policy is invalid") from exc
         audit_result = fleet_audit_client.verify_offline(
@@ -665,6 +666,7 @@ def verify_archive(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
             root / "audit" / "audit-signing-public.pem",
             root / "audit" / "anchor-receipts",
             require_worm=require_worm,
+            required_trust_scope=required_trust_scope,
         )
         archive_events = [
             event for event in fleet_audit_client._chain_without_secret(audit_ledger)

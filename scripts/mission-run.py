@@ -43,6 +43,27 @@ class MissionRunError(RuntimeError):
     """Mission runner reconciliation cannot proceed safely."""
 
 
+def enforce_audit_trust(
+    compiled: dict[str, Any], categories: list[str], execution_profile: str
+) -> None:
+    """Prevent runtime risk/profile requirements from accepting weaker audit policy."""
+    policy = compiled["workflow"]["audit"]
+    category_set = set(categories)
+    worm_categories = category_set & set(policy["worm_required_for"])
+    external_required = execution_profile == "regulated" or "regulated" in category_set
+    if worm_categories and policy["mode"] != "worm":
+        raise MissionRunError(
+            "mission risk requires WORM audit for categories: "
+            + ", ".join(sorted(worm_categories))
+        )
+    if external_required and (
+        policy["mode"] != "worm" or policy["trust_scope"] != "external-compliance"
+    ):
+        raise MissionRunError(
+            "regulated execution or risk requires worm mode with external-compliance trust"
+        )
+
+
 def run_process(
     command: list[str],
     *,
@@ -309,9 +330,13 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
     execution_profile = fleet_manifest.validate_profile(
         str(options.get("execution_profile", "native"))
     )
+    enforce_audit_trust(compiled, [], execution_profile)
 
     while True:
         current = fleet_mission.load_state(runs_dir, mission_id)
+        enforce_audit_trust(
+            compiled, list(current.get("risk_categories") or []), execution_profile
+        )
         feature = current["feature"]
         if current["status"] in mission_state.TERMINAL_STATUSES:
             control_lifecycle = fleet_control_service.ControlLifecycle(runs_dir, mission_id)
@@ -338,6 +363,7 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                 target=str(target_repo),
                 override=str(options.get("risk_override", "auto")),
             )
+            enforce_audit_trust(compiled, list(assessment["categories"]), execution_profile)
             mission_state.append_event(
                 runs_dir,
                 mission_id,
@@ -755,6 +781,7 @@ def create_and_drive(
         raise MissionRunError(str(exc)) from exc
     require_success(["git", "-C", str(target_repo), "rev-parse", "--git-dir"])
     compiled = workflow_config.compile_path(workflow_path(workflow_name))
+    enforce_audit_trust(compiled, [], execution_profile)
     timeout = timeout_seconds or int(compiled["workflow"]["limits"]["deadline_seconds"])
     if timeout < 60:
         raise MissionRunError("timeout must be at least 60 seconds")
@@ -805,6 +832,7 @@ def dry_run(
         target=str(target_repo),
         override=risk_override,
     )
+    enforce_audit_trust(compiled, list(assessment["categories"]), execution_profile)
     timeout = timeout_seconds or int(compiled["workflow"]["limits"]["deadline_seconds"])
     return {
         "feature": feature,

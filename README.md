@@ -291,6 +291,11 @@ signed audit; a workflow declaring WORM fails closed unless a real S3 Object
 Lock COMPLIANCE sink supplies versioned, verifiable anchor receipts.
 Use `--workflow regulated --execution-profile regulated` for that path; its
 backend configuration is preflighted before any CMUX fleet is created.
+The additive `local-worm` workflow proves the same Object Lock mechanics on an
+HTTPS loopback backend but records `trust_scope=local-development`; it can never
+satisfy `regulated` or any `external-compliance` requirement. See
+[`docs/local-worm.md`](docs/local-worm.md) for the pinned RustFS setup, live
+smoke, deletion proof, and teardown recipes.
 If a workflow declares `credentials` or `private_data` and requests a `full`
 archive, CONTROL must first record a separate, scoped, expiring approval:
 

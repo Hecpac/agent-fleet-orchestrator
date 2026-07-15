@@ -5,6 +5,22 @@ check:
 workflow-validate:
     python3 scripts/workflow_config.py validate workflows/*.yaml
 
+# Ephemeral local-only RustFS WORM environment. State and credentials stay in /tmp.
+worm-local-setup:
+    python3 scripts/fleet_worm_local.py setup
+
+worm-local-smoke:
+    python3 scripts/fleet_worm_local.py smoke
+
+worm-local-delete-test:
+    python3 scripts/fleet_worm_local.py delete-test
+
+worm-local-teardown:
+    python3 scripts/fleet_worm_local.py teardown
+
+worm-local-all:
+    python3 scripts/fleet_worm_local.py all
+
 provider-validate:
     python3 scripts/fleet_providers.py list
     python3 scripts/router_config.py --router orchestration/router.yaml validate
