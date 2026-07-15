@@ -286,11 +286,13 @@ def compile_workflow(
             router_value,
             preset_name=workflow["preset"],
             run_healthcheck=False,
+            check_runtime_availability=False,
         )
         assurance_plan = router_config.build_plan(
             router_value,
             preset_name=workflow["assurance"]["preset"],
             run_healthcheck=False,
+            check_runtime_availability=False,
         )
     except router_config.RouterError as exc:
         raise WorkflowError(f"router resolution failed: {exc}") from exc

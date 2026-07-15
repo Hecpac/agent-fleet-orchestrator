@@ -607,6 +607,7 @@ def select_lead(
     *,
     allow_fallback: bool = False,
     run_healthcheck: bool = True,
+    check_runtime_availability: bool = True,
 ) -> dict[str, Any]:
     candidates = list(config["lead"]["candidates"])
     if requested:
@@ -616,7 +617,12 @@ def select_lead(
     failures: list[str] = []
     for role_type in candidates:
         role = config["roles"][role_type]
-        available, reason = role_available(role, run_healthcheck=run_healthcheck)
+        if not role["enabled"]:
+            available, reason = False, "disabled"
+        elif not check_runtime_availability:
+            available, reason = True, "static resolution"
+        else:
+            available, reason = role_available(role, run_healthcheck=run_healthcheck)
         if available:
             command = list(role["command"])
             if role["provider"] == "openai":
@@ -679,6 +685,7 @@ def build_plan(
     allow_fallback: bool = False,
     no_lead: bool = False,
     run_healthcheck: bool = True,
+    check_runtime_availability: bool = True,
 ) -> dict[str, Any]:
     specs = list(instance_specs or [])
     if preset_name and specs:
@@ -707,6 +714,7 @@ def build_plan(
             lead_provider or preset_lead,
             allow_fallback=allow_fallback,
             run_healthcheck=run_healthcheck,
+            check_runtime_availability=check_runtime_availability,
         )
     resolved = _materialize_instances(config, instances)
     warnings: list[str] = []

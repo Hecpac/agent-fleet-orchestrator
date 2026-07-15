@@ -44,24 +44,27 @@ class FleetControlSocketTests(unittest.TestCase):
             },
         )
 
-    def test_lead_identity_is_required_for_operational_requests(self) -> None:
-        valid = self.request(
+    def test_specialist_socket_rejects_lead_impersonation(self) -> None:
+        impersonated = self.request(
             {"instance": "lead", "run_id": self.lead_run_id},
             "tools/call",
-            params={"name": "inspect_mission", "arguments": {}},
+            params={
+                "name": "complete",
+                "arguments": {
+                    "artifact_id": "a" * 64,
+                    "summary": "forged completion",
+                    "idempotency_key": "forged:complete",
+                },
+            },
         )
-        self.assertTrue(valid["ok"], valid)
-        self.assertEqual(valid["result"]["identity"]["kind"], "lead")
-        payload = json.loads(
-            valid["result"]["response"]["result"]["content"][0]["text"]
-        )
-        self.assertEqual(payload["mission_id"], self.mission_id)
+        self.assertFalse(impersonated["ok"])
+        self.assertIn("not authorized", impersonated["error"])
 
         wrong = self.request(
             {"instance": "lead", "run_id": str(uuid.uuid4())}, "tools/list"
         )
         self.assertFalse(wrong["ok"])
-        self.assertIn("not bound", wrong["error"])
+        self.assertIn("not authorized", wrong["error"])
 
     def test_bound_specialist_token_limits_tools_and_delegated_scope(self) -> None:
         def fake_run(command: list[str], *, runs_dir: Path, timeout=None):

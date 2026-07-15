@@ -267,9 +267,10 @@ interrupts retain the lease under the same rule.
 
 Mission-bound fleets also expose a private Unix Fleet Control socket. The
 kernel-authenticated peer UID is checked for every connection. Operational MCP
-requests additionally require the exact Lead run identity or a specialist run
-plus its ledger-bound capability token; specialists cannot call `complete`,
-cancel arbitrary work, escape capability scope, or subdelegate to the writer.
+requests are accepted only from a specialist run plus its ledger-bound
+capability token; Lead-shaped socket callers fail closed because the Lead uses
+the direct CONTROL CLI. Specialists cannot call `complete`, cancel arbitrary
+work, escape capability scope, or subdelegate to the writer.
 CONTROL preassigns and token-binds a specialist `run_id` before transferring its
 prompt, so a fast tool call cannot race delegation registration. OpenCode result
 extraction tolerates only a bounded database-visibility delay and otherwise

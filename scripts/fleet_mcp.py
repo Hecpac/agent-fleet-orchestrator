@@ -271,9 +271,9 @@ def _validate_socket_caller(
     token_id = caller.get("token_id")
     current = control.state()
     if instance == "lead":
-        if run_id != current.get("lead_run_id") or token_id not in (None, ""):
-            raise FleetControlError("Lead socket identity is not bound to this mission")
-        return {"kind": "lead", "instance": instance, "run_id": run_id}
+        raise FleetControlError(
+            "Lead callers are not authorized on the specialist control socket"
+        )
     if not isinstance(token_id, str) or not token_id:
         raise FleetControlError("specialist socket identity requires a capability token")
     token = fleet_delegation.load_token(control.runs_dir, control.mission_id, token_id)

@@ -158,21 +158,22 @@ developer's absolute paths. A legacy manifest normalizes to native plus
 
 `enforced_by:`
 
-- `tests/test_fleet_control_socket.py::FleetControlSocketTests::test_lead_identity_is_required_for_operational_requests`
+- `tests/test_fleet_control_socket.py::FleetControlSocketTests::test_specialist_socket_rejects_lead_impersonation`
 - `tests/test_fleet_control_socket.py::FleetControlSocketTests::test_bound_specialist_token_limits_tools_and_delegated_scope`
 - `tests/test_fleet_control_socket.py::FleetControlSocketTests::test_socket_permissions_and_health_are_kernel_scoped`
 - `tests/test_fleet_control.py::FleetControlTests::test_cli_and_mcp_share_core_and_do_not_screen_scrape`
 
 `why:` The private Unix socket is mode 0600 inside an owner-only directory and
 rejects a peer UID not reported by the kernel. Every operational request also
-names the exact durable caller. A Lead run must equal the Mission's bound
-`lead_run_id`; a specialist must match one delegation plus the uniquely bound
-capability token. Specialist calls are limited to inspection/result operations
-or subdelegation whose parent, token, capability, depth, and budget match that
-identity; they cannot complete the Mission, cancel arbitrary work, or reach the
-writer. The stdio MCP/CLI contracts remain available for legacy callers, while
-canonical Mission lifecycle reconciles one socket service across runner death
-and stops it before teardown.
+names the exact durable caller. The socket accepts only a specialist that
+matches one delegation plus the uniquely bound capability token; Lead-shaped
+callers fail closed and the Lead retains the direct CONTROL CLI. Specialist
+calls are limited to inspection/result operations or subdelegation whose
+parent, token, capability, depth, and budget match that identity; they cannot
+complete the Mission, cancel arbitrary work, or reach the writer. The stdio
+MCP/CLI contracts remain available for legacy callers, while canonical Mission
+lifecycle reconciles one socket service across runner death and stops it before
+teardown.
 
 ## Raw CMUX input is never tracked completion evidence
 

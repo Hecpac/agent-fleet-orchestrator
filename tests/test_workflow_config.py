@@ -52,6 +52,14 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertNotIn(b"command_shell", encoded)
         self.assertNotIn(b"tool_access", encoded)
 
+    def test_compile_is_independent_of_runtime_path_availability(self) -> None:
+        with mock.patch.object(
+            workflow_config.router_config.shutil, "which", return_value=None
+        ) as which:
+            compiled = workflow_config.compile_workflow(self.workflow, router=self.router)
+        which.assert_not_called()
+        self.assertEqual(compiled["resolved"]["lead"]["role_type"], "codex")
+
     def test_unknown_duplicate_shell_and_authority_keys_fail(self) -> None:
         fixtures = ROOT / "tests" / "fixtures" / "mission_control"
         for name, pattern in (
