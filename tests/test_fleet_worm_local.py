@@ -147,6 +147,21 @@ class FleetWormLocalTests(unittest.TestCase):
             local_worm.setup(state_dir, 9443)
         self.assertTrue((state_dir / local_worm.STATE_FILE).exists())
 
+    def test_owned_cleanup_timeout_is_unconfirmed(self) -> None:
+        with (
+            mock.patch.object(local_worm, "_docker_exists", return_value=True),
+            mock.patch.object(local_worm, "_docker_owner", return_value="owner"),
+            mock.patch.object(
+                local_worm.subprocess,
+                "run",
+                side_effect=local_worm.subprocess.TimeoutExpired(["docker"], 60),
+            ) as run,
+        ):
+            self.assertFalse(
+                local_worm._remove_owned_quietly("container", "owned", "owner")
+            )
+        self.assertEqual(run.call_args.kwargs["timeout"], 60)
+
     def test_generated_custom_ca_is_valid_for_sink_preflight(self) -> None:
         certs = self.root / "certs"
         local_worm._generate_certificates(certs)
