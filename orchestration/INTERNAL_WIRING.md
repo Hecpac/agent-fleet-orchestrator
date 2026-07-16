@@ -779,3 +779,32 @@ complete offline-verified public audit envelope. File or HTTP exporters are
 optional, label themselves `observational_only`, and are not invoked by the
 mission completion path, so exporter failure cannot change Lead authority or a
 terminal.
+
+## Model-injection boundary and known control gaps are explicit
+
+`rule: fleet_model_injection_boundary_is_explicit_and_test_locked`
+
+`enforced_by:`
+
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_prompt_injection_is_bounded_by_role_controls`
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_claude_policy_does_not_auto_allow_cmux_or_mutation`
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_opencode_broad_allowlist_is_detected_as_an_in_scope_gap`
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_same_uid_process_can_rewrite_private_file_and_is_out_of_scope`
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_control_is_trusted_and_can_reach_direct_entrypoints`
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_same_model_custom_race_is_permitted_but_not_assurance`
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_wait_uses_posix_alarm_and_alarm_is_pending_after_process_stop`
+
+`why:` Repository content, evidence packs, other model output, and the model
+itself are untrusted. Provider sandboxes, tool permissions, authority, phase
+gates, leases, and exact completion provenance are the intended deterministic
+boundary, while a matching sentinel never proves that a conclusion is true.
+Conformance is explicit rather than assumed: Claude and Codex controls are
+locked structurally, and the test records that current OpenCode `find *` and
+`sed *` allowances admit mutating forms and remain an open in-scope gap. The
+trusted computing base deliberately includes the provider CLIs, CMUX, the
+local Unix account, and CONTROL. A mode-0600 file does not isolate another
+process under that account, CONTROL retains direct convenience entrypoints,
+and a custom same-model race is not independent assurance. `fleet_wait.py` is
+locked to POSIX `alarm`, while a separate primitive probe verifies pending
+signal delivery across process stop/resume; the actual waiter and full-machine
+sleep/wake paths remain explicit live lanes.
