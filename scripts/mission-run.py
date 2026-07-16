@@ -360,7 +360,11 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                 if lifecycle.get("stopped_at") is None:
                     control_lifecycle.stop()
             if options.get("teardown") and manifest_path.exists():
-                require_success([str(ROOT / "scripts" / "fleet-down.sh"), feature], timeout=180)
+                require_success(
+                    [str(ROOT / "scripts" / "fleet-down.sh"), feature],
+                    timeout=180,
+                    env={**os.environ, "FLEET_RUNS_DIR": str(runs_dir)},
+                )
             else:
                 audit_lifecycle = fleet_audit_client.AuditLifecycle(runs_dir, mission_id)
                 if audit_lifecycle.lifecycle_path.exists():

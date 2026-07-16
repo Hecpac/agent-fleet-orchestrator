@@ -353,6 +353,37 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
         self.assertFalse(values["hooks_file"])
         self.assertEqual(values["cmux_disabled"], "1")
 
+    def test_codex_runner_does_not_duplicate_existing_hook_trust_bypass(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fake_codex = Path(directory) / "codex"
+            fake_codex.write_text(
+                "#!/bin/sh\n"
+                "python3 -c 'import sys; print(sys.argv[1:])' \"$@\"\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o700)
+            result = subprocess.run(
+                [
+                    "bash", str(RUNNER), "codex", "advisory", "-",
+                    str(fake_codex), "--dangerously-bypass-hook-trust",
+                ],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "CODEX_HOME": str(self.controller_codex_home),
+                    "CMUX_SURFACE_ID": "12345678-1234-4234-9234-123456789ABC",
+                },
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.count("--dangerously-bypass-hook-trust"),
+            1,
+        )
+
     def test_mission_specialist_uses_ephemeral_codex_home_with_auth(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller_codex_home = Path(directory) / "controller-codex"

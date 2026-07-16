@@ -298,7 +298,17 @@ case "$role_type" in
     # CMUX bridge in an ephemeral home for every authority/profile.
     provision_fleet_codex_home
     if [[ "$(basename "$1")" == "codex" && "${FLEET_HEALTHCHECK:-0}" != "1" ]]; then
-      set -- "$@" --enable hooks --dangerously-bypass-hook-trust
+      hook_trust_bypass=0
+      for argument in "$@"; do
+        if [[ "$argument" == "--dangerously-bypass-hook-trust" ]]; then
+          hook_trust_bypass=1
+          break
+        fi
+      done
+      set -- "$@" --enable hooks
+      if (( hook_trust_bypass == 0 )); then
+        set -- "$@" --dangerously-bypass-hook-trust
+      fi
       for event in SessionStart UserPromptSubmit Stop; do
         set -- "$@" -c "$(codex_hook_override "$event")"
       done

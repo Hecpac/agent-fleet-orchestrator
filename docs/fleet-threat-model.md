@@ -33,8 +33,8 @@ Current conformance is **partial**, not complete:
 
 | Provider path | Current evidence | Status |
 |---|---|---|
-| Codex advisory | Router pins `read-only` plus `--ask-for-approval never`; live canaries remained absent, but Codex narrated `BLOCKED` without a visible tool event. | Declared and statically locked; direct denial unverified. |
-| Claude reviewer | Plan mode, minimal allowlist, and fail-closed sandbox are locked; the live probe made no tool call and provider drift terminalized `indeterminate`. | Safe no-effect and identity fail-closed; direct denial unverified. |
+| Codex advisory | Router pins `read-only` plus `--ask-for-approval never`; the direct canary attempted the requested operation, the provider returned `Operation not permitted`, and the sentinel remained absent. | Declared, statically locked, and live-verified fail-closed. |
+| Claude reviewer | Minimal allowlist and fail-closed sandbox are locked; the direct `stream-json` canary emitted a real `Bash` tool request followed by a denied tool result, and the sentinel remained absent. | Declared, statically locked, and live-verified fail-closed. |
 | OpenCode reviewers | P1-OC1 defaults every tool to deny, enables only built-in `read`/`glob`/`grep`, denies external roots except a fresh isolated tool-output directory, and validates the resolved provider policy before TUI boot. FDP-2 receives CONTROL-generated Git evidence instead of shell access. | Implemented, test-locked, and live-verified in `orchestration/smoke-evidence/p1-oc1-opencode-boundary-20260716.md`. |
 
 ## Trusted computing base

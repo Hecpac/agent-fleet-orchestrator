@@ -281,6 +281,8 @@ class MissionRunTests(unittest.TestCase):
         def fake_require(command, *, timeout=None, env=None):
             self.assertEqual(Path(command[0]).name, "fleet-down.sh")
             self.assertNotIn("audit-stop", calls)
+            self.assertIsNotNone(env)
+            self.assertEqual(env["FLEET_RUNS_DIR"], str(self.runs))
             calls.append("fleet-down")
             return subprocess.CompletedProcess(command, 0, "", "")
 
