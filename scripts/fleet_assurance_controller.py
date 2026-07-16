@@ -18,6 +18,7 @@ import uuid
 
 import fleet_dialogue
 import fleet_dialogue_controller as fdp2
+import fleet_state
 from fleet_leases import closing_path, coordinator
 from fleet_ledger import append_record, events_for_run
 
@@ -610,7 +611,13 @@ def _state(runs_dir: Path, feature: str) -> dict[str, Any]:
     return value
 
 
-def _require_challenge_start_state(runs_dir: Path, feature: str) -> dict[str, Any]:
+def _require_challenge_start_state(
+    runs_dir: Path,
+    feature: str,
+    manifest: dict[str, str],
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     value = _state(runs_dir, feature)
     if value.get("active_phase") != "CHALLENGE":
         raise AssuranceError(
@@ -621,8 +628,28 @@ def _require_challenge_start_state(runs_dir: Path, feature: str) -> dict[str, An
         for entry in value["history"]
         if isinstance(entry, dict) and entry.get("phase") == "CHALLENGE"
     ]
-    if not challenge_entries or not isinstance(challenge_entries[-1].get("approved_by"), str) or not challenge_entries[-1]["approved_by"].strip():
-        raise AssuranceError("FDP-3 start requires the recorded human BUILD approval")
+    if not challenge_entries:
+        raise AssuranceError("FDP-3 start requires a recorded BUILD approval")
+    latest = challenge_entries[-1]
+    if manifest.get("mission_id"):
+        approval_event_sha256 = latest.get("approval_event_sha256")
+        if not isinstance(approval_event_sha256, str) or not approval_event_sha256:
+            raise AssuranceError(
+                "Mission-bound FDP-3 start requires the exact approval event"
+            )
+        try:
+            fleet_state.validate_mission_approval(
+                runs_dir / f"fleet-{feature}.manifest",
+                manifest,
+                approval_event_sha256,
+                now=now,
+            )
+        except fleet_state.PhaseApprovalError as exc:
+            raise AssuranceError(f"Mission approval is invalid: {exc}") from exc
+    elif not isinstance(latest.get("approved_by"), str) or not latest["approved_by"].strip():
+        raise AssuranceError(
+            "legacy FDP-3 start requires a recorded operator attestation"
+        )
     return value
 
 
@@ -1050,7 +1077,12 @@ def start(
         if events:
             raise AssuranceConflict("feature already has an FDP-3 assurance ledger")
         manifest = _load_manifest(runs_dir, feature, live_identity=True)
-        _require_challenge_start_state(runs_dir, feature)
+        _require_challenge_start_state(
+            runs_dir,
+            feature,
+            manifest,
+            now=current_time,
+        )
         if closing_path(runs_dir, feature).exists():
             raise AssuranceConflict(f"fleet '{feature}' is closing")
         for instance in (CHALLENGE_INSTANCE, VERIFY_INSTANCE):

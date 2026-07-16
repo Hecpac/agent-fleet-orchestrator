@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,10 @@ STATE = ROOT / "scripts" / "fleet_state.py"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import fleet_dialogue_controller as controller  # noqa: E402
+import fleet_mission  # noqa: E402
+import fleet_mission_state as mission_state  # noqa: E402
+import fleet_state  # noqa: E402
+import workflow_config  # noqa: E402
 
 
 class FleetStateTests(unittest.TestCase):
@@ -37,6 +42,95 @@ class FleetStateTests(unittest.TestCase):
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
         )
 
+    def mission_approval(self) -> str:
+        runs = self.manifest.parent
+        target = runs / "target"
+        target.mkdir()
+        compiled = workflow_config.compile_path(ROOT / "workflows" / "implementation.yaml")
+        mission_id, _ = fleet_mission.create_mission(
+            runs,
+            compiled=compiled,
+            feature="test",
+            objective="exercise exact approval provenance",
+            target_repo=target.resolve(),
+            base_sha="a" * 40,
+            idempotency_key="create:test-approval",
+        )
+        current = fleet_mission.load_state(runs, mission_id)
+        if current["risk"] != "high":
+            mission_state.append_event(
+                runs,
+                mission_id,
+                kind="risk_escalated",
+                actor="CONTROL",
+                idempotency_key="approval:risk",
+                payload={
+                    "from": current["risk"],
+                    "to": "high",
+                    "categories": ["production"],
+                    "reason": "test exact approval provenance",
+                },
+            )
+        request, _ = mission_state.append_event(
+            runs,
+            mission_id,
+            kind="assurance_requested",
+            actor="CONTROL",
+            idempotency_key="approval:request",
+            payload={
+                "risk": "high",
+                "categories": ["production"],
+                "scope": str(target.resolve()),
+                "workflow_digest": compiled["workflow_digest"],
+            },
+        )
+        approval, _ = mission_state.append_event(
+            runs,
+            mission_id,
+            kind="assurance_approved",
+            actor="HUMAN",
+            idempotency_key="approval:decision",
+            payload={
+                "approval_id": str(uuid.uuid4()),
+                "request_event_sha256": request["event_sha256"],
+                "workflow_digest": compiled["workflow_digest"],
+                "scope": str(target.resolve()),
+                "risk": "high",
+                "expires_at": "2099-07-16T00:00:00Z",
+                "approved_by_sha256": "b" * 64,
+                "decision": "approved",
+            },
+        )
+        mission_state.append_event(
+            runs,
+            mission_id,
+            kind="assurance_boot_started",
+            actor="CONTROL",
+            idempotency_key="approval:boot",
+            payload={
+                "preset": "fleet_dialogue",
+                "approval_event_sha256": approval["event_sha256"],
+            },
+        )
+        mission_state.append_event(
+            runs,
+            mission_id,
+            kind="assurance_started",
+            actor="CONTROL",
+            idempotency_key="approval:started",
+            payload={
+                "manifest": str(self.manifest),
+                "approval_event_sha256": approval["event_sha256"],
+            },
+        )
+        with self.manifest.open("a", encoding="utf-8") as handle:
+            handle.write(
+                f"mission_id={mission_id}\n"
+                "mode=assured\n"
+                f"target_repo={target.resolve()}\n"
+            )
+        return approval["event_sha256"]
+
     def test_future_phase_is_closed_until_evidence_backed_advance(self) -> None:
         self.assertEqual(self.run_state("init").returncode, 0)
         closed = self.run_state("check", "build")
@@ -54,7 +148,7 @@ class FleetStateTests(unittest.TestCase):
         self.assertEqual(self.run_state("check", "build").returncode, 3)
         self.assertEqual(self.run_state("check", "verify").returncode, 0)
 
-    def test_leaving_build_requires_human_approval(self) -> None:
+    def test_standalone_build_exit_requires_operator_attestation(self) -> None:
         self.assertEqual(self.run_state("init").returncode, 0)
         self.assertEqual(
             self.run_state("advance", "BUILD", "--evidence", "scope-approved").returncode, 0
@@ -72,6 +166,62 @@ class FleetStateTests(unittest.TestCase):
         state = json.loads(self.manifest.with_suffix(".state.json").read_text())
         self.assertEqual(state["active_phase"], "VERIFY")
         self.assertEqual(state["history"][-1]["approved_by"], "hector")
+
+    def test_mission_bound_build_exit_requires_exact_active_approval_event(self) -> None:
+        approval_sha = self.mission_approval()
+        self.assertEqual(self.run_state("init").returncode, 0)
+        self.assertEqual(
+            self.run_state("advance", "BUILD", "--evidence", "scope-approved").returncode,
+            0,
+        )
+
+        raw_label = self.run_state(
+            "advance", "VERIFY", "--evidence", "diff-ready", "--approved-by", "CONTROL"
+        )
+        self.assertEqual(raw_label.returncode, 2)
+        self.assertIn("rejects --approved-by text", raw_label.stderr)
+
+        wrong_event = self.run_state(
+            "advance",
+            "VERIFY",
+            "--evidence",
+            "diff-ready",
+            "--approval-event-sha256",
+            "c" * 64,
+        )
+        self.assertEqual(wrong_event.returncode, 3)
+        self.assertIn("not the active Mission approval", wrong_event.stderr)
+
+        manifest_values = fleet_state.manifest_values(self.manifest)
+        wrong_mode = dict(manifest_values, mode="guided")
+        with self.assertRaisesRegex(fleet_state.PhaseApprovalError, "mode=assured"):
+            fleet_state.validate_mission_approval(
+                self.manifest,
+                wrong_mode,
+                approval_sha,
+            )
+
+        with self.assertRaisesRegex(fleet_state.PhaseApprovalError, "expired"):
+            fleet_state.validate_mission_approval(
+                self.manifest,
+                manifest_values,
+                approval_sha,
+                now=datetime(2100, 1, 1, tzinfo=timezone.utc),
+            )
+
+        advanced = self.run_state(
+            "advance",
+            "VERIFY",
+            "--evidence",
+            "diff-ready",
+            "--approval-event-sha256",
+            approval_sha,
+        )
+        self.assertEqual(advanced.returncode, 0, advanced.stderr)
+        state = json.loads(self.manifest.with_suffix(".state.json").read_text())
+        self.assertEqual(state["active_phase"], "VERIFY")
+        self.assertEqual(state["history"][-1]["approval_event_sha256"], approval_sha)
+        self.assertNotIn("approved_by", state["history"][-1])
 
     def test_autonomous_mode_opens_all_roster_phases_without_approval(self) -> None:
         with self.manifest.open("a", encoding="utf-8") as handle:

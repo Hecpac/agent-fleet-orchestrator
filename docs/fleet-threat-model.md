@@ -113,6 +113,28 @@ group survived into the live manifest, and two tracked identity-distinct
 reviews completed successfully. One reviewer also emitted a disproven factual
 claim, demonstrating why tuple diversity is not semantic verification.
 
+## P1-HITL1A approval provenance
+
+Mission-bound assured fleets do not accept a free-form `--approved-by` string
+for BUILD exit. They require the exact active
+`assurance_approved.event_sha256`; `fleet_state.py` re-derives the Mission chain
+and validates assured-running state, feature, target scope, and expiry before
+recording the reference. `fleet_assured_runner.py` propagates that event hash,
+and FDP-3 revalidates it at start. A foreign, stale, expired, or label-only
+approval fails closed.
+
+Standalone guided fleets retain `--approved-by` as a compatibility attestation
+and cannot claim Mission-bound provenance. Neither path proves out-of-band
+human presence: `fleet-approve.py` and CONTROL still execute under the same
+local Unix account, and the approver hash is derived from `$USER`.
+
+Live evidence is recorded in
+`orchestration/smoke-evidence/p1-hitl1a-approval-provenance-20260716.md`: the
+real phase CLI rejected a free-form label and a foreign event without state or
+CMUX effects, accepted the exact active event, and the FDP-3 preflight
+revalidated it. Codex and MiniMax then accepted the diff in tracked,
+identity-distinct reviews.
+
 ## Explicit non-goals
 
 The following are **OUT OF SCOPE** for boundary A:

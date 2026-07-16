@@ -296,7 +296,7 @@ evidence references, a per-run timeout, an absolute deadline, and a three-round
 cap terminalize uncertainty instead of inferring success. Every Maker result
 must be one clean append-only commit. The separate control ledger is a durable
 hash chain, one conversation per feature may be active, and terminal state is
-immutable. Checker acceptance still requires a human BUILD exit and exact clean
+immutable. Checker acceptance still requires a gated BUILD exit and exact clean
 HEAD. Teardown refuses active dialogue and archives a live receipt whose files
 can be verified offline. Without the rule, self-validation, stale results,
 silent prompt drift, unbounded debate, or teardown races could be mistaken for
@@ -381,7 +381,7 @@ accepted result.
 - `tests/test_fleet_assurance_controller.py::FleetAssuranceControllerTests::test_dirty_snapshot_cleanup_fails_and_retains_both`
 - `tests/test_spec_coherence.py::SpecCoherenceTests::test_fdp3_contract_and_documentation_remain_aligned`
 
-`why:` FDP-3 starts only after the human-approved BUILD exit and rebinds the
+`why:` FDP-3 starts only after the approval-bound BUILD exit and rebinds the
 exact clean FDP-2 accepted HEAD. CONTROL copies and hashes the FDP-2 task spec,
 messages, and lifecycle evidence into an assurance-owned context, creates one
 clean detached snapshot per reviewer, and exposes exactly one explicit action
@@ -418,6 +418,28 @@ without relying on a description or pane title. Intentional same-identity
 partitions remain valid outside a group, and custom races remain explicitly
 unverified candidates. Distinct identities reduce one source of correlated
 error; they never prove semantic independence or correctness.
+
+## Mission-bound BUILD exit requires the exact active approval event
+
+`rule: mission_build_exit_requires_exact_active_assurance_approval_event`
+
+`enforced_by:`
+
+- `tests/test_fleet_state.py::FleetStateTests::test_mission_bound_build_exit_requires_exact_active_approval_event`
+- `tests/test_fleet_assured_runner.py::FleetAssuredRunnerTests::test_build_exit_passes_exact_mission_approval_event`
+- `tests/test_fleet_assurance_controller.py::FleetAssuranceControllerTests::test_mission_bound_start_revalidates_exact_approval_event`
+- `tests/test_fleet_state.py::FleetStateTests::test_standalone_build_exit_requires_operator_attestation`
+
+`why:` A Mission-bound assured manifest cannot leave BUILD with free-form
+`--approved-by` text. The phase gate requires the exact active
+`assurance_approved.event_sha256`, re-derives the Mission hash chain, and checks
+assured-running state, feature, target scope, and expiry before persisting that
+reference. The assured runner propagates the event hash instead of hashing a
+username, and FDP-3 independently revalidates the same event before starting.
+Standalone guided fleets retain the legacy operator label for compatibility,
+but docs identify it as attestation only. This establishes durable approval
+provenance, not cryptographic human presence; the local approval CLI and
+CONTROL remain inside the same Unix trust boundary.
 
 ## Durable writer branches
 
@@ -676,8 +698,9 @@ their durable timestamps without weakening source, workspace, or session checks.
 - `tests/test_mission_run.py::MissionRunTests::test_approved_high_risk_mission_bridges_to_assured_runner_and_lead`
 
 `why:` A high/unknown mission cannot boot the assured fleet until the exact
-request, workflow digest, target scope, risk, human identity hash, and expiry
-are bound into the Mission hash chain. The action executor consumes the
+request, workflow digest, target scope, risk, local operator identity hash, and
+expiry are bound into the Mission hash chain. BUILD exit and FDP-3 additionally
+bind the exact approval event hash. The action executor consumes the
 existing FDP-2/FDP-3 `next_action` contracts. Dispatch reconciles by exact
 prompt hash, wait requires the exact run, publication is content-addressed and
 idempotent, and phase advance checks the current durable phase before acting.

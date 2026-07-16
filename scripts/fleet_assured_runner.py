@@ -278,7 +278,13 @@ class AssuredRunner:
     def _phase(self) -> str:
         return str(self._phase_state()["active_phase"])
 
-    def _advance(self, phase: str, evidence: str, *, approved_by: str | None = None) -> None:
+    def _advance(
+        self,
+        phase: str,
+        evidence: str,
+        *,
+        approval_event_sha256: str | None = None,
+    ) -> None:
         state = self._phase_state()
         current = str(state["active_phase"])
         if current == phase:
@@ -288,7 +294,7 @@ class AssuredRunner:
                 (
                     latest.get("phase") != phase,
                     latest.get("evidence") != evidence,
-                    latest.get("approved_by") != approved_by,
+                    latest.get("approval_event_sha256") != approval_event_sha256,
                 )
             ):
                 raise AssuredRunnerError("persisted phase binding differs from requested advance")
@@ -297,8 +303,8 @@ class AssuredRunner:
             "python3", str(ROOT / "scripts" / "fleet_state.py"), "advance",
             str(self.manifest_path), phase, "--evidence", evidence,
         ]
-        if approved_by:
-            command += ["--approved-by", approved_by]
+        if approval_event_sha256:
+            command += ["--approval-event-sha256", approval_event_sha256]
         result = run_process(command, runs_dir=self.runs_dir, timeout=60)
         if result.returncode != 0:
             raise AssuredRunnerError(result.stderr.strip() or "assured phase advance failed")
@@ -458,7 +464,7 @@ class AssuredRunner:
         self._advance(
             "CHALLENGE",
             accepted["event_sha256"],
-            approved_by=f"sha256:{approval['approved_by_sha256']}",
+            approval_event_sha256=approval["event_sha256"],
         )
         assurance_path = self.runs_dir / f"fleet-{self.feature}.assurance-control.jsonl"
         if assurance_path.exists():

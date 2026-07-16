@@ -215,8 +215,11 @@ just send <feature> build "bounded task"
 
 Only CONTROL and the currently active phase may receive work. Advancing freezes
 earlier phases, so BUILD cannot mutate an artifact during CHALLENGE/VERIFY.
-Leaving BUILD additionally requires `--approved-by <human>` — a person signs
-off on the writer's diff before CHALLENGE/VERIFY see it.
+Standalone guided fleets use `--approved-by <operator-attestation>` when
+leaving BUILD; this is a label, not proof of human presence. Mission-bound
+assured fleets reject that flag and require the exact scoped
+`--approval-event-sha256`; the assured runner supplies it from Mission state and
+FDP-3 revalidates it before starting.
 
 ### Event-driven waiting (preferred — do not poll)
 

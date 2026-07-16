@@ -130,6 +130,31 @@ class FleetAssuredRunnerTests(unittest.TestCase):
         phase.assert_called_once_with("VERIFY", advance["event_sha256"])
         self.assertTrue(step.call_args.kwargs["phase_advanced"])
 
+    def test_build_exit_passes_exact_mission_approval_event(self) -> None:
+        self.runner.manifest_path.write_text("feature=assured\n", encoding="utf-8")
+        self.runner.manifest_path.with_suffix(".state.json").write_text(
+            json.dumps(
+                {
+                    "active_phase": "BUILD",
+                    "history": [{"phase": "BUILD", "evidence": "ready"}],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        completed = subprocess.CompletedProcess(["fleet_state.py"], 0, "advanced\n", "")
+        approval_sha = "d" * 64
+        with mock.patch.object(assured, "run_process", return_value=completed) as run:
+            self.runner._advance(
+                "CHALLENGE",
+                "accepted-head",
+                approval_event_sha256=approval_sha,
+            )
+        command = run.call_args.args[0]
+        self.assertIn("--approval-event-sha256", command)
+        self.assertEqual(command[command.index("--approval-event-sha256") + 1], approval_sha)
+        self.assertNotIn("--approved-by", command)
+
     def test_malformed_or_timed_out_controller_terminal_fails_closed(self) -> None:
         for status, reason in (
             ("indeterminate", "invalid_proposal_contract"),

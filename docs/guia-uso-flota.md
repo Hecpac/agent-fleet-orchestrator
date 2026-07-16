@@ -59,7 +59,7 @@ Los modos describen quién conduce el trabajo:
 |---|---|---|
 | `autonomous` | Lead | Abre las fases rutinarias del roster, pero conserva identidad, leases, un solo writer y completion exacta. |
 | `guided` | Operador o Lead | Requiere avanzar la fase durable antes del despacho. |
-| `assured` | CONTROL + FDP-2/FDP-3 + humano | Conserva todos los gates, incluida la aprobación humana para abandonar BUILD. |
+| `assured` | CONTROL + FDP-2/FDP-3 + aprobación Mission | Conserva todos los gates y liga la salida de BUILD al evento scoped activo. |
 
 Los perfiles describen el perímetro del proceso:
 
@@ -409,19 +409,26 @@ Este procedimiento es intencionalmente explícito. No elimines pasos ni gates.
    es estricto. Contrato malformado, identidad/variante incorrecta, timeout,
    deadline o exceso de rondas cierran fail-closed.
 
-4. `accepted` no abandona BUILD. Una persona debe aprobar y el gate vuelve a
-   comprobar el HEAD limpio exacto:
+4. `accepted` no abandona BUILD. El gate exige procedencia de aprobación y
+   vuelve a comprobar el HEAD limpio exacto:
 
    ```bash
    python3 scripts/fleet_state.py advance \
      orchestration/runs/fleet-<feature>.manifest CHALLENGE \
-     --evidence <evidencia-del-dialogo-aceptado> --approved-by <humano>
+     --evidence <evidencia-del-dialogo-aceptado> \
+     --approved-by <attestation-del-operador>
    ```
+
+   Ese comando es el camino standalone heredado y el valor es una etiqueta, no
+   prueba criptográfica de presencia humana. Si el manifest contiene
+   `mission_id`, `--approved-by` se rechaza: `mission-run` consume el
+   `assurance_approved` scoped y el assured runner pasa su
+   `--approval-event-sha256` exacto.
 
 ### FDP-3: GLM CHALLENGE y Claude VERIFY
 
-1. Inicia FDP-3 solo después de la aprobación humana y desde el HEAD exacto
-   aceptado por FDP-2:
+1. Inicia FDP-3 solo después del gate ligado a la aprobación y desde el HEAD
+   exacto aceptado por FDP-2:
 
    ```bash
    just fdp3-start <feature> <idempotency-key-estable>

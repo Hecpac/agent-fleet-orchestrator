@@ -369,6 +369,47 @@ class FleetAssuranceControllerTests(unittest.TestCase):
                 now=self.now + timedelta(minutes=8),
             )
 
+    def test_mission_bound_start_revalidates_exact_approval_event(self) -> None:
+        state_path = self.runs / f"fleet-{self.feature}.state.json"
+        value = json.loads(state_path.read_text(encoding="utf-8"))
+        challenge = value["history"][-1]
+        challenge.pop("approved_by")
+        approval_sha = "e" * 64
+        challenge["approval_event_sha256"] = approval_sha
+        state_path.write_text(json.dumps(value) + "\n", encoding="utf-8")
+        manifest = self.manifest_values()
+        manifest["mission_id"] = "00000000-0000-4000-8000-000000000999"
+
+        with mock.patch.object(
+            assurance.fleet_state,
+            "validate_mission_approval",
+            return_value={"event_sha256": approval_sha},
+        ) as validate:
+            assurance._require_challenge_start_state(
+                self.runs,
+                self.feature,
+                manifest,
+                now=self.now,
+            )
+        validate.assert_called_once_with(
+            self.runs / f"fleet-{self.feature}.manifest",
+            manifest,
+            approval_sha,
+            now=self.now,
+        )
+
+        with mock.patch.object(
+            assurance.fleet_state,
+            "validate_mission_approval",
+            side_effect=assurance.fleet_state.PhaseApprovalError("foreign event"),
+        ), self.assertRaisesRegex(assurance.AssuranceError, "foreign event"):
+            assurance._require_challenge_start_state(
+                self.runs,
+                self.feature,
+                manifest,
+                now=self.now,
+            )
+
     def test_invalid_claude_json_is_indeterminate(self) -> None:
         verify_event = self.enter_verify(self.challenge_to_gate())
         run_id = "claude-invalid-run"

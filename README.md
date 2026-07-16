@@ -151,7 +151,7 @@ Execution modes are intentionally separate:
 |---|---|---|---|
 | `autonomous` | `just dan` | Lead LLM dynamically decides/delegates | open-ended coding, research, diagnosis |
 | `guided` | `just fleet[-preset]` | Operator/lead advances explicit phases | manual experiments and narrow workflows |
-| `assured` | preset `fleet_dialogue` | FDP-2/FDP-3 state machines + human BUILD exit | production, money, secrets, destructive or high-risk work |
+| `assured` | preset `fleet_dialogue` | FDP-2/FDP-3 + scoped Mission approval provenance | production, money, secrets, destructive or high-risk work |
 
 The design rationale and source research live in `docs/dan-plus.md`.
 
@@ -221,11 +221,15 @@ already-concurrent runs may overshoot it. `fleet-wait` fires a `cmux notify`
 escalation (title `ESCALATION: ...`) naming the stuck instances when its
 deadline expires.
 
-Human-in-the-loop: in `guided` and `assured` modes, advancing the durable phase
-gate out of BUILD requires `--approved-by <human>` in addition to `--evidence`;
-the approver is recorded in the state history. `autonomous` fleets do not need
-phase advances: all manifest instances are dispatchable, and the lead escalates
-only risk-significant decisions defined by the Dan+ mission contract.
+Approval gate: a standalone `guided`/`assured` fleet records the legacy
+`--approved-by <operator-attestation>` label when leaving BUILD. That label is
+not proof of human presence. A Mission-bound `assured` fleet rejects the label
+and requires `--approval-event-sha256` for the exact active
+`assurance_approved` event; the gate revalidates its Mission, request, workflow,
+target scope, risk, and expiry before recording the reference. `autonomous`
+fleets do not need phase advances: all manifest instances are dispatchable, and
+the lead escalates only risk-significant decisions defined by the Dan+ mission
+contract.
 
 `scripts/fleet-up.sh` resolves and validates the complete plan before touching
 cmux, creates workspace `fleet-<feature>`, verifies the rendered pane order,
@@ -428,15 +432,21 @@ python3 scripts/fleet_dialogue_controller.py abandon orchestration/runs \
   --feature <feature> --reason <reason> --idempotency-key <stable-abandon-key>
 ```
 
-An `accepted` dialogue still does not advance phases. A human must approve the
-BUILD exit, and the gate rechecks that the Maker branch is clean and still at
-the exact accepted HEAD:
+An `accepted` dialogue still does not advance phases. In a standalone fleet the
+operator supplies the legacy attestation below; the gate also rechecks that the
+Maker branch is clean and still at the exact accepted HEAD:
 
 ```bash
 python3 scripts/fleet_state.py advance \
   orchestration/runs/fleet-<feature>.manifest CHALLENGE \
-  --evidence <accepted-dialogue-evidence> --approved-by <human>
+  --evidence <accepted-dialogue-evidence> \
+  --approved-by <operator-attestation>
 ```
+
+For a Mission-bound assured fleet, first record the scoped Mission approval
+with `just mission-approve`; `mission-run` and the assured runner then propagate
+its exact event hash automatically. Supplying `--approved-by` on that path is a
+hard error.
 
 `fleet-down` refuses an active conversation. For a terminal one it creates a
 live verification receipt and archives the control hash chain, task spec,
@@ -445,8 +455,8 @@ verifiable with `fleet_dialogue_controller.py verify --archive <archive>`.
 
 ### FDP-3 sequential assurance
 
-After FDP-2 reaches `accepted` and a human advances BUILD to CHALLENGE, FDP-3
-runs one identity-diverse GLM challenge followed by one Claude verification. It has
+After FDP-2 reaches `accepted` and the approval-bound gate advances BUILD to
+CHALLENGE, FDP-3 runs one identity-diverse GLM challenge followed by one Claude verification. It has
 its own hash-chained controller ledger and never reopens Maker automatically.
 Start it only from the exact clean FDP-2 accepted HEAD:
 

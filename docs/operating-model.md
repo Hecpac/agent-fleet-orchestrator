@@ -92,6 +92,14 @@ compiled workflows, and manifests preserve the group membership. Duplicate
 roles remain valid outside such a group, and tuple diversity is observational
 evidence—not proof that conclusions or model errors are independent.
 
+BUILD-exit approval has two explicit provenance levels. Standalone guided
+fleets retain `--approved-by` as a legacy operator attestation only.
+Mission-bound assured fleets reject that string and require the exact active
+`assurance_approved.event_sha256`; phase advance and FDP-3 both revalidate the
+Mission, request, workflow, scope, risk, and expiry. This binds durable
+provenance but does not prove out-of-band human presence because CONTROL and the
+approval CLI still share the local Unix trust boundary.
+
 Teardown refuses fleets with active dispatch leases and nonterminal Missions,
 stops Fleet Control, freezes the portable Mission archive while evidence is
 available, and removes the manifest only after CMUX confirms disappearance.

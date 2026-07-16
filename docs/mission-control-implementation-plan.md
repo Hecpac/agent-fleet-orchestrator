@@ -119,7 +119,7 @@ las misiones autónomas.
         |                                      +-- Verifier
         |                                      +-- delegated child agents
         |
-        +-- Assured driver --------- FDP-2 -> human BUILD exit -> FDP-3
+    +-- Assured driver --------- FDP-2 -> scoped approval BUILD exit -> FDP-3
         |
         +-- Provider adapters ------ Codex / Claude / OpenCode / Ollama / future API
         |
@@ -646,7 +646,7 @@ Entregables:
 
 Aceptación:
 
-- accepted -> human approval -> challenge -> verify funciona con un comando;
+- accepted -> scoped approval -> challenge -> verify funciona con un comando;
 - process kill en cualquier action reanuda sin duplicar;
 - malformed result y timeout fallan cerrados;
 - el Lead conserva capacidad de pedir análisis adicional;
