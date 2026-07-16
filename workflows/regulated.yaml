@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "name": "regulated",
+  "description": "Assured regulated work with mandatory S3 Object Lock WORM audit",
+  "preset": "dan",
+  "autonomy": {
+    "owner": "lead",
+    "allow_parallel": true,
+    "allow_subdelegation": true,
+    "max_delegation_depth": 3
+  },
+  "capabilities": {
+    "available": ["recon", "build", "challenge", "verify"],
+    "required_outcomes": ["lead_result"],
+    "writer": "build"
+  },
+  "risk": {
+    "minimum": "high",
+    "allow_lead_escalation": true,
+    "high_action": "confirm_assured"
+  },
+  "assurance": {
+    "profile": "proportional",
+    "preset": "fleet_dialogue",
+    "minimum_gates": ["fdp2", "human_build_exit", "fdp3"]
+  },
+  "audit": {
+    "mode": "worm",
+    "trust_scope": "external-compliance",
+    "worm_required_for": [
+      "regulated", "production", "money", "credentials", "private_data", "destructive"
+    ]
+  },
+  "archive": {
+    "mode": "incremental",
+    "content_policy": "redacted",
+    "include_final_tree": true,
+    "include_git_delta": true
+  },
+  "limits": {"deadline_seconds": 14400, "token_budget": 0, "budget_mode": "hard"}
+}

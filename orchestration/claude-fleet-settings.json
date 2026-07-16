@@ -1,0 +1,111 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(/__FLEET_REPO_ROOT__/orchestration/runs/prompts/**)"
+    ],
+    "deny": [
+      "Bash(sudo *)",
+      "Bash(* sudo *)",
+      "Bash(ssh *)",
+      "WebFetch",
+      "WebSearch",
+      "Agent",
+      "SendMessage",
+      "PushNotification",
+      "RemoteTrigger",
+      "CronCreate",
+      "CronDelete",
+      "CronList",
+      "Read(//tmp/fleet_audits/**)",
+      "Edit(//tmp/fleet_audits/**)",
+      "Write(//tmp/fleet_audits/**)",
+      "Read(/__FLEET_CONTROLLER_HOME__/.ssh/**)",
+      "Edit(/__FLEET_CONTROLLER_HOME__/.ssh/**)",
+      "Write(/__FLEET_CONTROLLER_HOME__/.ssh/**)",
+      "Read(/__FLEET_CONTROLLER_HOME__/.aws/**)",
+      "Edit(/__FLEET_CONTROLLER_HOME__/.aws/**)",
+      "Write(/__FLEET_CONTROLLER_HOME__/.aws/**)",
+      "Read(/__FLEET_CONTROLLER_HOME__/.codex/**)",
+      "Edit(/__FLEET_CONTROLLER_HOME__/.codex/**)",
+      "Write(/__FLEET_CONTROLLER_HOME__/.codex/**)",
+      "Read(/__FLEET_CONTROLLER_HOME__/.claude/**)",
+      "Edit(/__FLEET_CONTROLLER_HOME__/.claude/**)",
+      "Write(/__FLEET_CONTROLLER_HOME__/.claude/**)",
+      "Read(/__FLEET_CONTROLLER_HOME__/.claude.json)",
+      "Edit(/__FLEET_CONTROLLER_HOME__/.claude.json)",
+      "Write(/__FLEET_CONTROLLER_HOME__/.claude.json)"
+    ],
+    "defaultMode": "default",
+    "disableBypassPermissionsMode": "disable"
+  },
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "autoAllowBashIfSandboxed": false,
+    "allowUnsandboxedCommands": false,
+    "filesystem": {
+      "denyRead": [
+        "/tmp/fleet_audits",
+        "__FLEET_CONTROLLER_HOME__/.ssh",
+        "__FLEET_CONTROLLER_HOME__/.aws",
+        "__FLEET_CONTROLLER_HOME__/.codex",
+        "__FLEET_CONTROLLER_HOME__/.claude",
+        "__FLEET_CONTROLLER_HOME__/.claude.json"
+      ],
+      "denyWrite": [
+        "/tmp/fleet_audits",
+        "__FLEET_CONTROLLER_HOME__/.ssh",
+        "__FLEET_CONTROLLER_HOME__/.aws",
+        "__FLEET_CONTROLLER_HOME__/.codex",
+        "__FLEET_CONTROLLER_HOME__/.claude",
+        "__FLEET_CONTROLLER_HOME__/.claude.json"
+      ]
+    }
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __FLEET_CONTROLLER_HOME__/.claude/hooks/pre_tool.sh"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __FLEET_CONTROLLER_HOME__/.claude/hooks/pre_tool.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __FLEET_CONTROLLER_HOME__/.claude/hooks/post_tool.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash __FLEET_CONTROLLER_HOME__/.claude/hooks/post_tool.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "name": "implementation",
+  "description": "Autonomous implementation with proportional assurance",
+  "preset": "dan",
+  "autonomy": {
+    "owner": "lead",
+    "allow_parallel": true,
+    "allow_subdelegation": true,
+    "max_delegation_depth": 3
+  },
+  "capabilities": {
+    "available": ["recon", "build", "challenge", "verify"],
+    "required_outcomes": ["lead_result"],
+    "writer": "build"
+  },
+  "risk": {
+    "minimum": "low",
+    "allow_lead_escalation": true,
+    "high_action": "confirm_assured"
+  },
+  "assurance": {
+    "profile": "proportional",
+    "preset": "fleet_dialogue",
+    "minimum_gates": ["fdp2", "human_build_exit", "fdp3"]
+  },
+  "audit": {
+    "mode": "signed",
+    "trust_scope": "local-development",
+    "worm_required_for": ["regulated"]
+  },
+  "archive": {
+    "mode": "incremental",
+    "content_policy": "full",
+    "include_final_tree": true,
+    "include_git_delta": true
+  },
+  "limits": {
+    "deadline_seconds": 7200,
+    "token_budget": 0,
+    "budget_mode": "soft"
+  }
+}

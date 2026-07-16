@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fleet.local/schemas/workflow.schema.json",
+  "title": "Mission Control workflow",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "name",
+    "description",
+    "preset",
+    "autonomy",
+    "capabilities",
+    "risk",
+    "assurance",
+    "audit",
+    "archive",
+    "limits"
+  ],
+  "properties": {
+    "schema_version": {"const": 1},
+    "name": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,47}$"},
+    "description": {"type": "string", "minLength": 1, "maxLength": 1000},
+    "preset": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,47}$"},
+    "autonomy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["owner", "allow_parallel", "allow_subdelegation", "max_delegation_depth"],
+      "properties": {
+        "owner": {"const": "lead"},
+        "allow_parallel": {"type": "boolean"},
+        "allow_subdelegation": {"type": "boolean"},
+        "max_delegation_depth": {"type": "integer", "minimum": 0, "maximum": 8}
+      }
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "required_outcomes", "writer"],
+      "properties": {
+        "available": {"$ref": "#/$defs/uniqueNames"},
+        "required_outcomes": {"$ref": "#/$defs/uniqueNames"},
+        "writer": {"type": "string", "pattern": "^(none|[a-z][a-z0-9_-]{0,47})$"}
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["minimum", "allow_lead_escalation", "high_action"],
+      "properties": {
+        "minimum": {"enum": ["low", "medium", "high", "unknown"]},
+        "allow_lead_escalation": {"type": "boolean"},
+        "high_action": {"enum": ["confirm_assured", "fail"]}
+      }
+    },
+    "assurance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile", "preset", "minimum_gates"],
+      "properties": {
+        "profile": {"enum": ["none", "proportional", "assured"]},
+        "preset": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,47}$"},
+        "minimum_gates": {
+          "type": "array",
+          "items": {"enum": ["fdp2", "human_build_exit", "fdp3"]},
+          "uniqueItems": true
+        }
+      }
+    },
+    "audit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "trust_scope", "worm_required_for"],
+      "properties": {
+        "mode": {"enum": ["signed", "worm"]},
+        "trust_scope": {"enum": ["local-development", "external-compliance"]},
+        "worm_required_for": {
+          "type": "array",
+          "items": {"enum": ["regulated", "production", "money", "credentials", "private_data", "destructive"]},
+          "uniqueItems": true
+        }
+      }
+    },
+    "archive": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "content_policy", "include_final_tree", "include_git_delta"],
+      "properties": {
+        "mode": {"const": "incremental"},
+        "content_policy": {"enum": ["full", "redacted", "hash-only"]},
+        "include_final_tree": {"type": "boolean"},
+        "include_git_delta": {"type": "boolean"}
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["deadline_seconds", "token_budget", "budget_mode"],
+      "properties": {
+        "deadline_seconds": {"type": "integer", "minimum": 60, "maximum": 604800},
+        "token_budget": {"type": "integer", "minimum": 0},
+        "budget_mode": {"enum": ["soft", "hard"]}
+      }
+    }
+  },
+  "$defs": {
+    "uniqueNames": {
+      "type": "array",
+      "items": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,47}$"},
+      "uniqueItems": true
+    }
+  }
+}

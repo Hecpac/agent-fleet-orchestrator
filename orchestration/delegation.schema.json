@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://fleet.local/schemas/delegation.schema.json",
+  "title": "Mission Control delegation",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "delegation_id",
+    "mission_id",
+    "run_id",
+    "parent_run_id",
+    "delegated_by",
+    "recipient_instance",
+    "capability",
+    "objective_sha256",
+    "input_artifact_ids",
+    "expected_output_contract",
+    "deadline",
+    "provider",
+    "model",
+    "variant",
+    "depth",
+    "token_id"
+  ],
+  "properties": {
+    "delegation_id": {"type": "string", "format": "uuid"},
+    "mission_id": {"type": "string", "format": "uuid"},
+    "run_id": {"type": "string", "format": "uuid"},
+    "parent_run_id": {"type": ["string", "null"], "format": "uuid"},
+    "delegated_by": {"type": "string", "minLength": 1},
+    "recipient_instance": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,47}$"},
+    "capability": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,47}$"},
+    "objective_sha256": {"$ref": "#/$defs/sha256"},
+    "input_artifact_ids": {"type": "array", "items": {"$ref": "#/$defs/sha256"}, "uniqueItems": true},
+    "expected_output_contract": {"type": "object"},
+    "deadline": {"type": "string", "format": "date-time"},
+    "provider": {"type": "string", "minLength": 1},
+    "model": {"type": "string", "minLength": 1},
+    "variant": {"type": ["string", "null"]},
+    "depth": {"type": "integer", "minimum": 1, "maximum": 8},
+    "token_id": {"type": ["string", "null"], "format": "uuid"}
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

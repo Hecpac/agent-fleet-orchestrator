@@ -90,10 +90,71 @@ elif (
     raise SystemExit(1)
 elif command == "send-key" and os.environ.get("CMUX_FAIL_SEND_KEY") == "1":
     raise SystemExit(1)
-elif command == "send" or command == "send-key" or command == "workspace-action":
+elif command == "send":
+    surface = arg_value("--surface")
+    payload = args[-1]
+    for pane in state["panes"]:
+        if pane["surface"] != surface:
+            continue
+        if "run-interactive-agent.sh" in payload:
+            if " opencode" in payload:
+                pane["source"] = "opencode"
+            elif " claude" in payload:
+                pane["source"] = "claude"
+            else:
+                pane["source"] = "codex"
+        if payload.startswith("FLEET_RUN ") or "FDP_PROMPT=" in payload:
+            pane["pending_submit"] = True
+    save(state)
+elif command == "send-key":
+    surface = arg_value("--surface")
+    for pane in state["panes"]:
+        if pane["surface"] != surface or not pane.pop("pending_submit", False):
+            continue
+        source = pane.get("source", "codex")
+        session_key = "test_" + surface.replace(":", "_")
+        hook_dir = Path(os.environ["CMUX_HOOK_DIR"])
+        hook_dir.mkdir(parents=True, exist_ok=True)
+        session_path = hook_dir / f"{source}-hook-sessions.json"
+        sessions = json.loads(session_path.read_text()) if session_path.exists() else {"sessions": {}}
+        sessions["sessions"][session_key] = {
+            "sessionId": session_key,
+            "workspaceId": state["workspace_uuid"],
+            "surfaceId": pane["uuid"],
+            "updatedAt": 1,
+        }
+        session_path.write_text(json.dumps(sessions))
+        state["event_seq"] = state.get("event_seq", 42) + 1
+        event = {
+            "id": f"submit-{state['event_seq']}",
+            "type": "event",
+            "name": "agent.hook.UserPromptSubmit",
+            "source": source,
+            "workspace_id": state["workspace_uuid"],
+            "occurred_at": "2099-01-01T00:00:01.000Z",
+            "seq": state["event_seq"],
+            "boot_id": "boot-test",
+            "payload": {
+                "phase": "received",
+                "_source": source,
+                "session_id": f"{source}-{session_key}",
+            },
+        }
+        with Path(os.environ["CMUX_EVENTS_LOG"]).open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event) + "\n")
+    save(state)
+elif command in {"workspace-action", "set-status"}:
     pass
 elif command == "read-screen":
-    print("› ready\n❯\nctrl+p commands" if os.environ.get("CMUX_READY", "1") == "1" else "booting")
+    ready = os.environ.get("CMUX_READY", "1")
+    surface = arg_value("--surface")
+    pane = next((item for item in state["panes"] if item["surface"] == surface), {})
+    if ready == "trust":
+        print("Do you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, quit")
+    elif ready == "claude-login" and pane.get("source") == "claude":
+        print("Not logged in · Please run /login\n❯")
+    else:
+        print("› ready\n❯\nctrl+p commands" if ready == "1" else "booting")
 elif command == "events":
     print(json.dumps({
         "type": "ack",
@@ -160,6 +221,13 @@ class FleetUpTests(unittest.TestCase):
         self.bin.mkdir()
         self.runs = self.tmp / "runs"
         self.runs.mkdir()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.codex_home = self.home / ".codex"
+        self.codex_home.mkdir()
+        (self.codex_home / "auth.json").write_text(
+            '{"test":"authentication-placeholder"}\n', encoding="utf-8"
+        )
         self.state = self.tmp / "cmux-state.json"
         self.log = self.tmp / "cmux-log.jsonl"
         self.make_executable("cmux", FAKE_CMUX)
@@ -169,6 +237,8 @@ class FleetUpTests(unittest.TestCase):
         self.make_executable("ollama", "#!/bin/sh\nexit 0\n")
         self.make_executable("ps", "#!/bin/sh\necho codex claude opencode\n")
         self.events_log = self.tmp / "events.jsonl"
+        self.hook_dir = self.tmp / "hooks"
+        self.hook_dir.mkdir()
         self.events_log.write_text(
             "".join(
                 json.dumps(
@@ -197,16 +267,21 @@ class FleetUpTests(unittest.TestCase):
         self.env.update(
             {
                 "PATH": f"{self.bin}:{self.env['PATH']}",
+                "HOME": str(self.home),
+                "CODEX_HOME": str(self.codex_home),
                 "CMUX_STATE": str(self.state),
                 "CMUX_LOG": str(self.log),
                 "CMUX_EVENTS_LOG": str(self.events_log),
+                "CMUX_HOOK_DIR": str(self.hook_dir),
                 "FLEET_RUNS_DIR": str(self.runs),
+                "FLEET_WORKTREES_DIR": str(self.tmp / "worktrees"),
                 "FLEET_ROUTER_PATH": str(ROUTER),
                 "FLEET_BOOT_WAIT_ATTEMPTS": "1",
                 "FLEET_BOOT_WAIT_DELAY": "0",
                 "FLEET_SEND_KEY_DELAY": "0",
                 "FLEET_CONFIRM_SUBMIT_TIMEOUT": "1",
                 "ZHIPU_API_KEY": "test-only",
+                "MINIMAX_API_KEY": "test-only",
             }
         )
 
@@ -249,9 +324,119 @@ class FleetUpTests(unittest.TestCase):
         self.assertIn("workspace_uuid=", manifest)
         self.assertIn("build.phase=BUILD", manifest)
         self.assertIn("verify.phase=VERIFY", manifest)
+        self.assertIn("identity_group.count=1", manifest)
+        self.assertIn("identity_group.1=build,verify", manifest)
         state_file = self.runs / "fleet-order.state.json"
         self.assertTrue(state_file.exists())
         self.assertEqual(json.loads(state_file.read_text())["active_phase"], "CONTROL")
+
+    def test_dan_preset_publishes_autonomous_visible_roster(self) -> None:
+        result = self.run_fleet("dan-mode", "--preset", "dan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads(self.state.read_text())
+        self.assertEqual(
+            [pane["title"] for pane in state["panes"]],
+            ["lead", "scout", "builder", "challenger", "verifier"],
+        )
+        manifest = (self.runs / "fleet-dan-mode.manifest").read_text()
+        self.assertIn("preset=dan\n", manifest)
+        self.assertIn("mode=autonomous\n", manifest)
+        self.assertIn("scout.phase=RECON\n", manifest)
+        self.assertIn("builder.phase=BUILD\n", manifest)
+        self.assertIn("challenger.phase=CHALLENGE\n", manifest)
+        self.assertIn("verifier.phase=VERIFY\n", manifest)
+        sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
+        self.assertFalse(any("No despaches todavía" in payload for payload in sends))
+        self.assertTrue(
+            any(call and call[0] == "set-status" and "ready" in call for call in self.calls())
+        )
+
+    def test_mission_boot_binds_canonical_mission_id_in_manifest(self) -> None:
+        mission_id = "12345678-1234-4234-9234-123456789abc"
+        self.env["FLEET_MISSION_ID"] = mission_id
+        result = self.run_fleet("mission-bound", "--preset", "dan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        manifest = (self.runs / "fleet-mission-bound.manifest").read_text()
+        self.assertIn(f"mission_id={mission_id}\n", manifest)
+        sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
+        scout_launches = [
+            payload
+            for payload in sends
+            if "run-interactive-agent.sh" in payload and " codex_candidate " in payload
+        ]
+        self.assertEqual(len(scout_launches), 1)
+        scout_launch = scout_launches[0]
+        self.assertNotIn("--sandbox read-only", scout_launch)
+        self.assertIn("default_permissions", scout_launch)
+        self.assertIn("fleet_control", scout_launch)
+        self.assertIn("unix_sockets", scout_launch)
+        self.assertIn("mode=", scout_launch)
+        self.assertIn("limited", scout_launch)
+        self.assertIn("trust_level", scout_launch)
+        self.assertIn("untrusted", scout_launch)
+        self.assertIn("--dangerously-bypass-hook-trust", scout_launch)
+        self.assertIn(mission_id, scout_launch)
+
+        # A legacy, non-mission fleet keeps the established read-only flag.
+        self.state.unlink(missing_ok=True)
+        self.env.pop("FLEET_MISSION_ID")
+        legacy = self.run_fleet("mission-unbound", "--preset", "dan")
+        self.assertEqual(legacy.returncode, 0, legacy.stderr)
+        legacy_sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
+        legacy_scouts = [
+            payload
+            for payload in legacy_sends
+            if "run-interactive-agent.sh" in payload and " codex_candidate " in payload
+        ]
+        self.assertTrue(
+            any(
+                "--sandbox read-only" in payload
+                and "--dangerously-bypass-hook-trust" not in payload
+                for payload in legacy_scouts
+            )
+        )
+
+        self.env["FLEET_MISSION_ID"] = "not-a-uuid"
+        invalid = self.run_fleet("mission-invalid", "--preset", "dan")
+        self.assertEqual(invalid.returncode, 2)
+        self.assertIn("Invalid FLEET_MISSION_ID", invalid.stderr)
+
+    def test_execution_profiles_are_manifested_without_changing_declared_tools(self) -> None:
+        native = self.run_fleet("profile-native", "--preset", "implementation_review")
+        self.assertEqual(native.returncode, 0, native.stderr)
+        native_manifest = (self.runs / "fleet-profile-native.manifest").read_text()
+        self.assertIn("manifest_contract_version=2\n", native_manifest)
+        self.assertIn("execution_profile=native\n", native_manifest)
+        self.assertIn("tracking_protocol=control-v1\n", native_manifest)
+        native_tools = sorted(
+            line for line in native_manifest.splitlines() if ".tool_access=" in line
+        )
+
+        # Use a fresh fake-cmux state after the independent native fleet.
+        self.state.unlink(missing_ok=True)
+        sandboxed = self.run_fleet(
+            "profile-sandboxed", "--preset", "implementation_review",
+            "--execution-profile", "sandboxed",
+        )
+        self.assertEqual(sandboxed.returncode, 0, sandboxed.stderr)
+        sandboxed_manifest = (self.runs / "fleet-profile-sandboxed.manifest").read_text()
+        self.assertIn("execution_profile=sandboxed\n", sandboxed_manifest)
+        sandboxed_tools = sorted(
+            line.replace("profile-sandboxed", "profile-native")
+            for line in sandboxed_manifest.splitlines() if ".tool_access=" in line
+        )
+        self.assertEqual(native_tools, sandboxed_tools)
+        sends = [call[-1] for call in self.calls() if call and call[0] == "send"]
+        self.assertTrue(any("FLEET_EXECUTION_PROFILE=sandboxed" in value for value in sends))
+
+    def test_regulated_profile_rejects_unbound_legacy_boot(self) -> None:
+        result = self.run_fleet(
+            "profile-regulated", "--preset", "implementation_review",
+            "--execution-profile", "regulated",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("regulated execution requires", result.stderr)
+        self.assertFalse(self.calls(), "profile validation must happen before CMUX mutation")
 
     def test_named_duplicate_roles_are_addressable(self) -> None:
         result = self.run_fleet(
@@ -268,6 +453,8 @@ class FleetUpTests(unittest.TestCase):
         manifest = (self.runs / "fleet-research-local.manifest").read_text()
         self.assertIn("triage_scope.role_type=triage", manifest)
         self.assertIn("triage_sources.role_type=triage", manifest)
+        self.assertIn("identity_group.count=0", manifest)
+        self.assertNotIn("identity_group.1=", manifest)
 
         advance = subprocess.run(
             [
@@ -281,7 +468,10 @@ class FleetUpTests(unittest.TestCase):
         self.assertEqual(advance.returncode, 0, advance.stderr)
 
         dispatch = subprocess.run(
-            ["bash", str(FLEET_DISPATCH), "research-local", "triage_scope", "summarize this"],
+            [
+                "bash", str(FLEET_DISPATCH), "research-local", "triage_scope",
+                "summarize this", "--json",
+            ],
             cwd=ROOT,
             env=self.env,
             text=True,
@@ -291,6 +481,11 @@ class FleetUpTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(dispatch.returncode, 0, dispatch.stderr)
+        dispatch_payload = json.loads(dispatch.stdout)
+        self.assertEqual(dispatch_payload["feature"], "research-local")
+        self.assertEqual(dispatch_payload["instance"], "triage_scope")
+        self.assertEqual(dispatch_payload["runner"], "local")
+        self.assertIn("local token spend:", dispatch.stderr)
         sends = [call for call in self.calls() if call and call[0] == "send"]
         self.assertTrue(any("run-local-task.sh research-local triage_scope triage" in call[-1] for call in sends))
         duplicate_dispatch = subprocess.run(
@@ -339,7 +534,7 @@ class FleetUpTests(unittest.TestCase):
             all("--model gpt-5.6-sol" in payload for payload in codex_launches)
         )
 
-    def test_fleet_dialogue_preset_materializes_one_writer_and_three_independent_gates(self) -> None:
+    def test_fleet_dialogue_preset_materializes_one_writer_and_three_identity_diverse_gates(self) -> None:
         target = self.make_target_repo()
         result = self.run_fleet(
             "fdp2-roster",
@@ -368,6 +563,8 @@ class FleetUpTests(unittest.TestCase):
             "challenge.phase=CHALLENGE",
             "verify.role_type=claude_reviewer",
             "verify.phase=VERIFY",
+            "identity_group.count=1",
+            "identity_group.1=maker,checker,challenge,verify",
         )
         for contract in required:
             self.assertIn(contract, manifest)
@@ -389,7 +586,10 @@ class FleetUpTests(unittest.TestCase):
         self.assertTrue(maker_boots)
         for payload in maker_boots:
             self.assertIn("sandbox_workspace_write.writable_roots", payload)
+            self.assertIn("trust_level", payload)
+            self.assertIn("untrusted", payload)
             self.assertNotIn("danger-full-access", payload)
+
         state_advance = subprocess.run(
             [
                 "python3", str(ROOT / "scripts" / "fleet_state.py"), "advance",
@@ -421,6 +621,36 @@ class FleetUpTests(unittest.TestCase):
             .splitlines()
         ]
         self.assertEqual(lifecycle[-1]["variant"], "none")
+
+    def test_project_trust_gate_is_not_mistaken_for_codex_readiness(self) -> None:
+        self.env["CMUX_READY"] = "trust"
+        result = self.run_fleet("trust-gate", "--preset", "implementation_review")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unresolved project trust gate", result.stderr)
+        self.assertFalse((self.runs / "fleet-trust-gate.manifest").exists())
+        state = json.loads(self.state.read_text())
+        self.assertTrue(state.get("closed"), "failed boot must close its CMUX workspace")
+
+    def test_non_lead_isolated_healthcheck_fails_before_workspace_creation(self) -> None:
+        self.make_executable(
+            "claude",
+            "#!/bin/sh\ncase \"$*\" in *\"auth status\"*) exit 9;; esac\nexit 0\n",
+        )
+        result = self.run_fleet("claude-auth-fail", "--preset", "frontier_verification")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("verify/claude_reviewer", result.stderr)
+        self.assertIn("isolated runtime healthcheck", result.stderr)
+        self.assertFalse(self.state.exists(), "preflight failure must not create a workspace")
+
+    def test_provider_auth_screen_is_not_mistaken_for_readiness(self) -> None:
+        self.env["CMUX_READY"] = "claude-login"
+        result = self.run_fleet("claude-login-screen", "--preset", "frontier_verification")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fatal provider/authentication screen", result.stderr)
+        self.assertIn("Not logged in", result.stderr)
+        self.assertFalse((self.runs / "fleet-claude-login-screen.manifest").exists())
+        state = json.loads(self.state.read_text())
+        self.assertTrue(state.get("closed"), "failed boot must close its CMUX workspace")
 
     def test_frontier_send_returns_exact_run_and_rejects_second_active_turn(self) -> None:
         result = self.run_fleet("frontier-send", "agent=codex_candidate")
@@ -582,7 +812,7 @@ class FleetUpTests(unittest.TestCase):
         self.assertEqual(len(latest), 2)
         self.assertEqual(
             sorted(event["status"] for event in latest.values()),
-            ["dispatched", "indeterminate"],
+            ["authorized", "indeterminate"],
         )
         for event in latest.values():
             lock = self.runs / "locks" / f"race-partial-dispatch.{event['instance']}.lock"
@@ -1149,11 +1379,11 @@ class FleetUpTests(unittest.TestCase):
             text=True, capture_output=True, check=False,
         )
         self.assertNotEqual(branch.returncode, 0)
-        self.assertFalse((self.runs / "worktrees" / "wtfailed-build").exists())
+        self.assertFalse((self.tmp / "worktrees" / "wtfailed-build").exists())
 
     def test_failed_boot_preserves_writer_branch_that_advanced_during_shutdown(self) -> None:
         target = self.make_target_repo()
-        worktree = self.runs / "worktrees" / "wtfailedcommit-build"
+        worktree = self.tmp / "worktrees" / "wtfailedcommit-build"
         self.env["CMUX_READY"] = "0"
         self.env["CMUX_COMMIT_WORKTREE_ON_CLOSE"] = str(worktree)
         result = self.run_fleet(

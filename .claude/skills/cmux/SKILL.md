@@ -68,9 +68,10 @@ DELEGATE (boot/reuse a fleet, dispatch, fleet-wait, then verify + synthesize):
 
 - **Audit / review / "what am I missing?"** → ALWAYS ≥2 workers with distinct
   perspectives (e.g. codex + minimax, or reviewer + code_worker) before giving
-  your own verdict. Independent agreement = confidence; disagreement = dig in.
+  your own verdict. Identity-diverse agreement directs investigation but does
+  not prove correctness; disagreement = dig in.
 - **Risky change about to close** (merge, deploy, config touching money/prod)
-  → one independent frontier review is mandatory, not optional.
+  → one separately executed, identity-distinct frontier review is mandatory.
 - **≥3 independent subtasks** → parallelize across workers instead of serial.
 - **Broad search / classification / summarization at scale** → fan out to
   cheap local workers (triage, light_code); synthesize yourself.
@@ -84,7 +85,20 @@ DO IT YOURSELF (delegating is waste):
 Always: workers generate, YOU verify claims against source before adopting
 them (small models mark DONE optimistically), and you own the synthesis.
 
-Boot a team from the capability router. The default `small` preset creates a
+For an end-to-end open mission, prefer Dan+:
+
+```bash
+just dan <feature> "<complete objective>" --target-repo <repo>
+```
+
+This boots the `dan` preset in `autonomous` mode and gives the full mission to
+the lead. The lead chooses specialists, dispatches separable work before
+waiting, cross-feeds durable results, verifies proportionally, and returns one
+exact tracked result. Routine work needs no phase advance or human approval.
+Use `fleet_dialogue` when production, money, secrets, destructive actions, or a
+known high-risk boundary requires the assured FDP-2/FDP-3 path.
+
+For lower-level/manual operation, boot a team from the capability router. The default `small` preset creates a
 Codex lead; Claude is an enabled fallback candidate (`first_available` walks
 `lead.candidates` in order). Panes render by rank: CONTROL → RECON → BUILD → CHALLENGE → VERIFY.
 
@@ -101,14 +115,37 @@ An `instance_id` is addressable in the manifest and points to a reusable
 `role_type`; duplicates use names such as `triage_scope=triage` and
 `triage_sources=triage`.
 
+Review presets declare `identity_groups`. Router validation requires a distinct
+`provider/model/variant` tuple for every member before CMUX effects, and the
+plan plus manifest retain the group. This proves configured identity diversity,
+not semantic independence. Default race roles must also be identity-diverse;
+custom same-model races remain allowed but are never assurance.
+
 `authority`, `tool_access`, and `resource_class` are validated declarations,
 and the supported wrappers now enforce important parts of them: interactive
 agents inherit an environment allowlist; advisory Codex runs read-only;
 OpenCode challengers and Claude verification use plan/read-only modes; local
-dispatch uses instance/heavy leases. Direct manual `cmux send` remains an
-emergency bypass, so keep one writer and use `fleet-send.sh` normally.
+dispatch uses instance/heavy leases. Direct manual `cmux send` can change the
+visible pane but cannot bind a contract-v2 tracked run; keep one writer and use
+`fleet-send.sh` for every authoritative turn.
 The CONTROL lead alone uses `danger-full-access` so it can reach the cmux Unix
 socket; its environment is still allowlisted.
+OpenCode fleet reviewers default every tool to deny and resolve with only the
+built-in `read`, `glob`, and `grep` tools enabled; Bash, external roots, and
+unlisted/future tools remain denied. The only exception is the instance's fresh
+isolated `tool-output` directory. The launcher validates the merged
+provider policy before TUI boot. FDP-2 supplies Git and dialogue data through a
+CONTROL-generated evidence pack embedded in the hash-bound Checker prompt.
+Every Fleet Codex process uses an ephemeral Codex home with a
+single controller-owned CMUX hook bridge so legacy and current controller hook
+trees cannot emit duplicate physical submissions. The automation-only hook
+trust bypass applies exclusively to those hard-coded repo-owned overrides;
+controller hook command text is never copied. Mission-bound read-only
+specialists additionally use a
+named profile that extends `:read-only` and permits only the mission's exact
+Fleet Control socket. Existing authentication is copied and CMUX hooks are
+installed through a fixed controller-owned bridge; unrelated hook commands and
+broad controller sandbox settings are not copied.
 Pass `--target-repo <path>` to `fleet-up` and each write-authority instance
 gets a dedicated `fleet/<feature>/<instance>` branch and worktree at the target
 repo's current `HEAD`. Existing branches fail closed; teardown removes only an
@@ -130,11 +167,12 @@ Roles come in two kinds:
 - **Frontier agents** (interactive CLIs, tracked in cmux's agent panel via
   hooks; prompt them by `send`ing text + enter like a human typing):
 `codex` (codex CLI),
-  `minimax` (opencode -m minimax/MiniMax-M3, needs `MINIMAX_API_KEY`),
-  `glm` (opencode -m zai/glm-5.2, needs `ZHIPU_API_KEY`).
+  `minimax` (OpenCode agent pinned to MiniMax-M3/none, needs `MINIMAX_API_KEY`),
+  `glm` (OpenCode `-m` pinned to GLM-5.2 with no variant, needs `ZHIPU_API_KEY`).
 
-Fleet Codex roles use the official hooks and authentication from `~/.codex`,
-but the router pins `gpt-5.6-sol`; personal model defaults are not inherited.
+Fleet Codex roles copy authentication from the controller home but never load
+its general hook/config tree. The router pins `gpt-5.6-sol`; personal model
+defaults are not inherited.
 
 Frontier panes are interactive agents: after sending a prompt, wait for their
 hook event and then `read-screen`. `fleet-up` preflights executables, keys,
@@ -142,6 +180,11 @@ models, and lead health before creating the workspace; an unavailable member
 fails closed instead of leaving a shell that can mistake a prompt for a command.
 
 `fleet-up.sh` writes `orchestration/runs/fleet-<feature>.manifest`:
+
+- `manifest_contract_version=2`, `execution_profile`, and
+  `tracking_protocol=control-v1` describe enforcement without changing the
+  router's declared capabilities. Legacy manifests normalize to `native` plus
+  `legacy-cmux` and may be inspected/migrated with `fleet_manifest.py`.
 
 ```
 schema_version=3
@@ -172,8 +215,11 @@ just send <feature> build "bounded task"
 
 Only CONTROL and the currently active phase may receive work. Advancing freezes
 earlier phases, so BUILD cannot mutate an artifact during CHALLENGE/VERIFY.
-Leaving BUILD additionally requires `--approved-by <human>` — a person signs
-off on the writer's diff before CHALLENGE/VERIFY see it.
+Standalone guided fleets use `--approved-by <operator-attestation>` when
+leaving BUILD; this is a label, not proof of human presence. Mission-bound
+assured fleets reject that flag and require the exact scoped
+`--approval-event-sha256`; the assured runner supplies it from Mission state and
+FDP-3 revalidates it before starting.
 
 ### Event-driven waiting (preferred — do not poll)
 
@@ -195,7 +241,8 @@ cmux read-screen --surface <its surface> --workspace <ws> --lines 50
 `result_file`; pass `--json` for canonical JSONL. Exit codes are 0 succeeded,
 1 failed, 2 usage/identity/protocol, 3 blocked, 4 abandoned, 5 indeterminate,
 and 124 deadline. Every local or frontier instance requires `--run`. Frontier
-`UserPromptSubmit` binds session/surface; completed Stop only wakes exact
+CONTROL authorizes one exact `UserPromptSubmit` event ID/boot/sequence before
+it can bind session/surface; completed Stop only wakes exact
 `FLEET_RESULT:<run_id>:<STATUS>` verification. Missing or ambiguous evidence is
 indeterminate, never success. The sentinel must be the final non-empty line and
 the Stop must follow the single bound submit. A replay gap attempts catch-up
@@ -206,9 +253,15 @@ sends and unconfirmed race interrupts also retain their surface-UUID lease.
 OpenCode emits multiple Stops: only its structured final Stop is eligible, and
 the run-tagged user message, complete assistant text, completion time,
 provider, and model are read through `opencode db`. Terminal chrome, truncated
-workstream preambles, and lossy exports never prove OpenCode completion.
+workstream preambles, and lossy exports never prove OpenCode completion. Each
+OpenCode pane writes its copied database to a surface-scoped temporary XDG data
+home so the verifier can query the exact isolated session without consulting
+the controller's global database; the wrapper removes it when the pane exits.
+Provider, model, and provider-specific variant identity must match the final
+database message exactly: MiniMax pins explicit `none`; GLM pins absence.
 The dispatch wrappers also accept `--json`; orchestration callers must use that
-canonical output rather than parse human-facing text. Audit recovery requires
+canonical stdout rather than parse human-facing text; diagnostics stay on
+stderr. Audit recovery requires
 the recorded baseline plus a continuous boot-scoped sequence.
 Local notifications are also wake-ups only. Local workers cannot write files
 themselves; feed them a bounded evidence pack and capture their stdout durably
@@ -228,8 +281,8 @@ rest; treat a missing STATUS block as still-running or failed.
 
 ### Agent race (first success is a candidate)
 
-For hotfix/needle-in-a-haystack tasks, race heterogeneous agents on the same
-task; losers are interrupted automatically:
+For hotfix/needle-in-a-haystack tasks, race agents on the same task. Defaults
+are identity-diverse; explicit custom roles may repeat an identity:
 
 ```bash
 just race <name> "<task>" [instance=role ...]  # defaults come from router
@@ -240,7 +293,8 @@ Prints the first successful candidate and its screen, then leaves the other
 agents running by default. Failed, blocked, and abandoned candidates do not
 stop `--any` while another candidate remains viable. Only use
 `--cancel-losers` after a separate verification gate. The workspace remains
-available for inspection and teardown.
+available for inspection and teardown. A race result is never independent
+assurance, even when its configured identities differ.
 
 ### Decision queue (humans are slow — make blocking visible)
 
@@ -254,8 +308,10 @@ available for inspection and teardown.
 ### Fleet etiquette
 
 - One workspace per team/feature; never mix teams in one workspace.
-- Communication is flat: any pane may `cmux send` to any other pane, but keep
-  synthesis/decisions in the lead.
+- In `autonomous` mode, collaboration is lateral but tracked: route a worker's
+  exact durable result to any peer in a later `fleet-send` turn. Never inject a
+  raw second prompt into a pane with an active run. In `assured` mode, CONTROL
+  mediates the fixed dialogue protocol.
 - On finishing a major task, emit `cmux notify --title "fleet-<feature>" --body
   "<result>"` so the human sees it without watching.
 - Tear down with `just fleet-down <feature>` when work is merged/abandoned.

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "expected": {
+    "routing-selection": {
+      "selected": ["challenger", "lead", "verifier"],
+      "omitted": ["builder", "scout"],
+      "decision_authority": "lead"
+    },
+    "parallel-specialists": {
+      "max_parallel_runs": 3,
+      "max_fan_out": 2
+    },
+    "relay-adoption": {
+      "relayed_results": 1,
+      "durable_result_sets": 2
+    },
+    "risk-escalation-human-wait": {
+      "human_wait_seconds": 5.0,
+      "raw_content_allowed": false
+    }
+  }
+}

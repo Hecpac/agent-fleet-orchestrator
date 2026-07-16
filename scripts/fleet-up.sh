@@ -4,7 +4,7 @@ set -euo pipefail
 # Boot a capability-ordered cmux fleet from orchestration/router.yaml.
 #
 # Usage:
-#   ./scripts/fleet-up.sh <feature> [--preset <name>]
+#   ./scripts/fleet-up.sh <feature> [--preset <name>] [--execution-profile <name>]
 #   ./scripts/fleet-up.sh <feature> [--lead-provider <role>] [instance=role ...]
 #   ./scripts/fleet-up.sh --list-presets
 #
@@ -14,18 +14,33 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 router="$repo_root/scripts/router_config.py"
 runs_dir="${FLEET_RUNS_DIR:-$repo_root/orchestration/runs}"
+worktrees_root="${FLEET_WORKTREES_DIR:-/tmp/fleet_workspaces-$(id -u)}"
+mission_id="${FLEET_MISSION_ID:-}"
+execution_profile="${FLEET_EXECUTION_PROFILE:-native}"
+control_socket=""
+if [[ -n "$mission_id" ]]; then
+  control_socket="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve())' \
+    "${FLEET_CONTROL_SOCKET_DIR:-/tmp/fleet-control-$(id -u)}/$mission_id.sock")"
+fi
 export CMUX_QUIET=1
+
+if [[ -n "$mission_id" && ! "$mission_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+  echo "Invalid FLEET_MISSION_ID: expected canonical lowercase UUID." >&2
+  exit 2
+fi
 
 usage() {
   cat >&2 <<'EOF'
 Usage:
-  fleet-up.sh <feature> [--preset <name>] [--target-repo <path>]
+  fleet-up.sh <feature> [--preset <name>] [--target-repo <path>] [--execution-profile <name>]
   fleet-up.sh <feature> [--lead-provider <role>] [--allow-fallback] [instance=role ...]
   fleet-up.sh --list-presets
 
 --target-repo <path>: git repository the fleet works on. Every instance with
 write authority gets a dedicated fleet/<feature>/<instance> branch and worktree
 there, so committed output remains reachable after teardown.
+--execution-profile <name>: native (default), sandboxed, or regulated. Profiles
+change the process perimeter; router-declared tool capabilities remain intact.
 EOF
 }
 
@@ -61,6 +76,11 @@ while [[ $# -gt 0 ]]; do
       target_repo="$2"
       shift 2
       ;;
+    --execution-profile)
+      [[ $# -ge 2 ]] || { echo "--execution-profile requires a name" >&2; exit 2; }
+      execution_profile="$2"
+      shift 2
+      ;;
     --lead-provider|--lead)
       [[ $# -ge 2 ]] || { echo "$1 requires a role type" >&2; exit 2; }
       lead_provider="$2"
@@ -86,11 +106,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+python3 "$repo_root/scripts/fleet_manifest.py" validate-profile "$execution_profile" >/dev/null || exit 2
+if [[ "$execution_profile" == "regulated" && -z "$mission_id" ]]; then
+  echo "regulated execution requires a canonical FLEET_MISSION_ID" >&2
+  exit 2
+fi
+
 if [[ -n "$target_repo" ]]; then
   if ! git -C "$target_repo" rev-parse --git-dir >/dev/null 2>&1; then
     echo "--target-repo is not a git repository: $target_repo" >&2
     exit 2
   fi
+  # Preserve the operator-visible repository path in the manifest. Only the
+  # kernel-addressed control socket needs physical-path canonicalization.
   target_repo="$(cd "$target_repo" && pwd)"
 fi
 
@@ -108,6 +136,7 @@ plan_output="$(python3 "$router" "${plan_args[@]}")" || exit 2
 
 schema_version=""
 resolved_preset=""
+execution_mode="guided"
 lead_role_type=""
 lead_command=""
 lead_executable=""
@@ -135,6 +164,7 @@ tool_accesses=()
 providers=()
 hook_sources=()
 variants=()
+identity_groups=()
 warnings=()
 
 while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n o p; do
@@ -142,6 +172,7 @@ while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n o p; do
     META)
       schema_version="$a"
       resolved_preset="$b"
+      execution_mode="${c:-guided}"
       ;;
     LEAD)
       lead_role_type="$b"
@@ -174,6 +205,9 @@ while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n o p; do
       hook_sources+=("$o")
       variants+=("$p")
       ;;
+    IDENTITY_GROUP)
+      identity_groups+=("$b")
+      ;;
     WARNING)
       warnings+=("$a")
       ;;
@@ -202,11 +236,61 @@ check_required_env() {
   IFS="$old_ifs"
 }
 
+preflight_interactive_role() {
+  local role_type="$1" authority="$2" required_csv="$3" label="$4"
+  local healthcheck_json="" argument=""
+  local -a healthcheck=()
+
+  if ! healthcheck_json="$(python3 "$router" role-field "$role_type" healthcheck)"; then
+    echo "Interactive role '$label' has no valid healthcheck." >&2
+    return 1
+  fi
+  while IFS= read -r argument; do
+    healthcheck+=("$argument")
+  done < <(python3 -c '
+import json
+import sys
+for value in json.loads(sys.argv[1]):
+    print(value)
+' "$healthcheck_json")
+  if (( ${#healthcheck[@]} == 0 )); then
+    echo "Interactive role '$label' resolved an empty healthcheck." >&2
+    return 1
+  fi
+
+  if ! FLEET_HEALTHCHECK=1 \
+    FLEET_EXECUTION_PROFILE="$execution_profile" \
+    FLEET_MISSION_ID="$mission_id" \
+    FLEET_CONTROL_SOCKET="$control_socket" \
+    "$repo_root/scripts/run-interactive-agent.sh" \
+      "$role_type" "$authority" "${required_csv:--}" "${healthcheck[@]}" \
+      >/dev/null; then
+    echo "Interactive role '$label' failed its isolated runtime healthcheck." >&2
+    return 1
+  fi
+}
+
 interactive_launch_command() {
   local role_type="$1" authority="$2" required_csv="$3" command_shell="$4"
   [[ -n "$required_csv" ]] || required_csv="-"
-  printf '%q %q %q %q %s' \
-    "$repo_root/scripts/run-interactive-agent.sh" "$role_type" "$authority" "$required_csv" "$command_shell"
+  printf 'FLEET_EXECUTION_PROFILE=%q FLEET_MISSION_ID=%q FLEET_CONTROL_SOCKET=%q %q %q %q %q %s' \
+    "$execution_profile" "$mission_id" "$control_socket" "$repo_root/scripts/run-interactive-agent.sh" \
+    "$role_type" "$authority" "$required_csv" "$command_shell"
+}
+
+codex_control_permission_profile() {
+  local socket_path="$1"
+  python3 -c '
+import json
+import sys
+
+socket = json.dumps(sys.argv[1])
+print(
+    "permissions={fleet_control={description=\"Mission-scoped read-only Fleet Control client.\","
+    "extends=\":read-only\",network={enabled=true,mode=\"limited\","
+    "unix_sockets={" + socket + "=\"allow\"}}}}"
+)
+' "$socket_path"
 }
 
 wait_for_agent_prompt() {
@@ -216,6 +300,11 @@ wait_for_agent_prompt() {
   local attempt screen=""
   for ((attempt=1; attempt<=attempts; attempt++)); do
     screen="$(cmux read-screen --surface "$surface" --workspace "$ws_ref" --lines 8 2>/dev/null || true)"
+    if grep -Eqi 'Not logged in|Please run /login|Invalid MCP configuration|provider state.*symlink' <<< "$screen"; then
+      echo "Interactive agent '$label' reached a fatal provider/authentication screen." >&2
+      printf '%s\n' "$screen" >&2
+      return 1
+    fi
     tty_name="$(cmux tree --workspace "$ws_ref" | awk -v target="$surface" '
       index($0, target) { if (match($0, /tty=[^ ]+/)) print substr($0, RSTART + 4, RLENGTH - 4) }
     ')"
@@ -224,6 +313,10 @@ wait_for_agent_prompt() {
       process_alive=1
     fi
     if (( process_alive == 1 )) && grep -Eq "$ready_pattern" <<< "$screen"; then
+      if grep -Fq "Do you trust the contents of this directory?" <<< "$screen"; then
+        echo "Interactive agent '$label' is blocked on an unresolved project trust gate." >&2
+        return 1
+      fi
       return 0
     fi
     [[ "$delay" == "0" ]] || sleep "$delay"
@@ -241,6 +334,8 @@ if [[ "${FLEET_NO_LEAD:-0}" != "1" ]]; then
     exit 2
   }
   check_required_env "$lead_requires_env" || exit 2
+  preflight_interactive_role "$lead_role_type" control "$lead_requires_env" \
+    "lead/$lead_role_type" || exit 2
 fi
 
 for ((i=0; i<${#instance_ids[@]}; i++)); do
@@ -253,6 +348,9 @@ for ((i=0; i<${#instance_ids[@]}; i++)); do
       echo "Role instance ${instance_ids[$i]} is not ready." >&2
       exit 2
     }
+    preflight_interactive_role \
+      "${role_types[$i]}" "${authorities[$i]}" "${required_envs[$i]}" \
+      "${instance_ids[$i]}/${role_types[$i]}" || exit 2
   else
     command -v ollama >/dev/null 2>&1 || { echo "ollama is required for ${instance_ids[$i]}" >&2; exit 2; }
     ollama show "${models[$i]}" >/dev/null 2>&1 || {
@@ -388,18 +486,28 @@ trap cleanup_on_exit EXIT
 # named branch and dedicated worktree of the target repo, then starts inside it.
 worktrees=()
 if [[ -n "$target_repo" ]]; then
+  python3 -c '
+import os, stat, sys
+from pathlib import Path
+path = Path(sys.argv[1]).expanduser()
+if path.exists() or path.is_symlink():
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.geteuid():
+        raise SystemExit("unsafe fleet worktree root")
+else:
+    path.mkdir(parents=True, mode=0o700)
+os.chmod(path, 0o700)
+' "$worktrees_root" || { echo "Refusing unsafe worktree root: $worktrees_root" >&2; exit 2; }
   for ((i=0; i<${#instance_ids[@]}; i++)); do
     worktrees[$i]=""
     if [[ "${authorities[$i]}" == "write" ]]; then
-      wt="$runs_dir/worktrees/$feature-${instance_ids[$i]}"
+      wt="$worktrees_root/$feature-${instance_ids[$i]}"
       branch="${worktree_branches[$i]}"
       base_sha="${worktree_base_shas[$i]}"
       if [[ -e "$wt" ]]; then
         echo "Worktree path already exists: $wt" >&2
         exit 2
       fi
-      mkdir -p "$runs_dir/worktrees"
-      chmod 700 "$runs_dir/worktrees"
       if ! git -C "$target_repo" branch "$branch" "$base_sha" >/dev/null 2>&1; then
         echo "Could not create writer branch $branch; it may have been created concurrently." >&2
         exit 2
@@ -439,14 +547,38 @@ for ((i=${#instance_ids[@]}-1; i>=0; i--)); do
   surfaces[$i]="$surface"
   cmux rename-tab --surface "$surface" --workspace "$ws_ref" "${instance_ids[$i]}" >/dev/null
   if [[ "${runners[$i]}" == "interactive" ]]; then
-    launch_command="$(interactive_launch_command "${role_types[$i]}" "${authorities[$i]}" "${required_envs[$i]}" "${commands[$i]}")"
+    agent_command="${commands[$i]}"
+    if [[ -n "$mission_id" && "${providers[$i]}" == "openai" \
+      && "${authorities[$i]}" != "write" && "${authorities[$i]}" != "control" ]]; then
+      if [[ "$agent_command" != *" --sandbox read-only"* ]]; then
+        echo "Mission-bound OpenAI specialist ${instance_ids[$i]} lacks the expected read-only sandbox contract." >&2
+        exit 2
+      fi
+      # Permission profiles do not compose with --sandbox. Replace the legacy
+      # read-only flag with an equivalent read-only profile that additionally
+      # permits exactly this mission's authenticated AF_UNIX control socket.
+      agent_command="${agent_command/ --sandbox read-only/}"
+      codex_control_policy="$(codex_control_permission_profile "$control_socket")"
+      codex_project_root="${target_repo:-$repo_root}"
+      codex_project_policy="$(python3 -c 'import json, sys; print(f"projects={{{json.dumps(sys.argv[1])}={{trust_level=\"untrusted\"}}}}")' "$codex_project_root")"
+      agent_command="$agent_command$(printf ' -c %q -c %q -c %q' \
+        "$codex_control_policy" 'default_permissions="fleet_control"' "$codex_project_policy")"
+      # run-interactive-agent provisions only controller-vetted CMUX hooks in
+      # an ephemeral Codex home. Skip the per-run trust UI so that automation
+      # cannot have its first tracked prompt consumed by the hook browser.
+      agent_command="$agent_command --dangerously-bypass-hook-trust"
+    fi
+    launch_command="$(interactive_launch_command "${role_types[$i]}" "${authorities[$i]}" "${required_envs[$i]}" "$agent_command")"
     if [[ -n "${worktrees[$i]:-}" ]]; then
       # A linked worktree keeps its Git admin dir and objects in the target
       # repo's common .git, outside the Codex workspace-write sandbox. Writer
       # commits are the designed durable output, so grant exactly that dir.
       if [[ "${providers[$i]}" == "openai" ]]; then
         writer_git_dir="$(git -C "$target_repo" rev-parse --path-format=absolute --git-common-dir)"
-        launch_command="$launch_command$(printf ' -c %q' "sandbox_workspace_write.writable_roots=[\"$writer_git_dir\"]")"
+        writer_git_dir_json="$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$writer_git_dir")"
+        codex_project_policy="$(python3 -c 'import json, sys; print(f"projects={{{json.dumps(sys.argv[1])}={{trust_level=\"untrusted\"}}}}")' "$target_repo")"
+        launch_command="$launch_command$(printf ' -c %q' "sandbox_workspace_write.writable_roots=[$writer_git_dir_json]")"
+        launch_command="$launch_command$(printf ' -c %q' "$codex_project_policy")"
       fi
       launch_command="$(printf 'cd %q && ' "${worktrees[$i]}")$launch_command"
     fi
@@ -496,8 +628,18 @@ lead_uuid="$(uuid_for_ref "$lead_surface")"
 manifest_tmp="$(mktemp "$runs_dir/.fleet-$feature.manifest.XXXXXX")"
 {
   echo "schema_version=$schema_version"
+  echo "manifest_contract_version=2"
+  echo "execution_profile=$execution_profile"
+  echo "tracking_protocol=control-v1"
   echo "feature=$feature"
   echo "preset=$resolved_preset"
+  echo "mode=$execution_mode"
+  echo "identity_group.count=${#identity_groups[@]}"
+  for ((i=0; i<${#identity_groups[@]}; i++)); do
+    echo "identity_group.$((i + 1))=${identity_groups[$i]}"
+  done
+  [[ -z "$mission_id" ]] || echo "mission_id=$mission_id"
+  [[ -z "$control_socket" ]] || echo "control_socket=$control_socket"
   echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "workspace_cwd=$repo_root"
   if [[ -n "$target_repo" ]]; then
@@ -562,14 +704,22 @@ else
 
   wait_for_agent_prompt "$lead_surface" "lead/$lead_role_type" "$lead_ready_pattern" "$lead_executable" || exit 1
 
-  cmux send --surface "$lead_surface" --workspace "$ws_ref" \
-    "Eres el lead ($lead_role_type) de fleet-$feature en $ws_ref. El preset resuelto es '$resolved_preset'. Lee $manifest y verifica UUIDs/surfaces contra 'cmux tree --workspace $ws_ref --id-format both'. Los panes están ordenados por capacidad. No despaches todavía: reporta el roster en una línea y espera instrucciones." >/dev/null
-  [[ "${FLEET_SEND_KEY_DELAY:-0.2}" == "0" ]] || sleep "${FLEET_SEND_KEY_DELAY:-0.2}"
-  cmux send-key --surface "$lead_surface" --workspace "$ws_ref" enter >/dev/null
-  cmux read-screen --surface "$lead_surface" --workspace "$ws_ref" --lines 8 >/dev/null
+  if [[ "$execution_mode" == "autonomous" ]]; then
+    # The first submitted lead turn must be the tracked mission from fleet-run.
+    # A boot-time orientation turn can still be active (or trigger a CLI update)
+    # when the mission arrives, making UserPromptSubmit ownership ambiguous.
+    cmux set-status mission ready --workspace "$ws_ref" --icon sparkles >/dev/null || true
+    cmux read-screen --surface "$lead_surface" --workspace "$ws_ref" --lines 8 >/dev/null
+  else
+    cmux send --surface "$lead_surface" --workspace "$ws_ref" \
+      "Eres el lead ($lead_role_type) de fleet-$feature en $ws_ref. El preset resuelto es '$resolved_preset' y su modo es '$execution_mode'. Lee $manifest y verifica UUIDs/surfaces contra 'cmux tree --workspace $ws_ref --id-format both'. Los panes están ordenados por capacidad. No despaches todavía: reporta el roster y el modo en una línea, y espera la misión." >/dev/null
+    [[ "${FLEET_SEND_KEY_DELAY:-0.2}" == "0" ]] || sleep "${FLEET_SEND_KEY_DELAY:-0.2}"
+    cmux send-key --surface "$lead_surface" --workspace "$ws_ref" enter >/dev/null
+    cmux read-screen --surface "$lead_surface" --workspace "$ws_ref" --lines 8 >/dev/null
+  fi
 fi
 
 completed=1
-echo "fleet-$feature is up (preset: $resolved_preset, lead: ${lead_role_type:-monitor})."
+echo "fleet-$feature is up (preset: $resolved_preset, mode: $execution_mode, lead: ${lead_role_type:-monitor})."
 echo "manifest: $manifest"
 cat "$manifest"

@@ -53,18 +53,55 @@ the phase gate before acting. Except for CONTROL, only the currently active
 phase may receive work; advancing to CHALLENGE or VERIFY freezes BUILD.
 
 Interactive agents run through an environment allowlist. Codex non-writers use
-the read-only sandbox, OpenCode challengers use the `plan` agent, and the
-frontier Claude reviewer uses `permission-mode plan`.
+the read-only sandbox; OpenCode reviewers default every tool to deny, enable
+only built-in `read`/`glob`/`grep`, and deny external roots except their fresh
+isolated tool-output directory; the frontier Claude reviewer uses
+`permission-mode plan`. OpenCode's resolved policy is
+validated before its TUI boots. A mission-bound Codex
+specialist gets an ephemeral Codex home with existing authentication and only
+the fixed controller-owned CMUX hook bridge. Its named permission profile extends
+`:read-only` and permits only the canonical Fleet Control Unix socket path.
 
 The CONTROL lead is the deliberate exception: it uses Codex
 `danger-full-access` because CMUX control requires its Unix socket outside the
 workspace sandbox. Its environment remains allowlisted, and writer/reviewer
 permissions are unchanged.
 
+The process profile is separate from phase/authority. `native` preserves the
+current tools; `sandboxed` confines temporary/cache/runtime state to the
+ephemeral worker home; `regulated` additionally requires Mission identity and
+CONTROL-only effects. Router `tool_access` is identical across profiles.
+
+For contract-v2 interactive runs, a hook event is not ownership by itself.
+`fleet-send` must persist an authorization for the exact submit event ID, boot,
+sequence, session, workspace, and surface before the waiter can bind it. Raw
+CMUX input is therefore visible but untracked. Mission-bound control calls use
+a private Unix socket with peer-UID plus Lead-run/capability-token validation.
+CONTROL assigns the exact specialist run ID and binds its capability token
+before prompt transfer, closing the fast-caller registration race.
+
 Local dispatch acquires a per-instance lease and, for heavy models, a global
 heavy-worker lease, plus global-local and per-role semaphore slots. Every lease
 contains its owning `run_id`. Task text is stored mode `0600`; the ledger stores
 only its SHA-256 plus lifecycle/result metadata.
 
-Teardown refuses fleets with active dispatch leases and archives manifest,
-phase history, and ledger only after CMUX confirms the workspace disappeared.
+Presets may declare `identity_groups` for review paths whose configured model
+diversity matters. Router validation requires at least two members and a unique
+`provider/model/variant` tuple for every member before CMUX starts. Plans,
+compiled workflows, and manifests preserve the group membership. Duplicate
+roles remain valid outside such a group, and tuple diversity is observational
+evidence—not proof that conclusions or model errors are independent.
+
+BUILD-exit approval has two explicit provenance levels. Standalone guided
+fleets retain `--approved-by` as a legacy operator attestation only.
+Mission-bound assured fleets reject that string and require the exact active
+`assurance_approved.event_sha256`; phase advance and FDP-3 both revalidate the
+Mission, request, workflow, scope, risk, and expiry. This binds durable
+provenance but does not prove out-of-band human presence because CONTROL and the
+approval CLI still share the local Unix trust boundary.
+
+Teardown refuses fleets with active dispatch leases and nonterminal Missions,
+stops Fleet Control, freezes the portable Mission archive while evidence is
+available, and removes the manifest only after CMUX confirms disappearance.
+Sensitive `full` archives additionally require a distinct scoped, expiring
+archive approval; the ordinary assurance approval cannot authorize disclosure.

@@ -22,6 +22,10 @@ from typing import Any, Iterable
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT / "scripts") not in sys.path:
+    sys.path.insert(0, str(ROOT / "scripts"))
+import fleet_providers
+
 DEFAULT_ROUTER = ROOT / "orchestration" / "router.yaml"
 IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
@@ -30,6 +34,7 @@ RUNNERS = {"interactive", "local"}
 AUTHORITIES = {"control", "write", "advisory", "verification"}
 RESOURCE_CLASSES = {"remote", "local_light", "local_heavy"}
 PHASES = {"CONTROL", "RECON", "BUILD", "CHALLENGE", "VERIFY"}
+EXECUTION_MODES = {"autonomous", "guided", "assured"}
 US = "\x1f"
 OPENCODE_AGENTS_DIR = ROOT / ".opencode" / "agents"
 OPENCODE_AGENT_IDENTITY_RE = re.compile(r"^(model|variant):[ \t]*(\S(?:.*\S)?)[ \t]*$")
@@ -161,6 +166,79 @@ def _expect_manifest_scalar(value: Any, where: str) -> str:
     if any(character in value for character in ("\n", "\r", "\x00", US)):
         raise RouterError(f"{where} contains a forbidden control character")
     return value
+
+
+def _provider_identity(role: dict[str, Any]) -> tuple[str, str, str | None]:
+    return (
+        str(role["provider"]),
+        str(role["model"]),
+        str(role["variant"]) if role.get("variant") is not None else None,
+    )
+
+
+def _identity_label(identity: tuple[str, str, str | None]) -> str:
+    provider, model, variant = identity
+    return f"{provider}/{model}/{variant if variant is not None else '-'}"
+
+
+def _require_distinct_identities(
+    members: list[tuple[str, dict[str, Any]]], where: str
+) -> None:
+    if len(members) < 2:
+        raise RouterError(f"{where} must contain at least two instances")
+    seen: dict[tuple[str, str, str | None], str] = {}
+    for instance_id, role in members:
+        identity = _provider_identity(role)
+        previous = seen.get(identity)
+        if previous is not None:
+            raise RouterError(
+                f"{where} repeats provider/model/variant identity "
+                f"{_identity_label(identity)} for {previous} and {instance_id}"
+            )
+        seen[identity] = instance_id
+
+
+def _validate_identity_groups(
+    config: dict[str, Any],
+    instances: list[dict[str, Any]],
+    value: Any,
+    where: str,
+) -> list[list[str]]:
+    if not isinstance(value, list) or not value:
+        raise RouterError(f"{where} must be a non-empty list of instance groups")
+    instances_by_id = {
+        str(instance["instance_id"]): instance
+        for instance in instances
+        if isinstance(instance, dict) and "instance_id" in instance
+    }
+    normalized: list[list[str]] = []
+    seen_groups: set[tuple[str, ...]] = set()
+    for index, raw_group in enumerate(value):
+        group_where = f"{where}[{index}]"
+        members = _expect_string_list(raw_group, group_where, nonempty=True)
+        if len(members) != len(set(members)):
+            raise RouterError(f"{group_where} contains duplicate instance IDs")
+        unknown = [member for member in members if member not in instances_by_id]
+        if unknown:
+            raise RouterError(
+                f"{group_where} references unknown instances: {', '.join(unknown)}"
+            )
+        group_key = tuple(sorted(members))
+        if group_key in seen_groups:
+            raise RouterError(f"{where} contains a duplicate group: {', '.join(members)}")
+        seen_groups.add(group_key)
+        _require_distinct_identities(
+            [
+                (
+                    member,
+                    config["roles"][str(instances_by_id[member]["role_type"])],
+                )
+                for member in members
+            ],
+            group_where,
+        )
+        normalized.append(list(members))
+    return normalized
 
 
 def validate_router(config: dict[str, Any]) -> None:
@@ -420,11 +498,34 @@ def validate_router(config: dict[str, Any]) -> None:
             if role["resource_class"] == "remote":
                 raise RouterError(f"router.roles.{role_type} local role cannot use resource_class remote")
 
+        try:
+            provider_identity = fleet_providers.identity(
+                str(role["provider"]),
+                str(role["model"]),
+                role.get("variant"),
+                str(role.get("hook_source", "")),
+            )
+            adapter = fleet_providers.DEFAULT_REGISTRY.resolve(
+                hook_source=provider_identity.hook_source,
+                provider=provider_identity.provider,
+            )
+            adapter.validate_configuration(
+                provider_identity,
+                command=list(role["command"]) if role["runner"] == "interactive" else None,
+                runner=str(role["runner"]),
+            )
+        except fleet_providers.ProviderError as exc:
+            raise RouterError(f"router.roles.{role_type} provider adapter: {exc}") from exc
+
     for role_type in race_roles:
         if role_type not in roles:
             raise RouterError(f"router.defaults.race_roles references unknown role: {role_type}")
         if roles[role_type]["runner"] != "interactive":
             raise RouterError(f"router.defaults.race_roles must reference interactive roles: {role_type}")
+    _require_distinct_identities(
+        [(role_type, roles[role_type]) for role_type in race_roles],
+        "router.defaults.race_roles",
+    )
 
     lead = _expect_mapping(config["lead"], "router.lead")
     _expect_keys(
@@ -470,7 +571,7 @@ def validate_router(config: dict[str, Any]) -> None:
         _expect_keys(
             preset,
             required={"description", "include_lead", "instances"},
-            optional={"lead_provider"},
+            optional={"lead_provider", "mode", "identity_groups"},
             where=f"router.presets.{preset_name}",
         )
         if not isinstance(preset["description"], str) or not preset["description"]:
@@ -479,9 +580,20 @@ def validate_router(config: dict[str, Any]) -> None:
             raise RouterError(f"router.presets.{preset_name}.include_lead must be boolean")
         if "lead_provider" in preset and preset["lead_provider"] not in candidates:
             raise RouterError(f"router.presets.{preset_name}.lead_provider is not a lead candidate")
+        if preset.get("mode", "guided") not in EXECUTION_MODES:
+            raise RouterError(
+                f"router.presets.{preset_name}.mode must be one of {sorted(EXECUTION_MODES)}"
+            )
         if not isinstance(preset["instances"], list):
             raise RouterError(f"router.presets.{preset_name}.instances must be a list")
         _validate_instances(config, preset["instances"], f"router.presets.{preset_name}.instances")
+        if "identity_groups" in preset:
+            _validate_identity_groups(
+                config,
+                preset["instances"],
+                preset["identity_groups"],
+                f"router.presets.{preset_name}.identity_groups",
+            )
 
 
 def _validate_instances(config: dict[str, Any], instances: list[dict[str, Any]], where: str) -> None:
@@ -579,6 +691,7 @@ def select_lead(
     *,
     allow_fallback: bool = False,
     run_healthcheck: bool = True,
+    check_runtime_availability: bool = True,
 ) -> dict[str, Any]:
     candidates = list(config["lead"]["candidates"])
     if requested:
@@ -588,7 +701,12 @@ def select_lead(
     failures: list[str] = []
     for role_type in candidates:
         role = config["roles"][role_type]
-        available, reason = role_available(role, run_healthcheck=run_healthcheck)
+        if not role["enabled"]:
+            available, reason = False, "disabled"
+        elif not check_runtime_availability:
+            available, reason = True, "static resolution"
+        else:
+            available, reason = role_available(role, run_healthcheck=run_healthcheck)
         if available:
             command = list(role["command"])
             if role["provider"] == "openai":
@@ -651,6 +769,7 @@ def build_plan(
     allow_fallback: bool = False,
     no_lead: bool = False,
     run_healthcheck: bool = True,
+    check_runtime_availability: bool = True,
 ) -> dict[str, Any]:
     specs = list(instance_specs or [])
     if preset_name and specs:
@@ -660,6 +779,8 @@ def build_plan(
         instances = parse_instance_specs(config, specs)
         include_lead = True
         preset_lead = None
+        execution_mode = "guided"
+        identity_groups: list[list[str]] = []
     else:
         source = preset_name or config["defaults"]["preset"]
         if source not in config["presets"]:
@@ -669,6 +790,8 @@ def build_plan(
         instances = copy.deepcopy(preset["instances"])
         include_lead = preset["include_lead"]
         preset_lead = preset.get("lead_provider")
+        execution_mode = preset.get("mode", "guided")
+        identity_groups = copy.deepcopy(preset.get("identity_groups", []))
 
     lead = None
     if include_lead and not no_lead:
@@ -677,6 +800,7 @@ def build_plan(
             lead_provider or preset_lead,
             allow_fallback=allow_fallback,
             run_healthcheck=run_healthcheck,
+            check_runtime_availability=check_runtime_availability,
         )
     resolved = _materialize_instances(config, instances)
     warnings: list[str] = []
@@ -695,15 +819,19 @@ def build_plan(
     return {
         "schema_version": config["schema_version"],
         "preset": source,
+        "mode": execution_mode,
         "lead": lead,
         "instances": resolved,
+        "identity_groups": identity_groups,
         "limits": copy.deepcopy(config["limits"]),
         "warnings": warnings,
     }
 
 
 def _records(plan: dict[str, Any]) -> str:
-    lines = [US.join(["META", str(plan["schema_version"]), plan["preset"]])]
+    lines = [
+        US.join(["META", str(plan["schema_version"]), plan["preset"], plan["mode"]])
+    ]
     if plan["lead"]:
         lead = plan["lead"]
         lines.append(
@@ -753,6 +881,8 @@ def _records(plan: dict[str, Any]) -> str:
                 ]
             )
         )
+    for index, group in enumerate(plan["identity_groups"], 1):
+        lines.append(US.join(["IDENTITY_GROUP", str(index), ",".join(group)]))
     for warning in plan["warnings"]:
         lines.append(US.join(["WARNING", warning]))
     return "\n".join(lines)

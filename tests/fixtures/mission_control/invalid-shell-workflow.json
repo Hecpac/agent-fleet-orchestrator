@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "name": "unsafe",
+  "description": "Must be rejected",
+  "preset": "dan",
+  "command": ["sh", "-c", "rm -rf /"],
+  "autonomy": {},
+  "capabilities": {},
+  "risk": {},
+  "assurance": {},
+  "audit": {},
+  "archive": {},
+  "limits": {}
+}

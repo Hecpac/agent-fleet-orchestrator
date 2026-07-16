@@ -11,12 +11,14 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
 import uuid
 from typing import Any
 
+import fleet_providers
 from fleet_leases import (
     LeaseError,
     acquire_frontier,
@@ -40,12 +42,13 @@ SENTINEL_STATUSES = {
     "FAILED": "failed",
 }
 HOOK_SESSION_FILES = {
-    "codex": "codex-hook-sessions.json",
-    "claude": "claude-hook-sessions.json",
-    "opencode": "opencode-hook-sessions.json",
+    adapter.hook_source: adapter.session_file
+    for adapter in fleet_providers.default_adapters()
+    if adapter.hook_source and adapter.session_file
 }
 TRANSCRIPT_EVIDENCE_ATTEMPTS = 4
 TRANSCRIPT_EVIDENCE_RETRY_SECONDS = 0.1
+OPENCODE_STATE_ROOT = Path("/tmp/agent-fleet-orchestrator-opencode")
 
 
 class FrontierError(RuntimeError):
@@ -239,22 +242,19 @@ def session_matches(
 
 
 def prompt_with_contract(task: str, run_id: str, *, hook_source: str = "") -> str:
-    logical_prompt = (
-        f"{task}\n\n"
-        "Fleet completion protocol: in the final answer, include exactly one final line "
-        f"using FLEET_RESULT:{run_id}:<STATUS>, where STATUS is DONE, BLOCKED, or FAILED. "
-        "Do not emit that line before the final answer."
+    if hook_source not in HOOK_SESSION_FILES:
+        return fleet_providers.BaseAdapter.logical_prompt(task, run_id)
+    defaults = {
+        "codex": ("openai", "compatibility-model"),
+        "claude": ("anthropic", "compatibility-model"),
+        "opencode": ("compatibility-provider", "compatibility-model"),
+    }
+    provider, model = defaults[hook_source]
+    configured = fleet_providers.identity(provider, model, None, hook_source)
+    adapter = fleet_providers.DEFAULT_REGISTRY.resolve(
+        hook_source=hook_source, provider=provider
     )
-    if hook_source == "opencode":
-        # OpenCode treats literal newlines pasted into its TUI as independent
-        # submissions. Encode the complete logical prompt as one JSON string so
-        # cmux transfers exactly one UserPromptSubmit without weakening the
-        # run/prompt identity recorded by CONTROL.
-        return (
-            "Decode the JSON string after FDP_PROMPT= as your exact prompt and follow it. "
-            f"FDP_PROMPT={json.dumps(logical_prompt, ensure_ascii=False)}"
-        )
-    return logical_prompt
+    return adapter.prepare_submission(configured, task, run_id, Path("/prompt"))["prompt"]
 
 
 def sentinel_status(screen: str, run_id: str) -> tuple[str, str]:
@@ -317,8 +317,57 @@ def _opencode_final_stop(payload: dict[str, Any]) -> bool:
     )
 
 
+def opencode_data_home(surface_uuid: str) -> Path:
+    try:
+        canonical_surface = str(uuid.UUID(surface_uuid)).upper()
+    except ValueError as exc:
+        raise FrontierError("OpenCode evidence surface id is invalid") from exc
+    surface_root = OPENCODE_STATE_ROOT / canonical_surface
+    data_home = surface_root / "data"
+    if OPENCODE_STATE_ROOT.is_symlink() or surface_root.is_symlink() or data_home.is_symlink():
+        raise FrontierError("OpenCode evidence state must not use symlinks")
+    try:
+        resolved_root = OPENCODE_STATE_ROOT.resolve(strict=True)
+        resolved_surface = surface_root.resolve(strict=True)
+        resolved_data = data_home.resolve(strict=True)
+        resolved_surface.relative_to(resolved_root)
+        resolved_data.relative_to(resolved_surface)
+    except (OSError, ValueError) as exc:
+        raise FrontierError("OpenCode evidence data home is unavailable") from exc
+    return data_home
+
+
+def cleanup_opencode_data_home(surface_uuid: str) -> bool:
+    """Remove one OpenCode evidence home after its frontier run is terminal."""
+    try:
+        canonical_surface = str(uuid.UUID(surface_uuid)).upper()
+    except ValueError as exc:
+        raise FrontierError("OpenCode evidence surface id is invalid") from exc
+    if OPENCODE_STATE_ROOT.is_symlink():
+        raise FrontierError("OpenCode evidence state root must not be a symlink")
+    surface_root = OPENCODE_STATE_ROOT / canonical_surface
+    if surface_root.is_symlink():
+        raise FrontierError("OpenCode evidence surface state must not be a symlink")
+    if not surface_root.exists():
+        return False
+    if not surface_root.is_dir():
+        raise FrontierError("OpenCode evidence surface state is unsafe")
+    try:
+        resolved_root = OPENCODE_STATE_ROOT.resolve(strict=True)
+        resolved_surface = surface_root.resolve(strict=True)
+        resolved_surface.relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise FrontierError("OpenCode evidence surface state is unsafe") from exc
+    shutil.rmtree(surface_root)
+    try:
+        OPENCODE_STATE_ROOT.rmdir()
+    except OSError:
+        pass
+    return True
+
+
 def opencode_turn_evidence(
-    session_id: str, run_id: str, stop_occurred_at: str
+    session_id: str, run_id: str, stop_occurred_at: str, surface_uuid: str
 ) -> tuple[str, str, str, str | None]:
     raw_session_id = session_id.removeprefix("opencode-")
     if not re.fullmatch(r"ses_[A-Za-z0-9]+", raw_session_id):
@@ -327,6 +376,7 @@ def opencode_turn_evidence(
     if stop_time is None:
         raise FrontierError("OpenCode Stop has no valid timestamp")
     stop_millis = int(stop_time.timestamp() * 1000)
+    data_home = opencode_data_home(surface_uuid)
     query = (
         "SELECT m.id AS message_id, m.time_created AS message_created, "
         "m.data AS message_data, p.id AS part_id, "
@@ -338,11 +388,12 @@ def opencode_turn_evidence(
     )
     try:
         result = subprocess.run(
-            ["opencode", "db", "--format", "json", query],
+            ["opencode", "db", "--pure", "--format", "json", query],
             capture_output=True,
             text=True,
             timeout=15,
             check=False,
+            env={**os.environ, "XDG_DATA_HOME": str(data_home)},
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise FrontierError(f"cannot query OpenCode turn evidence: {exc}") from exc
@@ -722,6 +773,7 @@ def prepare_run(
     model: str = "",
     hook_source: str = "",
     variant: str = "",
+    run_id: str = "",
 ) -> dict[str, Any]:
     if not provider or not model or not hook_source:
         raise FrontierError("frontier runs require provider, model, and hook source identity")
@@ -731,9 +783,27 @@ def prepare_run(
         raise FrontierError("frontier variant identity is supported only for OpenCode")
     if any(character in variant for character in ("\n", "\r", "\x00", "\x1f")):
         raise FrontierError("frontier variant identity contains a forbidden control character")
-    run_id = str(uuid.uuid4())
+    try:
+        configured_provider = fleet_providers.identity(
+            provider, model, variant or None, hook_source
+        )
+        adapter = fleet_providers.adapter_for(configured_provider)
+    except fleet_providers.ProviderError as exc:
+        raise FrontierError(f"frontier provider adapter rejected identity: {exc}") from exc
+    if run_id:
+        try:
+            canonical_run_id = str(uuid.UUID(run_id))
+        except ValueError as exc:
+            raise FrontierError("frontier run_id must be a canonical UUID") from exc
+        if canonical_run_id != run_id:
+            raise FrontierError("frontier run_id must be a canonical UUID")
+        run_id = canonical_run_id
+    else:
+        run_id = str(uuid.uuid4())
     task_sha256 = hashlib.sha256(task.encode("utf-8")).hexdigest()
     ledger = ledger_path(runs_dir, feature)
+    if events_for_run(ledger, run_id=run_id):
+        raise FrontierError(f"frontier run_id is already durable: {run_id}")
     preparing_at = utc_now()
     preparing = {
         "timestamp": preparing_at,
@@ -750,6 +820,7 @@ def prepare_run(
         "provider": provider,
         "model": model,
         "hook_source": hook_source,
+        "tracking_protocol": "control-v1",
         "preparing_at": preparing_at,
     }
     if variant:
@@ -769,10 +840,11 @@ def prepare_run(
             workspace_uuid=workspace_uuid,
             surface_uuid=surface_uuid,
         )
-        # Persist the exact composed prompt so dispatch can send a tiny
-        # single-line pointer instead of a chunkable multi-KB paste.
-        prompt = prompt_with_contract(task, run_id, hook_source=hook_source)
         prompt_file = runs_dir / "prompts" / feature / f"{run_id}.txt"
+        submission = adapter.prepare_submission(
+            configured_provider, task, run_id, prompt_file
+        )
+        prompt = submission["prompt"]
         prompt_file.parent.mkdir(parents=True, exist_ok=True)
         prompt_file.write_text(prompt, encoding="utf-8")
         ack = event_ack()
@@ -793,6 +865,8 @@ def prepare_run(
             "provider": provider,
             "model": model,
             "hook_source": hook_source,
+            "provider_adapter": adapter.name,
+            "tracking_protocol": "control-v1",
             "event_boot_id": ack["boot_id"],
             "after_seq": resume["latest_seq"],
             "event_oldest_seq": resume.get("oldest_seq"),
@@ -807,6 +881,8 @@ def prepare_run(
             "lease": str(lease),
             "prompt": prompt,
             "prompt_path": str(prompt_file),
+            "submission_payload": submission["payload"],
+            "submission_transport": submission["transport"],
         }
     except Exception:
         append_event(
@@ -839,6 +915,8 @@ def _common_event(state: dict[str, Any]) -> dict[str, Any]:
         "provider",
         "model",
         "hook_source",
+        "provider_adapter",
+        "tracking_protocol",
         "variant",
         "event_boot_id",
         "after_seq",
@@ -881,6 +959,11 @@ def terminalize(
         instance=str(state["instance"]),
     )
     if existing and existing.get("status") in TERMINAL_STATUSES:
+        if existing.get("hook_source") == "opencode" and existing.get("surface_uuid"):
+            try:
+                cleanup_opencode_data_home(str(existing["surface_uuid"]))
+            except FrontierError:
+                pass
         return existing
     if status == "succeeded" and result_file is None:
         raise FrontierError("succeeded frontier terminal requires a durable result file")
@@ -913,11 +996,17 @@ def terminalize(
     appended = append_event(ledger, terminal)
     if appended and release_lease:
         _release_frontier_lease(runs_dir, state)
-    return latest_event(
+    result = latest_event(
         ledger,
         run_id=str(state["run_id"]),
         instance=str(state["instance"]),
     ) or terminal
+    if result.get("hook_source") == "opencode" and result.get("surface_uuid"):
+        try:
+            cleanup_opencode_data_home(str(result["surface_uuid"]))
+        except FrontierError:
+            pass
+    return result
 
 
 def terminalize_response(
@@ -1003,9 +1092,40 @@ def process_event(
     if not session_id:
         return None
 
+    try:
+        expected_identity = fleet_providers.identity(
+            str(state.get("provider") or ""),
+            str(state.get("model") or ""),
+            state.get("variant"),
+            expected_source,
+        )
+        adapter = fleet_providers.adapter_for(expected_identity)
+    except fleet_providers.ProviderError:
+        return terminalize(
+            runs_dir,
+            state,
+            status="indeterminate",
+            reason="frontier_provider_adapter_mismatch",
+            completed_at=str(event.get("occurred_at") or utc_now()),
+            event=event,
+            release_lease=False,
+        )
+    observation = adapter.observe(event, state)
+
     name = event.get("name")
     ledger = ledger_path(runs_dir, str(state["feature"]))
-    if name == "agent.hook.UserPromptSubmit" and payload.get("phase") == "received":
+    if observation == "bind":
+        if state.get("tracking_protocol") == "control-v1":
+            if not state.get("submission_event_id"):
+                return None
+            if any(
+                (
+                    state.get("submission_event_id") != event.get("id"),
+                    state.get("submission_boot_id") != event.get("boot_id"),
+                    state.get("submission_seq") != event.get("seq"),
+                )
+            ):
+                return None
         if not session_matches(
             session_id,
             workspace_uuid=str(state["workspace_uuid"]),
@@ -1039,7 +1159,7 @@ def process_event(
         state.update(binding)
         return None
 
-    if name == "agent.hook.SessionEnd" and payload.get("phase") == "completed":
+    if observation == "session_end":
         if (
             expected_source != "claude"
             or not state.get("session_id")
@@ -1057,7 +1177,7 @@ def process_event(
             release_lease=False,
         )
 
-    if name != "agent.hook.Stop" or payload.get("phase") != "completed":
+    if observation != "stop":
         return None
     if not state.get("session_id"):
         return None
@@ -1070,60 +1190,42 @@ def process_event(
         hook_source=expected_source,
     ):
         return None
-    if expected_source == "opencode":
-        if not _opencode_final_stop(payload):
-            return None
-        response = ""
-        try:
-            response, actual_provider, actual_model, actual_variant = opencode_turn_evidence(
-                session_id,
-                str(state["run_id"]),
-                str(event.get("occurred_at") or ""),
-            )
-            status, reason = structured_sentinel_status(response, str(state["run_id"]))
-            if (
-                actual_provider != str(state.get("provider") or "")
-                or actual_model != str(state.get("model") or "")
-            ):
-                status, reason = "indeterminate", "frontier_opencode_identity_mismatch"
-            elif state.get("variant") and actual_variant != state["variant"]:
-                status, reason = "indeterminate", "frontier_opencode_variant_mismatch"
-        except FrontierError:
-            status, reason = "indeterminate", "frontier_opencode_evidence_unavailable"
-        return terminalize_response(
-            runs_dir,
-            state,
-            response=response,
-            status=status,
-            reason=reason,
-            completed_at=str(event.get("occurred_at") or utc_now()),
-            event=event,
-        )
-    evidence_readers = {
-        "codex": codex_turn_evidence,
-        "claude": claude_turn_evidence,
-    }
-    evidence_reader = evidence_readers.get(expected_source)
-    if evidence_reader is None:
-        return None
     response = ""
     try:
-        response, actual_provider, actual_model = transcript_turn_evidence(
-            evidence_reader,
+        readers = {
+            "codex": lambda current_session, current_run, stopped: transcript_turn_evidence(
+                codex_turn_evidence, current_session, current_run, stopped
+            ),
+            "claude": lambda current_session, current_run, stopped: transcript_turn_evidence(
+                claude_turn_evidence, current_session, current_run, stopped
+            ),
+            "opencode": lambda current_session, current_run, stopped: transcript_turn_evidence(
+                lambda session, run, occurred_at: opencode_turn_evidence(
+                    session,
+                    run,
+                    occurred_at,
+                    str(state["surface_uuid"]),
+                ),
+                current_session,
+                current_run,
+                stopped,
+            ),
+        }
+        evidence = adapter.extract_final_response(
+            expected_identity,
             session_id,
             str(state["run_id"]),
             str(event.get("occurred_at") or ""),
+            readers,
         )
+        response = evidence.response
         status, reason = structured_sentinel_status(response, str(state["run_id"]))
-        if (
-            actual_provider != str(state.get("provider") or "")
-            or actual_model != str(state.get("model") or "")
-        ):
-            status, reason = (
-                "indeterminate",
-                f"frontier_{expected_source}_identity_mismatch",
-            )
-    except FrontierError:
+        try:
+            adapter.verify_identity(expected_identity, evidence)
+        except fleet_providers.ProviderIdentityError as exc:
+            suffix = "variant_mismatch" if exc.field == "variant" else "identity_mismatch"
+            status, reason = "indeterminate", f"frontier_{expected_source}_{suffix}"
+    except (FrontierError, fleet_providers.ProviderError):
         status, reason = (
             "indeterminate",
             f"frontier_{expected_source}_evidence_unavailable",
@@ -1171,6 +1273,74 @@ def confirm_prompt_submission(
             count += 1
         if count >= 1:
             return count
+        if time.monotonic() >= deadline:
+            raise FrontierError(
+                "no UserPromptSubmit observed after dispatch; prompt transfer unconfirmed"
+            )
+        time.sleep(0.25)
+
+
+def authorize_prompt_submission(
+    runs_dir: Path,
+    *,
+    feature: str,
+    instance: str,
+    run_id: str,
+    workspace_uuid: str,
+    hook_source: str,
+    since: str,
+    timeout_seconds: float = 10.0,
+) -> dict[str, Any]:
+    """Bind exactly one physical submit to a CONTROL-prepared tracked run."""
+    ledger = ledger_path(runs_dir, feature)
+    state = frontier_state(ledger, run_id=run_id, instance=instance)
+    if not state or state.get("runner") != "interactive":
+        raise FrontierError(f"unknown frontier run: {instance}={run_id}")
+    if state.get("tracking_protocol") != "control-v1":
+        raise FrontierError("submission authorization requires control-v1 tracking")
+    if state.get("submission_event_id"):
+        return state
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        matches: list[dict[str, Any]] = []
+        for event in audit_events():
+            payload = event.get("payload") or {}
+            session_id = str(payload.get("session_id") or "")
+            if (
+                event.get("name") == "agent.hook.UserPromptSubmit"
+                and payload.get("phase") == "received"
+                and event.get("source") == hook_source
+                and payload.get("_source") == hook_source
+                and str(event.get("workspace_id") or "").upper() == workspace_uuid.upper()
+                and str(event.get("occurred_at") or "") >= since
+                and _event_after_dispatch(state, event, allow_cross_boot=True)
+                and session_id
+                and session_matches(
+                    session_id,
+                    workspace_uuid=str(state["workspace_uuid"]),
+                    surface_uuid=str(state["surface_uuid"]),
+                    hook_source=hook_source,
+                )
+            ):
+                matches.append(event)
+        if len(matches) == 1:
+            event = matches[0]
+            session_id = str((event.get("payload") or {}).get("session_id") or "")
+            authorized = {
+                **_common_event(state),
+                "timestamp": utc_now(),
+                "status": "authorized",
+                "submission_event_id": event["id"],
+                "submission_boot_id": event["boot_id"],
+                "submission_seq": event["seq"],
+                "submission_session_id": session_id,
+                "submission_authorized_at": utc_now(),
+            }
+            if not append_event(ledger, authorized):
+                raise FrontierError("frontier run became terminal before submission authorization")
+            return authorized
+        if len(matches) > 1:
+            raise FrontierError("multiple UserPromptSubmit events make transfer authorization ambiguous")
         if time.monotonic() >= deadline:
             raise FrontierError(
                 "no UserPromptSubmit observed after dispatch; prompt transfer unconfirmed"
@@ -1370,6 +1540,7 @@ def _parser() -> argparse.ArgumentParser:
         prepare.add_argument(f"--{name}", required=True)
     for name in ("provider", "model", "hook-source", "variant"):
         prepare.add_argument(f"--{name}", default="")
+    prepare.add_argument("--run-id", default="")
     abandon = sub.add_parser("abandon")
     abandon.add_argument("runs_dir")
     for name in ("feature", "instance", "run-id", "reason"):
@@ -1383,6 +1554,8 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("workspace-uuid", "hook-source", "since"):
         confirm.add_argument(f"--{name}", required=True)
     confirm.add_argument("--timeout", type=float, default=10.0)
+    for name in ("feature", "instance", "run-id"):
+        confirm.add_argument(f"--{name}")
     return parser
 
 
@@ -1404,6 +1577,7 @@ def main() -> int:
                 model=args.model,
                 hook_source=args.hook_source,
                 variant=args.variant,
+                run_id=args.run_id,
             )
         elif args.command == "abandon":
             result = abandon_run(
@@ -1414,14 +1588,29 @@ def main() -> int:
                 reason=args.reason,
             )
         elif args.command == "confirm-submit":
-            result = {
-                "confirmed_submissions": confirm_prompt_submission(
+            supplied = [args.feature, args.instance, args.run_id]
+            if any(supplied) and not all(supplied):
+                raise FrontierError("--feature, --instance, and --run-id must be supplied together")
+            if all(supplied):
+                result = authorize_prompt_submission(
+                    runs_dir,
+                    feature=args.feature,
+                    instance=args.instance,
+                    run_id=args.run_id,
                     workspace_uuid=args.workspace_uuid,
                     hook_source=args.hook_source,
                     since=args.since,
                     timeout_seconds=args.timeout,
                 )
-            }
+            else:
+                result = {
+                    "confirmed_submissions": confirm_prompt_submission(
+                        workspace_uuid=args.workspace_uuid,
+                        hook_source=args.hook_source,
+                        since=args.since,
+                        timeout_seconds=args.timeout,
+                    )
+                }
         else:
             result = mark_indeterminate(
                 runs_dir,

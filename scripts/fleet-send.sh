@@ -4,16 +4,34 @@ set -euo pipefail
 feature="${1:-}"
 instance_id="${2:-}"
 task="${3:-}"
-output_mode="${4:-}"
+shift 3 || true
+output_mode=""
+run_id_override=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)
+      output_mode="--json"
+      shift
+      ;;
+    --run-id)
+      [[ $# -ge 2 ]] || { echo "--run-id requires a canonical UUID" >&2; exit 2; }
+      run_id_override="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runs_dir="${FLEET_RUNS_DIR:-$repo_root/orchestration/runs}"
 manifest="$runs_dir/fleet-$feature.manifest"
 frontier="$repo_root/scripts/fleet_frontier.py"
 export CMUX_QUIET=1
 
-if [[ -z "$feature" || -z "$instance_id" || -z "$task" || ! -f "$manifest" \
-  || ( -n "$output_mode" && "$output_mode" != "--json" ) ]]; then
-  echo "Usage: $0 <feature> <instance-id> \"<task>\" [--json]" >&2
+if [[ -z "$feature" || -z "$instance_id" || -z "$task" || ! -f "$manifest" ]]; then
+  echo "Usage: $0 <feature> <instance-id> \"<task>\" [--run-id <uuid>] [--json]" >&2
   exit 2
 fi
 
@@ -41,13 +59,16 @@ model="$(manifest_value "$instance_id.model")"
 hook_source="$(manifest_value "$instance_id.hook_source")"
 variant="$(manifest_value "$instance_id.variant")"
 
-prepared="$(python3 "$frontier" prepare "$runs_dir" \
+prepare_args=(prepare "$runs_dir" \
   --feature "$feature" --instance "$instance_id" --role "$role" --phase "$phase" \
   --task "$task" --workspace-uuid "$workspace_uuid" --surface-uuid "$surface_uuid" \
   --provider "$provider" --model "$model" --hook-source "$hook_source" \
-  --variant "$variant")"
-run_id="$(jq -r '.run_id' <<< "$prepared")"
-prompt="$(jq -r '.prompt' <<< "$prepared")"
+  --variant "$variant")
+[[ -z "$run_id_override" ]] || prepare_args+=(--run-id "$run_id_override")
+prepared="$(python3 "$frontier" "${prepare_args[@]}")"
+run_id="$(jq -er '.run_id // empty' <<< "$prepared")" || exit 75
+prompt="$(jq -er '.prompt // empty' <<< "$prepared")" || exit 75
+payload="$(jq -er '.submission_payload // empty' <<< "$prepared")" || exit 75
 send_attempted=0
 entered=0
 cleanup_untransferred() {
@@ -66,25 +87,11 @@ cleanup_untransferred() {
 }
 trap cleanup_untransferred EXIT
 
-# Decision C transport: the composed prompt is durable on disk; dispatch a
-# tiny single-line pointer (no newlines, no backslash sequences) so neither
-# paste chunking nor cmux escape handling can split or truncate it, then
-# require at least one observed UserPromptSubmit before trusting transfer.
-prompt_path="$(jq -r '.prompt_path' <<< "$prepared")"
-# The pointer carries the run's user-binding marker: provider evidence
-# extraction locates the dispatched turn by finding FLEET_RESULT:<run>:<STATUS>
-# in the user message.
-pointer="FLEET_RUN $run_id: open the file $prompt_path and execute its entire content as your exact task for this turn, following its output schema and field names exactly as written. Its completion protocol requires one final line using FLEET_RESULT:$run_id:<STATUS> where STATUS is DONE, BLOCKED, or FAILED."
-# OpenCode prompts are already one single-line FDP_PROMPT-encoded string (no
-# raw newlines, so neither chunk boundaries nor escape handling can submit
-# early), and MiniMax demonstrably loses schema fidelity through file
-# indirection; keep the encoded inline payload there and use the pointer for
-# codex/claude, where it is proven.
-if [[ "$hook_source" == "opencode" ]]; then
-  payload="$prompt"
-else
-  payload="$pointer"
-fi
+# The provider adapter chooses an identity-bound transport while the composed
+# prompt remains durable on disk. CONTROL still performs the existing cmux
+# side effect and requires a UserPromptSubmit before trusting transfer.
+prompt_path="$(jq -er '.prompt_path // empty' <<< "$prepared")" || exit 75
+[[ -n "$prompt_path" && -n "$prompt" && -n "$payload" ]] || exit 75
 send_attempted=1
 since="$(date -u +%Y-%m-%dT%H:%M:%S)"
 cmux send --surface "$surface" --workspace "$workspace" "$payload" >/dev/null
@@ -96,6 +103,7 @@ cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
 confirmed=0
 for _attempt in 1 2 3; do
   if python3 "$frontier" confirm-submit "$runs_dir" \
+    --feature "$feature" --instance "$instance_id" --run-id "$run_id" \
     --workspace-uuid "$workspace_uuid" --hook-source "$hook_source" \
     --since "$since" --timeout "${FLEET_CONFIRM_SUBMIT_TIMEOUT:-6}" >/dev/null 2>&1; then
     confirmed=1
@@ -105,6 +113,7 @@ for _attempt in 1 2 3; do
 done
 if (( confirmed == 0 )); then
   python3 "$frontier" confirm-submit "$runs_dir" \
+    --feature "$feature" --instance "$instance_id" --run-id "$run_id" \
     --workspace-uuid "$workspace_uuid" --hook-source "$hook_source" \
     --since "$since" --timeout 4 >/dev/null
 fi

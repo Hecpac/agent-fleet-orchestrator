@@ -29,6 +29,7 @@ CHECKER_INSTANCE = "checker"
 MAX_REVISION_ROUNDS = 3
 RUN_TIMEOUT_SECONDS = 30 * 60
 DIALOGUE_DEADLINE_SECONDS = 4 * 60 * 60
+MAX_CHECKER_EVIDENCE_BYTES = fleet_dialogue.MAX_PAYLOAD_BYTES
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 TERMINAL_STATES = {
@@ -511,8 +512,24 @@ def _state_phase(runs_dir: Path, feature: str) -> str:
 
 def _git(manifest: dict[str, str], *args: str, worktree: bool = False) -> str:
     root = manifest[f"{MAKER_INSTANCE}.worktree"] if worktree else manifest["target_repo"]
+    environment = {
+        **os.environ,
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+    }
     result = subprocess.run(
-        ["git", "-C", root, *args],
+        [
+            "git",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+            root,
+            *args,
+        ],
+        env=environment,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -570,10 +587,20 @@ def _render_template(name: str, replacements: dict[str, str]) -> str:
         text = _template_path(name).read_text(encoding="utf-8")
     except OSError as exc:
         raise ControllerError(f"missing FDP-2 prompt template: {name}") from exc
-    for key, value in replacements.items():
-        text = text.replace("{{" + key + "}}", value)
-    if re.search(r"\{\{[A-Z0-9_]+\}\}", text):
-        raise ControllerError(f"unresolved placeholder in FDP-2 prompt: {name}")
+    placeholders = set(re.findall(r"\{\{([A-Z0-9_]+)\}\}", text))
+    missing = sorted(placeholders - replacements.keys())
+    if missing:
+        raise ControllerError(
+            f"unresolved placeholder in FDP-2 prompt {name}: {', '.join(missing)}"
+        )
+    # Substitute only tokens that were present in the trusted template. Replacement
+    # values are untrusted evidence and must remain opaque even when a diff contains a
+    # token such as ``{{FEATURE}}`` that is also meaningful to this template.
+    text = re.sub(
+        r"\{\{([A-Z0-9_]+)\}\}",
+        lambda match: replacements[match.group(1)],
+        text,
+    )
     # Shell command substitution preserves this payload byte-for-byte only when
     # it has no trailing newline. The lifecycle ledger hashes the task argument,
     # so prompt files deliberately end on the final visible character.
@@ -747,10 +774,17 @@ def _checker_prompt(
     task_spec_file: str,
     task_spec_sha256: str,
     task_spec: dict[str, Any],
-    message_id: str,
+    message: dict[str, Any],
+    payload: bytes,
     head_sha: str,
     round_number: int,
 ) -> tuple[str, str]:
+    evidence_json, evidence_sha256 = _checker_evidence_pack(
+        manifest=manifest,
+        message=message,
+        payload=payload,
+        head_sha=head_sha,
+    )
     content = _render_template(
         "fdp2_checker.md",
         {
@@ -762,9 +796,11 @@ def _checker_prompt(
             "TASK_SPEC_FILE": task_spec_file,
             "TASK_SPEC_SHA256": task_spec_sha256,
             "TASK_SPEC_JSON": json.dumps(task_spec, indent=2, sort_keys=True),
-            "MESSAGE_ID": message_id,
+            "MESSAGE_ID": message["message_id"],
             "HEAD_SHA": head_sha,
             "ROUND": str(round_number),
+            "EVIDENCE_SHA256": evidence_sha256,
+            "EVIDENCE_JSON": evidence_json,
         },
     )
     return _write_prompt(
@@ -774,6 +810,94 @@ def _checker_prompt(
         f"checker-{round_number}.txt",
         content,
     )
+
+
+def _checker_evidence_pack(
+    *,
+    manifest: dict[str, str],
+    message: dict[str, Any],
+    payload: bytes,
+    head_sha: str,
+) -> tuple[str, str]:
+    source_result = _parse_result(payload, str(message["source_run_id"]))
+    if not isinstance(source_result, dict):
+        raise ContractError("Checker evidence source result must be an object")
+    base_sha = source_result.get("base_sha")
+    source_head = source_result.get("head_sha")
+    if not GIT_SHA.fullmatch(str(base_sha or "")):
+        raise ContractError("Checker evidence base_sha is invalid")
+    if source_head != head_sha or not GIT_SHA.fullmatch(str(source_head or "")):
+        raise ContractError("Checker evidence head_sha does not match the bound conversation head")
+    status = _git(
+        manifest,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+        worktree=True,
+    )
+    if status:
+        raise ContractError("Checker evidence requires a clean Maker worktree")
+    commit_count = _git(manifest, "rev-list", "--count", f"{base_sha}..{head_sha}")
+    if commit_count != "1":
+        raise ContractError("Checker evidence requires exactly one Maker commit")
+    evidence = {
+        "schema_version": 1,
+        "integrity": {
+            "message_id": message["message_id"],
+            "payload_sha256": message["payload_sha256"],
+            "payload_bytes": message["payload_bytes"],
+            "base_sha": base_sha,
+            "head_sha": head_sha,
+            "branch": manifest[f"{MAKER_INSTANCE}.branch"],
+            "worktree_status_porcelain": status,
+            "commit_count": int(commit_count),
+        },
+        "message_envelope": message,
+        "source_result": source_result,
+        "git": {
+            "commit": _git(
+                manifest,
+                "show",
+                "--no-ext-diff",
+                "--no-textconv",
+                "-s",
+                "--format=fuller",
+                head_sha,
+            ),
+            "name_status": _git(
+                manifest,
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--name-status",
+                base_sha,
+                head_sha,
+                "--",
+            ),
+            "diff": _git(
+                manifest,
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--no-renames",
+                "--binary",
+                "--full-index",
+                "--unified=40",
+                base_sha,
+                head_sha,
+                "--",
+            ),
+        },
+    }
+    serialized = json.dumps(evidence, indent=2, sort_keys=True, ensure_ascii=True)
+    payload_bytes = serialized.encode("utf-8")
+    if len(payload_bytes) > MAX_CHECKER_EVIDENCE_BYTES:
+        raise ContractError(
+            f"Checker evidence exceeds {MAX_CHECKER_EVIDENCE_BYTES} bytes"
+        )
+    return serialized, hashlib.sha256(payload_bytes).hexdigest()
 
 
 def _revision_prompt(
@@ -1366,7 +1490,8 @@ def _ingest_message_locked(
             task_spec_file=snapshot["task_spec_file"],
             task_spec_sha256=snapshot["task_spec_sha256"],
             task_spec=task_spec,
-            message_id=message_id,
+            message=message,
+            payload=payload,
             head_sha=snapshot["current_head_sha"],
             round_number=snapshot["revision_round"],
         )
@@ -1397,7 +1522,8 @@ def _ingest_message_locked(
             task_spec_file=snapshot["task_spec_file"],
             task_spec_sha256=snapshot["task_spec_sha256"],
             task_spec=task_spec,
-            message_id=message_id,
+            message=message,
+            payload=payload,
             head_sha=snapshot["current_head_sha"],
             round_number=snapshot["revision_round"],
         )
@@ -1621,7 +1747,13 @@ def _verify_message_bindings(
         for event in events
         if event["snapshot"].get("last_message_id") is not None
     }
-    actual = {message["message_id"] for message in messages}
+    # FDP-1 is shared plumbing. FDP-2 owns only Maker/Checker publications;
+    # later assurance slices bind their own Challenge/Verify messages.
+    actual = {
+        message["message_id"]
+        for message in messages
+        if message.get("source_instance") in {MAKER_INSTANCE, CHECKER_INSTANCE}
+    }
     if bound != actual:
         raise ControllerError("FDP-2 controller/message bindings are incomplete")
 

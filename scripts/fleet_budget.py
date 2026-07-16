@@ -50,7 +50,9 @@ def main() -> int:
         return 2
 
     spent = spent_tokens(Path(sys.argv[2]))
-    print(f"local token spend: {spent}/{budget}")
+    # Diagnostics belong on stderr so callers that promise canonical JSON can
+    # reserve stdout for their machine-readable contract.
+    print(f"local token spend: {spent}/{budget}", file=sys.stderr)
     if spent >= budget:
         print(
             f"local token budget exhausted: {spent}/{budget}; "

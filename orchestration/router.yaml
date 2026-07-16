@@ -119,7 +119,7 @@
       "provider": "anthropic",
       "model": "claude-fable-5",
       "hook_source": "claude",
-      "command": ["claude", "--model", "claude-fable-5"],
+      "command": ["claude", "--model", "claude-fable-5", "--no-chrome"],
       "healthcheck": ["claude", "auth", "status"],
       "ready_pattern": "^[[:space:]]*❯[[:space:]]*$|new task\\?",
       "enabled": true,
@@ -158,7 +158,7 @@
       "enabled": true,
       "requires_env": ["ZHIPU_API_KEY"],
       "capabilities": ["diverse_perspective", "parallel_validation", "architecture_challenge"],
-      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "tool_access": ["filesystem_read"],
       "authority": "advisory",
       "resource_class": "remote",
       "display_rank": 40,
@@ -169,14 +169,15 @@
       "runner": "interactive",
       "provider": "minimax",
       "model": "MiniMax-M3",
+      "variant": "none",
       "hook_source": "opencode",
-      "command": ["opencode", "-m", "minimax/MiniMax-M3", "--agent", "plan"],
+      "command": ["opencode", "--agent", "fleet-reviewer"],
       "healthcheck": ["opencode", "--version"],
       "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
       "enabled": true,
       "requires_env": ["MINIMAX_API_KEY"],
       "capabilities": ["diverse_perspective", "parallel_validation", "architecture_challenge"],
-      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "tool_access": ["filesystem_read"],
       "authority": "advisory",
       "resource_class": "remote",
       "display_rank": 40,
@@ -187,14 +188,15 @@
       "runner": "interactive",
       "provider": "minimax",
       "model": "MiniMax-M3",
+      "variant": "none",
       "hook_source": "opencode",
-      "command": ["opencode", "-m", "minimax/MiniMax-M3", "--agent", "fleet-reviewer"],
+      "command": ["opencode", "--agent", "fleet-reviewer"],
       "healthcheck": ["opencode", "--version"],
       "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
       "enabled": true,
       "requires_env": ["MINIMAX_API_KEY"],
       "capabilities": ["candidate_generation", "parallel_validation", "diverse_perspective"],
-      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "tool_access": ["filesystem_read"],
       "authority": "advisory",
       "resource_class": "remote",
       "display_rank": 31,
@@ -213,7 +215,7 @@
       "enabled": true,
       "requires_env": ["MINIMAX_API_KEY"],
       "capabilities": ["contract_checking", "parallel_validation", "diverse_perspective"],
-      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "tool_access": ["filesystem_read"],
       "authority": "advisory",
       "resource_class": "remote",
       "display_rank": 31,
@@ -254,14 +256,27 @@
     }
   },
   "presets": {
+    "dan": {
+      "description": "Dan+ autonomous visible team: one lead dynamically delegates to heterogeneous specialists and owns synthesis.",
+      "mode": "autonomous",
+      "include_lead": true,
+      "identity_groups": [["builder", "challenger", "verifier"]],
+      "instances": [
+        {"instance_id": "scout", "role_type": "codex_candidate", "display_rank": 20, "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read"]},
+        {"instance_id": "builder", "role_type": "codex"},
+        {"instance_id": "challenger", "role_type": "glm"},
+        {"instance_id": "verifier", "role_type": "claude_reviewer"}
+      ]
+    },
     "small": {
       "description": "One frontier lead for a bounded sequential task.",
       "include_lead": true,
       "instances": []
     },
     "audit": {
-      "description": "Independent frontier perspectives followed by a supplied-diff reviewer.",
+      "description": "Identity-diverse frontier perspectives followed by a supplied-diff reviewer.",
       "include_lead": true,
+      "identity_groups": [["analysis", "challenge", "verify"]],
       "instances": [
         {"instance_id": "analysis", "role_type": "codex", "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read"]},
         {"instance_id": "challenge", "role_type": "minimax"},
@@ -269,16 +284,18 @@
       ]
     },
     "implementation_review": {
-      "description": "One tool-capable writer and one independent supplied-diff reviewer.",
+      "description": "One tool-capable writer and one identity-distinct supplied-diff reviewer.",
       "include_lead": true,
+      "identity_groups": [["build", "verify"]],
       "instances": [
         {"instance_id": "build", "role_type": "codex"},
         {"instance_id": "verify", "role_type": "reviewer"}
       ]
     },
     "frontier_verification": {
-      "description": "One writer, one heterogeneous read-only challenger, and one frontier verifier.",
+      "description": "One writer, one identity-diverse read-only challenger, and one frontier verifier.",
       "include_lead": true,
+      "identity_groups": [["build", "challenge", "verify"]],
       "instances": [
         {"instance_id": "build", "role_type": "codex"},
         {"instance_id": "challenge", "role_type": "glm"},
@@ -286,8 +303,10 @@
       ]
     },
     "fleet_dialogue": {
-      "description": "Bounded CONTROL-stepped Maker/Checker dialogue followed by independent challenge and verification.",
+      "description": "Bounded CONTROL-stepped Maker/Checker dialogue followed by identity-diverse challenge and verification.",
+      "mode": "assured",
       "include_lead": true,
+      "identity_groups": [["maker", "checker", "challenge", "verify"]],
       "instances": [
         {"instance_id": "maker", "role_type": "codex"},
         {"instance_id": "checker", "role_type": "minimax_checker"},
@@ -296,8 +315,9 @@
       ]
     },
     "hotfix_validated": {
-      "description": "Parallel candidates whose first result must still pass deterministic and independent verification gates.",
+      "description": "Identity-diverse candidates whose first result must still pass deterministic verification gates.",
       "include_lead": true,
+      "identity_groups": [["candidate_codex", "candidate_minimax", "verify"]],
       "instances": [
         {"instance_id": "candidate_codex", "role_type": "codex_candidate"},
         {"instance_id": "candidate_minimax", "role_type": "minimax_candidate"},
@@ -307,6 +327,7 @@
     "research": {
       "description": "Two uniquely addressed local triage instances plus heterogeneous frontier synthesis.",
       "include_lead": true,
+      "identity_groups": [["research", "challenge"]],
       "instances": [
         {"instance_id": "triage_scope", "role_type": "triage"},
         {"instance_id": "triage_sources", "role_type": "triage"},

@@ -33,6 +33,7 @@ class RouterConfigTests(unittest.TestCase):
         self.assertEqual(
             set(self.config["presets"]),
             {
+                "dan",
                 "small",
                 "audit",
                 "frontier_verification",
@@ -65,6 +66,7 @@ class RouterConfigTests(unittest.TestCase):
 
     def test_preset_order_is_capability_first(self) -> None:
         expected = {
+            "dan": ["scout", "builder", "challenger", "verifier"],
             "small": [],
             "audit": ["analysis", "challenge", "verify"],
             "frontier_verification": ["build", "challenge", "verify"],
@@ -80,6 +82,29 @@ class RouterConfigTests(unittest.TestCase):
                     run_healthcheck=False,
                 )
                 self.assertEqual([item["instance_id"] for item in plan["instances"]], instance_ids)
+
+    def test_execution_modes_separate_autonomy_from_assurance(self) -> None:
+        dan = router_config.build_plan(
+            self.config, preset_name="dan", run_healthcheck=False
+        )
+        assured = router_config.build_plan(
+            self.config, preset_name="fleet_dialogue", run_healthcheck=False
+        )
+        custom = router_config.build_plan(
+            self.config, instance_specs=["triage"], run_healthcheck=False
+        )
+        self.assertEqual(dan["mode"], "autonomous")
+        self.assertEqual(assured["mode"], "assured")
+        self.assertEqual(custom["mode"], "guided")
+        self.assertEqual(
+            [item["instance_id"] for item in dan["instances"]],
+            ["scout", "builder", "challenger", "verifier"],
+        )
+
+        config = copy.deepcopy(self.config)
+        config["presets"]["dan"]["mode"] = "ceremonial"
+        with self.assertRaisesRegex(router_config.RouterError, "mode must be one of"):
+            router_config.load_router(self.write_config(config))
 
     def test_non_writer_codex_is_read_only(self) -> None:
         plan = router_config.build_plan(self.config, preset_name="audit", run_healthcheck=False)
@@ -161,13 +186,37 @@ class RouterConfigTests(unittest.TestCase):
     def test_opencode_provider_model_must_match_command(self) -> None:
         config = copy.deepcopy(self.config)
         config["roles"]["minimax"]["model"] = "DifferentModel"
-        with self.assertRaisesRegex(router_config.RouterError, "must match command -m"):
+        with self.assertRaisesRegex(router_config.RouterError, "must match agent model"):
             router_config.load_router(self.write_config(config))
 
         config = copy.deepcopy(self.config)
         del config["roles"]["minimax"]["model"]
         with self.assertRaisesRegex(router_config.RouterError, "non-empty string"):
             router_config.load_router(self.write_config(config))
+
+    def test_minimax_opencode_roles_pin_durable_none_variant(self) -> None:
+        for role_name, role in self.config["roles"].items():
+            if role.get("hook_source") != "opencode" or role.get("provider") != "minimax":
+                continue
+            with self.subTest(role=role_name):
+                self.assertEqual(role.get("variant"), "none")
+                self.assertNotIn("-m", role["command"])
+                self.assertNotIn("--variant", role["command"])
+                self.assertIn("--agent", role["command"])
+        glm = self.config["roles"]["glm"]
+        self.assertNotIn("variant", glm)
+        self.assertEqual(
+            glm["command"],
+            ["opencode", "-m", "zai/glm-5.2", "--agent", "glm-challenger"],
+        )
+
+    def test_opencode_roles_declare_only_filesystem_read_access(self) -> None:
+        for role_name in ("glm", "minimax", "minimax_candidate", "minimax_checker"):
+            with self.subTest(role=role_name):
+                self.assertEqual(
+                    self.config["roles"][role_name]["tool_access"],
+                    ["filesystem_read"],
+                )
 
     def test_opencode_variant_must_be_durable_and_agent_pinned(self) -> None:
         config = copy.deepcopy(self.config)
@@ -245,6 +294,73 @@ class RouterConfigTests(unittest.TestCase):
         self.assertEqual({item["authority"] for item in plan["instances"]}, {"advisory"})
         for item in plan["instances"]:
             self.assertNotIn("workspace-write", item["command"])
+
+    def test_default_race_requires_distinct_provider_model_variant_identities(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["defaults"]["race_roles"] = ["codex_candidate", "codex_candidate"]
+        with self.assertRaisesRegex(
+            router_config.RouterError,
+            "repeats provider/model/variant identity",
+        ):
+            router_config.load_router(self.write_config(config))
+
+    def test_preset_identity_groups_fail_closed_on_repeated_identity(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["presets"]["duplicate_identity"] = {
+            "description": "invalid identity-diverse group",
+            "include_lead": False,
+            "identity_groups": [["first", "second"]],
+            "instances": [
+                {"instance_id": "first", "role_type": "codex_candidate"},
+                {"instance_id": "second", "role_type": "codex_candidate"},
+            ],
+        }
+        with self.assertRaisesRegex(
+            router_config.RouterError,
+            "repeats provider/model/variant identity",
+        ):
+            router_config.load_router(self.write_config(config))
+
+    def test_identity_groups_reject_unknown_duplicate_or_single_members(self) -> None:
+        cases = (
+            ([["analysis", "missing"]], "unknown instances"),
+            ([["analysis", "analysis"]], "duplicate instance IDs"),
+            ([["analysis"]], "at least two instances"),
+        )
+        for groups, error in cases:
+            with self.subTest(groups=groups):
+                config = copy.deepcopy(self.config)
+                config["presets"]["audit"]["identity_groups"] = groups
+                with self.assertRaisesRegex(router_config.RouterError, error):
+                    router_config.load_router(self.write_config(config))
+
+    def test_identity_groups_reject_same_members_in_different_order(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["presets"]["audit"]["identity_groups"] = [
+            ["analysis", "challenge"],
+            ["challenge", "analysis"],
+        ]
+        with self.assertRaisesRegex(router_config.RouterError, "duplicate group"):
+            router_config.load_router(self.write_config(config))
+
+    def test_intentional_duplicate_roles_outside_identity_group_remain_valid(self) -> None:
+        plan = router_config.build_plan(
+            self.config,
+            preset_name="research",
+            run_healthcheck=False,
+        )
+        self.assertEqual(plan["identity_groups"], [["research", "challenge"]])
+        instances = {item["instance_id"]: item for item in plan["instances"]}
+        self.assertEqual(
+            (
+                instances["triage_scope"]["provider"],
+                instances["triage_scope"]["model"],
+            ),
+            (
+                instances["triage_sources"]["provider"],
+                instances["triage_sources"]["model"],
+            ),
+        )
 
     def test_duplicate_role_types_with_unique_instance_ids_are_allowed(self) -> None:
         plan = router_config.build_plan(
@@ -348,6 +464,14 @@ class RouterConfigTests(unittest.TestCase):
             ["opencode", "--agent", "minimax-checker"],
         )
         self.assertEqual(instances["checker"]["variant"], "none")
+        self.assertEqual(
+            plan["identity_groups"],
+            [["maker", "checker", "challenge", "verify"]],
+        )
+        self.assertIn(
+            "IDENTITY_GROUP\x1f1\x1fmaker,checker,challenge,verify",
+            router_config._records(plan),
+        )
 
     def test_custom_input_is_sorted_by_rank_then_instance(self) -> None:
         plan = router_config.build_plan(

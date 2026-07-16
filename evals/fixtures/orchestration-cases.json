@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "case_id": "routing-selection",
+      "focus": "routing",
+      "durable_signals": ["lead_dispatched", "delegation_registered"],
+      "metric_path": "agents.selected.instance_id"
+    },
+    {
+      "case_id": "parallel-specialists",
+      "focus": "parallelism",
+      "durable_signals": ["legacy.dispatched_at", "legacy.completed_at"],
+      "metric_path": "delegation.max_parallel_runs"
+    },
+    {
+      "case_id": "relay-adoption",
+      "focus": "relay",
+      "durable_signals": ["result_recorded", "result_relayed"],
+      "metric_path": "adoption.relayed_results"
+    },
+    {
+      "case_id": "risk-escalation-human-wait",
+      "focus": "escalation",
+      "durable_signals": ["risk_escalated", "assurance_requested", "assurance_approved"],
+      "metric_path": "timing.human_wait_seconds"
+    }
+  ]
+}
