@@ -68,6 +68,10 @@ Nota de enforcement: los wrappers validan UUID, identidad, autoridad, sandbox,
 leases y finalización por `run_id`. En `autonomous`, el gate de fase está abierto
 para todo el roster; en `guided`/`assured` conserva las transiciones explícitas.
 En todos los modos hay un solo writer y una race entrega un candidato, no verdad.
+Los revisores OpenCode no reciben Bash ni raíces externas del controlador: el launcher
+valida que la configuración resuelta exponga únicamente `read`, `glob` y `grep`.
+Para FDP-2, CONTROL incorpora Git y el mensaje exacto en un evidence pack
+hash-bound antes de despachar al Checker.
 
 Qué pasa solo: el plan completo se valida antes de tocar cmux, los panes quedan
 ordenados `CONTROL → RECON → BUILD → CHALLENGE → VERIFY`, se verifican contra

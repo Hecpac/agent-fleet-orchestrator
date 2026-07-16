@@ -114,6 +114,31 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
+    def resolved_opencode_policy(self, *, bash_enabled: bool = False) -> dict[str, object]:
+        return {
+            "name": "fleet-reviewer",
+            "permission": [
+                {"permission": "*", "pattern": "*", "action": "deny"},
+                {"permission": "read", "pattern": "*", "action": "allow"},
+                {"permission": "read", "pattern": "*.env", "action": "deny"},
+                {"permission": "read", "pattern": "*.env.*", "action": "deny"},
+                {"permission": "read", "pattern": "*.env.example", "action": "allow"},
+                {"permission": "glob", "pattern": "*", "action": "allow"},
+                {"permission": "grep", "pattern": "*", "action": "allow"},
+                {"permission": "external_directory", "pattern": "*", "action": "deny"},
+            ],
+            "tools": {
+                "invalid": False,
+                "bash": bash_enabled,
+                "read": True,
+                "glob": True,
+                "grep": True,
+                "edit": False,
+                "write": False,
+                "task": False,
+            },
+        }
+
     def test_isolates_home_credentials_and_git_identity(self) -> None:
         result = self.run_role(
             "codex",
@@ -420,6 +445,11 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
                 path = home / relative
                 path.mkdir(parents=True)
                 (path / "provider.json").write_text("{}\n", encoding="utf-8")
+            tool_output = home / ".local" / "share" / "opencode" / "tool-output"
+            tool_output.mkdir()
+            (tool_output / "controller-history").write_text(
+                "must-not-copy\n", encoding="utf-8"
+            )
             unrelated = home / ".config" / "other-app"
             unrelated.mkdir()
             (unrelated / "secret").write_text("must-not-copy", encoding="utf-8")
@@ -428,6 +458,7 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
                 extra_env={"HOME": str(home)},
                 expression="{key: {'root': os.environ.get(key), "
                 "'opencode': os.path.isfile(os.environ[key] + '/opencode/provider.json'), "
+                "'tool_output': os.path.exists(os.environ[key] + '/opencode/tool-output'), "
                 "'other': os.path.exists(os.environ[key] + '/other-app')} "
                 "for key in ('XDG_CONFIG_HOME','XDG_DATA_HOME','XDG_STATE_HOME')}",
             ))
@@ -435,6 +466,7 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             self.assertIn("/tmp/fleet_home.", value["root"])
             self.assertTrue(value["opencode"])
             self.assertFalse(value["other"])
+        self.assertFalse(values["XDG_DATA_HOME"]["tool_output"])
 
     def test_opencode_live_surface_uses_deterministic_ephemeral_data_home(self) -> None:
         surface_uuid = str(uuid.uuid4()).upper()
@@ -492,6 +524,60 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             result = self.run_role("glm", extra_env={"HOME": str(home)})
         self.assertEqual(result.returncode, 2)
         self.assertIn("symlink escapes its isolated root", result.stderr)
+
+    def test_opencode_tui_starts_only_after_resolved_policy_passes(self) -> None:
+        for bash_enabled in (False, True):
+            with self.subTest(bash_enabled=bash_enabled), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                marker = root / "tui-started"
+                fake = root / "opencode"
+                document = self.resolved_opencode_policy(bash_enabled=bash_enabled)
+                fake.write_text(
+                    "#!/usr/bin/env python3\n"
+                    "import json, pathlib, sys\n"
+                    f"document = {document!r}\n"
+                    "if sys.argv[1:3] == ['debug', 'agent']:\n"
+                    "    print(json.dumps(document))\n"
+                    "    raise SystemExit(0)\n"
+                    f"pathlib.Path({str(marker)!r}).write_text('started\\n')\n"
+                    "print('TUI_OK')\n",
+                    encoding="utf-8",
+                )
+                fake.chmod(0o700)
+                home = root / "home"
+                home.mkdir()
+                result = subprocess.run(
+                    [
+                        "bash",
+                        str(RUNNER),
+                        "minimax",
+                        "advisory",
+                        "-",
+                        str(fake),
+                        "--agent",
+                        "fleet-reviewer",
+                        "--version",
+                    ],
+                    cwd=ROOT,
+                    env={
+                        **os.environ,
+                        "HOME": str(home),
+                        # An inherited marker must not bypass a real --agent launch.
+                        "FLEET_HEALTHCHECK": "1",
+                    },
+                    text=True,
+                    capture_output=True,
+                    timeout=10,
+                    check=False,
+                )
+                if bash_enabled:
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("exact read-only set", result.stderr)
+                    self.assertFalse(marker.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(result.stdout.strip(), "TUI_OK")
+                    self.assertTrue(marker.exists())
 
     def test_forbidden_required_credentials_fail_closed(self) -> None:
         for name in (

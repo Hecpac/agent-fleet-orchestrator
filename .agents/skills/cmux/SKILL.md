@@ -123,6 +123,12 @@ visible pane but cannot bind a contract-v2 tracked run; keep one writer and use
 `fleet-send.sh` for every authoritative turn.
 The CONTROL lead alone uses `danger-full-access` so it can reach the cmux Unix
 socket; its environment is still allowlisted.
+OpenCode fleet reviewers default every tool to deny and resolve with only the
+built-in `read`, `glob`, and `grep` tools enabled; Bash, external roots, and
+unlisted/future tools remain denied. The only exception is the instance's fresh
+isolated `tool-output` directory. The launcher validates the merged
+provider policy before TUI boot. FDP-2 supplies Git and dialogue data through a
+CONTROL-generated evidence pack embedded in the hash-bound Checker prompt.
 Every Fleet Codex process uses an ephemeral Codex home with a
 single controller-owned CMUX hook bridge so legacy and current controller hook
 trees cannot emit duplicate physical submissions. The automation-only hook

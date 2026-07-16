@@ -246,6 +246,12 @@ the exact turn through their source-specific hook session and transcript files;
 their terminal chrome is never completion evidence. Every interactive role pins
 a model before dispatch, and the structured result must confirm it. Missing or
 mismatched evidence retains the lease as `indeterminate`.
+OpenCode reviewers are additionally deny-by-default: only the built-in
+`read`, `glob`, and `grep` tools resolve enabled; Bash, external roots, and
+every unlisted/future tool remain denied. The only external exception is
+OpenCode's fresh isolated `tool-output` directory; controller history is not
+copied into it. The launcher validates that exact
+merged provider policy inside the isolated XDG environment before TUI boot.
 Catch-up requires the recorded baseline and continuous boot-scoped audit
 sequence; truncated or corrupt audit evidence is rejected. Event ACKs are
 schema-validated before readiness is published.
@@ -352,6 +358,13 @@ ledger and must match OpenCode's final `message.variant`; absence or drift close
 the run as `indeterminate`. CONTROL is a stepper: it
 returns one `next_action` but never dispatches a model or publishes an FDP-1
 message automatically.
+
+The MiniMax Checker does not execute Bash, Git, or `fleet_dialogue.py` itself.
+Before every Checker turn, CONTROL embeds a bounded evidence pack in the
+already hash-bound durable prompt: exact message envelope and source result,
+base/head/branch identity, clean worktree state, commit metadata, name-status,
+and a patch produced with external diff/text conversion disabled. This keeps
+the dialogue auditable without exposing a process tool to untrusted model input.
 
 OpenCode 1.18.0 records `variant: none` for MiniMax but omits the field for the
 current GLM session. MiniMax fleet roles therefore pin that value in dedicated

@@ -301,6 +301,38 @@ can be verified offline. Without the rule, self-validation, stale results,
 silent prompt drift, unbounded debate, or teardown races could be mistaken for
 accepted work.
 
+## OpenCode reviewers have no model-driven process or external access
+
+`rule: opencode_reviewers_have_no_model_driven_process_or_external_access`
+
+`enforced_by:`
+
+- `tests/test_opencode_policy.py::OpenCodePolicyTests::test_exact_read_only_policy_passes_after_permissive_global_rules`
+- `tests/test_opencode_policy.py::OpenCodePolicyTests::test_any_enabled_process_tool_fails_closed`
+- `tests/test_opencode_policy.py::OpenCodePolicyTests::test_late_external_allow_fails_closed`
+- `tests/test_opencode_policy.py::OpenCodePolicyTests::test_only_exact_isolated_tool_output_exception_is_allowed`
+- `tests/test_opencode_policy.py::OpenCodePolicyTests::test_missing_global_catch_all_deny_fails_closed`
+- `tests/test_opencode_policy.py::OpenCodePolicyTests::test_agent_resolution_timeout_fails_closed`
+- `tests/test_run_interactive_agent.py::InteractiveAgentEnvironmentTests::test_opencode_tui_starts_only_after_resolved_policy_passes`
+- `tests/test_fleet_dialogue_controller.py::FleetDialogueControllerTests::test_happy_path_accepts_and_build_gate_revalidates_exact_head`
+- `tests/test_fleet_dialogue_controller.py::FleetDialogueControllerTests::test_template_does_not_reinterpret_known_tokens_inside_evidence`
+- `tests/test_router_config.py::RouterConfigTests::test_opencode_roles_declare_only_filesystem_read_access`
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_opencode_reviewers_default_deny_process_and_external_access`
+
+`why:` Every OpenCode fleet reviewer defaults every current and future tool to
+deny, enables only the provider's built-in `read`, `glob`, and `grep`, denies
+external roots except its fresh isolated `tool-output` directory, and keeps
+`.env` reads denied. Controller tool-output history is excluded from the copied
+provider state. The launcher resolves the
+merged provider configuration inside the same isolated XDG environment and
+aborts before TUI boot unless its exact effective tool set and adversarial
+permission probes match this contract. FDP-2 therefore reuses CONTROL's
+existing read-only Git validation and durable prompt writer to embed a bounded,
+hash-bound evidence pack; the Checker never receives Bash or direct Git access.
+This prevents broad shell globs, redirection, `find -exec`, inherited global
+permissions, or a future provider tool from turning a prose “read-only” role
+into a filesystem, credential, or CMUX effect path.
+
 ## Durable MiniMax OpenCode variant identity
 
 `rule: minimax_opencode_roles_require_durable_none_variant`
@@ -788,7 +820,7 @@ terminal.
 
 - `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_prompt_injection_is_bounded_by_role_controls`
 - `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_claude_policy_does_not_auto_allow_cmux_or_mutation`
-- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_opencode_broad_allowlist_is_detected_as_an_in_scope_gap`
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_opencode_reviewers_default_deny_process_and_external_access`
 - `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_same_uid_process_can_rewrite_private_file_and_is_out_of_scope`
 - `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_control_is_trusted_and_can_reach_direct_entrypoints`
 - `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_same_model_custom_race_is_permitted_but_not_assurance`
@@ -799,8 +831,9 @@ itself are untrusted. Provider sandboxes, tool permissions, authority, phase
 gates, leases, and exact completion provenance are the intended deterministic
 boundary, while a matching sentinel never proves that a conclusion is true.
 Conformance is explicit rather than assumed: Claude and Codex controls are
-locked structurally, and the test records that current OpenCode `find *` and
-`sed *` allowances admit mutating forms and remain an open in-scope gap. The
+locked structurally, while OpenCode removes process execution and external
+paths from the model tool surface and validates the resolved provider policy
+before boot. The
 trusted computing base deliberately includes the provider CLIs, CMUX, the
 local Unix account, and CONTROL. A mode-0600 file does not isolate another
 process under that account, CONTROL retains direct convenience entrypoints,

@@ -210,6 +210,14 @@ class RouterConfigTests(unittest.TestCase):
             ["opencode", "-m", "zai/glm-5.2", "--agent", "glm-challenger"],
         )
 
+    def test_opencode_roles_declare_only_filesystem_read_access(self) -> None:
+        for role_name in ("glm", "minimax", "minimax_candidate", "minimax_checker"):
+            with self.subTest(role=role_name):
+                self.assertEqual(
+                    self.config["roles"][role_name]["tool_access"],
+                    ["filesystem_read"],
+                )
+
     def test_opencode_variant_must_be_durable_and_agent_pinned(self) -> None:
         config = copy.deepcopy(self.config)
         config["roles"]["minimax_checker"]["variant"] = "thinking"

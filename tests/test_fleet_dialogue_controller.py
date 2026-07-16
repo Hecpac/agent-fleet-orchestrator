@@ -239,6 +239,24 @@ class FleetDialogueControllerTests(unittest.TestCase):
         self.assertIn(started["snapshot"]["task_spec_sha256"], checker_prompt)
         self.assertIn('"objective": "implement the bounded FDP-2 test change"', checker_prompt)
         self.assertIn(str(self.target), checker_prompt)
+        self.assertNotIn("fleet_dialogue.py read", checker_prompt)
+        self.assertNotIn("git -C", checker_prompt)
+        packed = checker_prompt.split("EVIDENCE_PACK_JSON_BEGIN\n", 1)[1].split(
+            "\nEVIDENCE_PACK_JSON_END", 1
+        )[0]
+        evidence = json.loads(packed)
+        declared_sha = checker_prompt.split("SHA-256 canónico es `", 1)[1].split("`", 1)[0]
+        self.assertEqual(
+            hashlib.sha256(packed.encode("utf-8")).hexdigest(), declared_sha
+        )
+        self.assertEqual(evidence["integrity"]["message_id"], message["message_id"])
+        self.assertEqual(evidence["integrity"]["base_sha"], self.base_sha)
+        self.assertEqual(evidence["integrity"]["head_sha"], head)
+        self.assertEqual(evidence["integrity"]["commit_count"], 1)
+        self.assertEqual(evidence["integrity"]["worktree_status_porcelain"], "")
+        self.assertEqual(evidence["source_result"], proposal)
+        self.assertIn("proposal.txt", evidence["git"]["name_status"])
+        self.assertIn("+proposal", evidence["git"]["diff"])
         return checker_event, head
 
     def accept_conversation(self) -> tuple[dict, str]:
@@ -577,6 +595,41 @@ class FleetDialogueControllerTests(unittest.TestCase):
         )
         with self.assertRaises(controller.ControllerError):
             self.start("bad-spec")
+
+    def test_template_replacements_are_opaque_to_placeholder_detection(self) -> None:
+        rendered = controller._render_template(
+            "fdp2_maker_proposal.md",
+            {
+                "FEATURE": "opaque",
+                "CONVERSATION_ID": "conversation",
+                "TARGET_REPO": str(self.target),
+                "WORKTREE": str(self.target),
+                "BRANCH": "fleet/opaque/maker",
+                "BASE_SHA": self.base_sha,
+                "TASK_SPEC_FILE": str(self.spec_file),
+                "TASK_SPEC_SHA256": "0" * 64,
+                "TASK_SPEC_JSON": '{"objective":"{{UNTRUSTED_TOKEN}}"}',
+            },
+        )
+        self.assertIn("{{UNTRUSTED_TOKEN}}", rendered)
+
+    def test_template_does_not_reinterpret_known_tokens_inside_evidence(self) -> None:
+        hostile = '{"diff":"+literal {{FEATURE}} and {{BASE_SHA}}"}'
+        rendered = controller._render_template(
+            "fdp2_maker_proposal.md",
+            {
+                "FEATURE": "opaque",
+                "CONVERSATION_ID": "conversation",
+                "TARGET_REPO": str(self.target),
+                "WORKTREE": str(self.target),
+                "BRANCH": "fleet/opaque/maker",
+                "BASE_SHA": self.base_sha,
+                "TASK_SPEC_FILE": str(self.spec_file),
+                "TASK_SPEC_SHA256": "0" * 64,
+                "TASK_SPEC_JSON": hostile,
+            },
+        )
+        self.assertIn(hostile, rendered)
 
     def test_revision_requires_every_finding_and_opens_round_before_run(self) -> None:
         checker_event, head = self.proposal_to_checker()

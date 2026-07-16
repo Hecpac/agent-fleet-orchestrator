@@ -34,7 +34,7 @@ Current conformance is **partial**, not complete:
 |---|---|---|
 | Codex advisory | Router pins `read-only` plus `--ask-for-approval never`; live canaries remained absent, but Codex narrated `BLOCKED` without a visible tool event. | Declared and statically locked; direct denial unverified. |
 | Claude reviewer | Plan mode, minimal allowlist, and fail-closed sandbox are locked; the live probe made no tool call and provider drift terminalized `indeterminate`. | Safe no-effect and identity fail-closed; direct denial unverified. |
-| OpenCode reviewers | `edit: deny` and default Bash deny exist, but broad allowed command globs admit mutating command forms. | **P1 OPEN — does not yet satisfy boundary A.** |
+| OpenCode reviewers | P1-OC1 defaults every tool to deny, enables only built-in `read`/`glob`/`grep`, denies external roots except a fresh isolated tool-output directory, and validates the resolved provider policy before TUI boot. FDP-2 receives CONTROL-generated Git evidence instead of shell access. | Implemented, test-locked, and live-verified in `orchestration/smoke-evidence/p1-oc1-opencode-boundary-20260716.md`. |
 
 ## Trusted computing base
 
@@ -60,18 +60,35 @@ be described as covered by this boundary.
 | Credentials and controller dotfiles | Agent tool environments do not inherit broad credentials and provider sandboxes deny controller-private roots. |
 | Final decision | A model result remains advisory until deterministic evidence or the applicable verification gate accepts it. |
 
-## Known in-scope control gaps
+## P1-OC1 OpenCode containment
 
-The OpenCode agent policies currently allow broad Bash patterns including
-`find *` and `sed *`. A deny-by-default rule does not make these patterns
-read-only: `find -delete`, `find -exec ...`, `find -fprint ...`, and `sed -i`
-can mutate files, while `find -exec` can launch another executable such as
-CMUX. The threat-model test detects and documents these patterns; it does not
-claim they are safe.
+The previous policy tried to approximate read-only Bash with broad patterns.
+That was not enforceable: `find -exec`, `sed -i`, shell redirection, and future
+commands could turn an allowed prefix into a mutation or CMUX invocation.
 
-This is a **P1 OPEN** remediation lane. Until those commands are replaced with
-an argument-aware policy or removed, OpenCode's prose label “read-only” is an
-intent, not an enforced model-injection boundary.
+P1-OC1 removes model-driven process execution instead of extending that
+allowlist. Every OpenCode reviewer now starts from `"*": deny`, enables only
+the provider's built-in `read`, `glob`, and `grep` tools, denies external roots
+except OpenCode's exact isolated `tool-output` directory, and keeps `.env` reads
+denied. Controller tool-output history is removed from the copied provider
+state. `run-interactive-agent.sh` resolves
+the merged OpenCode configuration with `opencode debug agent --pure` and aborts
+before TUI boot unless the effective tool set and permission probes match the
+repo contract exactly.
+
+FDP-2 no longer asks its Checker to execute `fleet_dialogue.py` or Git. CONTROL
+reuses its existing Git validation and durable prompt writer to embed a bounded
+evidence pack containing the exact dialogue envelope, parsed source result,
+base/head/branch identity, clean worktree state, commit metadata, name-status,
+and a no-ext-diff/no-textconv patch. The prompt hash binds that pack into the
+existing control ledger and offline archive.
+
+This closes the static/runtime configuration gap. The acceptance smoke is
+recorded in
+`orchestration/smoke-evidence/p1-oc1-opencode-boundary-20260716.md`: the
+installed provider deterministically denied Bash and an external read, while a
+tracked GLM pane completed a built-in Read/Grep review and accepted the fixes
+after finding one real template-integrity defect.
 
 ## Explicit non-goals
 
@@ -103,8 +120,8 @@ not establish that boundary.
 
 | # | Scenario | Expected result under boundary A | Automated evidence |
 |---|---|---|---|
-| 1 | Repository content asks a model to ignore policy and perform an unauthorized effect. | Required: deterministic role controls bound effects. Current: Codex/Claude are declared narrowly; OpenCode remains non-conformant because of broad Bash globs. | `test_prompt_injection_is_bounded_by_role_controls` and the provider-policy tests |
-| 2 | Claude or OpenCode tries to write controller evidence or invoke `cmux`. | Claude has no automatic permission; OpenCode has no explicit CMUX rule but `find -exec` is a known bypass candidate. Live canaries remained unchanged without direct tool events. | `test_claude_policy_does_not_auto_allow_cmux_or_mutation`, `test_opencode_broad_allowlist_is_detected_as_an_in_scope_gap`, and live smoke |
+| 1 | Repository content asks a model to ignore policy and perform an unauthorized effect. | Required: deterministic role controls bound effects. Current: OpenCode has no process tool or external path tool surface; Codex/Claude retain their separately documented controls. | `test_prompt_injection_is_bounded_by_role_controls`, `test_opencode_reviewers_default_deny_process_and_external_access`, and the resolved-policy tests |
+| 2 | Claude or OpenCode tries to write controller evidence or invoke `cmux`. | Claude has no automatic permission. OpenCode cannot call Bash or external paths; its launcher rejects a resolved policy that re-enables either. The P1-OC1 provider smoke directly denied Bash and an external read. | `test_claude_policy_does_not_auto_allow_cmux_or_mutation`, `test_opencode_reviewers_default_deny_process_and_external_access`, and `p1-oc1-opencode-boundary-20260716.md` |
 | 3 | An arbitrary process under the same UID rewrites a mode-0600 evidence file. | The write succeeds; this is an explicit boundary demonstration, not a protected case. | `test_same_uid_process_can_rewrite_private_file_and_is_out_of_scope` |
 | 4 | CONTROL calls a direct worker entrypoint and bypasses tracked dispatch. | The path exists and is trusted/operator-only; it must never be described as enforced against CONTROL. | `test_control_is_trusted_and_can_reach_direct_entrypoints` |
 | 5 | A custom race uses the same role/model twice. | It is permitted but cannot be reported as independent confirmation; the default race remains heterogeneous. | `test_same_model_custom_race_is_permitted_but_not_assurance` |
@@ -117,6 +134,8 @@ not establish that boundary.
   necessary; compare it with the declared role first.
 - Use tracked wrappers for authoritative work. Direct `cmux send` and
   `run-local-worker.sh` are observational/convenience paths, not provenance.
+- Supply OpenCode reviewers with CONTROL-generated evidence; do not restore a
+  Bash allowlist to make an ad-hoc review more convenient.
 - Never promote a race winner or cross-model agreement without deterministic
   verification appropriate to the task.
 - Report a same-UID, provider-CLI, or CONTROL compromise as a boundary change,

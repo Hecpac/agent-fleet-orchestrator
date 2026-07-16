@@ -53,8 +53,11 @@ the phase gate before acting. Except for CONTROL, only the currently active
 phase may receive work; advancing to CHALLENGE or VERIFY freezes BUILD.
 
 Interactive agents run through an environment allowlist. Codex non-writers use
-the read-only sandbox, OpenCode challengers use the `plan` agent, and the
-frontier Claude reviewer uses `permission-mode plan`. A mission-bound Codex
+the read-only sandbox; OpenCode reviewers default every tool to deny, enable
+only built-in `read`/`glob`/`grep`, and deny external roots except their fresh
+isolated tool-output directory; the frontier Claude reviewer uses
+`permission-mode plan`. OpenCode's resolved policy is
+validated before its TUI boots. A mission-bound Codex
 specialist gets an ephemeral Codex home with existing authentication and only
 the fixed controller-owned CMUX hook bridge. Its named permission profile extends
 `:read-only` and permits only the canonical Fleet Control Unix socket path.

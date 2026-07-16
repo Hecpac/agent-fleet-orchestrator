@@ -144,11 +144,10 @@ class SpecCoherenceTests(unittest.TestCase):
         challenger_agent = GLM_CHALLENGER.read_text(encoding="utf-8")
         for restriction in (
             'mode: primary',
-            'edit: deny',
-            '"*": deny',
-            'task: deny',
-            'skill: deny',
-            'question: deny',
+            '  "*": deny',
+            '"*.env": deny',
+            'external_directory: deny',
+            'Bash, Git commands, external directories, and every unlisted tool are denied.',
             'do not ask the user to approve a plan',
             'the first visible character',
         ):
@@ -156,6 +155,8 @@ class SpecCoherenceTests(unittest.TestCase):
                 self.assertIn(restriction, reviewer)
                 self.assertIn(restriction, checker_agent)
                 self.assertIn(restriction, challenger_agent)
+        for agent in (reviewer, checker_agent, challenger_agent):
+            self.assertNotIn("\n  bash:", agent)
         self.assertIn("model: minimax/MiniMax-M3", checker_agent)
         self.assertIn("variant: none", checker_agent)
         self.assertIn("model: minimax/MiniMax-M3", reviewer)
@@ -198,10 +199,11 @@ class SpecCoherenceTests(unittest.TestCase):
         self.assertIn('"verdict": "ACCEPT"', checker)
         self.assertIn('Una ruta nunca es evidencia', checker)
         self.assertIn('el primer carácter visible debe ser `{`', checker)
-        self.assertIn('Toda inspección de archivos, tests y Git', checker)
+        self.assertIn('EVIDENCE_PACK_JSON_BEGIN', checker)
+        self.assertIn('No ejecutes Bash ni Git', checker)
         self.assertIn('Cada finding debe aparecer exactamente una vez', revision)
         self.assertIn('already authorized BUILD', revision)
-        self.assertIn('fleet_dialogue.py read', checker)
+        self.assertNotIn('fleet_dialogue.py read', checker)
         self.assertIn('fleet_dialogue.py read', revision)
 
         wiring = INTERNAL_WIRING.read_text(encoding="utf-8")

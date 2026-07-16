@@ -86,6 +86,11 @@ herramientas.
   autoridad.
 - Los paneles sirven para observar. Los archivos, ledgers, receipts y eventos
   autorizados aportan evidencia.
+- Los roles OpenCode son filesystem-read sin shell: solo `read`, `glob` y `grep`
+  quedan habilitados, `external_directory` se deniega y el launcher valida la
+  política resuelta antes de boot; solo se exceptúa el `tool-output` efímero y
+  vacío de esa instancia. FDP-2 entrega Git mediante un evidence pack
+  durable generado por CONTROL.
 - `run_id`, UUID de workspace/surface, proveedor, modelo y, cuando aplica,
   variante deben coincidir. La ambigüedad falla cerrada.
 

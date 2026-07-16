@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import re
 import signal
 import stat
 import subprocess
@@ -68,21 +67,20 @@ class FleetThreatModelTests(unittest.TestCase):
             any("cmux" in permission.lower() for permission in settings["permissions"]["allow"])
         )
 
-    def test_opencode_broad_allowlist_is_detected_as_an_in_scope_gap(self) -> None:
-        risky_rules = {"find *", "sed *"}
+    def test_opencode_reviewers_default_deny_process_and_external_access(self) -> None:
         for path in OPENCODE_AGENTS:
             policy = path.read_text(encoding="utf-8")
-            self.assertIn("  edit: deny", policy)
-            self.assertIn('    "*": deny', policy)
-            self.assertIn("  task: deny", policy)
+            self.assertIn('  "*": deny', policy)
+            self.assertIn('    "*": allow', policy)
+            self.assertIn('    "*.env": deny', policy)
+            self.assertIn('    "*.env.*": deny', policy)
+            self.assertIn("  external_directory: deny", policy)
+            self.assertNotIn("\n  bash:", policy)
             self.assertNotRegex(policy, r'(?m)^\s+"cmux(?:\s|\*)')
-            allowed = set(
-                re.findall(r'(?m)^\s{4}"([^"]+)": allow\s*$', policy)
-            )
-            self.assertEqual(risky_rules & allowed, risky_rules)
-        for rule in sorted(risky_rules):
-            self.assertIn(f"`{rule}`", self.doc)
-        self.assertIn("P1 OPEN", self.doc)
+        for role_name in ("glm", "minimax", "minimax_candidate", "minimax_checker"):
+            self.assertEqual(self.router["roles"][role_name]["tool_access"], ["filesystem_read"])
+        self.assertIn("P1-OC1", self.doc)
+        self.assertNotIn("P1 OPEN — does not yet satisfy boundary A", self.doc)
 
     def test_same_uid_process_can_rewrite_private_file_and_is_out_of_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

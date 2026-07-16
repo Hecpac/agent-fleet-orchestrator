@@ -326,6 +326,10 @@ case "$role_type" in
         validate_isolated_provider_tree "$destination_root/$(basename "$source_dir")"
       fi
     done
+    # OpenCode may allow its own truncated-output directory after the agent's
+    # catch-all external deny. Never seed that exception with controller
+    # history; the isolated process may populate only its fresh copy.
+    rm -rf -- "$xdg_data/opencode/tool-output"
     keep+=(
       "XDG_CONFIG_HOME=$xdg_config"
       "XDG_DATA_HOME=$xdg_data"
@@ -373,6 +377,33 @@ if [[ -n "$required_csv" && "$required_csv" != "-" ]]; then
     keep+=("$name=${!name}")
   done
   IFS="$old_ifs"
+fi
+
+# OpenCode permissions are resolved after global and project configuration are
+# merged. Validate the exact effective tool map inside the same isolated XDG
+# environment before the TUI starts; a prose role label or router declaration
+# is never accepted as enforcement evidence.
+if [[ "$role_type" =~ ^(glm|minimax|minimax_checker)$ ]] && \
+   [[ "$(basename "$1")" == "opencode" ]]; then
+  # Fleet-up's preflight is the exact two-argument `opencode --version`
+  # command. Do not let an inherited FLEET_HEALTHCHECK value bypass policy
+  # validation for a real agent launch.
+  if [[ ! ( "${FLEET_HEALTHCHECK:-0}" == "1" && $# -eq 2 && "$2" == "--version" ) ]]; then
+    opencode_agent=""
+    for ((index=1; index<=$#; index++)); do
+      if [[ "${!index}" == "--agent" && $((index + 1)) -le $# ]]; then
+        next_index=$((index + 1))
+        opencode_agent="${!next_index}"
+        break
+      fi
+    done
+    if [[ -z "$opencode_agent" ]]; then
+      echo "OpenCode fleet command lacks a dedicated --agent identity" >&2
+      exit 2
+    fi
+    /usr/bin/env -i "${keep[@]}" python3 "$repo_root/scripts/opencode_policy.py" \
+      "$opencode_agent" --executable "$1" --quiet || exit 2
+  fi
 fi
 
 set +e
