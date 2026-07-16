@@ -1,0 +1,817 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cmux · guía visual de orquestación multi-agente</title>
+<style>
+:root {
+  --bg: #F5F7FB;
+  --bg-raised: #FFFFFF;
+  --ink: #1A2233;
+  --ink-soft: #4B586E;
+  --line: #D9DFEA;
+  --accent: #6D28D9;
+  --accent-ink: #FFFFFF;
+  --accent-soft: #EFE9FB;
+  --ok: #1A7F37;
+  --warn: #9A6700;
+  --bad: #C0362F;
+  --code-bg: #0E1420;
+  --code-ink: #D7E0EF;
+  --code-dim: #7C8AA5;
+  --code-accent: #B9A5F5;
+  --code-ok: #56D364;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0B0F17;
+    --bg-raised: #131A28;
+    --ink: #E6ECF7;
+    --ink-soft: #9AA6BC;
+    --line: #232D42;
+    --accent: #A78BFA;
+    --accent-ink: #14091F;
+    --accent-soft: #251C3E;
+    --ok: #3FB950;
+    --warn: #D29922;
+    --bad: #F47067;
+    --code-bg: #101725;
+  }
+}
+:root[data-theme="light"] {
+  --bg: #F5F7FB; --bg-raised: #FFFFFF; --ink: #1A2233; --ink-soft: #4B586E;
+  --line: #D9DFEA; --accent: #6D28D9; --accent-ink: #FFFFFF; --accent-soft: #EFE9FB;
+  --ok: #1A7F37; --warn: #9A6700; --bad: #C0362F; --code-bg: #0E1420;
+}
+:root[data-theme="dark"] {
+  --bg: #0B0F17; --bg-raised: #131A28; --ink: #E6ECF7; --ink-soft: #9AA6BC;
+  --line: #232D42; --accent: #A78BFA; --accent-ink: #14091F; --accent-soft: #251C3E;
+  --ok: #3FB950; --warn: #D29922; --bad: #F47067; --code-bg: #101725;
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  * { animation: none !important; transition: none !important; }
+}
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font-family: var(--sans); font-size: 16.5px; line-height: 1.65;
+}
+a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+.wrap { max-width: 920px; margin: 0 auto; padding: 0 24px; }
+.prose { max-width: 68ch; }
+.prose p { margin: 0.9em 0; color: var(--ink); }
+.prose p.lead { font-size: 1.12em; color: var(--ink-soft); }
+
+/* ── barra superior ─────────────────────────────── */
+.topbar {
+  position: sticky; top: 0; z-index: 40;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--line);
+}
+.topbar-inner {
+  max-width: 920px; margin: 0 auto; padding: 10px 24px;
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+}
+.brand { font-family: var(--mono); font-weight: 700; font-size: 14px; letter-spacing: .02em; white-space: nowrap; }
+.brand .dollar { color: var(--accent); }
+.toc { display: flex; gap: 4px 14px; flex-wrap: wrap; font-family: var(--mono); font-size: 12px; }
+.toc a { color: var(--ink-soft); text-decoration: none; }
+.toc a:hover { color: var(--accent); }
+.theme-btn {
+  margin-left: auto; font-family: var(--mono); font-size: 12px;
+  background: none; border: 1px solid var(--line); color: var(--ink-soft);
+  border-radius: 6px; padding: 4px 10px; cursor: pointer;
+}
+.theme-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+/* ── hero ───────────────────────────────────────── */
+header.hero { padding: 72px 0 48px; }
+.hero-kicker { font-family: var(--mono); font-size: 13px; color: var(--accent); letter-spacing: .08em; text-transform: uppercase; margin-bottom: 18px; }
+h1 {
+  font-family: var(--mono); font-size: clamp(30px, 5.2vw, 52px);
+  line-height: 1.08; margin: 0 0 20px; letter-spacing: -0.02em; text-wrap: balance;
+}
+h1 .accent { color: var(--accent); }
+.hero-sub { font-size: 1.15em; color: var(--ink-soft); max-width: 62ch; margin: 0 0 28px; }
+.hero-meta { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip {
+  font-family: var(--mono); font-size: 11.5px; color: var(--ink-soft);
+  border: 1px solid var(--line); background: var(--bg-raised);
+  border-radius: 999px; padding: 4px 12px;
+}
+.chip b { color: var(--ink); font-weight: 600; }
+
+/* ── secciones ──────────────────────────────────── */
+section { padding: 44px 0 12px; }
+.sec-head { margin-bottom: 26px; }
+.sec-eyebrow { font-family: var(--mono); font-size: 13px; color: var(--accent); margin-bottom: 6px; }
+.sec-eyebrow::before { content: "❯ "; color: var(--ink-soft); }
+h2 { font-family: var(--mono); font-size: clamp(22px, 3vw, 30px); margin: 0; letter-spacing: -0.01em; text-wrap: balance; }
+h3 { font-size: 17px; margin: 30px 0 10px; }
+h3 .mono, .mono { font-family: var(--mono); }
+
+/* ── tarjetas ───────────────────────────────────── */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 22px 0; }
+.card {
+  background: var(--bg-raised); border: 1px solid var(--line);
+  border-radius: 10px; padding: 18px 18px 16px;
+}
+.card .tag { font-family: var(--mono); font-size: 11px; letter-spacing: .09em; text-transform: uppercase; color: var(--accent); margin-bottom: 8px; }
+.card h4 { margin: 0 0 8px; font-size: 15.5px; }
+.card p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+.card .fix { margin-top: 12px; padding-top: 10px; border-top: 1px dashed var(--line); font-size: 13.5px; }
+.card .fix b { color: var(--ok); font-family: var(--mono); font-size: 12px; }
+
+/* ── bloques de terminal ────────────────────────── */
+.term {
+  background: var(--code-bg); color: var(--code-ink);
+  border-radius: 10px; border: 1px solid color-mix(in srgb, var(--code-bg) 60%, var(--line));
+  margin: 18px 0; overflow: hidden;
+}
+.term-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 14px; border-bottom: 1px solid rgba(255,255,255,.07);
+  font-family: var(--mono); font-size: 11.5px; color: var(--code-dim);
+}
+.term-bar .dots { display: flex; gap: 5px; }
+.term-bar .dots i { width: 9px; height: 9px; border-radius: 50%; background: rgba(255,255,255,.16); }
+.term-bar .copy {
+  margin-left: auto; font-family: var(--mono); font-size: 11px;
+  background: none; border: 1px solid rgba(255,255,255,.18); color: var(--code-dim);
+  border-radius: 5px; padding: 2px 9px; cursor: pointer;
+}
+.term-bar .copy:hover { color: var(--code-ink); border-color: var(--code-accent); }
+.term pre {
+  margin: 0; padding: 14px 16px; overflow-x: auto;
+  font-family: var(--mono); font-size: 13px; line-height: 1.6;
+}
+.term .c { color: var(--code-dim); }        /* comentario */
+.term .k { color: var(--code-accent); }     /* comando/verbo */
+.term .g { color: var(--code-ok); }         /* salida OK */
+
+/* ── jerarquía anidada ──────────────────────────── */
+.nest { font-family: var(--mono); font-size: 13px; margin: 22px 0; }
+.nest .lvl {
+  border: 1px solid var(--line); border-radius: 10px;
+  background: var(--bg-raised); padding: 12px 14px;
+}
+.nest .lvl + .lvl-note { margin-top: 4px; }
+.nest .lvl .lvl { margin-top: 10px; }
+.nest .name { color: var(--accent); font-weight: 700; }
+.nest .note { color: var(--ink-soft); font-family: var(--sans); font-size: 13px; margin-left: 8px; }
+
+/* ── loop de 4 verbos ───────────────────────────── */
+.loop { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin: 22px 0; }
+.verb {
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 10px;
+  padding: 16px; position: relative;
+}
+.verb .n { font-family: var(--mono); font-size: 11px; color: var(--ink-soft); }
+.verb code { font-family: var(--mono); font-size: 14px; color: var(--accent); font-weight: 700; display: block; margin: 4px 0 8px; }
+.verb p { margin: 0; font-size: 13.5px; color: var(--ink-soft); }
+
+/* ── fases / pipeline ───────────────────────────── */
+.phases { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; font-family: var(--mono); font-size: 12.5px; margin: 20px 0; }
+.phase {
+  border: 1px solid var(--line); background: var(--bg-raised);
+  border-radius: 7px; padding: 7px 13px; font-weight: 600;
+}
+.phase.active { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.phases .arr { color: var(--ink-soft); }
+
+/* ── tablas ─────────────────────────────────────── */
+.tbl-wrap { overflow-x: auto; margin: 20px 0; border: 1px solid var(--line); border-radius: 10px; background: var(--bg-raised); }
+table { border-collapse: collapse; width: 100%; font-size: 13.5px; }
+th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: none; }
+th { font-family: var(--mono); font-size: 11.5px; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-soft); background: color-mix(in srgb, var(--bg-raised) 60%, var(--bg)); }
+td code, li code, p code { font-family: var(--mono); font-size: 0.88em; background: var(--accent-soft); color: var(--accent); border-radius: 4px; padding: 1px 5px; }
+td .dim { color: var(--ink-soft); }
+tbody tr th[scope="row"] { background: none; text-transform: none; letter-spacing: 0; font-size: 13px; color: var(--ink); }
+
+/* ── reglas / listas con cicatriz ───────────────── */
+.rules { list-style: none; margin: 18px 0; padding: 0; display: grid; gap: 10px; }
+.rules li {
+  background: var(--bg-raised); border: 1px solid var(--line); border-radius: 9px;
+  padding: 12px 16px; font-size: 14.5px;
+}
+.rules li b { font-family: var(--mono); font-size: 13px; }
+.rules li .scar { display: block; margin-top: 5px; font-size: 13px; color: var(--ink-soft); }
+.rules li .scar::before { content: "cicatriz · "; font-family: var(--mono); font-size: 11px; color: var(--warn); letter-spacing: .05em; }
+.rules.anti li { border-left: 3px solid var(--bad); }
+.rules.anti li b { color: var(--bad); }
+
+/* ── callouts ───────────────────────────────────── */
+.callout {
+  border: 1px solid var(--line); border-left: 3px solid var(--accent);
+  background: var(--bg-raised); border-radius: 8px; padding: 14px 18px; margin: 22px 0;
+  font-size: 15px;
+}
+.callout.quote { font-size: 1.25em; font-family: var(--mono); line-height: 1.5; letter-spacing: -0.01em; }
+.callout.warn { border-left-color: var(--warn); }
+.callout .src { display: block; margin-top: 8px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-soft); }
+
+/* ── escalera de tiers ──────────────────────────── */
+.tiers { counter-reset: tier; list-style: none; margin: 20px 0; padding: 0; display: grid; gap: 0; }
+.tiers li { position: relative; padding: 14px 0 14px 58px; border-bottom: 1px dashed var(--line); }
+.tiers li:last-child { border-bottom: none; }
+.tiers li::before {
+  counter-increment: tier; content: "T" counter(tier);
+  position: absolute; left: 0; top: 14px;
+  font-family: var(--mono); font-size: 13px; font-weight: 700;
+  color: var(--accent); border: 1px solid var(--line); background: var(--bg-raised);
+  border-radius: 8px; width: 40px; height: 30px; display: grid; place-items: center;
+}
+.tiers li b { display: block; font-size: 15px; }
+.tiers li span { font-size: 13.5px; color: var(--ink-soft); }
+
+/* ── pie ────────────────────────────────────────── */
+footer { margin-top: 60px; border-top: 1px solid var(--line); padding: 34px 0 60px; }
+footer h2 { font-size: 18px; margin-bottom: 14px; }
+.src-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 6px; font-size: 14px; }
+.src-list .mono { font-size: 12px; color: var(--ink-soft); }
+.colophon { margin-top: 26px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-soft); }
+
+@media (max-width: 640px) {
+  body { font-size: 15.5px; }
+  header.hero { padding: 48px 0 32px; }
+  .toc { display: none; }
+}
+</style>
+</head>
+<body>
+
+<nav class="topbar" aria-label="Secciones">
+  <div class="topbar-inner">
+    <span class="brand"><span class="dollar">❯</span> cmux · guía visual</span>
+    <span class="toc">
+      <a href="#porque">porqué</a>
+      <a href="#que-es">qué-es</a>
+      <a href="#modelo">modelo</a>
+      <a href="#loop">loop</a>
+      <a href="#eventos">eventos</a>
+      <a href="#flota">tu-flota</a>
+      <a href="#patrones">patrones</a>
+      <a href="#practicas">prácticas</a>
+      <a href="#comparativa">vs-tmux</a>
+      <a href="#escalera">escalera</a>
+    </span>
+    <button class="theme-btn" id="themeBtn" type="button" aria-label="Cambiar tema">tema: auto</button>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="hero-kicker">start · monitor · improve your fleet</div>
+    <h1>Domina <span class="accent">cmux</span> como plano de control de tu flota de agentes</h1>
+    <p class="hero-sub">
+      Guía visual para entender y operar cmux en orquestación multi-agente:
+      el modelo mental, el loop de control de 4 verbos, eventos en vez de polling,
+      y cómo todo eso ya está cableado en tu repo <span class="mono">agent-fleet-orchestrator</span>.
+    </p>
+    <div class="hero-meta">
+      <span class="chip">fuente · video <b>IndyDevDan</b> (WAFUMBLOjHo)</span>
+      <span class="chip">repo · <b>learning-cmux-with-agents</b></span>
+      <span class="chip">docs · <b>manaflow-ai/cmux</b> (GPL-3.0)</span>
+      <span class="chip">tu operación · <b>fleet-* + router.yaml</b></span>
+    </div>
+  </div>
+</header>
+
+<main class="wrap">
+
+<!-- ══════════════════ 01 · PORQUÉ ══════════════════ -->
+<section id="porque">
+  <div class="sec-head">
+    <div class="sec-eyebrow">01 · porque</div>
+    <h2>Escala tu cómputo para escalar tu impacto</h2>
+  </div>
+  <div class="prose">
+    <p class="lead">
+      La tesis del video es una sola frase, y es la vara con la que se mide
+      cualquier herramienta de orquestación:
+    </p>
+  </div>
+  <div class="callout quote">
+    “Un agente que no puedes ver es un agente que no puedes mejorar.”
+    <span class="src">IndyDevDan — la diferencia entre vibe coding y agentic engineering</span>
+  </div>
+  <div class="prose">
+    <p>
+      Orquestar no es esconder agentes detrás de un SDK: es tener cada agente en una
+      superficie <em>visible, direccionable y programable</em>. Dan plantea tres problemas
+      que cualquier ingeniero con más de dos agentes reconoce — y evalúa si cmux los resuelve:
+    </p>
+  </div>
+  <div class="cards">
+    <div class="card">
+      <div class="tag">problema #1</div>
+      <h4>Acceso agéntico</h4>
+      <p>Sin acceso programático a tus agentes, tú eres el cuello de botella: cada arranque, cada prompt y cada lectura pasa por tus manos.</p>
+      <p class="fix"><b>✓ resuelto</b> · CLI + socket Unix a <em>cada</em> terminal: un agente opera a otros agentes igual que un humano.</p>
+    </div>
+    <div class="card">
+      <div class="tag">problema #2</div>
+      <h4>Agentes medibles</h4>
+      <p>Necesitas ver cada agente (Claude, Codex, MiniMax…) para saber qué salió bien y reforzar ese comportamiento — o interrumpir a tiempo.</p>
+      <p class="fix"><b>✓ resuelto</b> · panes por rol, tabs con identidad, colores por workspace, notificaciones y salto rápido a cualquier agente.</p>
+    </div>
+    <div class="card">
+      <div class="tag">problema #3</div>
+      <h4>Arranques instantáneos</h4>
+      <p>Bootear un equipo a mano mata la velocidad agéntica: 8 panes, 8 comandos, 8 contextos… cada vez.</p>
+      <p class="fix"><b>✓ resuelto</b> · session files y layouts declarativos reutilizables; en tu repo: <em>un</em> comando (<span class="mono">just fleet</span>).</p>
+    </div>
+  </div>
+  <div class="callout warn">
+    <b>Contrapeso del propio Dan:</b> los labs tienen incentivos para que quemes tokens
+    (<em>tokenmaxxing</em>). Más agentes no es más impacto: agentes <em>visibles y verificados</em> es más impacto.
+    Los problemas van primero; las herramientas, después.
+  </div>
+</section>
+
+<!-- ══════════════════ 02 · QUÉ ES ══════════════════ -->
+<section id="que-es">
+  <div class="sec-head">
+    <div class="sec-eyebrow">02 · que-es</div>
+    <h2>Qué es cmux (y qué no es)</h2>
+  </div>
+  <div class="prose">
+    <p>
+      cmux es un terminal nativo de macOS (Swift + AppKit) construido sobre
+      <b>libghostty</b> — el motor de renderizado de Ghostty como librería, igual que una app
+      usa WebKit. Es open source (GPL-3.0-or-later, de Manaflow) y se define como
+      <em>“a primitive, not a solution”</em>: piezas componibles, no un workflow impuesto.
+      Cualquier agente que corra en un terminal funciona sin integración: Claude Code,
+      Codex, OpenCode, Gemini CLI, Aider, Goose…
+    </p>
+  </div>
+  <div class="cards">
+    <div class="card">
+      <div class="tag">organización</div>
+      <h4>Sidebar con tabs verticales</h4>
+      <p>Cada workspace muestra rama git, PR vinculado, directorio, puertos escuchando y su última notificación. Un vistazo = estado de la flota.</p>
+    </div>
+    <div class="card">
+      <div class="tag">atención</div>
+      <h4>Anillos de notificación</h4>
+      <p>Los panes piden atención con un anillo azul; los tabs se encienden con badges. Escape sequences estándar (OSC 9/99/777) y <span class="mono">⌘⇧U</span> salta al último no leído.</p>
+    </div>
+    <div class="card">
+      <div class="tag">programabilidad</div>
+      <h4>CLI + socket API</h4>
+      <p>Crear workspaces, dividir panes, enviar teclas, leer pantallas, notificar y automatizar el browser — todo por línea de comandos.</p>
+    </div>
+    <div class="card">
+      <div class="tag">web</div>
+      <h4>Browser embebido scriptable</h4>
+      <p>Un pane de navegador junto al terminal: navegar, click, llenar formularios, snapshot del DOM, evaluar JS. Importa sesiones de Chrome, Firefox, Arc…</p>
+    </div>
+    <div class="card">
+      <div class="tag">remoto</div>
+      <h4>SSH de primera clase</h4>
+      <p><span class="mono">cmux ssh user@host</span> crea workspaces remotos; el browser enruta por la red remota (localhost “simplemente funciona”). Puede adjuntarse a tmux remoto.</p>
+    </div>
+    <div class="card">
+      <div class="tag">durabilidad</div>
+      <h4>Sesiones que sobreviven</h4>
+      <p>Ventanas, workspaces, panes, cwd y scrollback se restauran tras relanzar — incluso tras reiniciar la máquina. Hooks de agente permiten <span class="mono">claude --resume</span>.</p>
+    </div>
+  </div>
+  <div class="term">
+    <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span> instalación<button class="copy" type="button">copiar</button></div>
+    <pre><span class="c"># Homebrew</span>
+<span class="k">brew</span> tap manaflow-ai/cmux
+<span class="k">brew</span> install --cask cmux
+
+<span class="c"># La app renderiza con tu config de Ghostty (~/.config/ghostty/config):</span>
+<span class="c"># temas, fuentes y colores se heredan. Config propia: ~/.config/cmux/cmux.json</span></pre>
+  </div>
+</section>
+
+<!-- ══════════════════ 03 · MODELO MENTAL ══════════════════ -->
+<section id="modelo">
+  <div class="sec-head">
+    <div class="sec-eyebrow">03 · modelo-mental</div>
+    <h2>Cinco contenedores anidados</h2>
+  </div>
+  <div class="prose">
+    <p>
+      Todo en cmux vive en una sola jerarquía. Si tienes claro este dibujo,
+      cada comando del CLI se vuelve obvio: siempre estás nombrando uno de estos niveles.
+    </p>
+  </div>
+  <div class="nest">
+    <div class="lvl"><span class="name">Window</span><span class="note">una ventana de macOS con su sidebar</span>
+      <div class="lvl"><span class="name">Workspace</span><span class="note">una entrada del sidebar — un equipo, una misión</span>
+        <div class="lvl"><span class="name">Pane</span><span class="note">una región dividida dentro del workspace</span>
+          <div class="lvl"><span class="name">Surface</span><span class="note">un tab dentro del pane: terminal o browser — lo que direccionas</span>
+            <div class="lvl"><span class="name">Panel</span><span class="note">el contenido renderizado</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="prose">
+    <p>
+      Los comandos imprimen las referencias que crean —
+      <code>OK surface:7 pane:7 workspace:5</code> — y con esas <b>refs cortas</b>
+      (<code>workspace:5</code>, <code>surface:7</code>) diriges todo lo demás.
+    </p>
+  </div>
+  <div class="callout warn">
+    <b>Las refs cortas son posicionales, no identidades.</b> Una ref obsoleta puede resolver
+    a <em>otro</em> surface. Incidente real en tu repo: un <code>close-surface</code> con ref
+    vieja cerró el pane del lead vivo (se recuperó con <code>claude --resume</code>).
+    Regla dura: <code>tree</code> o manifest primero, <em>siempre</em>; UUIDs para acciones destructivas.
+  </div>
+</section>
+
+<!-- ══════════════════ 04 · LOOP DE CONTROL ══════════════════ -->
+<section id="loop">
+  <div class="sec-head">
+    <div class="sec-eyebrow">04 · loop-de-control</div>
+    <h2>Cuatro verbos: send → read → decide → repeat</h2>
+  </div>
+  <div class="prose">
+    <p>
+      Toda la orquestación colapsa en un loop mínimo. Un orquestador que domina
+      estos cuatro verbos puede levantar, dirigir y desmontar una flota entera —
+      es exactamente lo que prueban los 31 prompts de <span class="mono">learning-cmux-with-agents</span>.
+    </p>
+  </div>
+  <div class="loop">
+    <div class="verb"><span class="n">verbo 1 · escribir</span><code>cmux send</code><p>Teclea texto en un terminal, como si fueras tú. No pulsa enter.</p></div>
+    <div class="verb"><span class="n">verbo 2 · pulsar</span><code>cmux send-key</code><p>Pulsa una tecla con nombre: enter, escape, tab, ctrl-c.</p></div>
+    <div class="verb"><span class="n">verbo 3 · leer</span><code>cmux read-screen</code><p>Lee lo que el terminal imprimió (con <span class="mono">--scrollback</span> para historia).</p></div>
+    <div class="verb"><span class="n">verbo 4 · cerrar</span><code>cmux close-surface</code><p>Apaga la superficie cuando la misión termina.</p></div>
+  </div>
+  <div class="term">
+    <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span> ciclo completo sobre un agente<button class="copy" type="button">copiar</button></div>
+    <pre><span class="k">cmux</span> ping                                             <span class="c"># ¿la app vive? → </span><span class="g">PONG</span>
+<span class="k">cmux</span> tree --all                                       <span class="c"># mapa de todo lo que existe</span>
+<span class="k">cmux</span> new-workspace --name "audit" --cwd ~/repo --focus false
+<span class="k">cmux</span> new-pane --direction right --workspace 5 --focus false
+<span class="k">cmux</span> send --surface 7 --workspace 5 'explica el bug de scripts/foo.sh'
+<span class="k">cmux</span> send-key --surface 7 --workspace 5 enter          <span class="c"># send NO pulsa enter</span>
+<span class="k">cmux</span> read-screen --surface 7 --workspace 5 --lines 40  <span class="c"># nunca asumas: lee</span>
+<span class="k">cmux</span> close-surface --surface 7                         <span class="c"># tree PRIMERO si la ref no es fresca</span></pre>
+  </div>
+  <h3>Identidad visual desde el CLI</h3>
+  <div class="prose">
+    <p>
+      La visibilidad a escala se construye con los helpers: nombra, colorea y reporta
+      estado para que una flota de 8 se lea de un vistazo.
+    </p>
+  </div>
+  <div class="term">
+    <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span> helpers de visibilidad<button class="copy" type="button">copiar</button></div>
+    <pre><span class="k">cmux</span> rename-tab --surface 7 "BUILD·codex"
+<span class="k">cmux</span> workspace-action --action set-color --workspace 5 --color "#7C3AED"
+<span class="k">cmux</span> set-status build "running" ; <span class="k">cmux</span> set-progress 0.7 --label "tests"
+<span class="k">cmux</span> notify --title "fleet-audit" --body "2 P0 confirmados"
+<span class="k">cmux</span> trigger-flash</pre>
+  </div>
+  <ul class="rules">
+    <li><b>send no pulsa enter.</b> Siempre va seguido de <code>send-key … enter</code>. Los TUIs interactivos se interrumpen con <code>escape</code>; los shells one-shot con <code>ctrl-c</code>.</li>
+    <li><b>read-screen después de actuar.</b> Nunca asumas que un comando funcionó — el loop es send → <em>read</em> → decide.</li>
+    <li><b>Quotea con cuidado.</b> El texto de <code>send</code> pasa primero por <em>tu</em> shell: payload en comillas simples, escapa las internas.</li>
+    <li><b>Nunca promptees un surface que no identificaste</b> en <code>tree</code> o en un manifest. Lo mismo antes de cerrar.</li>
+  </ul>
+</section>
+
+<!-- ══════════════════ 05 · EVENTOS ══════════════════ -->
+<section id="eventos">
+  <div class="sec-head">
+    <div class="sec-eyebrow">05 · eventos-no-polling</div>
+    <h2>El patrón timbre: espera eventos, no relojes</h2>
+  </div>
+  <div class="prose">
+    <p>
+      Releer pantallas en un loop quema tokens y añade latencia. cmux emite un
+      <b>event stream</b>: te suscribes, duermes, y el evento (el “timbre”) te despierta con
+      los IDs de workspace/surface — entonces vas a buscar el detalle una sola vez.
+    </p>
+  </div>
+  <div class="term">
+    <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span> event stream<button class="copy" type="button">copiar</button></div>
+    <pre><span class="c"># stream crudo (hooks de agentes + notificaciones), con reconexión durable</span>
+<span class="k">cmux</span> events --name agent.hook --name notification.created --reconnect --cursor-file .cmux-cursor
+
+<span class="c"># en tu repo el patrón ya está empaquetado — despacha y bloquea en el evento exacto:</span>
+<span class="k">./scripts/fleet-send.sh</span> audit codex "revisa el diff del PR #42"
+<span class="k">./scripts/fleet-wait.sh</span> audit codex --run codex=&lt;run_id&gt; --timeout 1800
+<span class="k">cmux</span> read-screen --surface &lt;s&gt; --workspace &lt;ws&gt; --lines 50   <span class="c"># una sola lectura, al final</span></pre>
+  </div>
+  <div class="prose">
+    <p>
+      La regla de tu repo lo resume mejor que cualquier doc oficial:
+      <b>panes para VER, archivos para DATOS, eventos para SEÑALES.</b>
+      Las pantallas truncan (panes angostos, TUIs que redibujan), los títulos de
+      notificación viajan redactados, y el polling cuesta. Findings grandes → archivo;
+      completado → evento; supervisión → pane.
+    </p>
+    <p>
+      <span class="mono">fleet-wait</span> devuelve estado tipado —
+      exit codes <code>0</code> succeeded · <code>1</code> failed · <code>2</code> protocolo ·
+      <code>3</code> blocked · <code>4</code> abandoned · <code>5</code> indeterminate ·
+      <code>124</code> deadline — y evidencia ausente o ambigua es <em>indeterminate</em>, nunca éxito.
+    </p>
+  </div>
+</section>
+
+<!-- ══════════════════ 06 · TU FLOTA ══════════════════ -->
+<section id="flota">
+  <div class="sec-head">
+    <div class="sec-eyebrow">06 · tu-flota</div>
+    <h2>Cómo lo tienes cableado: agent-fleet-orchestrator</h2>
+  </div>
+  <div class="prose">
+    <p class="lead">
+      Regla del repo: <b>frontier coordina, locales ejecutan en paralelo.</b>
+      Tu implementación sube un nivel sobre el cmux crudo: manifests con UUIDs,
+      gates de fase, contratos de salida y presupuesto de recursos.
+    </p>
+  </div>
+  <h3>Ciclo de vida de un fleet</h3>
+  <div class="term">
+    <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span> de cero a teardown<button class="copy" type="button">copiar</button></div>
+    <pre><span class="k">cmux</span> ping && <span class="k">just</span> status          <span class="c"># radar: ¿agentes ⚠️ esperándote desde ayer?</span>
+<span class="k">just</span> fleet-preset audit audit       <span class="c"># bootea el roster canónico (o: just fleet &lt;f&gt; build=codex …)</span>
+<span class="k">just</span> advance audit BUILD &lt;gate-id&gt;  <span class="c"># avanza de fase SOLO con evidencia</span>
+<span class="k">just</span> send audit build "tarea acotada"
+<span class="k">./scripts/fleet-dispatch.sh</span> audit triage "clasifica esta evidencia…"   <span class="c"># worker local one-shot</span>
+<span class="k">./scripts/fleet-wait.sh</span> audit build --run build=&lt;run_id&gt; --timeout 1800
+<span class="k">just</span> fleet-down audit               <span class="c"># teardown al mergear/abandonar — sin workspaces zombis</span></pre>
+  </div>
+  <div class="phases" role="img" aria-label="Fases: CONTROL, RECON, BUILD, CHALLENGE, VERIFY">
+    <span class="phase active">CONTROL</span><span class="arr">→</span>
+    <span class="phase">RECON</span><span class="arr">→</span>
+    <span class="phase">BUILD</span><span class="arr">→</span>
+    <span class="phase">CHALLENGE</span><span class="arr">→</span>
+    <span class="phase">VERIFY</span>
+  </div>
+  <div class="prose">
+    <p>
+      Solo CONTROL y la fase activa reciben trabajo; avanzar congela las fases anteriores
+      (BUILD no puede mutar un artefacto durante CHALLENGE/VERIFY), y salir de BUILD exige
+      <code>--approved-by &lt;humano&gt;</code>. El manifest
+      (<span class="mono">orchestration/runs/fleet-&lt;feature&gt;.manifest</span>) es la fuente de
+      verdad rol → surface, y cada script compara sus UUIDs contra <code>tree</code> antes de
+      cualquier efecto — una discrepancia falla cerrada.
+    </p>
+  </div>
+  <h3>El roster (router.yaml)</h3>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Instancia</th><th>Tipo</th><th>Modelo</th><th>Para qué</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">lead</th><td>frontier · interactivo</td><td><span class="dim">codex → claude (first_available)</span></td><td>planear, rutear, decidir, sintetizar — único con <code>danger-full-access</code> al socket</td></tr>
+        <tr><th scope="row">codex</th><td>frontier · interactivo</td><td>gpt-5.6-sol</td><td>implementación, diagnóstico profundo, segunda opinión</td></tr>
+        <tr><th scope="row">minimax</th><td>frontier · interactivo</td><td>MiniMax-M3 (opencode)</td><td>perspectiva independiente barata (auditoría cruzada)</td></tr>
+        <tr><th scope="row">glm</th><td>frontier · interactivo</td><td>GLM-5.2 (opencode)</td><td>challenger adicional</td></tr>
+        <tr><th scope="row">triage</th><td>local · prompt-only</td><td>gemma3:4b</td><td>clasificar, resumir, extraer evidencia suministrada</td></tr>
+        <tr><th scope="row">light_code</th><td>local · prompt-only</td><td>granite-code:3b</td><td>análisis rápido de snippets y salidas de comandos</td></tr>
+        <tr><th scope="row">code_worker</th><td>local · prompt-only</td><td>qwen2.5-coder:7b</td><td>analizar código suministrado, proponer parches acotados</td></tr>
+        <tr><th scope="row">reviewer</th><td>local · prompt-only</td><td>code-auditor</td><td>revisar un diff / evidence pack</td></tr>
+        <tr><th scope="row">general_worker</th><td>local · prompt-only</td><td>gemma4</td><td>síntesis pesada sobre evidencia</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    <b>Presupuesto de memoria (M5, 16 GB):</b> máximo <em>un</em> modelo local 7B+ en vuelo
+    y tres workers locales concurrentes; nunca gemma4:26b, qwen3-coder:30b ni devstral:24b en local.
+    Los workers locales no tienen filesystem ni shell: reciben un <em>evidence pack</em> acotado
+    y responden por contrato — <code>STATUS: DONE|BLOCKED|FAILED</code> + SUMMARY / EVIDENCE /
+    RISKS / NEXT_ACTION. Parsea STATUS antes de confiar en el resto.
+  </div>
+  <h3>Cuándo delegar (y cuándo no)</h3>
+  <div class="cards">
+    <div class="card">
+      <div class="tag">delega — fleet</div>
+      <h4>“¿Qué se me escapa?”</h4>
+      <p>Auditorías y reviews: siempre ≥2 workers con perspectivas distintas antes de tu veredicto. Cambios riesgosos por cerrar: una review frontier independiente obligatoria. ≥3 subtareas independientes: paraleliza. Búsqueda/clasificación a escala: fan-out a locales baratos.</p>
+    </div>
+    <div class="card">
+      <div class="tag">hazlo tú — sin fleet</div>
+      <h4>“Haz esto”</h4>
+      <p>Tarea única secuencial, verificación pequeña contra código, cualquier cosa que un test responde barato, turnos conversacionales. Es el ~95% de los casos: la delegación es la excepción que paga, no el default.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════ 07 · PATRONES ══════════════════ -->
+<section id="patrones">
+  <div class="sec-head">
+    <div class="sec-eyebrow">07 · patrones</div>
+    <h2>Patrones de orquestación probados</h2>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th>Patrón</th><th>Qué es</th><th>Cuándo</th></tr></thead>
+      <tbody>
+        <tr>
+          <th scope="row">Three-tier</th>
+          <td>Orquestador prompta a leads; leads promptan a workers. Panes ordenados por rango (CONTROL → … → VERIFY), síntesis siempre en el lead.</td>
+          <td>Trabajo estructurado multi-fase; el patrón favorito de Dan.</td>
+        </tr>
+        <tr>
+          <th scope="row">Race</th>
+          <td><code>just race &lt;n&gt; "&lt;task&gt;"</code> — agentes heterogéneos compiten en la misma tarea; el primero en terminar es <em>candidato</em>, no verdad. <code>--cancel-losers</code> solo tras un gate de verificación.</td>
+          <td>Hotfix / needle-in-a-haystack: “producción caída, respuesta YA”. El video lo demuestra con 8 agentes.</td>
+        </tr>
+        <tr>
+          <th scope="row">Broadcast fan-out</th>
+          <td>La misma tarea (o particiones de ella) enviada a N panes a la vez; el orquestador cosecha y deduplica.</td>
+          <td>Clasificación, búsqueda amplia, resúmenes a escala — workers locales gratis.</td>
+        </tr>
+        <tr>
+          <th scope="row">Doorbell / event loop</th>
+          <td>Suscribirse a <code>agent.hook</code> + <code>notification.created</code>; dormir hasta el evento, leer una vez.</td>
+          <td>Cualquier espera sobre &gt;1 agente. Cero polling.</td>
+        </tr>
+        <tr>
+          <th scope="row">Boomerang</th>
+          <td>El worker ejecuta y colapsa su contexto en un resumen breve para el orquestador (eficiencia de tokens).</td>
+          <td>Cadenas largas donde el detalle intermedio ya no importa.</td>
+        </tr>
+        <tr>
+          <th scope="row">Supervisor loop</th>
+          <td>Escalada temporal: nudge a los 3 min → restart a los 5 → abandonar tras 2 fallos. En tu repo: <code>fleet-wait</code> dispara ESCALATION por timeout y <code>fleet-abandon</code> libera leases.</td>
+          <td>Flotas grandes donde algún worker siempre se atasca.</td>
+        </tr>
+        <tr>
+          <th scope="row">Pane analyzer</th>
+          <td>Clasificar el estado de un pane con un LLM barato (20–360 tokens) + caché por hash de contenido.</td>
+          <td>Dashboards de flota; detectar “needsInput” sin leer todo.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="prose">
+    <p>
+      Los últimos tres vienen del ecosistema pi/cmux (spec de Joel Hooks, dmux,
+      pi-coordination): vale la pena conocerlos aunque tu repo aún no los implemente —
+      son la evolución natural del <span class="mono">fleet-wait</span> que ya tienes.
+    </p>
+  </div>
+</section>
+
+<!-- ══════════════════ 08 · PRÁCTICAS ══════════════════ -->
+<section id="practicas">
+  <div class="sec-head">
+    <div class="sec-eyebrow">08 · practicas</div>
+    <h2>Buenas prácticas — cada una con su cicatriz</h2>
+  </div>
+  <div class="prose">
+    <p>
+      Destiladas de tu propia adopción (2026-07): no son teoría, cada regla tiene
+      un incidente detrás. Las diez que más pagan:
+    </p>
+  </div>
+  <ul class="rules">
+    <li><b>Problema primero, herramienta después.</b> Adopta cmux cuando el arranque manual y la falta de acceso programático te duelan de verdad — no por hype.</li>
+    <li><b>Sube por la escalera.</b> Manual → orquestador operando cmux → fleet con manifest → patrones (eventos, race). Cada nivel valida el anterior.</li>
+    <li><b>Verifica refs antes de actuar.</b><span class="scar">un close-surface con ref obsoleta cerró el lead vivo; se restauró con claude --resume.</span></li>
+    <li><b>Contratos de salida + verificación frontier.</b> Los modelos chicos marcan DONE con optimismo.<span class="scar">gemma3 marcó DONE sin implementar nada — el lead parsea y verifica, no confía.</span></li>
+    <li><b>UUID antes de cada efecto.</b> fleet-send/dispatch/wait/down comparan el UUID del manifest contra el tree actual; discrepancia = falla cerrada.</li>
+    <li><b>Higiene de secretos.</b> Notificaciones al teléfono pasan por servidores de cmux (activa Hide content).<span class="scar">un healthcheck de llaves dumpeó el environment al transcript; quedó silenciado.</span></li>
+    <li><b>Ganador ≠ correcto.</b> La carrera da velocidad, no verdad: verifica la respuesta ganadora antes de actuar, especialmente en hotfixes.</li>
+    <li><b>Revisa tus colas de decisión.</b><span class="scar">dos sesiones esperaron ~1h una elección humana sin que nadie lo notara — usa just status y cmux notify con "DECISION:".</span></li>
+    <li><b>Un workspace = una misión; teardown al cerrar.</b> Workspaces zombis acumulan confusión y sesiones idle.</li>
+    <li><b>Codifica cada lección en la skill.</b> <code>.claude/skills/cmux/SKILL.md</code> es memoria operativa: cada incidente se vuelve regla dura que el próximo orquestador hereda gratis.</li>
+  </ul>
+  <h3>Antipatrones</h3>
+  <ul class="rules anti">
+    <li><b>Token-maxing:</b> 20 agentes en loop sin mirar qué hacen. Si no supervisas ni cosechas patrones, el fleet es teatro caro.</li>
+    <li><b>Scraping de pantallas como canal de datos</b> entre agentes — las pantallas truncan; usa archivos.</li>
+    <li><b>Sleeps calibrados a mano</b> en lugar de eventos.</li>
+    <li><b>Un workspace eterno</b> con misiones mezcladas.</li>
+    <li><b>Merge/deploy confiado al fleet</b> sin gate humano.</li>
+  </ul>
+</section>
+
+<!-- ══════════════════ 09 · COMPARATIVA ══════════════════ -->
+<section id="comparativa">
+  <div class="sec-head">
+    <div class="sec-eyebrow">09 · vs-tmux-vs-warp</div>
+    <h2>¿Tienes que usar cmux?</h2>
+  </div>
+  <div class="prose">
+    <p>
+      No. La ideología es lo transferible: <b>acceso programático a los primitivos</b>.
+      La postura de Dan — y la de tus propios docs — es pragmática: tmux por estabilidad,
+      cmux por construcción agéntica moderna, lado a lado.
+    </p>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr><th></th><th>cmux</th><th>tmux</th><th>Warp</th></tr></thead>
+      <tbody>
+        <tr><th scope="row">Construido para</th><td>Flotas de agentes AI visibles y programables</td><td>Multiplexar terminales (1987→)</td><td>Terminal con AI integrada para humanos</td></tr>
+        <tr><th scope="row">Plataforma</th><td>macOS nativo (Swift + libghostty)</td><td>Linux / macOS / BSD / casi todo</td><td>macOS / Linux / Windows</td></tr>
+        <tr><th scope="row">Acceso programático</th><td>CLI + socket: panes, teclas, pantalla, browser, eventos, notificaciones</td><td>Sí: send-keys, capture-pane, hooks — probado por décadas</td><td>Limitado — orientado al humano en el teclado</td></tr>
+        <tr><th scope="row">Identidad visual de agentes</th><td>Sidebar, colores, badges, anillos de atención, agent panel</td><td>Status line configurable (a pulso)</td><td>Bloques y temas, sin semántica de agente</td></tr>
+        <tr><th scope="row">Browser embebido scriptable</th><td>Sí (click, DOM, JS, sesiones importadas)</td><td>No</td><td>No</td></tr>
+        <tr><th scope="row">Madurez</th><td>Nuevo, se mueve rápido</td><td>Roca</td><td>Estable, cerrado en lo agéntico</td></tr>
+        <tr><th scope="row">Licencia</th><td>GPL-3.0, open source</td><td>ISC, open source</td><td>Propietaria</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="callout">
+    La regla de filtro de Dan para cualquier herramienta nueva:
+    <b>si no tiene acceso programático, la ignora por completo.</b>
+    “Es solo un terminal” también es la salvaguarda: cualquier agente CLI funciona,
+    no hay lock-in, y tmux cubre lo mismo donde cmux no llega.
+  </div>
+</section>
+
+<!-- ══════════════════ 10 · ESCALERA ══════════════════ -->
+<section id="escalera">
+  <div class="sec-head">
+    <div class="sec-eyebrow">10 · escalera</div>
+    <h2>La escalera de aprendizaje (31 prompts, 5 tiers)</h2>
+  </div>
+  <div class="prose">
+    <p>
+      El repo compañero del video valida cada capacidad con prompts en lenguaje natural
+      ejecutados contra cmux vivo (v0.64.17), usando solo el loop de 4 verbos. Es el mapa
+      para subir de nivel — y tu repo ya opera sólidamente en T3:
+    </p>
+  </div>
+  <ol class="tiers">
+    <li><b>Foundations (01–05)</b><span>Crear workspaces, dividir panes en grillas, mapear la topología con tree.</span></li>
+    <li><b>Driving one agent (06–10)</b><span>Lanzar Claude Code / pi en un pane, inyectar credenciales vía .env, layouts declarativos (cmux.json).</span></li>
+    <li><b>Fleet orchestration (11–16)</b><span>Broadcast a 4 agentes a la vez, loops reactivos por eventos, poda por CPU. ← tu nivel actual, con gates y manifests propios.</span></li>
+    <li><b>Browser integration (17–20)</b><span>Surfaces de navegador que los agentes clickean, llenan y capturan; replay de sesiones para autenticación.</span></li>
+    <li><b>Scale &amp; resilience (21–25 + 26–31)</b><span>Command centers multi-ventana, agentes remotos por SSH, recuperación de crashes, el capstone “Software Factory” (plan → fan-out → test → verify → teardown) y personalización total.</span></li>
+  </ol>
+  <h3>Runbook de 30 segundos (cada vez que te sientas)</h3>
+  <div class="term">
+    <div class="term-bar"><span class="dots"><i></i><i></i><i></i></span> ritual diario<button class="copy" type="button">copiar</button></div>
+    <pre><span class="k">cmux</span> ping      <span class="c"># ¿la app está viva? → </span><span class="g">PONG</span>
+<span class="k">just</span> status    <span class="c"># ¿hay agentes ⚠️ needsInput esperándote? atiéndelos primero</span>
+<span class="c"># cierra workspaces sin misión: just fleet-down &lt;feature&gt;</span></pre>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <h2 class="mono">❯ fuentes</h2>
+    <ul class="src-list">
+      <li><a href="https://www.youtube.com/watch?v=WAFUMBLOjHo">SEE CMUX SOLVE Multi-Agent Orchestration (Claude Code and Pi Agent)</a> <span class="mono">— IndyDevDan, YouTube</span></li>
+      <li><a href="https://github.com/disler/learning-cmux-with-agents">disler/learning-cmux-with-agents</a> <span class="mono">— 31 prompts + guía visual (MIT)</span></li>
+      <li><a href="https://github.com/manaflow-ai/cmux">manaflow-ai/cmux</a> <span class="mono">— código fuente y README oficial (GPL-3.0)</span></li>
+      <li><a href="https://cmux.com">cmux.com</a> <span class="mono">— docs oficiales: /docs/api, /docs/browser-automation, /docs/keyboard-shortcuts</span></li>
+      <li><a href="https://gist.github.com/joelhooks/11aea283acfd5a7f50e596bc63bbdd28">cmux × pi: Multi-Agent Orchestration Rig</a> <span class="mono">— spec de control plane (Joel Hooks)</span></li>
+      <li><span class="mono">docs/cmux-best-practices.md · docs/guia-operacion-cmux.md · .claude/skills/cmux/SKILL.md · orchestration/router.yaml</span> <span class="mono">— tu propia operación</span></li>
+    </ul>
+    <p class="colophon">guía generada 2026-07-16 · agent-fleet-orchestrator/docs/guia-visual-cmux.html · “an agent you can't see is an agent you can't improve”</p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  // tema: auto → dark → light
+  var btn = document.getElementById('themeBtn');
+  var modes = ['auto', 'dark', 'light'];
+  var i = 0;
+  try { i = Math.max(0, modes.indexOf(localStorage.getItem('cmux-guide-theme') || 'auto')); } catch (e) {}
+  function apply() {
+    var m = modes[i];
+    if (m === 'auto') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', m);
+    if (btn) btn.textContent = 'tema: ' + m;
+    try { localStorage.setItem('cmux-guide-theme', m); } catch (e) {}
+  }
+  if (btn) btn.addEventListener('click', function () { i = (i + 1) % modes.length; apply(); });
+  apply();
+
+  // botones copiar: copia el texto plano del bloque
+  document.addEventListener('click', function (ev) {
+    var b = ev.target.closest('.copy');
+    if (!b) return;
+    var pre = b.closest('.term').querySelector('pre');
+    var text = pre ? pre.innerText : '';
+    function done(ok) {
+      b.textContent = ok ? 'copiado ✓' : 'error';
+      setTimeout(function () { b.textContent = 'copiar'; }, 1600);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { done(true); }, function () { done(false); });
+    } else { done(false); }
+  });
+})();
+</script>
+
+</body>
+</html>
