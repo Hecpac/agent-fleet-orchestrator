@@ -59,6 +59,8 @@ class FleetBudgetTests(unittest.TestCase):
         self.seed([(100, 50), (200, 100)])
         result = self.check(1000)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("local token spend: 450/1000", result.stderr)
         self.assertNotIn("WARNING", result.stderr)
 
     def test_spend_over_seventy_percent_warns(self) -> None:

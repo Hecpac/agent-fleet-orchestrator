@@ -301,27 +301,30 @@ can be verified offline. Without the rule, self-validation, stale results,
 silent prompt drift, unbounded debate, or teardown races could be mistaken for
 accepted work.
 
-## Dedicated MiniMax Checker variant identity
+## Durable MiniMax OpenCode variant identity
 
-`rule: minimax_checker_requires_durable_none_variant`
+`rule: minimax_opencode_roles_require_durable_none_variant`
 
 `enforced_by:`
 
 - `tests/test_router_config.py::RouterConfigTests::test_opencode_variant_must_be_durable_and_agent_pinned`
+- `tests/test_router_config.py::RouterConfigTests::test_minimax_opencode_roles_pin_durable_none_variant`
 - `tests/test_fleet_up.py::FleetUpTests::test_fleet_dialogue_preset_materializes_one_writer_and_three_independent_gates`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_prepare_identity_is_durable_before_lease_acquisition`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_variant_mismatch_is_indeterminate_and_retains_lease`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_missing_required_variant_is_indeterminate`
 - `tests/test_spec_coherence.py::SpecCoherenceTests::test_fdp2_contract_and_documentation_remain_aligned`
 
-`why:` FDP-2 uses a dedicated `minimax_checker` instead of changing the shared
-MiniMax candidate or CHALLENGE roles. The OpenCode 1.17.15 TUI rejects
-`--variant` (only `opencode run` accepts it), so the identity is pinned by the
-dedicated agent `.opencode/agents/minimax-checker.md`, which declares
-`model: minimax/MiniMax-M3` and `variant: none`; the boot command is
-`opencode --agent minimax-checker` with no `-m` or `--variant`. Router
-validation fails closed unless that agent file declares the exact
-provider/model and variant, and rejects any TUI command carrying `--variant`.
+`why:` OpenCode 1.18.0 records the explicit default `variant: none` for
+MiniMax TUI sessions while the current GLM session omits `message.variant`.
+The TUI rejects `--variant` (only `opencode run` accepts it), so every MiniMax
+fleet identity is pinned by a dedicated project agent that declares its exact
+provider/model and variant; its boot command carries `--agent` with no `-m` or
+`--variant`. Router validation fails closed unless the agent file matches all
+three fields. GLM deliberately keeps no durable variant and its final database
+message must likewise omit the field. FDP-2 retains its stricter dedicated
+`minimax-checker` instructions while general MiniMax uses the read-only
+`fleet-reviewer` agent.
 The same expected value is carried through the fleet manifest and every
 lifecycle event for that run. Completion reads the final assistant
 `message.variant` from OpenCode's database and requires an exact match. An
@@ -455,14 +458,18 @@ that atomically blocks later acquisitions. Recovered leases move to
 - `tests/test_fleet_up.py::FleetUpTests::test_frontier_preset_is_reproducible_and_ordered`
 - `tests/test_fleet_up.py::FleetUpTests::test_frontier_send_key_failure_retains_indeterminate_lease`
 - `tests/test_fleet_up.py::FleetUpTests::test_race_partial_dispatch_reports_exact_runs_and_retains_leases`
-- `tests/test_run_interactive_agent.py::InteractiveAgentEnvironmentTests::test_codex_roles_use_default_codex_home`
+- `tests/test_run_interactive_agent.py::InteractiveAgentEnvironmentTests::test_codex_roles_use_one_curated_ephemeral_hook_home`
 
 `why:` Every frontier attempt records a durable `preparing` identity before
 lease acquisition. A surface UUID—not merely its manifest alias—can belong to
 only one active run. Before Enter, dispatch records `run_id`, cmux `boot_id`,
-lower sequence, workspace UUID, and surface UUID. Fleet Codex processes use
-the default `~/.codex` config so the official cmux hooks are active, while the
-router pins `gpt-5.6-sol` so fleet execution does not inherit a personal model.
+lower sequence, workspace UUID, and surface UUID. Every Fleet Codex process
+copies only controller authentication into an ephemeral `CODEX_HOME` and
+installs one controller-owned cmux hook bridge; controller/legacy hook trees
+cannot merge into duplicate physical submissions. Hook trust is bypassed only
+for the three hard-coded repo-owned CLI overrides; no user-provided hook
+command is copied into that invocation. The router pins
+`gpt-5.6-sol` so fleet execution does not inherit a personal model.
 `UserPromptSubmit` must bind exactly one later turn to that surface; another
 distinct submit is ambiguous. A completed Stop must follow that binding and is
 only a wake-up: succeeded/blocked/failed requires exactly one matching final
@@ -493,6 +500,7 @@ tie-breaker.
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_rejects_wrong_source_and_non_opencode_session_file`
 - `tests/test_router_config.py::RouterConfigTests::test_interactive_roles_declare_supported_source_and_model_identity`
 - `tests/test_fleet_up.py::FleetUpTests::test_frontier_preset_is_reproducible_and_ordered`
+- `tests/test_run_interactive_agent.py::InteractiveAgentEnvironmentTests::test_opencode_live_surface_uses_deterministic_ephemeral_data_home`
 
 `why:` OpenCode emits multiple completed Stops for one turn. Stops without the
 feed plugin's structured final-context marker remain wake-ups and cannot
@@ -501,6 +509,10 @@ assistant messages, full text parts, completion timestamps, provider, and model
 come from the read-only `opencode db` interface—not terminal chrome, truncated
 workstream preambles, or lossy session exports. The last completed assistant
 before the Stop must contain one exact sentinel as its final non-empty line.
+The TUI writes its copied provider database to a surface-UUID-scoped directory
+under `/tmp/agent-fleet-orchestrator-opencode`; the evidence reader selects
+that exact `XDG_DATA_HOME` and the wrapper removes it when the pane process
+exits. It never queries or writes the controller's global OpenCode database.
 The event source, `opencode-` session prefix, and
 `opencode-hook-sessions.json` workspace/surface binding must also match the
 identity persisted before dispatch. Missing, malformed, temporally late, or

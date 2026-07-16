@@ -123,6 +123,7 @@ class SpecCoherenceTests(unittest.TestCase):
             challenge_role["command"],
             ["opencode", "-m", "zai/glm-5.2", "--agent", "glm-challenger"],
         )
+        self.assertNotIn("variant", challenge_role)
 
         verify_role = router["roles"][instances["verify"]]
         self.assertIn("--append-system-prompt", verify_role["command"])
@@ -157,8 +158,8 @@ class SpecCoherenceTests(unittest.TestCase):
                 self.assertIn(restriction, challenger_agent)
         self.assertIn("model: minimax/MiniMax-M3", checker_agent)
         self.assertIn("variant: none", checker_agent)
-        self.assertNotIn("\nmodel:", reviewer)
-        self.assertNotIn("\nvariant:", reviewer)
+        self.assertIn("model: minimax/MiniMax-M3", reviewer)
+        self.assertIn("variant: none", reviewer)
         self.assertNotIn("\nmodel:", challenger_agent)
         self.assertNotIn("\nvariant:", challenger_agent)
         for hardened in (
@@ -212,7 +213,7 @@ class SpecCoherenceTests(unittest.TestCase):
             'rule: opencode_prompt_transport_is_one_physical_submission', wiring
         )
         self.assertIn(
-            'rule: minimax_checker_requires_durable_none_variant', wiring
+            'rule: minimax_opencode_roles_require_durable_none_variant', wiring
         )
         self.assertIn(
             'test_opencode_prompt_transport_is_one_submission_with_exact_logical_prompt',

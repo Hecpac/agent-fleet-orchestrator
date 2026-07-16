@@ -31,6 +31,8 @@ fi
 isolated_home="$(mktemp -d /tmp/fleet_home.XXXXXX)"
 chmod 700 "$isolated_home"
 umask 077
+opencode_state_root="/tmp/agent-fleet-orchestrator-opencode"
+opencode_state_dir=""
 process_home="$isolated_home"
 process_user="fleet_worker"
 process_logname="fleet_worker"
@@ -44,8 +46,117 @@ for ((index=0; index<${#command_args[@]}; index++)); do
 done
 cleanup() {
   rm -rf -- "$isolated_home"
+  if [[ -n "$opencode_state_dir" ]]; then
+    rm -rf -- "$opencode_state_dir"
+    rmdir "$opencode_state_root" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT HUP INT TERM
+
+validate_isolated_provider_tree() {
+  local root="$1"
+  python3 - "$root" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+if root.is_symlink():
+    print(f"OpenCode provider state root must not be a symlink: {root}", file=sys.stderr)
+    raise SystemExit(2)
+
+try:
+    resolved_root = root.resolve(strict=True)
+except OSError as exc:
+    print(f"OpenCode provider state is unreadable: {root}: {exc}", file=sys.stderr)
+    raise SystemExit(2)
+
+for current, directories, files in os.walk(root, followlinks=False):
+    current_path = Path(current)
+    for name in [*directories, *files]:
+        candidate = current_path / name
+        if not candidate.is_symlink():
+            continue
+        raw_target = os.readlink(candidate)
+        if os.path.isabs(raw_target):
+            print(
+                f"OpenCode provider state contains an absolute symlink: {candidate}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        try:
+            resolved_target = candidate.resolve(strict=True)
+            resolved_target.relative_to(resolved_root)
+        except (OSError, ValueError):
+            print(
+                f"OpenCode provider state symlink escapes its isolated root: {candidate}",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+PY
+}
+
+codex_hook_override() {
+  local event="$1" hook_bridge surface socket command_json
+  hook_bridge="$(printf '%q' "$repo_root/scripts/cmux-codex-hook.sh")"
+  surface="$(printf '%q' "${CMUX_SURFACE_ID:-}")"
+  socket="$(printf '%q' "${CMUX_SOCKET_PATH:-}")"
+  command_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' \
+    "/usr/bin/env CMUX_SURFACE_ID=$surface CMUX_SOCKET_PATH=$socket CMUX_CODEX_HOOKS_DISABLED=0 /bin/bash $hook_bridge $event")"
+  printf 'hooks.%s=[{hooks=[{type="command",command=%s}]}]' "$event" "$command_json"
+}
+
+provision_fleet_codex_home() {
+  local controller_codex_home fleet_codex_home project_key
+  controller_codex_home="${CODEX_HOME:-$controller_home/.codex}"
+  if [[ ! -f "$controller_codex_home/auth.json" || -L "$controller_codex_home/auth.json" ]]; then
+    echo "Fleet Codex role requires a regular $controller_codex_home/auth.json" >&2
+    exit 2
+  fi
+
+  fleet_codex_home="$isolated_home/.codex"
+  mkdir -p "$fleet_codex_home"
+  chmod 700 "$fleet_codex_home"
+  cp "$controller_codex_home/auth.json" "$fleet_codex_home/auth.json"
+  chmod 600 "$fleet_codex_home/auth.json"
+  project_key="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$repo_root")"
+  printf '[features]\nhooks = true\n\n[projects.%s]\ntrust_level = "untrusted"\n' \
+    "$project_key" > "$fleet_codex_home/config.toml"
+  chmod 600 "$fleet_codex_home/config.toml"
+  keep+=(
+    "CODEX_HOME=$fleet_codex_home"
+    # cmux injects its own Codex hooks through CLI `-c` flags. Disable those
+    # in the shim, then install the repo-owned overrides below with the
+    # surface identity embedded in each command.
+    "CMUX_CODEX_HOOKS_DISABLED=1"
+  )
+}
+
+prepare_opencode_data_home() {
+  local surface_id="${CMUX_SURFACE_ID:-}"
+  if [[ -z "$surface_id" ]]; then
+    xdg_data="$isolated_home/xdg/data"
+    return
+  fi
+  if [[ ! "$surface_id" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+    echo "OpenCode surface identity is not a canonical UUID: $surface_id" >&2
+    exit 2
+  fi
+  surface_id="$(printf '%s' "$surface_id" | tr '[:lower:]' '[:upper:]')"
+  if [[ -L "$opencode_state_root" ]]; then
+    echo "OpenCode evidence state root must not be a symlink: $opencode_state_root" >&2
+    exit 2
+  fi
+  mkdir -p "$opencode_state_root"
+  chmod 700 "$opencode_state_root"
+  opencode_state_dir="$opencode_state_root/$surface_id"
+  if [[ -e "$opencode_state_dir" || -L "$opencode_state_dir" ]]; then
+    echo "OpenCode evidence state already exists for surface $surface_id" >&2
+    exit 2
+  fi
+  mkdir -m 700 "$opencode_state_dir"
+  xdg_data="$opencode_state_dir/data"
+}
 
 keep=()
 for name in PATH SHELL TERM COLORTERM LANG LC_ALL LC_CTYPE TMPDIR \
@@ -138,6 +249,31 @@ case "$role_type" in
     chmod 600 "$claude_config/settings.json"
     jq -n '{mcpServers: {}}' > "$claude_config/mcp.json"
     chmod 600 "$claude_config/mcp.json"
+    # Claude's interactive TUI consults ~/.claude.json after applying the
+    # session HOME override. A fresh isolated HOME otherwise re-enters
+    # onboarding and reports "Not logged in" even when OAuth is available in
+    # the controller user's macOS Keychain. Seed only the onboarding marker and
+    # the opaque account identifiers needed to locate that Keychain entry;
+    # never copy email, profile, history, settings, or credential material.
+    controller_claude_state="$controller_home/.claude.json"
+    if [[ -f "$controller_claude_state" && ! -L "$controller_claude_state" ]]; then
+      jq '
+        .oauthAccount as $account |
+        {hasCompletedOnboarding: true} +
+        (if (($account | type) == "object"
+             and ($account.accountUuid | type) == "string"
+             and ($account.organizationUuid | type) == "string")
+         then {oauthAccount: {
+           accountUuid: $account.accountUuid,
+           organizationUuid: $account.organizationUuid
+         }}
+         else {}
+         end)
+      ' "$controller_claude_state" > "$isolated_home/.claude.json"
+    else
+      jq -n '{hasCompletedOnboarding: true}' > "$isolated_home/.claude.json"
+    fi
+    chmod 600 "$isolated_home/.claude.json"
     # Claude OAuth is stored in the macOS Keychain under the controller USER
     # and HOME. Keep those values only for CLI bootstrap; the additional
     # settings above replace them for the session and all tool subprocesses.
@@ -145,54 +281,34 @@ case "$role_type" in
     process_user="$controller_user"
     process_logname="${LOGNAME:-$controller_user}"
     if [[ "$(basename "$1")" == "claude" ]]; then
-      set -- "$1" --setting-sources "" --settings "$claude_config/settings.json" \
-        --strict-mcp-config --mcp-config "$claude_config/mcp.json" "${@:2}"
+      if [[ "${FLEET_HEALTHCHECK:-0}" == "1" ]]; then
+        # `--mcp-config` accepts a variadic list and would consume `auth status`
+        # as file names. Authentication healthchecks do not need MCP state, but
+        # must still load the same isolated settings used by the real session.
+        set -- "$1" --setting-sources "" --settings "$claude_config/settings.json" \
+          "${@:2}"
+      else
+        set -- "$1" --setting-sources "" --settings "$claude_config/settings.json" \
+          --strict-mcp-config --mcp-config "$claude_config/mcp.json" "${@:2}"
+      fi
     fi
     ;;
   codex|codex_candidate)
-    controller_codex_home="${CODEX_HOME:-$controller_home/.codex}"
-    if [[ -n "${FLEET_MISSION_ID:-}" && -n "${FLEET_CONTROL_SOCKET:-}" \
-      && "$authority" != "write" && "$authority" != "control" ]]; then
-      # A controller config may still declare legacy sandbox_mode, which takes
-      # precedence over permission profiles. Use an ephemeral Codex home for
-      # mission specialists and copy authentication plus the existing trusted
-      # hook contract, but not the controller's general config, so the
-      # fleet_control least-privilege profile selected by fleet-up is actually
-      # enforceable and CMUX can still bind UserPromptSubmit/Stop evidence.
-      [[ -f "$controller_codex_home/auth.json" ]] || {
-        echo "Mission-bound Codex specialist requires $controller_codex_home/auth.json" >&2
-        exit 2
-      }
-      specialist_codex_home="$isolated_home/.codex"
-      mkdir -p "$specialist_codex_home"
-      chmod 700 "$specialist_codex_home"
-      cp "$controller_codex_home/auth.json" "$specialist_codex_home/auth.json"
-      chmod 600 "$specialist_codex_home/auth.json"
-      hook_bridge="$(printf '%q' "$repo_root/scripts/cmux-codex-hook.sh")"
-      jq -n --arg bridge "$hook_bridge" '
-        def binding($event): [{
-          hooks: [{
-            type: "command",
-            command: ("/bin/bash " + $bridge + " " + $event)
-          }]
-        }];
-        {hooks: {
-          SessionStart: binding("SessionStart"),
-          UserPromptSubmit: binding("UserPromptSubmit"),
-          Stop: binding("Stop")
-        }}
-      ' > "$specialist_codex_home/hooks.json"
-      chmod 600 "$specialist_codex_home/hooks.json"
-      printf '[features]\nhooks = true\n' > "$specialist_codex_home/config.toml"
-      chmod 600 "$specialist_codex_home/config.toml"
-      keep+=("CODEX_HOME=$specialist_codex_home")
-    else
-      keep+=("CODEX_HOME=$controller_codex_home")
+    # Fleet Codex processes must never merge controller and legacy hook trees:
+    # current Codex releases can otherwise emit two physical submit events for
+    # one Enter. Copy authentication only and install one controller-owned
+    # CMUX bridge in an ephemeral home for every authority/profile.
+    provision_fleet_codex_home
+    if [[ "$(basename "$1")" == "codex" && "${FLEET_HEALTHCHECK:-0}" != "1" ]]; then
+      set -- "$@" --enable hooks --dangerously-bypass-hook-trust
+      for event in SessionStart UserPromptSubmit Stop; do
+        set -- "$@" -c "$(codex_hook_override "$event")"
+      done
     fi
     ;;
   glm|minimax|minimax_checker)
     xdg_config="$isolated_home/xdg/config"
-    xdg_data="$isolated_home/xdg/data"
+    prepare_opencode_data_home
     xdg_state="$isolated_home/xdg/state"
     mkdir -p "$xdg_config" "$xdg_data" "$xdg_state"
     for mapping in \
@@ -202,11 +318,12 @@ case "$role_type" in
       source_dir="${mapping%%:*}"
       destination_root="${mapping#*:}"
       if [[ -d "$source_dir" ]]; then
-        if [[ -n "$(find "$source_dir" -type l -print -quit)" ]]; then
-          echo "OpenCode provider state must not contain symlinks: $source_dir" >&2
+        if [[ -L "$source_dir" ]]; then
+          echo "OpenCode provider state root must not be a symlink: $source_dir" >&2
           exit 2
         fi
         cp -R "$source_dir" "$destination_root/"
+        validate_isolated_provider_tree "$destination_root/$(basename "$source_dir")"
       fi
     done
     keep+=(

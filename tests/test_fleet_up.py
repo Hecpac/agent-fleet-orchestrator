@@ -147,8 +147,12 @@ elif command in {"workspace-action", "set-status"}:
     pass
 elif command == "read-screen":
     ready = os.environ.get("CMUX_READY", "1")
+    surface = arg_value("--surface")
+    pane = next((item for item in state["panes"] if item["surface"] == surface), {})
     if ready == "trust":
         print("Do you trust the contents of this directory?\n› 1. Yes, continue\n  2. No, quit")
+    elif ready == "claude-login" and pane.get("source") == "claude":
+        print("Not logged in · Please run /login\n❯")
     else:
         print("› ready\n❯\nctrl+p commands" if ready == "1" else "booting")
 elif command == "events":
@@ -217,6 +221,13 @@ class FleetUpTests(unittest.TestCase):
         self.bin.mkdir()
         self.runs = self.tmp / "runs"
         self.runs.mkdir()
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.codex_home = self.home / ".codex"
+        self.codex_home.mkdir()
+        (self.codex_home / "auth.json").write_text(
+            '{"test":"authentication-placeholder"}\n', encoding="utf-8"
+        )
         self.state = self.tmp / "cmux-state.json"
         self.log = self.tmp / "cmux-log.jsonl"
         self.make_executable("cmux", FAKE_CMUX)
@@ -256,6 +267,8 @@ class FleetUpTests(unittest.TestCase):
         self.env.update(
             {
                 "PATH": f"{self.bin}:{self.env['PATH']}",
+                "HOME": str(self.home),
+                "CODEX_HOME": str(self.codex_home),
                 "CMUX_STATE": str(self.state),
                 "CMUX_LOG": str(self.log),
                 "CMUX_EVENTS_LOG": str(self.events_log),
@@ -268,6 +281,7 @@ class FleetUpTests(unittest.TestCase):
                 "FLEET_SEND_KEY_DELAY": "0",
                 "FLEET_CONFIRM_SUBMIT_TIMEOUT": "1",
                 "ZHIPU_API_KEY": "test-only",
+                "MINIMAX_API_KEY": "test-only",
             }
         )
 
@@ -450,7 +464,10 @@ class FleetUpTests(unittest.TestCase):
         self.assertEqual(advance.returncode, 0, advance.stderr)
 
         dispatch = subprocess.run(
-            ["bash", str(FLEET_DISPATCH), "research-local", "triage_scope", "summarize this"],
+            [
+                "bash", str(FLEET_DISPATCH), "research-local", "triage_scope",
+                "summarize this", "--json",
+            ],
             cwd=ROOT,
             env=self.env,
             text=True,
@@ -460,6 +477,11 @@ class FleetUpTests(unittest.TestCase):
             check=False,
         )
         self.assertEqual(dispatch.returncode, 0, dispatch.stderr)
+        dispatch_payload = json.loads(dispatch.stdout)
+        self.assertEqual(dispatch_payload["feature"], "research-local")
+        self.assertEqual(dispatch_payload["instance"], "triage_scope")
+        self.assertEqual(dispatch_payload["runner"], "local")
+        self.assertIn("local token spend:", dispatch.stderr)
         sends = [call for call in self.calls() if call and call[0] == "send"]
         self.assertTrue(any("run-local-task.sh research-local triage_scope triage" in call[-1] for call in sends))
         duplicate_dispatch = subprocess.run(
@@ -600,6 +622,27 @@ class FleetUpTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unresolved project trust gate", result.stderr)
         self.assertFalse((self.runs / "fleet-trust-gate.manifest").exists())
+        state = json.loads(self.state.read_text())
+        self.assertTrue(state.get("closed"), "failed boot must close its CMUX workspace")
+
+    def test_non_lead_isolated_healthcheck_fails_before_workspace_creation(self) -> None:
+        self.make_executable(
+            "claude",
+            "#!/bin/sh\ncase \"$*\" in *\"auth status\"*) exit 9;; esac\nexit 0\n",
+        )
+        result = self.run_fleet("claude-auth-fail", "--preset", "frontier_verification")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("verify/claude_reviewer", result.stderr)
+        self.assertIn("isolated runtime healthcheck", result.stderr)
+        self.assertFalse(self.state.exists(), "preflight failure must not create a workspace")
+
+    def test_provider_auth_screen_is_not_mistaken_for_readiness(self) -> None:
+        self.env["CMUX_READY"] = "claude-login"
+        result = self.run_fleet("claude-login-screen", "--preset", "frontier_verification")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fatal provider/authentication screen", result.stderr)
+        self.assertIn("Not logged in", result.stderr)
+        self.assertFalse((self.runs / "fleet-claude-login-screen.manifest").exists())
         state = json.loads(self.state.read_text())
         self.assertTrue(state.get("closed"), "failed boot must close its CMUX workspace")
 

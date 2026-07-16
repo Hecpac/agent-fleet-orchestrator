@@ -68,6 +68,22 @@ class LocalWorkerContractTests(unittest.TestCase):
             usage = json.loads(usage_path.read_text())
             self.assertEqual(usage, {"prompt_eval_count": 42, "eval_count": 7})
 
+    def test_ollama_request_disables_hidden_thinking(self) -> None:
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = json.dumps(
+            {"response": "STATUS: DONE"}
+        ).encode("utf-8")
+        with mock.patch.object(
+            local_worker.urllib.request, "urlopen", return_value=response
+        ) as urlopen:
+            body = local_worker.call_ollama(
+                "http://localhost:11434", "fake", "prompt", 0.2, 768
+            )
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertFalse(payload["think"])
+        self.assertEqual(body["response"], "STATUS: DONE")
+
 
 if __name__ == "__main__":
     unittest.main()

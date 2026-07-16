@@ -123,7 +123,12 @@ visible pane but cannot bind a contract-v2 tracked run; keep one writer and use
 `fleet-send.sh` for every authoritative turn.
 The CONTROL lead alone uses `danger-full-access` so it can reach the cmux Unix
 socket; its environment is still allowlisted.
-Mission-bound read-only Codex specialists use an ephemeral Codex home with a
+Every Fleet Codex process uses an ephemeral Codex home with a
+single controller-owned CMUX hook bridge so legacy and current controller hook
+trees cannot emit duplicate physical submissions. The automation-only hook
+trust bypass applies exclusively to those hard-coded repo-owned overrides;
+controller hook command text is never copied. Mission-bound read-only
+specialists additionally use a
 named profile that extends `:read-only` and permits only the mission's exact
 Fleet Control socket. Existing authentication is copied and CMUX hooks are
 installed through a fixed controller-owned bridge; unrelated hook commands and
@@ -149,13 +154,12 @@ Roles come in two kinds:
 - **Frontier agents** (interactive CLIs, tracked in cmux's agent panel via
   hooks; prompt them by `send`ing text + enter like a human typing):
 `codex` (codex CLI),
-  `minimax` (opencode -m minimax/MiniMax-M3, needs `MINIMAX_API_KEY`),
-  `glm` (opencode -m zai/glm-5.2, needs `ZHIPU_API_KEY`).
+  `minimax` (OpenCode agent pinned to MiniMax-M3/none, needs `MINIMAX_API_KEY`),
+  `glm` (OpenCode `-m` pinned to GLM-5.2 with no variant, needs `ZHIPU_API_KEY`).
 
-Unbound Fleet Codex roles use the official hooks and authentication from
-`~/.codex`; mission-bound read-only specialists use the filtered ephemeral
-home above. The router pins `gpt-5.6-sol`; personal model defaults are not
-inherited.
+Fleet Codex roles copy authentication from the controller home but never load
+its general hook/config tree. The router pins `gpt-5.6-sol`; personal model
+defaults are not inherited.
 
 Frontier panes are interactive agents: after sending a prompt, wait for their
 hook event and then `read-screen`. `fleet-up` preflights executables, keys,
@@ -233,9 +237,15 @@ sends and unconfirmed race interrupts also retain their surface-UUID lease.
 OpenCode emits multiple Stops: only its structured final Stop is eligible, and
 the run-tagged user message, complete assistant text, completion time,
 provider, and model are read through `opencode db`. Terminal chrome, truncated
-workstream preambles, and lossy exports never prove OpenCode completion.
+workstream preambles, and lossy exports never prove OpenCode completion. Each
+OpenCode pane writes its copied database to a surface-scoped temporary XDG data
+home so the verifier can query the exact isolated session without consulting
+the controller's global database; the wrapper removes it when the pane exits.
+Provider, model, and provider-specific variant identity must match the final
+database message exactly: MiniMax pins explicit `none`; GLM pins absence.
 The dispatch wrappers also accept `--json`; orchestration callers must use that
-canonical output rather than parse human-facing text. Audit recovery requires
+canonical stdout rather than parse human-facing text; diagnostics stay on
+stderr. Audit recovery requires
 the recorded baseline plus a continuous boot-scoped sequence.
 Local notifications are also wake-ups only. Local workers cannot write files
 themselves; feed them a bounded evidence pack and capture their stdout durably

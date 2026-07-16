@@ -47,6 +47,7 @@ HOOK_SESSION_FILES = {
 }
 TRANSCRIPT_EVIDENCE_ATTEMPTS = 4
 TRANSCRIPT_EVIDENCE_RETRY_SECONDS = 0.1
+OPENCODE_STATE_ROOT = Path("/tmp/agent-fleet-orchestrator-opencode")
 
 
 class FrontierError(RuntimeError):
@@ -315,8 +316,28 @@ def _opencode_final_stop(payload: dict[str, Any]) -> bool:
     )
 
 
+def opencode_data_home(surface_uuid: str) -> Path:
+    try:
+        canonical_surface = str(uuid.UUID(surface_uuid)).upper()
+    except ValueError as exc:
+        raise FrontierError("OpenCode evidence surface id is invalid") from exc
+    surface_root = OPENCODE_STATE_ROOT / canonical_surface
+    data_home = surface_root / "data"
+    if OPENCODE_STATE_ROOT.is_symlink() or surface_root.is_symlink() or data_home.is_symlink():
+        raise FrontierError("OpenCode evidence state must not use symlinks")
+    try:
+        resolved_root = OPENCODE_STATE_ROOT.resolve(strict=True)
+        resolved_surface = surface_root.resolve(strict=True)
+        resolved_data = data_home.resolve(strict=True)
+        resolved_surface.relative_to(resolved_root)
+        resolved_data.relative_to(resolved_surface)
+    except (OSError, ValueError) as exc:
+        raise FrontierError("OpenCode evidence data home is unavailable") from exc
+    return data_home
+
+
 def opencode_turn_evidence(
-    session_id: str, run_id: str, stop_occurred_at: str
+    session_id: str, run_id: str, stop_occurred_at: str, surface_uuid: str
 ) -> tuple[str, str, str, str | None]:
     raw_session_id = session_id.removeprefix("opencode-")
     if not re.fullmatch(r"ses_[A-Za-z0-9]+", raw_session_id):
@@ -325,6 +346,7 @@ def opencode_turn_evidence(
     if stop_time is None:
         raise FrontierError("OpenCode Stop has no valid timestamp")
     stop_millis = int(stop_time.timestamp() * 1000)
+    data_home = opencode_data_home(surface_uuid)
     query = (
         "SELECT m.id AS message_id, m.time_created AS message_created, "
         "m.data AS message_data, p.id AS part_id, "
@@ -336,11 +358,12 @@ def opencode_turn_evidence(
     )
     try:
         result = subprocess.run(
-            ["opencode", "db", "--format", "json", query],
+            ["opencode", "db", "--pure", "--format", "json", query],
             capture_output=True,
             text=True,
             timeout=15,
             check=False,
+            env={**os.environ, "XDG_DATA_HOME": str(data_home)},
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise FrontierError(f"cannot query OpenCode turn evidence: {exc}") from exc
@@ -1136,7 +1159,15 @@ def process_event(
                 claude_turn_evidence, current_session, current_run, stopped
             ),
             "opencode": lambda current_session, current_run, stopped: transcript_turn_evidence(
-                opencode_turn_evidence, current_session, current_run, stopped
+                lambda session, run, occurred_at: opencode_turn_evidence(
+                    session,
+                    run,
+                    occurred_at,
+                    str(state["surface_uuid"]),
+                ),
+                current_session,
+                current_run,
+                stopped,
             ),
         }
         evidence = adapter.extract_final_response(

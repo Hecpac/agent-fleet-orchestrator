@@ -1,6 +1,8 @@
 ---
 description: Finish evidence-backed fleet reviews without entering an implementation plan.
 mode: primary
+model: minimax/MiniMax-M3
+variant: none
 temperature: 0.1
 permission:
   edit: deny

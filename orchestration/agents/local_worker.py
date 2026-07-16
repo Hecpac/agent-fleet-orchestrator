@@ -30,7 +30,7 @@ NEXT_ACTION:
 
 Evidence rules:
 - Only cite files, commands, outputs, or facts explicitly included in the task.
-- If no evidence was provided, write "EVIDENCE: Not provided".
+- Under the single EVIDENCE: heading, write "Not provided" if no evidence was supplied.
 - Do not infer project structure from common conventions.
 """
 
@@ -40,6 +40,7 @@ def call_ollama(host: str, model: str, prompt: str, temperature: float, num_pred
         "model": model,
         "prompt": prompt,
         "stream": False,
+        "think": False,
         "keep_alive": 0,
         "options": {
             "temperature": temperature,

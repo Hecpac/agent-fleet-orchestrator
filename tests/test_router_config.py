@@ -186,13 +186,29 @@ class RouterConfigTests(unittest.TestCase):
     def test_opencode_provider_model_must_match_command(self) -> None:
         config = copy.deepcopy(self.config)
         config["roles"]["minimax"]["model"] = "DifferentModel"
-        with self.assertRaisesRegex(router_config.RouterError, "must match command -m"):
+        with self.assertRaisesRegex(router_config.RouterError, "must match agent model"):
             router_config.load_router(self.write_config(config))
 
         config = copy.deepcopy(self.config)
         del config["roles"]["minimax"]["model"]
         with self.assertRaisesRegex(router_config.RouterError, "non-empty string"):
             router_config.load_router(self.write_config(config))
+
+    def test_minimax_opencode_roles_pin_durable_none_variant(self) -> None:
+        for role_name, role in self.config["roles"].items():
+            if role.get("hook_source") != "opencode" or role.get("provider") != "minimax":
+                continue
+            with self.subTest(role=role_name):
+                self.assertEqual(role.get("variant"), "none")
+                self.assertNotIn("-m", role["command"])
+                self.assertNotIn("--variant", role["command"])
+                self.assertIn("--agent", role["command"])
+        glm = self.config["roles"]["glm"]
+        self.assertNotIn("variant", glm)
+        self.assertEqual(
+            glm["command"],
+            ["opencode", "-m", "zai/glm-5.2", "--agent", "glm-challenger"],
+        )
 
     def test_opencode_variant_must_be_durable_and_agent_pinned(self) -> None:
         config = copy.deepcopy(self.config)

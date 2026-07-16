@@ -232,6 +232,40 @@ check_required_env() {
   IFS="$old_ifs"
 }
 
+preflight_interactive_role() {
+  local role_type="$1" authority="$2" required_csv="$3" label="$4"
+  local healthcheck_json="" argument=""
+  local -a healthcheck=()
+
+  if ! healthcheck_json="$(python3 "$router" role-field "$role_type" healthcheck)"; then
+    echo "Interactive role '$label' has no valid healthcheck." >&2
+    return 1
+  fi
+  while IFS= read -r argument; do
+    healthcheck+=("$argument")
+  done < <(python3 -c '
+import json
+import sys
+for value in json.loads(sys.argv[1]):
+    print(value)
+' "$healthcheck_json")
+  if (( ${#healthcheck[@]} == 0 )); then
+    echo "Interactive role '$label' resolved an empty healthcheck." >&2
+    return 1
+  fi
+
+  if ! FLEET_HEALTHCHECK=1 \
+    FLEET_EXECUTION_PROFILE="$execution_profile" \
+    FLEET_MISSION_ID="$mission_id" \
+    FLEET_CONTROL_SOCKET="$control_socket" \
+    "$repo_root/scripts/run-interactive-agent.sh" \
+      "$role_type" "$authority" "${required_csv:--}" "${healthcheck[@]}" \
+      >/dev/null; then
+    echo "Interactive role '$label' failed its isolated runtime healthcheck." >&2
+    return 1
+  fi
+}
+
 interactive_launch_command() {
   local role_type="$1" authority="$2" required_csv="$3" command_shell="$4"
   [[ -n "$required_csv" ]] || required_csv="-"
@@ -262,6 +296,11 @@ wait_for_agent_prompt() {
   local attempt screen=""
   for ((attempt=1; attempt<=attempts; attempt++)); do
     screen="$(cmux read-screen --surface "$surface" --workspace "$ws_ref" --lines 8 2>/dev/null || true)"
+    if grep -Eqi 'Not logged in|Please run /login|Invalid MCP configuration|provider state.*symlink' <<< "$screen"; then
+      echo "Interactive agent '$label' reached a fatal provider/authentication screen." >&2
+      printf '%s\n' "$screen" >&2
+      return 1
+    fi
     tty_name="$(cmux tree --workspace "$ws_ref" | awk -v target="$surface" '
       index($0, target) { if (match($0, /tty=[^ ]+/)) print substr($0, RSTART + 4, RLENGTH - 4) }
     ')"
@@ -291,6 +330,8 @@ if [[ "${FLEET_NO_LEAD:-0}" != "1" ]]; then
     exit 2
   }
   check_required_env "$lead_requires_env" || exit 2
+  preflight_interactive_role "$lead_role_type" control "$lead_requires_env" \
+    "lead/$lead_role_type" || exit 2
 fi
 
 for ((i=0; i<${#instance_ids[@]}; i++)); do
@@ -303,6 +344,9 @@ for ((i=0; i<${#instance_ids[@]}; i++)); do
       echo "Role instance ${instance_ids[$i]} is not ready." >&2
       exit 2
     }
+    preflight_interactive_role \
+      "${role_types[$i]}" "${authorities[$i]}" "${required_envs[$i]}" \
+      "${instance_ids[$i]}/${role_types[$i]}" || exit 2
   else
     command -v ollama >/dev/null 2>&1 || { echo "ollama is required for ${instance_ids[$i]}" >&2; exit 2; }
     ollama show "${models[$i]}" >/dev/null 2>&1 || {

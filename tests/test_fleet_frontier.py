@@ -1339,18 +1339,34 @@ class FleetFrontierTests(unittest.TestCase):
         result = subprocess.CompletedProcess(
             ["opencode", "db"], 0, stdout=json.dumps(rows), stderr=""
         )
-        with mock.patch.object(fleet_frontier.subprocess, "run", return_value=result):
+        with tempfile.TemporaryDirectory() as directory:
+            state_root = Path(directory) / "opencode-state"
+            data_home = state_root / SURFACE_UUID / "data"
+            data_home.mkdir(parents=True)
+            with (
+                mock.patch.object(fleet_frontier, "OPENCODE_STATE_ROOT", state_root),
+                mock.patch.object(
+                    fleet_frontier.subprocess, "run", return_value=result
+                ) as query,
+            ):
+                self.assertEqual(
+                    fleet_frontier.opencode_turn_evidence(
+                        SESSION_ID,
+                        run_id,
+                        "2026-07-12T00:00:03+00:00",
+                        SURFACE_UUID,
+                    ),
+                    (
+                        full_response,
+                        "minimax",
+                        "MiniMax-M3",
+                        "none",
+                    ),
+                )
             self.assertEqual(
-                fleet_frontier.opencode_turn_evidence(
-                    SESSION_ID, run_id, "2026-07-12T00:00:03+00:00"
-                ),
-                (
-                    full_response,
-                    "minimax",
-                    "MiniMax-M3",
-                    "none",
-                ),
+                query.call_args.kwargs["env"]["XDG_DATA_HOME"], str(data_home)
             )
+            self.assertIn("--pure", query.call_args.args[0])
 
     def test_opencode_rejects_wrong_source_and_non_opencode_session_file(self) -> None:
         run_id = "run-opencode-source"

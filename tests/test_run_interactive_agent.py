@@ -7,6 +7,7 @@ import socket
 import subprocess
 import tempfile
 import unittest
+import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,15 @@ HOOK_BRIDGE = ROOT / "scripts" / "cmux-codex-hook.sh"
 
 
 class InteractiveAgentEnvironmentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.controller_codex = tempfile.TemporaryDirectory()
+        self.addCleanup(self.controller_codex.cleanup)
+        self.controller_codex_home = Path(self.controller_codex.name) / "codex"
+        self.controller_codex_home.mkdir()
+        (self.controller_codex_home / "auth.json").write_text(
+            '{"test":"authentication-placeholder"}\n', encoding="utf-8"
+        )
+
     def test_cmux_hook_bridge_exposes_only_fixed_codex_events(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -55,6 +65,13 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             )
             self.assertEqual(ignored.returncode, 0, ignored.stderr)
             self.assertFalse(log.exists())
+            disabled = subprocess.run(
+                ["bash", str(HOOK_BRIDGE), "UserPromptSubmit"], input="{}\n",
+                env={**env, "CMUX_CODEX_HOOKS_DISABLED": "1"},
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(disabled.returncode, 0, disabled.stderr)
+            self.assertFalse(log.exists())
 
     def run_role(
         self,
@@ -67,7 +84,7 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
         profile: str = "native",
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
-        env["CODEX_HOME"] = "/tmp/controller-codex-home"
+        env["CODEX_HOME"] = str(self.controller_codex_home)
         env["SSH_AUTH_SOCK"] = "/tmp/controller-ssh-agent.sock"
         env["AWS_ACCESS_KEY_ID"] = "controller-aws-key"
         env["AWS_SECRET_ACCESS_KEY"] = "controller-aws-secret"
@@ -136,7 +153,7 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             expression="(lambda fleet_home, p, s: {"
             "'bootstrap_home_is_controller': os.environ['HOME'] != fleet_home,"
             "'config_under_fleet_home': p.startswith(fleet_home + '/'),"
-            "'auth_state_copied': os.path.isfile(fleet_home + '/.claude.json'),"
+            "'bootstrap_state': json.load(open(fleet_home + '/.claude.json', encoding='utf-8')),"
             "'session_home': s['env']['HOME'],"
             "'session_user': s['env']['USER'],"
             "'llm_model': os.environ.get('LLM_MODEL'),"
@@ -156,7 +173,14 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
         values = self.parse(result)
         self.assertTrue(values["bootstrap_home_is_controller"])
         self.assertTrue(values["config_under_fleet_home"])
-        self.assertFalse(values["auth_state_copied"])
+        bootstrap_state = values["bootstrap_state"]
+        self.assertTrue(bootstrap_state["hasCompletedOnboarding"])
+        self.assertLessEqual(set(bootstrap_state), {"hasCompletedOnboarding", "oauthAccount"})
+        if "oauthAccount" in bootstrap_state:
+            self.assertEqual(
+                set(bootstrap_state["oauthAccount"]),
+                {"accountUuid", "organizationUuid"},
+            )
         self.assertTrue(str(values["session_home"]).startswith("/tmp/fleet_home."))
         self.assertEqual(values["session_user"], "fleet_worker")
         self.assertIsNone(values["llm_model"])
@@ -177,19 +201,101 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
         self.assertTrue(values["unsandboxed_disabled"])
         self.assertTrue(values["permission_hook"])
 
-    def test_codex_roles_keep_explicit_codex_home(self) -> None:
+    def test_codex_roles_use_one_curated_ephemeral_hook_home(self) -> None:
         for role in ("codex", "codex_candidate"):
             with self.subTest(role=role):
-                result = self.run_role(
-                    role,
-                    expression="{'CODEX_HOME': os.environ.get('CODEX_HOME')}",
-                )
+                with tempfile.TemporaryDirectory() as directory:
+                    controller_codex_home = Path(directory) / "controller-codex"
+                    controller_codex_home.mkdir()
+                    (controller_codex_home / "auth.json").write_text(
+                        '{"test":"authentication-placeholder"}\n', encoding="utf-8"
+                    )
+                    (controller_codex_home / "hooks.json").write_text(
+                        json.dumps({"hooks": {"UserPromptSubmit": [{"hooks": [{
+                            "type": "command", "command": "python3 unrelated.py"
+                        }]}]}}) + "\n",
+                        encoding="utf-8",
+                    )
+                    values = self.parse(self.run_role(
+                        role,
+                        extra_env={"CODEX_HOME": str(controller_codex_home)},
+                        expression="(lambda p: {"
+                        "'codex_home': p,"
+                        "'fleet_home': os.environ['FLEET_HOME'],"
+                        "'auth': json.load(open(p + '/auth.json', encoding='utf-8'))['test'],"
+                        "'hooks_present': os.path.exists(p + '/hooks.json'),"
+                        "'config': open(p + '/config.toml', encoding='utf-8').read(),"
+                        "'cmux_hooks_disabled': os.environ.get('CMUX_CODEX_HOOKS_DISABLED')"
+                        "})(os.environ['CODEX_HOME'])",
+                    ))
                 self.assertEqual(
-                    self.parse(result)["CODEX_HOME"],
-                    "/tmp/controller-codex-home",
+                    values["codex_home"], values["fleet_home"] + "/.codex"
                 )
+                self.assertEqual(values["auth"], "authentication-placeholder")
+                self.assertFalse(values["hooks_present"])
+                self.assertIn("[features]\nhooks = true\n", values["config"])
+                self.assertIn(f'[projects."{ROOT}"]', values["config"])
+                self.assertIn('trust_level = "untrusted"', values["config"])
+                self.assertEqual(values["cmux_hooks_disabled"], "1")
 
-    def test_mission_specialist_uses_ephemeral_codex_home_with_auth_and_cmux_hooks(self) -> None:
+    def test_codex_cli_gets_exact_repo_owned_hook_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fake_codex = Path(directory) / "codex"
+            fake_codex.write_text(
+                "#!/bin/sh\n"
+                "python3 - \"$@\" <<'PY'\n"
+                "import json, os, sys\n"
+                "print(json.dumps({\n"
+                "  'argv': sys.argv[1:],\n"
+                "  'hooks_file': os.path.exists(os.environ['CODEX_HOME'] + '/hooks.json'),\n"
+                "  'cmux_disabled': os.environ.get('CMUX_CODEX_HOOKS_DISABLED'),\n"
+                "}))\n"
+                "PY\n",
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o700)
+            result = subprocess.run(
+                [
+                    "bash", str(RUNNER), "codex", "advisory", "-",
+                    str(fake_codex), "--model", "gpt-5.6-sol",
+                ],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "CODEX_HOME": str(self.controller_codex_home),
+                    "CMUX_SURFACE_ID": "12345678-1234-4234-9234-123456789ABC",
+                },
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        values = json.loads(result.stdout)
+        overrides = [
+            values["argv"][index + 1]
+            for index, value in enumerate(values["argv"])
+            if value == "-c"
+        ]
+        self.assertEqual(values["argv"].count("--enable"), 1)
+        self.assertIn("hooks", values["argv"])
+        self.assertEqual(
+            values["argv"].count("--dangerously-bypass-hook-trust"), 1
+        )
+        self.assertEqual(len(overrides), 3)
+        for event in ("SessionStart", "UserPromptSubmit", "Stop"):
+            matching = [value for value in overrides if value.startswith(f"hooks.{event}=")]
+            self.assertEqual(len(matching), 1)
+            self.assertIn("scripts/cmux-codex-hook.sh", matching[0])
+            self.assertIn(
+                "CMUX_SURFACE_ID=12345678-1234-4234-9234-123456789ABC",
+                matching[0],
+            )
+            self.assertIn("CMUX_CODEX_HOOKS_DISABLED=0", matching[0])
+        self.assertFalse(values["hooks_file"])
+        self.assertEqual(values["cmux_disabled"], "1")
+
+    def test_mission_specialist_uses_ephemeral_codex_home_with_auth(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             controller_codex_home = Path(directory) / "controller-codex"
             controller_codex_home.mkdir()
@@ -232,7 +338,6 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
                     "'under_fleet_home': p.startswith(os.environ['FLEET_HOME'] + '/'),"
                     "'auth': json.load(open(p + '/auth.json', encoding='utf-8'))['test'],"
                     "'hooks_present': os.path.exists(p + '/hooks.json'),"
-                    "'hooks': json.load(open(p + '/hooks.json', encoding='utf-8')),"
                     "'config': open(p + '/config.toml', encoding='utf-8').read(),"
                     "'config_parses': __import__('tomllib').load(open(p + '/config.toml', 'rb'))['features']['hooks']"
                     "})(os.environ['CODEX_HOME'])",
@@ -240,21 +345,8 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             )
         self.assertTrue(values["under_fleet_home"])
         self.assertEqual(values["auth"], "authentication-placeholder")
-        self.assertTrue(values["hooks_present"])
+        self.assertFalse(values["hooks_present"])
         self.assertTrue(values["config_parses"])
-        hook_commands = [
-            hook["command"]
-            for groups in values["hooks"]["hooks"].values()
-            for group in groups
-            for hook in group["hooks"]
-        ]
-        self.assertTrue(hook_commands)
-        self.assertEqual(len(hook_commands), 3)
-        self.assertTrue(
-            all("scripts/cmux-codex-hook.sh" in command for command in hook_commands)
-        )
-        self.assertFalse(any("unrelated.py" in command for command in hook_commands))
-        self.assertEqual(set(values["hooks"]["hooks"]), {"SessionStart", "UserPromptSubmit", "Stop"})
         self.assertIn("hooks = true", values["config"])
         self.assertNotIn("sandbox_mode", values["config"])
 
@@ -269,7 +361,7 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
                 },
             )
         self.assertEqual(result.returncode, 2)
-        self.assertIn("Mission-bound Codex specialist requires", result.stderr)
+        self.assertIn("Fleet Codex role requires", result.stderr)
 
     def test_sandboxed_profile_narrows_runtime_perimeter_without_changing_role(self) -> None:
         values = self.parse(
@@ -343,6 +435,63 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             self.assertIn("/tmp/fleet_home.", value["root"])
             self.assertTrue(value["opencode"])
             self.assertFalse(value["other"])
+
+    def test_opencode_live_surface_uses_deterministic_ephemeral_data_home(self) -> None:
+        surface_uuid = str(uuid.uuid4()).upper()
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            provider = home / ".local" / "share" / "opencode"
+            provider.mkdir(parents=True)
+            (provider / "provider.json").write_text("{}\n", encoding="utf-8")
+            values = self.parse(self.run_role(
+                "glm",
+                extra_env={"HOME": str(home), "CMUX_SURFACE_ID": surface_uuid},
+                expression="{"
+                "'data': os.environ['XDG_DATA_HOME'],"
+                "'config': os.environ['XDG_CONFIG_HOME'],"
+                "'state': os.environ['XDG_STATE_HOME'],"
+                "'fleet_home': os.environ['FLEET_HOME'],"
+                "'provider': os.path.isfile(os.environ['XDG_DATA_HOME'] + '/opencode/provider.json')"
+                "}",
+            ))
+        self.assertEqual(
+            values["data"],
+            f"/tmp/agent-fleet-orchestrator-opencode/{surface_uuid}/data",
+        )
+        self.assertTrue(values["config"].startswith(values["fleet_home"] + "/"))
+        self.assertTrue(values["state"].startswith(values["fleet_home"] + "/"))
+        self.assertTrue(values["provider"])
+        self.assertFalse(Path(values["data"]).exists())
+
+    def test_opencode_preserves_relative_symlinks_that_stay_inside_provider_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            package = home / ".config" / "opencode" / "node_modules" / "package"
+            package.mkdir(parents=True)
+            (package / "tool.py").write_text("internal\n", encoding="utf-8")
+            bin_dir = home / ".config" / "opencode" / "node_modules" / ".bin"
+            bin_dir.mkdir()
+            (bin_dir / "tool").symlink_to("../package/tool.py")
+            values = self.parse(self.run_role(
+                "glm",
+                extra_env={"HOME": str(home)},
+                expression="(lambda p: {'is_link': os.path.islink(p), "
+                "'content': open(p, encoding='utf-8').read().strip()})("
+                "os.environ['XDG_CONFIG_HOME'] + '/opencode/node_modules/.bin/tool')",
+            ))
+        self.assertTrue(values["is_link"])
+        self.assertEqual(values["content"], "internal")
+
+    def test_opencode_rejects_symlinks_that_escape_provider_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            provider = home / ".config" / "opencode"
+            provider.mkdir(parents=True)
+            (home / ".config" / "outside.json").write_text("{}\n", encoding="utf-8")
+            (provider / "escape").symlink_to("../outside.json")
+            result = self.run_role("glm", extra_env={"HOME": str(home)})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("symlink escapes its isolated root", result.stderr)
 
     def test_forbidden_required_credentials_fail_closed(self) -> None:
         for name in (

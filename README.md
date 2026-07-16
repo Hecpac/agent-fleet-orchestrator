@@ -76,6 +76,10 @@ python3 orchestration/agents/local_worker.py \
 Terminal orchestration is wired through the cmux CLI. The canonical roster,
 capabilities, launch commands, display ranks, limits, and presets live in
 `orchestration/router.yaml` (JSON-compatible YAML, parsed with Python stdlib).
+The canonical operator guide is
+[`docs/guia-uso-flota.md`](docs/guia-uso-flota.md); the shorter
+[`docs/guia-operacion-cmux.md`](docs/guia-operacion-cmux.md) is a complementary
+CMUX visibility runbook.
 
 ### Mission Control (canonical entry point)
 
@@ -246,11 +250,14 @@ Catch-up requires the recorded baseline and continuous boot-scoped audit
 sequence; truncated or corrupt audit evidence is rejected. Event ACKs are
 schema-validated before readiness is published.
 Local and frontier dispatch leases are owner-checked; frontier exclusivity is
-enforced by surface UUID across manifest aliases. Unbound Fleet Codex workers
-use the default `~/.codex` configuration so cmux's official hooks remain active;
-mission-bound read-only specialists use the filtered ephemeral configuration
-described above. The router pins `gpt-5.6-sol` independently of the user's
-configured model.
+enforced by surface UUID across manifest aliases. Every Fleet Codex process
+copies controller authentication into an ephemeral home with one
+controller-owned cmux hook bridge, so legacy and current hook trees cannot
+double-submit a turn. Its automation-only hook trust bypass applies only to
+the three hard-coded repo-owned overrides; user hook command text is never
+copied into the process. Mission-bound read-only specialists additionally use the
+filtered permission profile described above. The router pins `gpt-5.6-sol`
+independently of the user's configured model.
 Teardown publishes an atomic closing owner so new dispatches cannot enter
 after its lease check.
 If a hard-killed runner leaves leases while its pane is still alive, automatic
@@ -338,13 +345,19 @@ closing marker and archives both the dialogue ledger and payload store.
 The `fleet_dialogue` preset adds a fail-closed BUILD loop with fixed identities:
 Codex/OpenAI is the only Maker, the dedicated read-only `minimax_checker` pins
 `variant: none` through the `minimax-checker` OpenCode agent (the OpenCode
-1.17.15 TUI rejects `--variant`, so the boot command carries no `-m` or
-`--variant`), GLM remains the CHALLENGE role, and Claude remains the
+TUI rejects `--variant`, so the boot command carries no `-m` or `--variant`),
+GLM remains the CHALLENGE role, and Claude remains the
 VERIFY role. The checker variant is persisted in the manifest and lifecycle
 ledger and must match OpenCode's final `message.variant`; absence or drift closes
 the run as `indeterminate`. CONTROL is a stepper: it
 returns one `next_action` but never dispatches a model or publishes an FDP-1
 message automatically.
+
+OpenCode 1.18.0 records `variant: none` for MiniMax but omits the field for the
+current GLM session. MiniMax fleet roles therefore pin that value in dedicated
+project agents and carry it through the manifest and lifecycle ledger; GLM
+retains an absent variant. The verifier requires the provider-specific value
+exactly and does not reinterpret or discard either representation.
 
 Start the fleet, enter BUILD, and freeze a strict task spec:
 
