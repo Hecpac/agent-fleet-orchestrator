@@ -1,4 +1,4 @@
-# FDP-2 Checker — verificación independiente
+# FDP-2 Checker — verificación con identidad distinta
 
 Feature: `{{FEATURE}}`
 Conversation: `{{CONVERSATION_ID}}`

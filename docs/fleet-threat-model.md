@@ -22,7 +22,8 @@ controls outside the model:
 - one-writer and phase gates;
 - exact `run_id`, workspace, surface, provider, model, and transcript binding;
 - local-worker leases and budgets on the tracked dispatch path;
-- deterministic tests and independent verification before accepting claims.
+- deterministic tests and separately executed, identity-bound verification
+  before accepting claims.
 
 Completion provenance proves which configured run produced a final response.
 It does **not** prove that the response is correct. A valid transcript that
@@ -90,6 +91,28 @@ installed provider deterministically denied Bash and an external read, while a
 tracked GLM pane completed a built-in Read/Grep review and accepted the fixes
 after finding one real template-integrity defect.
 
+## P1-IND1 identity diversity
+
+The runtime uses **identity diversity**, not “independence”, for the property it
+can prove. A declared group is valid only when every member has a different
+configured `(provider, model, variant)` tuple. `router_config.py` rejects a
+duplicate identity in the default race or any preset `identity_groups` before
+CMUX effects. The resolved groups are copied into plan output, workflow
+compilations, and fleet manifests beside the exact member identities.
+
+This contract deliberately permits same-identity partitions outside declared
+groups, including custom races and the two bounded triage partitions in the
+`research` preset. A custom race still prints only `FIRST CANDIDATE (NOT
+VERIFIED)`. Distinct tuples make corroboration auditable; they do not measure
+training lineage, uncorrelated errors, or semantic truth.
+
+Live evidence is recorded in
+`orchestration/smoke-evidence/p1-ind1-identity-groups-20260716.md`: a duplicate
+default-race identity failed before any CMUX effect, a valid three-identity
+group survived into the live manifest, and two tracked identity-distinct
+reviews completed successfully. One reviewer also emitted a disproven factual
+claim, demonstrating why tuple diversity is not semantic verification.
+
 ## Explicit non-goals
 
 The following are **OUT OF SCOPE** for boundary A:
@@ -124,7 +147,7 @@ not establish that boundary.
 | 2 | Claude or OpenCode tries to write controller evidence or invoke `cmux`. | Claude has no automatic permission. OpenCode cannot call Bash or external paths; its launcher rejects a resolved policy that re-enables either. The P1-OC1 provider smoke directly denied Bash and an external read. | `test_claude_policy_does_not_auto_allow_cmux_or_mutation`, `test_opencode_reviewers_default_deny_process_and_external_access`, and `p1-oc1-opencode-boundary-20260716.md` |
 | 3 | An arbitrary process under the same UID rewrites a mode-0600 evidence file. | The write succeeds; this is an explicit boundary demonstration, not a protected case. | `test_same_uid_process_can_rewrite_private_file_and_is_out_of_scope` |
 | 4 | CONTROL calls a direct worker entrypoint and bypasses tracked dispatch. | The path exists and is trusted/operator-only; it must never be described as enforced against CONTROL. | `test_control_is_trusted_and_can_reach_direct_entrypoints` |
-| 5 | A custom race uses the same role/model twice. | It is permitted but cannot be reported as independent confirmation; the default race remains heterogeneous. | `test_same_model_custom_race_is_permitted_but_not_assurance` |
+| 5 | A custom race uses the same role/model twice. | It remains permitted but is only an unverified candidate. Default race identities and declared preset groups fail closed on duplicate `provider/model/variant` tuples. | `test_same_model_custom_race_is_permitted_but_never_claims_assurance` and the router identity-group tests |
 | 6 | The waiter process is suspended beyond its alarm deadline. | `fleet_wait.py` uses POSIX `alarm`; a separate primitive probe confirms the signal becomes pending across process stop/resume. The actual waiter path and full Mac sleep/wake remain open live lanes. | `test_wait_uses_posix_alarm_and_alarm_is_pending_after_process_stop` |
 
 ## Operator rules

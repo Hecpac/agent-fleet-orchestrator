@@ -295,6 +295,64 @@ class RouterConfigTests(unittest.TestCase):
         for item in plan["instances"]:
             self.assertNotIn("workspace-write", item["command"])
 
+    def test_default_race_requires_distinct_provider_model_variant_identities(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["defaults"]["race_roles"] = ["codex_candidate", "codex_candidate"]
+        with self.assertRaisesRegex(
+            router_config.RouterError,
+            "repeats provider/model/variant identity",
+        ):
+            router_config.load_router(self.write_config(config))
+
+    def test_preset_identity_groups_fail_closed_on_repeated_identity(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["presets"]["duplicate_identity"] = {
+            "description": "invalid identity-diverse group",
+            "include_lead": False,
+            "identity_groups": [["first", "second"]],
+            "instances": [
+                {"instance_id": "first", "role_type": "codex_candidate"},
+                {"instance_id": "second", "role_type": "codex_candidate"},
+            ],
+        }
+        with self.assertRaisesRegex(
+            router_config.RouterError,
+            "repeats provider/model/variant identity",
+        ):
+            router_config.load_router(self.write_config(config))
+
+    def test_identity_groups_reject_unknown_duplicate_or_single_members(self) -> None:
+        cases = (
+            ([["analysis", "missing"]], "unknown instances"),
+            ([["analysis", "analysis"]], "duplicate instance IDs"),
+            ([["analysis"]], "at least two instances"),
+        )
+        for groups, error in cases:
+            with self.subTest(groups=groups):
+                config = copy.deepcopy(self.config)
+                config["presets"]["audit"]["identity_groups"] = groups
+                with self.assertRaisesRegex(router_config.RouterError, error):
+                    router_config.load_router(self.write_config(config))
+
+    def test_intentional_duplicate_roles_outside_identity_group_remain_valid(self) -> None:
+        plan = router_config.build_plan(
+            self.config,
+            preset_name="research",
+            run_healthcheck=False,
+        )
+        self.assertEqual(plan["identity_groups"], [["research", "challenge"]])
+        instances = {item["instance_id"]: item for item in plan["instances"]}
+        self.assertEqual(
+            (
+                instances["triage_scope"]["provider"],
+                instances["triage_scope"]["model"],
+            ),
+            (
+                instances["triage_sources"]["provider"],
+                instances["triage_sources"]["model"],
+            ),
+        )
+
     def test_duplicate_role_types_with_unique_instance_ids_are_allowed(self) -> None:
         plan = router_config.build_plan(
             self.config,
@@ -397,6 +455,14 @@ class RouterConfigTests(unittest.TestCase):
             ["opencode", "--agent", "minimax-checker"],
         )
         self.assertEqual(instances["checker"]["variant"], "none")
+        self.assertEqual(
+            plan["identity_groups"],
+            [["maker", "checker", "challenge", "verify"]],
+        )
+        self.assertIn(
+            "IDENTITY_GROUP\x1f1\x1fmaker,checker,challenge,verify",
+            router_config._records(plan),
+        )
 
     def test_custom_input_is_sorted_by_rank_then_instance(self) -> None:
         plan = router_config.build_plan(

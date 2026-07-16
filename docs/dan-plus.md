@@ -45,7 +45,7 @@ it does not justify spending tokens on every pane.
   when it improves measured outcomes. Therefore the Dan+ lead owns the task
   graph; FDP state machines are not its default path.
 - [Anthropic Agent Teams](https://code.claude.com/docs/en/agent-teams) validates
-  a lead plus independent, directly inspectable teammates for research, review,
+  a lead plus separately addressable, directly inspectable teammates for research, review,
   competing hypotheses, and cross-layer work—and warns against multi-agent
   overhead for sequential tasks. Dan+ tells the lead to delegate selectively.
 - [OpenAI Agents SDK orchestration guidance](https://openai.github.io/openai-agents-python/multi_agent/)
@@ -82,7 +82,7 @@ can make the active run ambiguous. In a contract-v2 fleet, raw CMUX input also
 cannot become a tracked result: CONTROL must authorize the exact submit event
 before session binding. Dan+ uses result-driven collaboration:
 
-1. independent agents return a durable result;
+1. separately tracked agents return a durable result;
 2. the lead can route that exact result file to any peer in a later tracked run;
 3. the recipient challenges, revises, or verifies it;
 4. every adopted contribution retains its run identity.

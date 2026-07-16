@@ -68,6 +68,11 @@ Nota de enforcement: los wrappers validan UUID, identidad, autoridad, sandbox,
 leases y finalización por `run_id`. En `autonomous`, el gate de fase está abierto
 para todo el roster; en `guided`/`assured` conserva las transiciones explícitas.
 En todos los modos hay un solo writer y una race entrega un candidato, no verdad.
+Los presets de revisión declaran `identity_groups`: antes de crear el workspace,
+el router exige una tupla `provider/model/variant` distinta por miembro y el
+manifest conserva `identity_group.*`. Esto prueba diversidad de identidad, no
+independencia semántica; una race custom del mismo modelo sigue permitida pero
+nunca deja de ser candidato no verificado.
 Los revisores OpenCode no reciben Bash ni raíces externas del controlador: el launcher
 valida que la configuración resuelta exponga únicamente `read`, `glob` y `grep`.
 Para FDP-2, CONTROL incorpora Git y el mensaje exacto en un evidence pack

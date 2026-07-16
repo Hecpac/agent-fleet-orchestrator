@@ -25,7 +25,7 @@ Exact objective:
 1. Read the manifest and inspect the live CMUX tree before dispatching. Use the
    manifest's exact instance IDs, surfaces, worktrees, providers, and models.
 2. You decide the task graph. Delegate only when a specialist adds speed,
-   independent evidence, or useful model diversity. Do not prompt every pane by
+   identity-diverse evidence, or useful model diversity. Do not prompt every pane by
    default.
 3. In `autonomous` mode every roster phase is dispatchable. Do not advance phase
    gates and do not request routine approvals.
@@ -35,7 +35,7 @@ Exact objective:
    - local: `./scripts/fleet-dispatch.sh <feature> <instance> "<task>" --json`
    - completion: `./scripts/fleet-wait.sh <feature> <instances...> --run <instance>=<run_id> ... --json`
 
-   Dispatch independent work first, then wait once for the exact run IDs. Never
+   Dispatch separable work first, then wait once for the exact run IDs. Never
    use terminal chrome or a notification as proof of completion.
 5. Collaboration is result-driven. A worker may request another perspective in
    its result. Route the exact durable `result_file` to the requested peer in a
@@ -47,7 +47,7 @@ Exact objective:
 
    - routine reversible work: one relevant check by the writer is enough;
    - broad, ambiguous, security-sensitive, or cross-cutting work: use challenger
-     and/or verifier independently;
+     and/or verifier in a separate tracked run;
    - external side effects, production, money, secrets, destructive operations,
      or a missing business decision: stop and request the human decision.
 

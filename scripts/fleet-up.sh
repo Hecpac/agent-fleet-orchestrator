@@ -164,6 +164,7 @@ tool_accesses=()
 providers=()
 hook_sources=()
 variants=()
+identity_groups=()
 warnings=()
 
 while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n o p; do
@@ -203,6 +204,9 @@ while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n o p; do
       providers+=("$n")
       hook_sources+=("$o")
       variants+=("$p")
+      ;;
+    IDENTITY_GROUP)
+      identity_groups+=("$b")
       ;;
     WARNING)
       warnings+=("$a")
@@ -630,6 +634,10 @@ manifest_tmp="$(mktemp "$runs_dir/.fleet-$feature.manifest.XXXXXX")"
   echo "feature=$feature"
   echo "preset=$resolved_preset"
   echo "mode=$execution_mode"
+  echo "identity_group.count=${#identity_groups[@]}"
+  for ((i=0; i<${#identity_groups[@]}; i++)); do
+    echo "identity_group.$((i + 1))=${identity_groups[$i]}"
+  done
   [[ -z "$mission_id" ]] || echo "mission_id=$mission_id"
   [[ -z "$control_socket" ]] || echo "control_socket=$control_socket"
   echo "created_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

@@ -23,6 +23,7 @@ OPENCODE_AGENTS = (
 )
 RUN_LOCAL_WORKER = ROOT / "scripts" / "run-local-worker.sh"
 FLEET_WAIT = ROOT / "scripts" / "fleet_wait.py"
+FLEET_RACE = ROOT / "scripts" / "fleet-race.sh"
 
 sys.path.insert(0, str(ROOT / "scripts"))
 import router_config  # noqa: E402
@@ -111,7 +112,7 @@ class FleetThreatModelTests(unittest.TestCase):
         self.assertIn("orchestration/agents/local_worker.py", direct)
         self.assertNotIn("fleet_leases.py", direct)
 
-    def test_same_model_custom_race_is_permitted_but_not_assurance(self) -> None:
+    def test_same_model_custom_race_is_permitted_but_never_claims_assurance(self) -> None:
         default_roles = self.router["defaults"]["race_roles"]
         default_identities = {
             (
@@ -127,6 +128,10 @@ class FleetThreatModelTests(unittest.TestCase):
             ["candidate_a=codex_candidate", "candidate_b=codex_candidate"],
         )
         self.assertEqual([item["role_type"] for item in custom], ["codex_candidate"] * 2)
+        race = FLEET_RACE.read_text(encoding="utf-8")
+        self.assertIn("FIRST CANDIDATE (NOT VERIFIED)", race)
+        self.assertIn("verify surface", race)
+        self.assertNotIn("ASSURANCE PASSED", race)
 
     @unittest.skipUnless(hasattr(signal, "SIGSTOP"), "requires POSIX process signals")
     def test_wait_uses_posix_alarm_and_alarm_is_pending_after_process_stop(self) -> None:

@@ -85,6 +85,13 @@ heavy-worker lease, plus global-local and per-role semaphore slots. Every lease
 contains its owning `run_id`. Task text is stored mode `0600`; the ledger stores
 only its SHA-256 plus lifecycle/result metadata.
 
+Presets may declare `identity_groups` for review paths whose configured model
+diversity matters. Router validation requires at least two members and a unique
+`provider/model/variant` tuple for every member before CMUX starts. Plans,
+compiled workflows, and manifests preserve the group membership. Duplicate
+roles remain valid outside such a group, and tuple diversity is observational
+evidence—not proof that conclusions or model errors are independent.
+
 Teardown refuses fleets with active dispatch leases and nonterminal Missions,
 stops Fleet Control, freezes the portable Mission archive while evidence is
 available, and removes the manifest only after CMUX confirms disappearance.

@@ -81,6 +81,7 @@ class FleetAssuranceControllerTests(unittest.TestCase):
         raw: bytes | None = None,
         status: str = "succeeded",
         elapsed: int = 10,
+        variant: str | None = None,
     ) -> bytes:
         expected = event["snapshot"]["expected"]
         values = self.manifest_values()
@@ -95,6 +96,8 @@ class FleetAssuranceControllerTests(unittest.TestCase):
             "provider": values[f"{expected['instance']}.provider"],
             "model": values[f"{expected['instance']}.model"],
         }
+        if variant is not None:
+            common["variant"] = variant
         append_event(
             self.runs / f"fleet-{self.feature}.ledger.jsonl",
             {**common, "timestamp": started.isoformat(), "status": "preparing"},
@@ -343,6 +346,28 @@ class FleetAssuranceControllerTests(unittest.TestCase):
             terminal["snapshot"]["terminal_reason"],
             f"run_timeout_exceeded:{run_id}",
         )
+
+    def test_run_variant_must_match_complete_fdp3_roster_identity(self) -> None:
+        started = self.start_assurance()
+        run_id = "glm-variant-drift-run"
+        self.seed_run(
+            started,
+            run_id,
+            {
+                "schema_version": 1,
+                "summary": "identity drift must fail closed",
+                "findings": [],
+            },
+            variant="unexpected",
+        )
+        with self.assertRaisesRegex(assurance.AssuranceError, "run variant"):
+            assurance.step(
+                self.runs,
+                feature=self.feature,
+                idempotency_key="variant-drift-glm",
+                run_id=run_id,
+                now=self.now + timedelta(minutes=8),
+            )
 
     def test_invalid_claude_json_is_indeterminate(self) -> None:
         verify_event = self.enter_verify(self.challenge_to_gate())

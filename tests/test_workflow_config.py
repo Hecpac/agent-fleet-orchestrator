@@ -33,6 +33,14 @@ class WorkflowConfigTests(unittest.TestCase):
         implementation = next(item for item in compiled if item["workflow"]["name"] == "implementation")
         self.assertEqual(implementation["resolved"]["writer_instance"], "builder")
         self.assertEqual(implementation["resolved"]["mode"], "autonomous")
+        self.assertEqual(
+            implementation["resolved"]["identity_groups"],
+            [["builder", "challenger", "verifier"]],
+        )
+        self.assertEqual(
+            implementation["resolved"]["assurance_identity_groups"],
+            [["maker", "checker", "challenge", "verify"]],
+        )
         local_worm = next(item for item in compiled if item["workflow"]["name"] == "local-worm")
         self.assertEqual(local_worm["workflow"]["audit"], {
             "mode": "worm", "trust_scope": "local-development", "worm_required_for": [],

@@ -68,9 +68,10 @@ DELEGATE (boot/reuse a fleet, dispatch, fleet-wait, then verify + synthesize):
 
 - **Audit / review / "what am I missing?"** → ALWAYS ≥2 workers with distinct
   perspectives (e.g. codex + minimax, or reviewer + code_worker) before giving
-  your own verdict. Independent agreement = confidence; disagreement = dig in.
+  your own verdict. Identity-diverse agreement directs investigation but does
+  not prove correctness; disagreement = dig in.
 - **Risky change about to close** (merge, deploy, config touching money/prod)
-  → one independent frontier review is mandatory, not optional.
+  → one separately executed, identity-distinct frontier review is mandatory.
 - **≥3 independent subtasks** → parallelize across workers instead of serial.
 - **Broad search / classification / summarization at scale** → fan out to
   cheap local workers (triage, light_code); synthesize yourself.
@@ -91,7 +92,7 @@ just dan <feature> "<complete objective>" --target-repo <repo>
 ```
 
 This boots the `dan` preset in `autonomous` mode and gives the full mission to
-the lead. The lead chooses specialists, dispatches independent work before
+the lead. The lead chooses specialists, dispatches separable work before
 waiting, cross-feeds durable results, verifies proportionally, and returns one
 exact tracked result. Routine work needs no phase advance or human approval.
 Use `fleet_dialogue` when production, money, secrets, destructive actions, or a
@@ -113,6 +114,12 @@ capabilities, access declarations, resource classes, display ranks, and presets.
 An `instance_id` is addressable in the manifest and points to a reusable
 `role_type`; duplicates use names such as `triage_scope=triage` and
 `triage_sources=triage`.
+
+Review presets declare `identity_groups`. Router validation requires a distinct
+`provider/model/variant` tuple for every member before CMUX effects, and the
+plan plus manifest retain the group. This proves configured identity diversity,
+not semantic independence. Default race roles must also be identity-diverse;
+custom same-model races remain allowed but are never assurance.
 
 `authority`, `tool_access`, and `resource_class` are validated declarations,
 and the supported wrappers now enforce important parts of them: interactive
@@ -271,8 +278,8 @@ rest; treat a missing STATUS block as still-running or failed.
 
 ### Agent race (first success is a candidate)
 
-For hotfix/needle-in-a-haystack tasks, race heterogeneous agents on the same
-task; losers are interrupted automatically:
+For hotfix/needle-in-a-haystack tasks, race agents on the same task. Defaults
+are identity-diverse; explicit custom roles may repeat an identity:
 
 ```bash
 just race <name> "<task>" [instance=role ...]  # defaults come from router
@@ -283,7 +290,8 @@ Prints the first successful candidate and its screen, then leaves the other
 agents running by default. Failed, blocked, and abandoned candidates do not
 stop `--any` while another candidate remains viable. Only use
 `--cancel-losers` after a separate verification gate. The workspace remains
-available for inspection and teardown.
+available for inspection and teardown. A race result is never independent
+assurance, even when its configured identities differ.
 
 ### Decision queue (humans are slow — make blocking visible)
 

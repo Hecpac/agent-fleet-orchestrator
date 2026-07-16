@@ -13,13 +13,16 @@ TARGET_REPO=<ruta absoluta del repositorio objetivo>
 OBJECTIVE=<resultado concreto que debe producir la flota>
 NEGATIVE_SCOPE=<acciones y archivos expresamente prohibidos>
 EXPECTED_INSTANCES=<instance_id separados por espacios, sin incluir CONTROL>
+EXPECTED_IDENTITY_GROUPS=<grupos separados por ;, miembros separados por coma>
 TIMEOUT_SECONDS=<límite por fase>
 EVIDENCE_DIR=<directorio durable para resultados y reporte final>
 ```
 
 Antes del arranque, confirma en `orchestration/router.yaml` que cada instancia
 esperada pertenece al preset y anota su `runner`, `phase`, `authority`,
-`tool_access`, provider y model. CONTROL coordina el lifecycle; solo se incluye
+`tool_access`, provider, model y variant. Copia también los `identity_groups`
+declarados: cada grupo debe tener tuplas `provider/model/variant` distintas.
+CONTROL coordina el lifecycle; solo se incluye
 en `EXPECTED_INSTANCES` si recibe una tarea cuyo resultado deba evaluarse.
 
 ## Contratos no negociables
@@ -39,6 +42,8 @@ en `EXPECTED_INSTANCES` si recibe una tarea cuyo resultado deba evaluarse.
 - Falla cerrado ante timeout, `blocked`, `failed`, `abandoned`, `indeterminate`,
   evidencia ausente, identidad ambigua o un `STATUS` inválido.
 - No uses polling ni sleeps para esperar agentes. Usa `fleet-wait`.
+- No llames “independientes” a dos runs por cantidad. Solo un grupo declarado y
+  validado puede reportarse como identity-diverse, y aun así no prueba verdad.
 - No hagas teardown mientras exista un run activo o indeterminado. Confirma que
   el agente está quiescent y usa `fleet-abandon` explícitamente cuando corresponda.
 
@@ -48,7 +53,7 @@ en `EXPECTED_INSTANCES` si recibe una tarea cuyo resultado deba evaluarse.
    `cmux ping` únicamente como prueba de disponibilidad.
 2. Captura branch, HEAD y `git status --short` de `TARGET_REPO` como baseline.
 3. Resuelve el plan sin mutaciones y verifica que coincide con
-   `EXPECTED_INSTANCES`.
+   `EXPECTED_INSTANCES` y `EXPECTED_IDENTITY_GROUPS`.
 4. Arranca el preset por el wrapper soportado:
 
    ```bash
@@ -72,7 +77,7 @@ Para cada fase configurada, avanza el gate con una referencia durable:
 just advance <feature> <PHASE> <evidence-path-or-gate-id>
 ```
 
-Envía la misma tarea acotada a las instancias independientes de esa fase. Para
+Envía la misma tarea acotada a las instancias identity-diverse de esa fase. Para
 un agente frontier:
 
 ```bash
@@ -156,6 +161,7 @@ TARGET_REPO:
 BASE_SHA:
 FINAL_SHA:
 EXPECTED_INSTANCES:
+IDENTITY_GROUPS: <miembros y tupla provider/model/variant de cada uno>
 RUNS: <instance=run_id, terminal status, exit_code, result_file cuando aplique>
 WORKER_RESULTS:
 DISAGREEMENTS:
@@ -180,14 +186,15 @@ OBJECTIVE=Auditar la coherencia entre orchestration/router.yaml, README.md y
 NEGATIVE_SCOPE=No modificar archivos, no ejecutar acciones destructivas y no
   ampliar la revisión fuera de esos tres documentos.
 EXPECTED_INSTANCES=analysis challenge verify
+EXPECTED_IDENTITY_GROUPS=analysis,challenge,verify
 ```
 
 Distribución obligatoria:
 
 1. `analysis` (RECON, frontier read-only) inspecciona las tres fuentes y entrega
    hallazgos con citas `path:line`.
-2. `challenge` (CHALLENGE, frontier read-only) repite la revisión de forma
-   independiente y busca contradicciones u omisiones del primer análisis.
+2. `challenge` (CHALLENGE, frontier read-only) repite la revisión con una
+   identidad distinta y busca contradicciones u omisiones del primer análisis.
 3. `verify` (VERIFY, local) recibe un evidence pack con los tres documentos y
    ambos resultados; decide si las conclusiones están respaldadas.
 

@@ -1179,7 +1179,7 @@ def _run_terminal(
             raise AssuranceError("run phase does not match the FDP-3 stage")
         if row.get("task_sha256") != expected["prompt_sha256"]:
             raise AssuranceError("run task hash does not match the durable FDP-3 prompt")
-        for field in ("provider", "model"):
+        for field in ("provider", "model", "variant"):
             if row.get(field) != manifest.get(f"{instance}.{field}"):
                 raise AssuranceError(f"run {field} does not match the FDP-3 roster")
     terminal_rows = [row for row in rows if row.get("status") in LIFECYCLE_TERMINALS]

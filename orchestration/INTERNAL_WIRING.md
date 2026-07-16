@@ -34,7 +34,8 @@ control.
 
 `why:` A workflow is compiled into canonical JSON and stable digests while
 router healthchecks are disabled. Compilation resolves the preset, public
-provider/model identity, capabilities, assurance preset, and unique writer, but
+provider/model identity, declared identity groups, capabilities, assurance
+preset/groups, and unique writer, but
 never exposes commands/tool access or invokes CMUX. Therefore invalid policy
 fails before boot and identical inputs always produce identical bytes.
 
@@ -287,7 +288,7 @@ the recipient automatically; CONTROL must use the existing dispatch wrappers.
 - `tests/test_spec_coherence.py::SpecCoherenceTests::test_fdp2_contract_and_documentation_remain_aligned`
 
 `why:` The `fleet_dialogue` preset fixes Maker, Checker, CHALLENGE, and VERIFY
-to independent providers and grants write authority only to Maker. CONTROL
+to identity-distinct providers and grants write authority only to Maker. CONTROL
 freezes an exact task-spec hash, exposes one explicit dispatch or publication
 action at a time, and binds every accepted run and message by ID and payload
 hash; it never performs either side effect. Strict JSON contracts, real
@@ -341,7 +342,7 @@ into a filesystem, credential, or CMUX effect path.
 
 - `tests/test_router_config.py::RouterConfigTests::test_opencode_variant_must_be_durable_and_agent_pinned`
 - `tests/test_router_config.py::RouterConfigTests::test_minimax_opencode_roles_pin_durable_none_variant`
-- `tests/test_fleet_up.py::FleetUpTests::test_fleet_dialogue_preset_materializes_one_writer_and_three_independent_gates`
+- `tests/test_fleet_up.py::FleetUpTests::test_fleet_dialogue_preset_materializes_one_writer_and_three_identity_diverse_gates`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_prepare_identity_is_durable_before_lease_acquisition`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_variant_mismatch_is_indeterminate_and_retains_lease`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_missing_required_variant_is_indeterminate`
@@ -365,7 +366,7 @@ The strict Checker JSON contract remains byte-exact: no parser relaxation,
 `<think>` stripping, or output repair can convert reasoning leakage into an
 accepted result.
 
-## Sequential independent fleet assurance
+## Sequential identity-diverse fleet assurance
 
 `rule: sequential_assurance_is_context_bound_phase_gated_and_fail_closed`
 
@@ -375,6 +376,7 @@ accepted result.
 - `tests/test_fleet_assurance_controller.py::FleetAssuranceControllerTests::test_rejected_requires_sustained_or_new_finding`
 - `tests/test_fleet_assurance_controller.py::FleetAssuranceControllerTests::test_invalid_glm_and_timeout_fail_closed`
 - `tests/test_fleet_assurance_controller.py::FleetAssuranceControllerTests::test_invalid_claude_json_is_indeterminate`
+- `tests/test_fleet_assurance_controller.py::FleetAssuranceControllerTests::test_run_variant_must_match_complete_fdp3_roster_identity`
 - `tests/test_fleet_assurance_controller.py::FleetAssuranceControllerTests::test_phase_gate_requires_exact_control_head`
 - `tests/test_fleet_assurance_controller.py::FleetAssuranceControllerTests::test_dirty_snapshot_cleanup_fails_and_retains_both`
 - `tests/test_spec_coherence.py::SpecCoherenceTests::test_fdp3_contract_and_documentation_remain_aligned`
@@ -385,13 +387,37 @@ messages, and lifecycle evidence into an assurance-owned context, creates one
 clean detached snapshot per reviewer, and exposes exactly one explicit action
 at a time. GLM may publish findings but no verdict; only after that exact
 message is bound may the phase gate accept its control-head hash and enable
-Claude. Claude independently adjudicates every GLM finding and can close only
+Claude. Claude separately adjudicates every GLM finding and can close only
 `verified` or `rejected`; malformed contracts, identity drift, timeouts, or
 missing evidence terminalize uncertainty. The separate assurance hash chain,
 single-attempt policy, immutable terminals, live receipt, offline archive, and
 clean-only snapshot teardown prevent stale reviews, silent retries, Maker
 self-validation, cross-phase dispatch, or destructive cleanup from being
 mistaken for technical verification.
+
+## Declared identity diversity is complete and auditable
+
+`rule: declared_identity_groups_require_distinct_provider_model_variant`
+
+`enforced_by:`
+
+- `tests/test_router_config.py::RouterConfigTests::test_default_race_requires_distinct_provider_model_variant_identities`
+- `tests/test_router_config.py::RouterConfigTests::test_preset_identity_groups_fail_closed_on_repeated_identity`
+- `tests/test_router_config.py::RouterConfigTests::test_identity_groups_reject_unknown_duplicate_or_single_members`
+- `tests/test_router_config.py::RouterConfigTests::test_intentional_duplicate_roles_outside_identity_group_remain_valid`
+- `tests/test_fleet_up.py::FleetUpTests::test_preset_renders_ranked_visual_order`
+- `tests/test_workflow_config.py::WorkflowConfigTests::test_repository_workflows_compile_against_router`
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_same_model_custom_race_is_permitted_but_never_claims_assurance`
+
+`why:` Identity diversity means only that every named member in a declared
+group has a different configured `(provider, model, variant)` tuple. The router
+validates default race identities and every preset `identity_groups` contract
+before CMUX effects. Resolved groups survive in plans, workflow compilations,
+and manifests beside the member identities, so an operator can audit the claim
+without relying on a description or pane title. Intentional same-identity
+partitions remain valid outside a group, and custom races remain explicitly
+unverified candidates. Distinct identities reduce one source of correlated
+error; they never prove semantic independence or correctness.
 
 ## Durable writer branches
 
@@ -823,7 +849,7 @@ terminal.
 - `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_opencode_reviewers_default_deny_process_and_external_access`
 - `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_same_uid_process_can_rewrite_private_file_and_is_out_of_scope`
 - `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_control_is_trusted_and_can_reach_direct_entrypoints`
-- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_same_model_custom_race_is_permitted_but_not_assurance`
+- `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_same_model_custom_race_is_permitted_but_never_claims_assurance`
 - `tests/test_fleet_threat_model.py::FleetThreatModelTests::test_wait_uses_posix_alarm_and_alarm_is_pending_after_process_stop`
 
 `why:` Repository content, evidence packs, other model output, and the model
@@ -837,7 +863,8 @@ before boot. The
 trusted computing base deliberately includes the provider CLIs, CMUX, the
 local Unix account, and CONTROL. A mode-0600 file does not isolate another
 process under that account, CONTROL retains direct convenience entrypoints,
-and a custom same-model race is not independent assurance. `fleet_wait.py` is
+and a custom same-model race is only an unverified candidate. Declared identity
+groups prove tuple diversity, not semantic independence. `fleet_wait.py` is
 locked to POSIX `alarm`, while a separate primitive probe verifies pending
 signal delivery across process stop/resume; the actual waiter and full-machine
 sleep/wake paths remain explicit live lanes.

@@ -14,8 +14,10 @@ agentes. Cada práctica de abajo tiene un incidente o evidencia detrás.
    workspace, estados en sidebar. Un agente que ves es un agente que puedes
    interrumpir, corregir y mejorar.
 3. **Heterogeneidad de modelos.** Distintos proveedores en una pantalla. La
-   auditoría uu demostró el valor: 2 P0 por cross-confirmación independiente
-   (codex + minimax) y 2 P0 más que solo uno de los dos vio.
+   auditoría uu demostró el valor: Codex y MiniMax corroboraron 2 P0 y cada uno
+   encontró otros 2 que el otro no vio. El router ahora registra y valida esa
+   diversidad de identidad; la coincidencia sigue sin ser prueba de verdad ni
+   de errores estadísticamente independientes.
 4. **Recuperación.** Los hooks de agentes guardan sesiones; un pane cerrado por
    accidente se restauró con `claude --resume <id>` sin perder contexto.
 5. **Orquestación por eventos.** `fleet-wait` duerme hasta `agent.hook.Stop` /

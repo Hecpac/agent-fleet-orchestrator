@@ -344,11 +344,13 @@ def compile_workflow(
         "resolved": {
             "preset": plan["preset"],
             "mode": plan["mode"],
+            "identity_groups": plan["identity_groups"],
             "lead": public_member(plan["lead"]) if plan.get("lead") else None,
             "instances": [public_member(item) for item in plan["instances"]],
             "available_capabilities": sorted(resolved_capabilities),
             "writer_instance": writers[0] if writers else None,
             "assurance_preset": assurance_plan["preset"],
+            "assurance_identity_groups": assurance_plan["identity_groups"],
         },
     }
     result["compiled_digest"] = sha256(result)

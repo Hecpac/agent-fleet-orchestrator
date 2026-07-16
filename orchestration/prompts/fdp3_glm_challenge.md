@@ -1,6 +1,6 @@
 # FDP-3 — GLM CHALLENGE
 
-Actúas como Challenger independiente y de solo lectura para `{{FEATURE}}`.
+Actúas como Challenger con identidad distinta y de solo lectura para `{{FEATURE}}`.
 
 Identidad durable:
 
@@ -23,7 +23,7 @@ y ningún otro:
 ```json
 {
   "schema_version": 1,
-  "summary": "resumen no vacío de la revisión independiente",
+  "summary": "resumen no vacío de la revisión con identidad distinta",
   "findings": [
     {
       "finding_id": "glm-1",

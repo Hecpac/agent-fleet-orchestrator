@@ -93,6 +93,10 @@ herramientas.
   durable generado por CONTROL.
 - `run_id`, UUID de workspace/surface, proveedor, modelo y, cuando aplica,
   variante deben coincidir. La ambigüedad falla cerrada.
+- Un preset que declara `identity_groups` exige tuplas
+  `provider/model/variant` distintas dentro de cada grupo antes de tocar CMUX.
+  El manifest conserva `identity_group.count` y cada grupo; esto es diversidad
+  de identidad auditable, no independencia semántica.
 
 El contrato de salida de un worker es:
 
@@ -170,8 +174,8 @@ Los presets disponibles son `dan`, `small`, `audit`, `implementation_review`,
 |---|---|---|
 | `dan` | autónomo: lead, scout, builder, challenger, verifier | Misión abierta con delegación dinámica. |
 | `small` | guiado: solo lead | Tarea acotada y secuencial. |
-| `audit` | guiado: analysis, challenge, verify | Perspectivas independientes y revisión supplied-diff. |
-| `implementation_review` | guiado: build, verify | Un writer y un reviewer local independiente. |
+| `audit` | guiado: analysis, challenge, verify | Perspectivas con identidad diversa y revisión supplied-diff. |
+| `implementation_review` | guiado: build, verify | Un writer y un reviewer local con identidad distinta. |
 | `frontier_verification` | guiado: build, challenge, verify | Writer, GLM read-only y Claude verifier. |
 | `fleet_dialogue` | asegurado: maker, checker, challenge, verify | FDP-2 y FDP-3 con gates completos. |
 | `hotfix_validated` | guiado: candidate_codex, candidate_minimax, verify | Candidatos paralelos que aún requieren verificación. |
@@ -291,7 +295,7 @@ Los roles predeterminados son `codex_candidate` y `minimax_candidate`. La primer
 ejecución `succeeded` es un **candidato no verificado**, no aceptación. Los demás
 runs se conservan por defecto. `--cancel-losers` solo solicita interrupción; en
 frontier, la interrupción no confirmada queda `indeterminate` y retiene su lease.
-Verifica el candidato mediante tests deterministas y revisión independiente
+Verifica el candidato mediante tests deterministas y revisión con identidad distinta
 antes de actuar, integrar, cancelar evidencia o cerrar la flota.
 
 ## 7. Recuperación
@@ -441,7 +445,7 @@ Este procedimiento es intencionalmente explícito. No elimines pasos ni gates.
 
    - `terminal`: detén el flujo; el terminal es inmutable.
 
-GLM publica findings, no verdict. Claude revisa independientemente cada finding
+GLM publica findings, no verdict. Claude revisa por separado cada finding
 y solo puede cerrar `verified` o `rejected`. No hay retries ni fallback de
 proveedor. JSON malformado, timeout, identidad desviada, evidencia ausente o
 snapshots dirty cierran fail-closed.

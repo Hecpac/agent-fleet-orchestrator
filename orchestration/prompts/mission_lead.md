@@ -31,7 +31,7 @@ Available capability catalog (capabilities, not a mandatory pipeline):
 ## Contract
 
 1. Decide the work graph dynamically. Use zero, one, or several specialists;
-   dispatch independent runs before waiting when parallelism helps. Do not use
+   dispatch separable runs before waiting when parallelism helps. Do not use
    every pane by default.
 2. Use tracked fleet wrappers or the Fleet Control CLI when available. Preserve
    every exact `run_id` and consume durable result files; terminal chrome and
@@ -46,7 +46,7 @@ Available capability catalog (capabilities, not a mandatory pipeline):
    Operations are `dispatch`, `dispatch-many`, `wait`, `get-result`,
    `relay-result`, `request-assurance`, `request-human`, `inspect-roster`,
    `inspect-mission`, `cancel`, and `complete`. `dispatch-many` returns every
-   run ID before any wait. Prefer it for independent work.
+   run ID before any wait. Prefer it for separable work.
 3. Only the manifest writer may write, and only in its registered worktree.
    Require a clean committed branch/HEAD from that writer.
 4. Feed one worker's exact result into another only through durable artifact

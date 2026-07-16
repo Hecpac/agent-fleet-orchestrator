@@ -130,7 +130,7 @@ just dan <feature> "<complete objective>" --target-repo <repo>
 The `dan` preset creates a visible CONTROL lead plus `scout`, `builder`,
 `challenger`, and `verifier` panes. It is `mode=autonomous`: every roster phase
 is dispatchable without `advance` or routine human approval. The lead decides
-which specialists are useful, dispatches independent runs before waiting,
+which specialists are useful, dispatches separable runs before waiting,
 cross-feeds durable results when another perspective is valuable, verifies in
 proportion to risk, and reports the writer branch/HEAD. A successful mission is
 still bound to an exact lead `run_id`, provider/model evidence, and durable
@@ -176,6 +176,14 @@ Panes are ordered by capability rank rather than argument accident:
 `CONTROL → RECON → BUILD → CHALLENGE → VERIFY`. `instance_id` is separate from
 `role_type`, so `triage_scope=triage triage_sources=triage` is valid and each
 worker remains independently addressable.
+
+Presets that rely on heterogeneous review declare `identity_groups`. The router
+fails before CMUX effects unless every member in a group has a distinct
+`provider/model/variant` tuple, then persists the resolved groups as
+`identity_group.*` in the manifest. This is an auditable identity property, not
+a claim that model errors are statistically independent. The default race is
+also identity-diverse; custom same-model races remain allowed but return only
+an unverified candidate.
 
 Current enforcement boundary: `authority`, `tool_access`, resource classes,
 execution profile, and tracked-input protocol are validated contracts. Every
@@ -438,7 +446,7 @@ verifiable with `fleet_dialogue_controller.py verify --archive <archive>`.
 ### FDP-3 sequential assurance
 
 After FDP-2 reaches `accepted` and a human advances BUILD to CHALLENGE, FDP-3
-runs one independent GLM challenge followed by one Claude verification. It has
+runs one identity-diverse GLM challenge followed by one Claude verification. It has
 its own hash-chained controller ledger and never reopens Maker automatically.
 Start it only from the exact clean FDP-2 accepted HEAD:
 
@@ -468,7 +476,7 @@ python3 scripts/fleet_assurance_controller.py step orchestration/runs \
   --feature <feature> --phase-advanced --idempotency-key <stable-key>
 ```
 
-GLM returns findings only. Claude must independently adjudicate every GLM
+GLM returns findings only. Claude must separately adjudicate every GLM
 finding and returns exactly `VERIFIED` or `REJECTED`; malformed JSON, identity
 drift, a 30-minute run timeout, or the two-hour absolute deadline closes
 fail-closed. There are no retries or provider fallbacks.

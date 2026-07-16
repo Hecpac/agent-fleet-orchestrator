@@ -324,6 +324,8 @@ class FleetUpTests(unittest.TestCase):
         self.assertIn("workspace_uuid=", manifest)
         self.assertIn("build.phase=BUILD", manifest)
         self.assertIn("verify.phase=VERIFY", manifest)
+        self.assertIn("identity_group.count=1", manifest)
+        self.assertIn("identity_group.1=build,verify", manifest)
         state_file = self.runs / "fleet-order.state.json"
         self.assertTrue(state_file.exists())
         self.assertEqual(json.loads(state_file.read_text())["active_phase"], "CONTROL")
@@ -451,6 +453,8 @@ class FleetUpTests(unittest.TestCase):
         manifest = (self.runs / "fleet-research-local.manifest").read_text()
         self.assertIn("triage_scope.role_type=triage", manifest)
         self.assertIn("triage_sources.role_type=triage", manifest)
+        self.assertIn("identity_group.count=0", manifest)
+        self.assertNotIn("identity_group.1=", manifest)
 
         advance = subprocess.run(
             [
@@ -530,7 +534,7 @@ class FleetUpTests(unittest.TestCase):
             all("--model gpt-5.6-sol" in payload for payload in codex_launches)
         )
 
-    def test_fleet_dialogue_preset_materializes_one_writer_and_three_independent_gates(self) -> None:
+    def test_fleet_dialogue_preset_materializes_one_writer_and_three_identity_diverse_gates(self) -> None:
         target = self.make_target_repo()
         result = self.run_fleet(
             "fdp2-roster",
@@ -559,6 +563,8 @@ class FleetUpTests(unittest.TestCase):
             "challenge.phase=CHALLENGE",
             "verify.role_type=claude_reviewer",
             "verify.phase=VERIFY",
+            "identity_group.count=1",
+            "identity_group.1=maker,checker,challenge,verify",
         )
         for contract in required:
             self.assertIn(contract, manifest)
