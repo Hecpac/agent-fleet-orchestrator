@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import sys
+from typing import Iterator
 
 import fleet_mission_state as mission_state
 
@@ -18,6 +20,23 @@ PHASE_ORDER = ["CONTROL", "RECON", "BUILD", "CHALLENGE", "VERIFY"]
 
 class PhaseApprovalError(RuntimeError):
     """A BUILD-exit approval is absent, stale, or bound to another Mission."""
+
+
+@contextmanager
+def mission_approval_lock(
+    manifest_path: Path, manifest: dict[str, str]
+) -> Iterator[None]:
+    """Hold the Mission lock while consuming a Mission-bound approval."""
+    mission_id = manifest.get("mission_id", "")
+    if not mission_id:
+        yield
+        return
+    try:
+        root = mission_state.mission_root(manifest_path.parent, mission_id)
+    except mission_state.MissionStateError as exc:
+        raise PhaseApprovalError(f"Mission identity is invalid: {exc}") from exc
+    with mission_state.exclusive_lock(root / ".lock"):
+        yield
 
 
 def manifest_values(path: Path) -> dict[str, str]:
@@ -175,80 +194,88 @@ def main() -> int:
         print("phase transition requires --evidence <path|sha|gate-id>", file=sys.stderr)
         return 2
     mission_bound = bool(manifest.get("mission_id"))
-    if current == "BUILD" and manifest.get("mode", "guided") != "autonomous":
-        if mission_bound:
-            if args.approved_by:
-                print(
-                    "Mission-bound BUILD exit rejects --approved-by text; "
-                    "use --approval-event-sha256 <exact assurance_approved event>",
-                    file=sys.stderr,
-                )
-                return 2
-            if not args.approval_event_sha256:
-                print(
-                    "Mission-bound BUILD exit requires --approval-event-sha256 "
-                    "<exact assurance_approved event>",
-                    file=sys.stderr,
-                )
-                return 2
+    approval_lock = (
+        mission_approval_lock(manifest_path, manifest)
+        if current == "BUILD"
+        and mission_bound
+        and manifest.get("mode", "guided") != "autonomous"
+        else nullcontext()
+    )
+    with approval_lock:
+        if current == "BUILD" and manifest.get("mode", "guided") != "autonomous":
+            if mission_bound:
+                if args.approved_by:
+                    print(
+                        "Mission-bound BUILD exit rejects --approved-by text; "
+                        "use --approval-event-sha256 <exact assurance_approved event>",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if not args.approval_event_sha256:
+                    print(
+                        "Mission-bound BUILD exit requires --approval-event-sha256 "
+                        "<exact assurance_approved event>",
+                        file=sys.stderr,
+                    )
+                    return 2
+                try:
+                    validate_mission_approval(
+                        manifest_path,
+                        manifest,
+                        args.approval_event_sha256,
+                    )
+                except PhaseApprovalError as exc:
+                    print(f"Mission approval gate closed: {exc}", file=sys.stderr)
+                    return 3
+            else:
+                if args.approval_event_sha256:
+                    print(
+                        "--approval-event-sha256 requires a Mission-bound manifest",
+                        file=sys.stderr,
+                    )
+                    return 2
+                if not args.approved_by:
+                    print(
+                        "leaving BUILD requires --approved-by <operator-attestation>: "
+                        "legacy guided fleets record a label, not cryptographic human presence",
+                        file=sys.stderr,
+                    )
+                    return 2
+        if current == "BUILD" and manifest.get("preset") == "fleet_dialogue":
             try:
-                validate_mission_approval(
-                    manifest_path,
-                    manifest,
-                    args.approval_event_sha256,
-                )
-            except PhaseApprovalError as exc:
-                print(f"Mission approval gate closed: {exc}", file=sys.stderr)
+                from fleet_dialogue_controller import ControllerError, accepted_build_gate
+
+                accepted_build_gate(manifest_path.parent, manifest.get("feature", ""), manifest)
+            except ControllerError as exc:
+                print(f"FDP-2 BUILD gate closed: {exc}", file=sys.stderr)
                 return 3
-        else:
-            if args.approval_event_sha256:
-                print(
-                    "--approval-event-sha256 requires a Mission-bound manifest",
-                    file=sys.stderr,
-                )
-                return 2
-            if not args.approved_by:
-                print(
-                    "leaving BUILD requires --approved-by <operator-attestation>: "
-                    "legacy guided fleets record a label, not cryptographic human presence",
-                    file=sys.stderr,
-                )
-                return 2
-    if current == "BUILD" and manifest.get("preset") == "fleet_dialogue":
-        try:
-            from fleet_dialogue_controller import ControllerError, accepted_build_gate
+        if current == "CHALLENGE" and manifest.get("preset") == "fleet_dialogue":
+            try:
+                from fleet_assurance_controller import AssuranceError, challenge_phase_gate
 
-            accepted_build_gate(manifest_path.parent, manifest.get("feature", ""), manifest)
-        except ControllerError as exc:
-            print(f"FDP-2 BUILD gate closed: {exc}", file=sys.stderr)
-            return 3
-    if current == "CHALLENGE" and manifest.get("preset") == "fleet_dialogue":
-        try:
-            from fleet_assurance_controller import AssuranceError, challenge_phase_gate
-
-            challenge_phase_gate(
-                manifest_path.parent,
-                manifest.get("feature", ""),
-                manifest,
-                args.evidence,
-            )
-        except AssuranceError as exc:
-            print(f"FDP-3 CHALLENGE gate closed: {exc}", file=sys.stderr)
-            return 3
-    state["active_phase"] = requested
-    entry = {
-        "phase": requested,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "evidence": args.evidence,
-    }
-    if current == "BUILD" and mission_bound and args.approval_event_sha256:
-        entry["approval_event_sha256"] = args.approval_event_sha256
-    elif args.approved_by:
-        entry["approved_by"] = args.approved_by
-    state["history"].append(entry)
-    write_atomic(path, state)
-    print(f"advanced {current} -> {requested}")
-    return 0
+                challenge_phase_gate(
+                    manifest_path.parent,
+                    manifest.get("feature", ""),
+                    manifest,
+                    args.evidence,
+                )
+            except AssuranceError as exc:
+                print(f"FDP-3 CHALLENGE gate closed: {exc}", file=sys.stderr)
+                return 3
+        state["active_phase"] = requested
+        entry = {
+            "phase": requested,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "evidence": args.evidence,
+        }
+        if current == "BUILD" and mission_bound and args.approval_event_sha256:
+            entry["approval_event_sha256"] = args.approval_event_sha256
+        elif args.approved_by:
+            entry["approved_by"] = args.approved_by
+        state["history"].append(entry)
+        write_atomic(path, state)
+        print(f"advanced {current} -> {requested}")
+        return 0
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -617,6 +618,7 @@ def _require_challenge_start_state(
     manifest: dict[str, str],
     *,
     now: datetime | None = None,
+    validate_approval: bool = True,
 ) -> dict[str, Any]:
     value = _state(runs_dir, feature)
     if value.get("active_phase") != "CHALLENGE":
@@ -637,15 +639,16 @@ def _require_challenge_start_state(
             raise AssuranceError(
                 "Mission-bound FDP-3 start requires the exact approval event"
             )
-        try:
-            fleet_state.validate_mission_approval(
-                runs_dir / f"fleet-{feature}.manifest",
-                manifest,
-                approval_event_sha256,
-                now=now,
-            )
-        except fleet_state.PhaseApprovalError as exc:
-            raise AssuranceError(f"Mission approval is invalid: {exc}") from exc
+        if validate_approval:
+            try:
+                fleet_state.validate_mission_approval(
+                    runs_dir / f"fleet-{feature}.manifest",
+                    manifest,
+                    approval_event_sha256,
+                    now=now,
+                )
+            except fleet_state.PhaseApprovalError as exc:
+                raise AssuranceError(f"Mission approval is invalid: {exc}") from exc
     elif not isinstance(latest.get("approved_by"), str) or not latest["approved_by"].strip():
         raise AssuranceError(
             "legacy FDP-3 start requires a recorded operator attestation"
@@ -1082,6 +1085,7 @@ def start(
             feature,
             manifest,
             now=current_time,
+            validate_approval=False,
         )
         if closing_path(runs_dir, feature).exists():
             raise AssuranceConflict(f"fleet '{feature}' is closing")
@@ -1159,17 +1163,34 @@ def start(
             ),
             "terminal_reason": None,
         }
-        return _append_event_locked(
-            runs_dir,
-            feature,
-            events,
-            assurance_id=assurance_id,
-            event_type="assurance_started",
-            idempotency_key=idempotency_key,
-            request=request,
-            snapshot=snapshot,
-            now=current_time,
+        approval_lock = (
+            fleet_state.mission_approval_lock(
+                runs_dir / f"fleet-{feature}.manifest",
+                manifest,
+            )
+            if manifest.get("mission_id")
+            else nullcontext()
         )
+        with approval_lock:
+            if manifest.get("mission_id"):
+                _require_challenge_start_state(
+                    runs_dir,
+                    feature,
+                    manifest,
+                    now=now or utc_now(),
+                    validate_approval=True,
+                )
+            return _append_event_locked(
+                runs_dir,
+                feature,
+                events,
+                assurance_id=assurance_id,
+                event_type="assurance_started",
+                idempotency_key=idempotency_key,
+                request=request,
+                snapshot=snapshot,
+                now=current_time,
+            )
 
 
 def _bound_ids(events: list[dict[str, Any]]) -> tuple[set[str], set[str]]:

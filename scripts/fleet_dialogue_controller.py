@@ -828,7 +828,14 @@ def _checker_evidence_pack(
         raise ContractError("Checker evidence base_sha is invalid")
     if source_head != head_sha or not GIT_SHA.fullmatch(str(source_head or "")):
         raise ContractError("Checker evidence head_sha does not match the bound conversation head")
-    status = _git(manifest, "status", "--porcelain=v1", "--untracked-files=all", worktree=True)
+    status = _git(
+        manifest,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+        worktree=True,
+    )
     if status:
         raise ContractError("Checker evidence requires a clean Maker worktree")
     commit_count = _git(manifest, "rev-list", "--count", f"{base_sha}..{head_sha}")
@@ -875,6 +882,8 @@ def _checker_evidence_pack(
                 "--no-ext-diff",
                 "--no-textconv",
                 "--no-renames",
+                "--binary",
+                "--full-index",
                 "--unified=40",
                 base_sha,
                 head_sha,

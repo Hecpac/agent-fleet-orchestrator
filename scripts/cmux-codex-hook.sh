@@ -43,7 +43,10 @@ payload="$(mktemp "${TMPDIR:-/tmp}/fleet-codex-hook.XXXXXX")" || {
 }
 chmod 600 "$payload"
 trap 'rm -f -- "$payload"' EXIT HUP INT TERM
-cat > "$payload" || true
+if ! cat > "$payload"; then
+  echo '{}'
+  exit 0
+fi
 
 socket_args=()
 if [[ -n "$socket_path" ]]; then

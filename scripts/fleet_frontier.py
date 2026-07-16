@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -334,6 +335,35 @@ def opencode_data_home(surface_uuid: str) -> Path:
     except (OSError, ValueError) as exc:
         raise FrontierError("OpenCode evidence data home is unavailable") from exc
     return data_home
+
+
+def cleanup_opencode_data_home(surface_uuid: str) -> bool:
+    """Remove one OpenCode evidence home after its frontier run is terminal."""
+    try:
+        canonical_surface = str(uuid.UUID(surface_uuid)).upper()
+    except ValueError as exc:
+        raise FrontierError("OpenCode evidence surface id is invalid") from exc
+    if OPENCODE_STATE_ROOT.is_symlink():
+        raise FrontierError("OpenCode evidence state root must not be a symlink")
+    surface_root = OPENCODE_STATE_ROOT / canonical_surface
+    if surface_root.is_symlink():
+        raise FrontierError("OpenCode evidence surface state must not be a symlink")
+    if not surface_root.exists():
+        return False
+    if not surface_root.is_dir():
+        raise FrontierError("OpenCode evidence surface state is unsafe")
+    try:
+        resolved_root = OPENCODE_STATE_ROOT.resolve(strict=True)
+        resolved_surface = surface_root.resolve(strict=True)
+        resolved_surface.relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise FrontierError("OpenCode evidence surface state is unsafe") from exc
+    shutil.rmtree(surface_root)
+    try:
+        OPENCODE_STATE_ROOT.rmdir()
+    except OSError:
+        pass
+    return True
 
 
 def opencode_turn_evidence(
@@ -929,6 +959,11 @@ def terminalize(
         instance=str(state["instance"]),
     )
     if existing and existing.get("status") in TERMINAL_STATUSES:
+        if existing.get("hook_source") == "opencode" and existing.get("surface_uuid"):
+            try:
+                cleanup_opencode_data_home(str(existing["surface_uuid"]))
+            except FrontierError:
+                pass
         return existing
     if status == "succeeded" and result_file is None:
         raise FrontierError("succeeded frontier terminal requires a durable result file")
@@ -961,11 +996,17 @@ def terminalize(
     appended = append_event(ledger, terminal)
     if appended and release_lease:
         _release_frontier_lease(runs_dir, state)
-    return latest_event(
+    result = latest_event(
         ledger,
         run_id=str(state["run_id"]),
         instance=str(state["instance"]),
     ) or terminal
+    if result.get("hook_source") == "opencode" and result.get("surface_uuid"):
+        try:
+            cleanup_opencode_data_home(str(result["surface_uuid"]))
+        except FrontierError:
+            pass
+    return result
 
 
 def terminalize_response(

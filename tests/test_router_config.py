@@ -334,6 +334,15 @@ class RouterConfigTests(unittest.TestCase):
                 with self.assertRaisesRegex(router_config.RouterError, error):
                     router_config.load_router(self.write_config(config))
 
+    def test_identity_groups_reject_same_members_in_different_order(self) -> None:
+        config = copy.deepcopy(self.config)
+        config["presets"]["audit"]["identity_groups"] = [
+            ["analysis", "challenge"],
+            ["challenge", "analysis"],
+        ]
+        with self.assertRaisesRegex(router_config.RouterError, "duplicate group"):
+            router_config.load_router(self.write_config(config))
+
     def test_intentional_duplicate_roles_outside_identity_group_remain_valid(self) -> None:
         plan = router_config.build_plan(
             self.config,

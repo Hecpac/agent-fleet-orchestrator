@@ -5,6 +5,7 @@ from pathlib import Path
 import json
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -13,6 +14,8 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run-interactive-agent.sh"
 HOOK_BRIDGE = ROOT / "scripts" / "cmux-codex-hook.sh"
+sys.path.insert(0, str(ROOT / "scripts"))
+import fleet_frontier  # noqa: E402
 
 
 class InteractiveAgentEnvironmentTests(unittest.TestCase):
@@ -72,6 +75,36 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             )
             self.assertEqual(disabled.returncode, 0, disabled.stderr)
             self.assertFalse(log.exists())
+
+    def test_cmux_hook_drops_partial_payload_when_stdin_copy_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_cat = root / "cat"
+            fake_cat.write_text(
+                "#!/bin/sh\n"
+                "printf '{\\\"partial\\\":true}'\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            fake_cat.chmod(0o700)
+            cmux = root / "cmux"
+            cmux.write_text("#!/bin/sh\nprintf '{}\\n'\n", encoding="utf-8")
+            cmux.chmod(0o700)
+            result = subprocess.run(
+                ["bash", str(HOOK_BRIDGE), "UserPromptSubmit"],
+                input='{"complete":true}\n',
+                env={
+                    **os.environ,
+                    "PATH": f"{root}:{os.environ['PATH']}",
+                    "CMUX_BUNDLED_CLI_PATH": str(cmux),
+                    "CMUX_SURFACE_ID": "surface:test",
+                },
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "{}")
 
     def run_role(
         self,
@@ -486,13 +519,25 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
                 "'provider': os.path.isfile(os.environ['XDG_DATA_HOME'] + '/opencode/provider.json')"
                 "}",
             ))
+            resumed = self.parse(self.run_role(
+                "glm",
+                extra_env={"HOME": str(home), "CMUX_SURFACE_ID": surface_uuid},
+                expression="{"
+                "'data': os.environ['XDG_DATA_HOME'],"
+                "'provider': os.path.isfile(os.environ['XDG_DATA_HOME'] + '/opencode/provider.json')"
+                "}",
+            ))
         self.assertEqual(
             values["data"],
             f"/tmp/agent-fleet-orchestrator-opencode/{surface_uuid}/data",
         )
+        self.assertEqual(resumed["data"], values["data"])
         self.assertTrue(values["config"].startswith(values["fleet_home"] + "/"))
         self.assertTrue(values["state"].startswith(values["fleet_home"] + "/"))
         self.assertTrue(values["provider"])
+        self.assertTrue(resumed["provider"])
+        self.assertTrue(Path(values["data"]).exists())
+        self.assertTrue(fleet_frontier.cleanup_opencode_data_home(surface_uuid))
         self.assertFalse(Path(values["data"]).exists())
 
     def test_opencode_preserves_relative_symlinks_that_stay_inside_provider_state(self) -> None:

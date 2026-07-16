@@ -131,7 +131,7 @@ Mission Control crea un `mission_id`, enlaza un único resultado Lead, registra
 intentos y efectos antes de ejecutarlos y archiva la evidencia antes de aceptar
 éxito. Una misión de riesgo alto o desconocido se detiene antes de bootear hasta
 recibir una aprobación limitada a la misión, workflow, alcance, riesgo,
-identidad humana y expiración:
+identidad del operador local y expiración:
 
 ```bash
 just mission-show <mission_id>

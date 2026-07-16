@@ -223,7 +223,7 @@ def _validate_identity_groups(
             raise RouterError(
                 f"{group_where} references unknown instances: {', '.join(unknown)}"
             )
-        group_key = tuple(members)
+        group_key = tuple(sorted(members))
         if group_key in seen_groups:
             raise RouterError(f"{where} contains a duplicate group: {', '.join(members)}")
         seen_groups.add(group_key)

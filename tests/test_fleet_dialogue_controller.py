@@ -259,6 +259,58 @@ class FleetDialogueControllerTests(unittest.TestCase):
         self.assertIn("+proposal", evidence["git"]["diff"])
         return checker_event, head
 
+    def test_checker_evidence_rejects_ignored_worktree_residue(self) -> None:
+        self.start()
+        (self.target / ".gitignore").write_text("ignored.txt\n", encoding="utf-8")
+        (self.target / "proposal.txt").write_text("proposal\n", encoding="utf-8")
+        self.git("add", ".gitignore", "proposal.txt")
+        self.git("commit", "-q", "-m", "proposal")
+        head = self.git("rev-parse", "HEAD")
+        (self.target / "ignored.txt").write_text("residue\n", encoding="utf-8")
+        run_id = "proposal-run"
+        payload = self.result_payload(
+            {"base_sha": self.base_sha, "head_sha": head}, run_id
+        )
+        message = {
+            "message_id": "message-ignored-residue",
+            "source_run_id": run_id,
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "payload_bytes": len(payload),
+        }
+        with self.assertRaisesRegex(controller.ContractError, "clean Maker worktree"):
+            controller._checker_evidence_pack(
+                manifest=controller._manifest_values(self.manifest),
+                message=message,
+                payload=payload,
+                head_sha=head,
+            )
+
+    def test_checker_evidence_includes_binary_diff(self) -> None:
+        self.start()
+        (self.target / "binary.bin").write_bytes(b"\x00\x01\xff\x00")
+        self.git("add", "binary.bin")
+        self.git("commit", "-q", "-m", "binary")
+        head = self.git("rev-parse", "HEAD")
+        run_id = "binary-run"
+        payload = self.result_payload(
+            {"base_sha": self.base_sha, "head_sha": head}, run_id
+        )
+        message = {
+            "message_id": "message-binary",
+            "source_run_id": run_id,
+            "payload_sha256": hashlib.sha256(payload).hexdigest(),
+            "payload_bytes": len(payload),
+        }
+        evidence_json, _ = controller._checker_evidence_pack(
+            manifest=controller._manifest_values(self.manifest),
+            message=message,
+            payload=payload,
+            head_sha=head,
+        )
+        evidence = json.loads(evidence_json)
+        self.assertIn("binary.bin", evidence["git"]["name_status"])
+        self.assertIn("GIT binary patch", evidence["git"]["diff"])
+
     def accept_conversation(self) -> tuple[dict, str]:
         checker_event, head = self.proposal_to_checker()
         run_id = "checker-accept-run"

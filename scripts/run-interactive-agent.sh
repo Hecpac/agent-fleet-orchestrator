@@ -46,10 +46,6 @@ for ((index=0; index<${#command_args[@]}; index++)); do
 done
 cleanup() {
   rm -rf -- "$isolated_home"
-  if [[ -n "$opencode_state_dir" ]]; then
-    rm -rf -- "$opencode_state_dir"
-    rmdir "$opencode_state_root" 2>/dev/null || true
-  fi
 }
 trap cleanup EXIT HUP INT TERM
 
@@ -150,11 +146,13 @@ prepare_opencode_data_home() {
   mkdir -p "$opencode_state_root"
   chmod 700 "$opencode_state_root"
   opencode_state_dir="$opencode_state_root/$surface_id"
-  if [[ -e "$opencode_state_dir" || -L "$opencode_state_dir" ]]; then
-    echo "OpenCode evidence state already exists for surface $surface_id" >&2
+  if [[ -L "$opencode_state_dir" || ( -e "$opencode_state_dir" && ! -d "$opencode_state_dir" ) ]]; then
+    echo "OpenCode evidence state is not a directory for surface $surface_id" >&2
     exit 2
   fi
-  mkdir -m 700 "$opencode_state_dir"
+  if [[ ! -e "$opencode_state_dir" ]]; then
+    mkdir -m 700 "$opencode_state_dir"
+  fi
   xdg_data="$opencode_state_dir/data"
 }
 
@@ -321,6 +319,14 @@ case "$role_type" in
         if [[ -L "$source_dir" ]]; then
           echo "OpenCode provider state root must not be a symlink: $source_dir" >&2
           exit 2
+        fi
+        if [[ "$destination_root" == "$xdg_data" \
+          && -d "$destination_root/$(basename "$source_dir")" ]]; then
+          # The controller removes this durable evidence home only after it has
+          # persisted a terminal frontier receipt. Preserve it for provider
+          # restart/reconciliation until then.
+          validate_isolated_provider_tree "$destination_root/$(basename "$source_dir")"
+          continue
         fi
         cp -R "$source_dir" "$destination_root/"
         validate_isolated_provider_tree "$destination_root/$(basename "$source_dir")"
