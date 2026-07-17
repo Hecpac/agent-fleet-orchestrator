@@ -8,7 +8,10 @@ ejecuta en un runner hospedado de Ubuntu para cada pull request, cada push a
 
 `scripts/check-ci.sh` valida los workflows tipados, compila `scripts/` y
 `tests/`, comprueba la sintaxis de todos los launchers Bash, ejecuta la suite
-completa y revisa whitespace con `git diff --check`.
+completa y revisa whitespace con `git diff --check`. Los tests que dependen de
+una instalación local de hooks de Claude se marcan explícitamente como
+omitidos en runners hospedados y permanecen cubiertos por el lane live de
+macOS; no se sustituyen por credenciales ni servicios falsos.
 
 El mismo contrato se puede ejecutar localmente con:
 

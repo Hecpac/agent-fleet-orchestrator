@@ -24,6 +24,19 @@ class FleetDialogueTests(unittest.TestCase):
         self.addCleanup(self.tempdir.cleanup)
         self.runs = Path(self.tempdir.name) / "runs"
         self.runs.mkdir()
+        self.binary_dir = self.runs.parent / "bin"
+        self.binary_dir.mkdir()
+        (self.binary_dir / "cmux").write_text(
+            "#!/usr/bin/env bash\n"
+            "cat <<'EOF'\n"
+            "workspace workspace:1 00000000-0000-0000-0000-000000000001 fleet\n"
+            "surface surface:1 00000000-0000-0000-0000-000000000101\n"
+            "surface surface:2 00000000-0000-0000-0000-000000000102\n"
+            "surface surface:3 00000000-0000-0000-0000-000000000103\n"
+            "EOF\n",
+            encoding="utf-8",
+        )
+        (self.binary_dir / "cmux").chmod(0o755)
         self.feature = "dialogue-test"
         self.identity_patch = mock.patch.object(
             fleet_dialogue, "validate_identity", return_value=[]
@@ -265,21 +278,10 @@ class FleetDialogueTests(unittest.TestCase):
         self.assertEqual(len(fleet_dialogue.load_messages(self.runs, self.feature)), 1)
 
     def _cli_env(self) -> dict[str, str]:
-        binary_dir = self.runs.parent / "bin"
-        binary_dir.mkdir(exist_ok=True)
-        cmux = binary_dir / "cmux"
-        cmux.write_text(
-            "#!/usr/bin/env bash\n"
-            "cat <<'EOF'\n"
-            "workspace workspace:1 00000000-0000-0000-0000-000000000001 fleet\n"
-            "surface surface:1 00000000-0000-0000-0000-000000000101\n"
-            "surface surface:2 00000000-0000-0000-0000-000000000102\n"
-            "surface surface:3 00000000-0000-0000-0000-000000000103\n"
-            "EOF\n",
-            encoding="utf-8",
-        )
-        cmux.chmod(0o755)
-        return {**os.environ, "PATH": f"{binary_dir}:{os.environ.get('PATH', '')}"}
+        return {
+            **os.environ,
+            "PATH": f"{self.binary_dir}:{os.environ.get('PATH', '')}",
+        }
 
 
 if __name__ == "__main__":

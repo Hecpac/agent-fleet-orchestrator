@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,11 @@ SPEC.loader.exec_module(router_config)
 class RouterConfigTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = router_config.load_router()
+        self.which_patch = mock.patch.object(
+            router_config.shutil, "which", return_value="/usr/bin/fleet-ci-provider"
+        )
+        self.which_patch.start()
+        self.addCleanup(self.which_patch.stop)
 
     def write_config(self, config: dict) -> str:
         handle = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
