@@ -120,9 +120,9 @@ fleet-down feature:
 race name task *roles:
     ./scripts/fleet-race.sh {{name}} "{{task}}" {{roles}}
 
-# Decision-queue radar: which agents are blocked waiting on a human, and how long.
-status:
-    python3 scripts/fleet_status.py
+# Durable Decision Brief radar first; CMUX hook state remains auxiliary.
+status *flags:
+    python3 scripts/fleet_status.py {{flags}}
 
 # Advance the durable capability gate with an evidence reference.
 # Standalone guided BUILD exit uses --approved-by <operator-attestation>.

@@ -393,9 +393,13 @@ and writes `orchestration/runs/fleet-<feature>.manifest`. The manifest records
 instance-to-surface mappings plus role types, runners, ranks, authority, and
 durable workspace/surface UUIDs.
 
-`just status` is the decision-queue radar: it lists every tracked agent
-session (via cmux hook data) and surfaces the ones blocked waiting on a human,
-with age — check it whenever you return to the machine.
+`just status` is the durable operator radar. It scans pending Decision Briefs
+across every canonical Mission in one `FLEET_RUNS_DIR`, groups them by a
+redacted stable project identity, and renders them before auxiliary cmux hook
+state. `just status --json` emits the machine contract. Status is read-only: an
+expired safe default is labelled `DEFAULT_ELIGIBLE`, never applied. An unsafe or
+invalid Mission ledger remains visible as `INVALID/UNREADABLE`; valid missions
+are still printed and the command exits non-zero.
 
 Mission decisions use a stronger path than a free-form wait. The Lead must bind
 one recommendation and one dissenting `CHALLENGE`/`VERIFY` artifact from
@@ -416,6 +420,12 @@ Mission completion until resolution. Only low-risk reversible briefs may carry
 a default, and CONTROL can durably apply only that exact default after two
 hours. Specialists cannot discover or call `request_decision`; the management
 socket and Lead CLI share the same Fleet Control core.
+
+After a new request is durably appended, the production Lead CLI/MCP attempts
+one secret-free `cmux notify`. It is best-effort only: failure does not roll back
+the request, normal idempotent replay does not notify twice, and the ledger/radar
+remain the recovery path. Periodic reminders and multi-root discovery are not
+part of the S0 contract.
 
 Coordination is event-driven, not polled: both `fleet-dispatch` and `fleet-send`
 return a durable `run_id`; pass every one back as `--run instance=run_id` to

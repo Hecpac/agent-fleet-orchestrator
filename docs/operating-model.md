@@ -68,6 +68,17 @@ but it is not the evidence-bound team-consensus protocol. Under the documented
 single-Mac/same-UID S0 boundary, actor `HUMAN` is a durable local operator
 attestation, not cryptographic proof that a distinct human was present.
 
+The operator-wide surface is `just status`. It scans every canonical Mission in
+one `FLEET_RUNS_DIR`, groups pending briefs by a redacted stable project
+identity, and renders them before auxiliary CMUX hook state. Use `just status
+--json` for automation. The command is read-only: a passed deadline is shown as
+`DEFAULT_ELIGIBLE`, never reconciled. Invalid or unsafe Mission ledgers remain
+visible as `INVALID/UNREADABLE` and produce a non-zero exit while healthy
+missions are still reported. A newly appended brief also attempts one
+secret-free `cmux notify`; that notice is best-effort wake-up only, not evidence
+of delivery or decision authority. Periodic reminders, an outbox, and
+multi-root discovery are outside this S0 slice.
+
 ## Worker Contract
 
 Every worker must end with:

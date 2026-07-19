@@ -132,8 +132,10 @@ a completion y no debe usarse como evidencia.
 just fleet-down <nombre>    # reconcilia, cierra y archiva manifest/evidencia
 ```
 
-Checklist: ¿el resultado quedó en un archivo/commit/PR? ¿decisiones pendientes
-anotadas? ¿`just status` sin ⚠️? Un workspace = una misión; misión cerrada =
+Checklist: ¿el resultado quedó en un archivo/commit/PR? ¿`just status` muestra
+alguna Decision Brief durable o ledger `INVALID/UNREADABLE`? ¿las decisiones se
+resolvieron por ID exacto? El estado de hooks CMUX es auxiliar; una notificación
+no prueba entrega ni resolución. Un workspace = una misión; misión cerrada =
 workspace cerrado.
 
 ---

@@ -273,6 +273,33 @@ publication to the Lead, while the specialist discovery/proxy surface does not.
 As elsewhere in S0, `HUMAN` is an actor label inside the trusted same-UID
 boundary rather than out-of-band proof of human presence.
 
+## Global decision radar is durable, read-only, and notification-independent
+
+`rule: global_decision_radar_never_mutates_or_silently_omits_mission_truth`
+
+`enforced_by:`
+
+- `tests/test_fleet_status.py::FleetStatusTests::test_decision_inventory_is_read_only_and_keeps_invalid_missions_visible`
+- `tests/test_fleet_status.py::FleetStatusTests::test_inventory_aggregates_pending_decisions_across_projects_in_one_root`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_global_inventory_redacts_brief_and_marks_default_without_mutation`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_best_effort_notification_is_secret_free_once_and_never_authoritative`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_production_cli_and_mcp_enable_the_best_effort_notifier`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_report_counts_durable_decisions_and_human_wait`
+
+`why:` One operator radar scans the canonical Mission directories under exactly
+one trusted `FLEET_RUNS_DIR`, groups pending briefs by a redacted stable
+`target_repo` identity, and derives every row from the hash-chained Mission
+ledger. The query is observational: an expired safe default is labelled
+`DEFAULT_ELIGIBLE` but is never reconciled by status. A malformed, unsafe, or
+linked canonical Mission ledger is reported as `INVALID/UNREADABLE`; healthy
+missions remain visible and the command exits non-zero instead of silently
+omitting the failure. JSON and human output exclude question, title, options,
+tradeoffs, dissent, evidence content, and full repository paths. CMUX receives
+at most one secret-free best-effort wake-up for a newly appended request; a
+missing or failed notification cannot roll back, resolve, or contradict the
+durable decision. Per-Mission reports derive decision counts and human wait from
+the same ledger and remain non-authoritative.
+
 ## Risk-proportional execution modes
 
 `rule: autonomous_dispatch_skips_routine_phase_gates_without_weakening_identity`

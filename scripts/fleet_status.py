@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""Decision-queue radar: show every tracked agent session and who is blocked.
+"""Durable Decision Brief radar plus tracked CMUX agent session status.
 
-Reads ~/.cmuxterm/*-hook-sessions.json (written by cmux agent hooks) and maps
-workspace UUIDs to names via `cmux tree`. Sessions in needsInput are the ones
-silently waiting on a human — surface them first, with age.
+Pending decisions come from hash-chained Mission ledgers and are shown before
+advisory hook state. Invalid Mission ledgers remain visible and make the command
+exit non-zero. Reading status never reconciles or appends Mission events.
 
-Usage: fleet_status.py [--max-age-hours N]   (default 24)
+Usage: fleet_status.py [--runs-dir PATH] [--json] [--max-age-hours N]
 """
 
+from __future__ import annotations
+
 import argparse
+from datetime import datetime, timezone
 import math
 import os
 import re
@@ -19,6 +22,7 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+import fleet_decisions
 import fleet_json
 import fleet_manifest
 import fleet_safe_paths
@@ -201,12 +205,14 @@ def positive_finite_hours(raw: str) -> float:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--runs-dir", default=str(_manifest_root()))
     parser.add_argument(
         "--max-age-hours",
         type=positive_finite_hours,
         default=24.0,
     )
     parser.add_argument("--show-hints", action="store_true")
+    parser.add_argument("--json", action="store_true")
     return parser
 
 
@@ -227,12 +233,76 @@ def _surface_uuid(value: Any) -> str:
     return str(uuid.UUID(value)).upper()
 
 
+def _age_text(seconds: float) -> str:
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m"
+    return f"{seconds / 3600:.1f}h"
+
+
+def _print_decisions(
+    decisions: list[dict[str, Any]], invalid_missions: list[dict[str, Any]]
+) -> None:
+    if decisions:
+        print(f"⚠️  {len(decisions)} DECISION BRIEF(S) PENDIENTES:")
+        project_key: tuple[str, str] | None = None
+        for decision in decisions:
+            key = (decision["project"], decision["project_id"])
+            if key != project_key:
+                print(f"\nProyecto {key[0]} [{key[1][:12]}]")
+                project_key = key
+            affected = ",".join(decision["affected_instances"])
+            print(
+                f"  {decision['status']:<16} {_age_text(decision['age_seconds']):>6} "
+                f"{decision['risk']}/{decision['impact']} {decision['feature']} "
+                f"deadline={decision['deadline_at']} affected={affected}"
+            )
+            print(
+                f"    mission={decision['mission_id']} decision={decision['decision_id']}"
+            )
+    if invalid_missions:
+        if decisions:
+            print()
+        print(
+            f"❌ {len(invalid_missions)} MISSION LEDGER(S) INVALID/UNREADABLE:"
+        )
+        for invalid in invalid_missions:
+            mission_id = invalid["mission_id"] or "mission-store"
+            print(f"  {mission_id}: {invalid['reason']}")
+
+
+def _print_sessions(rows: list[dict[str, Any]]) -> None:
+    blocked = [r for r in rows if r["state"] == "needsInput" and r["alive"]]
+    if blocked:
+        print(f"⚠️  {len(blocked)} agente(s) BLOQUEADOS esperando interacción humana:\n")
+    for row in rows:
+        mark = {
+            "needsInput": "⚠️ ",
+            "auth": "🔐",
+            "running": "▶️ ",
+            "idle": "· ",
+            "completed": "✓ ",
+            "untracked": "○ ",
+        }.get(row["state"], "? ")
+        dead = " [proceso muerto]" if row["alive"] is False else ""
+        age = f"{row['age_min']:.0f}m" if row["age_min"] is not None else "?"
+        print(
+            f"{mark}{row['state']:<10} {age:>5}  {row['instance']:<14} "
+            f"{row['phase']:<10} {row['agent']:<9} {row['ws']:<22} "
+            f"{row['hint']}{dead}"
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
 
-    ws_names = workspace_names()
-    inventory = manifest_inventory()
+    runs_dir = Path(args.runs_dir)
     now = time.time()
+    decision_inventory = fleet_decisions.decision_inventory(
+        runs_dir,
+        now=datetime.fromtimestamp(now, tz=timezone.utc),
+    )
+    ws_names = workspace_names()
+    inventory = manifest_inventory(runs_dir)
     rows: list[dict[str, Any]] = []
     seen_surfaces: set[str] = set()
     home = Path(os.path.expanduser("~/.cmuxterm"))
@@ -306,29 +376,29 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
 
-    if not rows:
+    invalid_missions = decision_inventory["invalid_missions"]
+    decisions = decision_inventory["decisions"]
+    if args.json:
+        payload = {
+            "schema_version": 1,
+            "authority": "mission_ledger",
+            "read_only": True,
+            "decisions": decisions,
+            "invalid_missions": invalid_missions,
+            "sessions": rows,
+        }
+        print(fleet_json.canonical_bytes(payload).decode("utf-8"))
+        return 2 if invalid_missions else 0
+
+    if not rows and not decisions and not invalid_missions:
         print("Sin sesiones de agente registradas en la ventana de tiempo.")
         return 0
 
-    blocked = [r for r in rows if r["state"] == "needsInput" and r["alive"]]
-    if blocked:
-        print(f"⚠️  {len(blocked)} agente(s) BLOQUEADOS esperando decisión humana:\n")
-    for r in rows:
-        mark = {
-            "needsInput": "⚠️ ",
-            "auth": "🔐",
-            "running": "▶️ ",
-            "idle": "· ",
-            "completed": "✓ ",
-            "untracked": "○ ",
-        }.get(r["state"], "? ")
-        dead = " [proceso muerto]" if r["alive"] is False else ""
-        age = f"{r['age_min']:.0f}m" if r["age_min"] is not None else "?"
-        print(
-            f"{mark}{r['state']:<10} {age:>5}  {r['instance']:<14} "
-            f"{r['phase']:<10} {r['agent']:<9} {r['ws']:<22} {r['hint']}{dead}"
-        )
-    return 0
+    _print_decisions(decisions, invalid_missions)
+    if (decisions or invalid_missions) and rows:
+        print("\nSesiones CMUX (estado auxiliar):")
+    _print_sessions(rows)
+    return 2 if invalid_missions else 0
 
 
 if __name__ == "__main__":

@@ -337,7 +337,9 @@ class RootedFS:
         current_fd = self._duplicate_root()
         traversed: list[str] = []
         try:
-            for part, required_mode in zip(parts, modes, strict=True):
+            # _directory_modes validated the exact cardinality before this
+            # descriptor walk; plain zip preserves that invariant on Python 3.9.
+            for part, required_mode in zip(parts, modes):
                 traversed.append(part)
                 where = "/".join(traversed)
                 created = False

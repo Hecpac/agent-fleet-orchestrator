@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Callable
 import uuid
 
 import fleet_admission
@@ -38,6 +38,54 @@ DEFAULT_RUNS_DIR = ROOT / "orchestration" / "runs"
 
 class FleetControlError(RuntimeError):
     """A Fleet Control request violates mission or runtime evidence."""
+
+
+DecisionNotifier = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+
+
+def _notification_result(*, attempted: bool, accepted: bool) -> dict[str, Any]:
+    return {
+        "attempted": attempted,
+        "accepted": accepted,
+        "guarantee": "best_effort",
+        "authority": "wake_up_only",
+    }
+
+
+def cmux_decision_notifier(
+    current: dict[str, Any], decision: dict[str, Any]
+) -> dict[str, Any]:
+    """Send one secret-free CMUX wake-up without affecting Mission truth."""
+
+    request = decision["request"]
+    command = [
+        "cmux",
+        "notify",
+        "--title",
+        f"fleet decision: {current['feature']}",
+        "--body",
+        (
+            f"mission={current['mission_id']} decision={decision['decision_id']} "
+            f"risk={request['risk']} impact={request['impact']} "
+            f"deadline={decision['deadline_at']}"
+        ),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env={**os.environ, "CMUX_QUIET": "1"},
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return _notification_result(attempted=True, accepted=False)
+    return _notification_result(
+        attempted=True,
+        accepted=completed.returncode == 0,
+    )
 
 
 def run_process(
@@ -127,7 +175,12 @@ def require_usage_launch(
 
 class FleetControl:
     def __init__(
-        self, runs_dir: Path, mission_id: str, *, preset: str | None = None
+        self,
+        runs_dir: Path,
+        mission_id: str,
+        *,
+        preset: str | None = None,
+        decision_notifier: DecisionNotifier | None = None,
     ) -> None:
         self.runs_dir = runs_dir.resolve()
         self.mission_id = mission_state.normalize_uuid(mission_id, "mission_id")
@@ -145,6 +198,7 @@ class FleetControl:
         if selected not in {resolved["preset"], resolved["assurance_preset"]}:
             raise FleetControlError("Fleet Control preset is outside compiled workflow")
         self.preset = selected
+        self._decision_notifier = decision_notifier
 
     def _selected_roster(self) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         resolved = self.compiled["resolved"]
@@ -1569,11 +1623,18 @@ class FleetControl:
             formatted = fleet_decisions.format_brief(refreshed, decision)
         except fleet_decisions.DecisionError as exc:
             raise FleetControlError(str(exc)) from exc
+        notification = _notification_result(attempted=False, accepted=False)
+        if appended and self._decision_notifier is not None:
+            try:
+                notification = self._decision_notifier(refreshed, decision)
+            except Exception:
+                notification = _notification_result(attempted=True, accepted=False)
         return {
             "event": event,
             "appended": appended,
             "decision": decision,
             "brief": formatted,
+            "notification": notification,
         }
 
     def list_decisions(self, *, pending_only: bool = False) -> dict[str, Any]:
@@ -1813,7 +1874,12 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
-        control = FleetControl(Path(args.runs_dir), args.mission_id, preset=args.preset)
+        control = FleetControl(
+            Path(args.runs_dir),
+            args.mission_id,
+            preset=args.preset,
+            decision_notifier=cmux_decision_notifier,
+        )
         if args.command == "dispatch":
             value = control.dispatch(
                 recipient_instance=args.recipient,

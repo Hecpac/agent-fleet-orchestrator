@@ -19,6 +19,7 @@ import fleet_decisions
 import fleet_ledger
 import fleet_mcp
 import fleet_mission_state as mission_state
+import fleet_report
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -250,6 +251,189 @@ class FleetDecisionTests(unittest.TestCase):
                 idempotency_key="decision:unblocked:builder",
             )
         self.assertEqual(dispatched["recipient_instance"], "builder")
+
+    def test_best_effort_notification_is_secret_free_once_and_never_authoritative(
+        self,
+    ) -> None:
+        recommendation, challenge = self.seed_evidence()
+        brief = self.brief(recommendation, challenge)
+        brief["title"] = "private title must not enter notification"
+        brief["question"] = "private question must not enter notification"
+        brief["dissent"] = "private dissent must not enter notification"
+        notifying = fleet_control.FleetControl(
+            self.runs,
+            self.mission_id,
+            decision_notifier=fleet_control.cmux_decision_notifier,
+        )
+        accepted = subprocess.CompletedProcess(["cmux", "notify"], 0, "", "")
+        with mock.patch.object(
+            fleet_control.subprocess, "run", return_value=accepted
+        ) as notify:
+            requested = notifying.request_decision(
+                brief=brief,
+                idempotency_key="decision:notify-once",
+            )
+            repeated = notifying.request_decision(
+                brief=brief,
+                idempotency_key="decision:notify-once",
+            )
+
+        self.assertTrue(requested["notification"]["attempted"])
+        self.assertTrue(requested["notification"]["accepted"])
+        self.assertEqual(requested["notification"]["authority"], "wake_up_only")
+        self.assertFalse(repeated["appended"])
+        self.assertFalse(repeated["notification"]["attempted"])
+        notify.assert_called_once()
+        rendered_command = " ".join(notify.call_args.args[0])
+        self.assertIn(self.mission_id, rendered_command)
+        self.assertIn(requested["decision"]["decision_id"], rendered_command)
+        self.assertNotIn(brief["title"], rendered_command)
+        self.assertNotIn(brief["question"], rendered_command)
+        self.assertNotIn(brief["dissent"], rendered_command)
+
+        before = len(notifying.events())
+        with mock.patch.object(
+            fleet_control.subprocess,
+            "run",
+            side_effect=OSError("cmux unavailable"),
+        ):
+            failed_notice = notifying.request_decision(
+                brief=brief,
+                idempotency_key="decision:notify-failure",
+            )
+        self.assertTrue(failed_notice["appended"])
+        self.assertTrue(failed_notice["notification"]["attempted"])
+        self.assertFalse(failed_notice["notification"]["accepted"])
+        self.assertEqual(len(notifying.events()), before + 1)
+
+    def test_report_counts_durable_decisions_and_human_wait(self) -> None:
+        recommendation, challenge = self.seed_evidence()
+        requested = self.control.request_decision(
+            brief=self.brief(recommendation, challenge),
+            idempotency_key="decision:report-metrics",
+        )
+
+        pending_report = fleet_report.build_report(self.runs, self.mission_id)
+        self.assertEqual(
+            pending_report["decisions"],
+            {
+                "total": 1,
+                "pending": 1,
+                "resolved": 0,
+                "human_resolved": 0,
+                "automatic_resolved": 0,
+            },
+        )
+        self.assertIn(
+            "Decisions: total=1 pending=1",
+            fleet_report.human_report(pending_report),
+        )
+
+        requested_at = datetime.fromisoformat(
+            requested["decision"]["requested_at"].replace("Z", "+00:00")
+        )
+        resolved_at = (requested_at + timedelta(seconds=5)).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        with mock.patch.object(
+            mission_state, "_next_timestamp", return_value=resolved_at
+        ):
+            fleet_decisions.resolve_human(
+                self.runs,
+                self.mission_id,
+                decision_id=requested["decision"]["decision_id"],
+                option_id="additive",
+                reason="operator selected the recommended option",
+                idempotency_key="human:decision:report-metrics",
+            )
+        resolved_report = fleet_report.build_report(self.runs, self.mission_id)
+        self.assertEqual(resolved_report["decisions"]["pending"], 0)
+        self.assertEqual(resolved_report["decisions"]["resolved"], 1)
+        self.assertEqual(resolved_report["decisions"]["human_resolved"], 1)
+        self.assertEqual(resolved_report["timing"]["human_wait_seconds"], 5.0)
+
+    def test_global_inventory_redacts_brief_and_marks_default_without_mutation(
+        self,
+    ) -> None:
+        recommendation, challenge = self.seed_evidence()
+        brief = self.brief(recommendation, challenge)
+        brief["question"] = "operator-only question"
+        brief["dissent"] = "operator-only dissent"
+        requested = self.control.request_decision(
+            brief=brief,
+            idempotency_key="decision:global-inventory",
+        )
+        deadline = datetime.fromisoformat(
+            requested["decision"]["deadline_at"].replace("Z", "+00:00")
+        )
+        ledger = mission_state.ledger_path(self.runs, self.mission_id)
+        before = ledger.read_bytes()
+
+        inventory = fleet_decisions.decision_inventory(
+            self.runs,
+            now=deadline + timedelta(seconds=1),
+        )
+
+        self.assertEqual(len(inventory["decisions"]), 1)
+        row = inventory["decisions"][0]
+        self.assertEqual(row["mission_id"], self.mission_id)
+        self.assertEqual(row["decision_id"], requested["decision"]["decision_id"])
+        self.assertEqual(row["status"], "DEFAULT_ELIGIBLE")
+        self.assertTrue(row["default_eligible"])
+        self.assertEqual(ledger.read_bytes(), before)
+        serialized = json.dumps(inventory, sort_keys=True)
+        self.assertNotIn(brief["question"], serialized)
+        self.assertNotIn(brief["dissent"], serialized)
+        self.assertNotIn(brief["title"], serialized)
+
+    def test_production_cli_and_mcp_enable_the_best_effort_notifier(self) -> None:
+        cli_control = mock.Mock()
+        cli_control.state.return_value = {"status": "running"}
+        with (
+            mock.patch.object(
+                fleet_control, "FleetControl", return_value=cli_control
+            ) as cli_constructor,
+            mock.patch("builtins.print"),
+        ):
+            result = fleet_control.main(
+                [
+                    "--runs-dir",
+                    str(self.runs),
+                    "--mission-id",
+                    self.mission_id,
+                    "inspect-mission",
+                ]
+            )
+        self.assertEqual(result, 0)
+        cli_constructor.assert_called_once_with(
+            self.runs,
+            self.mission_id,
+            preset=None,
+            decision_notifier=fleet_control.cmux_decision_notifier,
+        )
+
+        mcp_control = mock.Mock()
+        with (
+            mock.patch.object(
+                fleet_mcp, "FleetControl", return_value=mcp_control
+            ) as mcp_constructor,
+            mock.patch.object(fleet_mcp.sys, "stdin", []),
+        ):
+            result = fleet_mcp.main(
+                [
+                    "--runs-dir",
+                    str(self.runs),
+                    "--mission-id",
+                    self.mission_id,
+                ]
+            )
+        self.assertEqual(result, 0)
+        mcp_constructor.assert_called_once_with(
+            self.runs,
+            self.mission_id,
+            preset=None,
+            decision_notifier=fleet_control.cmux_decision_notifier,
+        )
 
     def test_challenge_must_be_identity_distinct_and_from_review_phase(self) -> None:
         recommendation, challenge = self.seed_evidence()

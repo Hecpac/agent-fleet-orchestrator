@@ -4,15 +4,148 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
+import re
 from typing import Any
 
 import fleet_mission
 import fleet_mission_state as mission_state
+import fleet_safe_paths
 
 
 class DecisionError(RuntimeError):
     """A human decision operation violates its durable Mission binding."""
+
+
+def _invalid_inventory_entry(mission_id: str | None) -> dict[str, Any]:
+    return {
+        "mission_id": mission_id,
+        "status": "INVALID/UNREADABLE",
+        "reason": "strict mission ledger validation failed",
+    }
+
+
+def _project_identity(target_repo: str) -> tuple[str, str]:
+    digest = hashlib.sha256(target_repo.encode("utf-8")).hexdigest()
+    raw_label = Path(target_repo).name
+    label = re.sub(r"[^A-Za-z0-9._-]+", "_", raw_label).strip("_")[:64]
+    return label or f"repo-{digest[:12]}", digest
+
+
+def decision_inventory(
+    runs_dir: Path,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Aggregate redacted pending decisions from one trusted Mission store.
+
+    Discovery and ledger reads are descriptor-anchored. Invalid canonical
+    Mission directories remain visible without suppressing healthy missions.
+    The function never reconciles deadlines or appends Mission events.
+    """
+
+    observed_at = now or datetime.now(timezone.utc)
+    if observed_at.tzinfo is None:
+        raise DecisionError("decision inventory time must include timezone")
+    observed_at = observed_at.astimezone(timezone.utc)
+    result: dict[str, Any] = {
+        "schema_version": 1,
+        "authority": "mission_ledger",
+        "read_only": True,
+        "decisions": [],
+        "invalid_missions": [],
+    }
+    try:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            selected_root = rooted.root
+            root_names = rooted.list_directory("", directory_modes=())
+            if "missions" not in root_names:
+                return result
+            mission_names = rooted.list_directory(
+                "missions", directory_modes=(0o700,)
+            )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError:
+        result["invalid_missions"].append(_invalid_inventory_entry(None))
+        return result
+
+    for mission_id in mission_names:
+        try:
+            normalized = mission_state.normalize_uuid(mission_id, "mission_id")
+        except mission_state.MissionStateError:
+            continue
+        if normalized != mission_id:
+            continue
+        try:
+            events = mission_state.read_events(
+                mission_state.ledger_path(selected_root, mission_id),
+                expected_mission_id=mission_id,
+            )
+            current = mission_state.derive_state(events)
+        except mission_state.MissionStateError:
+            result["invalid_missions"].append(
+                _invalid_inventory_entry(mission_id)
+            )
+            continue
+
+        project, project_id = _project_identity(current["target_repo"])
+        for decision_id, decision in sorted(current["pending_decisions"].items()):
+            request = decision["request"]
+            requested_at = mission_state.parse_timestamp(
+                decision["requested_at"], "decision requested_at"
+            )
+            deadline_at = mission_state.parse_timestamp(
+                decision["deadline_at"], "decision deadline_at"
+            )
+            default_eligible = bool(
+                observed_at >= deadline_at
+                and request["risk"] == "low"
+                and request["reversible"] is True
+                and request["default_option_id"] is not None
+            )
+            if default_eligible:
+                status = "DEFAULT_ELIGIBLE"
+            elif observed_at >= deadline_at:
+                status = "OVERDUE"
+            else:
+                status = "PENDING"
+            result["decisions"].append(
+                {
+                    "project": project,
+                    "project_id": project_id,
+                    "feature": current["feature"],
+                    "mission_id": mission_id,
+                    "mission_status": current["status"],
+                    "decision_id": decision_id,
+                    "status": status,
+                    "impact": request["impact"],
+                    "risk": request["risk"],
+                    "reversible": request["reversible"],
+                    "affected_instances": request["affected_instances"],
+                    "requested_at": decision["requested_at"],
+                    "deadline_at": decision["deadline_at"],
+                    "age_seconds": round(
+                        max(0.0, (observed_at - requested_at).total_seconds()), 6
+                    ),
+                    "default_eligible": default_eligible,
+                }
+            )
+
+    result["decisions"].sort(
+        key=lambda item: (
+            item["project"],
+            item["project_id"],
+            item["deadline_at"],
+            item["feature"],
+            item["mission_id"],
+            item["decision_id"],
+        )
+    )
+    result["invalid_missions"].sort(
+        key=lambda item: item["mission_id"] or ""
+    )
+    return result
 
 
 def _load_state(runs_dir: Path, mission_id: str) -> tuple[str, dict[str, Any]]:

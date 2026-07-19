@@ -160,15 +160,49 @@ def _max_parallel(records: list[dict[str, Any]]) -> int:
 
 def _human_wait(events: list[dict[str, Any]], end: datetime) -> float:
     starts: list[datetime] = []
-    total = 0.0
+    decision_starts: dict[str, datetime] = {}
+    intervals: list[tuple[datetime, datetime]] = []
     for event in events:
+        timestamp = _timestamp(event["timestamp"], "human wait event")
         if event["kind"] in {"assurance_requested", "human_approval_requested"}:
-            starts.append(_timestamp(event["timestamp"], "human wait start"))
+            starts.append(timestamp)
         elif event["kind"] == "assurance_approved" and starts:
-            total += _seconds(starts.pop(), _timestamp(event["timestamp"], "human wait end"))
-    for start in starts:
-        total += _seconds(start, end)
-    return round(total, 6)
+            intervals.append((starts.pop(), timestamp))
+        elif event["kind"] == "human_decision_requested":
+            decision_starts[event["payload"]["decision_id"]] = timestamp
+        elif event["kind"] == "human_decision_resolved":
+            start = decision_starts.pop(event["payload"]["decision_id"], None)
+            if start is not None:
+                intervals.append((start, timestamp))
+    intervals.extend((start, end) for start in starts)
+    intervals.extend((start, end) for start in decision_starts.values())
+    merged: list[tuple[datetime, datetime]] = []
+    for start, stop in sorted(intervals):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, stop))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], stop))
+    return round(sum(_seconds(start, stop) for start, stop in merged), 6)
+
+
+def _decision_metrics(decisions: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    values = list(decisions.values())
+    resolutions = [
+        value["resolution"]
+        for value in values
+        if isinstance(value.get("resolution"), dict)
+    ]
+    return {
+        "total": len(values),
+        "pending": sum(value["status"] == "pending" for value in values),
+        "resolved": sum(value["status"] == "resolved" for value in values),
+        "human_resolved": sum(
+            value["resolution_kind"] == "human" for value in resolutions
+        ),
+        "automatic_resolved": sum(
+            value["resolution_kind"] == "automatic" for value in resolutions
+        ),
+    }
 
 
 def _provider_metrics(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -297,6 +331,7 @@ def derive_report(
                 for name in OUTCOMES
             },
         },
+        "decisions": _decision_metrics(state["decisions"]),
         "providers": _provider_metrics(records),
         "adoption": {
             "relayed_results": len(relayed_artifacts),
@@ -397,6 +432,7 @@ def human_report(report: dict[str, Any]) -> str:
     timing = report["timing"]
     delegation = report["delegation"]
     outcomes = report["outcomes"]["counts"]
+    decisions = report["decisions"]
     archive = report["archive"]
     lines = [
         f"Mission {report['mission_id']} ({report['feature']}): {report['status']}",
@@ -411,6 +447,11 @@ def human_report(report: dict[str, Any]) -> str:
             f"fan_out={delegation['max_fan_out']} parallel={delegation['max_parallel_runs']}"
         ),
         "Outcomes: " + " ".join(f"{name}={outcomes[name]}" for name in OUTCOMES),
+        (
+            f"Decisions: total={decisions['total']} pending={decisions['pending']} "
+            f"resolved={decisions['resolved']} human={decisions['human_resolved']} "
+            f"automatic={decisions['automatic_resolved']}"
+        ),
         (
             f"Archive: present={str(archive['present']).lower()} "
             f"verified={str(archive['verified']).lower()} bytes={archive['bytes']}"

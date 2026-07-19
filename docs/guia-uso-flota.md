@@ -389,9 +389,19 @@ Durante una misión usa:
 
 ```bash
 just status
+just status --json
 just mission-show <mission_id>
 just mission-control-health <mission_id>
 ```
+
+`just status` agrega las Decision Briefs pendientes de todas las misiones bajo
+una sola `FLEET_RUNS_DIR` y las agrupa por una identidad de proyecto estable y
+redactada. Las decisiones salen antes que el estado auxiliar de hooks CMUX. La
+consulta nunca resuelve: un default vencido aparece como `DEFAULT_ELIGIBLE`.
+Un ledger inseguro o inválido aparece como `INVALID/UNREADABLE`; las misiones
+sanas siguen visibles y el comando sale distinto de cero. El aviso CMUX emitido
+al publicar un brief es sólo best-effort; vuelve siempre al radar/ledger como
+fuente de verdad.
 
 Después del terminal verifica evidencia durable. Ejecuta la verificación de
 auditoría cuando el workflow haya requerido el AuditService asegurado:

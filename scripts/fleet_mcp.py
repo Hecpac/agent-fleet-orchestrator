@@ -2309,7 +2309,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--launch-id")
     args = parser.parse_args(argv)
     try:
-        control = FleetControl(Path(args.runs_dir), args.mission_id, preset=args.preset)
+        control = FleetControl(
+            Path(args.runs_dir),
+            args.mission_id,
+            preset=args.preset,
+            decision_notifier=fleet_control_module.cmux_decision_notifier,
+        )
         if args.socket:
             if not args.launch_id:
                 raise FleetControlError("--socket requires --launch-id")

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timezone
 import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -10,11 +12,14 @@ import unittest
 import uuid
 from unittest import mock
 
+from tests.mission_control_test_support import create_running_mission
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import fleet_json  # noqa: E402
+import fleet_decisions  # noqa: E402
 import fleet_status  # noqa: E402
 
 
@@ -264,6 +269,11 @@ class FleetStatusTests(unittest.TestCase):
             ),
             mock.patch.object(fleet_status, "workspace_names", return_value={}),
             mock.patch.object(fleet_status, "manifest_inventory", return_value={}),
+            mock.patch.object(
+                fleet_status.fleet_decisions,
+                "decision_inventory",
+                return_value={"decisions": [], "invalid_missions": []},
+            ),
             redirect_stdout(stdout),
         ):
             self.assertEqual(fleet_status.main([]), 0)
@@ -272,6 +282,185 @@ class FleetStatusTests(unittest.TestCase):
             stdout.getvalue(),
             "Sin sesiones de agente registradas en la ventana de tiempo.\n",
         )
+
+    def test_decision_inventory_is_read_only_and_keeps_invalid_missions_visible(
+        self,
+    ) -> None:
+        _, valid_mission, _ = create_running_mission(
+            self.root, feature="radar-valid"
+        )
+        corrupt_mission = str(uuid.uuid4())
+        corrupt_root = self.runs / "missions" / corrupt_mission
+        corrupt_root.mkdir(mode=0o700)
+        self.write_file(corrupt_root / "mission.jsonl", b"{}\n")
+
+        linked_mission = str(uuid.uuid4())
+        linked_root = self.runs / "missions" / linked_mission
+        linked_root.mkdir(mode=0o700)
+        outside = self.root / "outside-ledger.jsonl"
+        self.write_file(
+            outside,
+            (self.runs / "missions" / valid_mission / "mission.jsonl").read_bytes(),
+        )
+        os.link(outside, linked_root / "mission.jsonl")
+
+        before_paths = {path.relative_to(self.runs) for path in self.runs.rglob("*")}
+        before_files = {
+            path.relative_to(self.runs): path.read_bytes()
+            for path in self.runs.rglob("*")
+            if path.is_file() and not path.is_symlink()
+        }
+        observed_at = datetime(2026, 7, 19, tzinfo=timezone.utc)
+
+        first = fleet_decisions.decision_inventory(self.runs, now=observed_at)
+        second = fleet_decisions.decision_inventory(self.runs, now=observed_at)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first["authority"], "mission_ledger")
+        self.assertTrue(first["read_only"])
+        self.assertEqual(first["decisions"], [])
+        self.assertEqual(
+            {item["mission_id"] for item in first["invalid_missions"]},
+            {corrupt_mission, linked_mission},
+        )
+        self.assertEqual(
+            {path.relative_to(self.runs) for path in self.runs.rglob("*")},
+            before_paths,
+        )
+        self.assertEqual(
+            {
+                path.relative_to(self.runs): path.read_bytes()
+                for path in self.runs.rglob("*")
+                if path.is_file() and not path.is_symlink()
+            },
+            before_files,
+        )
+
+    def test_json_radar_prioritizes_redacted_decisions_and_exits_nonzero_on_invalid(
+        self,
+    ) -> None:
+        decision_id = str(uuid.uuid4())
+        mission_id = str(uuid.uuid4())
+        pending = {
+            "project": "alpha",
+            "project_id": "a" * 64,
+            "feature": "decision-radar",
+            "mission_id": mission_id,
+            "mission_status": "running",
+            "decision_id": decision_id,
+            "status": "DEFAULT_ELIGIBLE",
+            "impact": "checkpoint",
+            "risk": "low",
+            "reversible": True,
+            "affected_instances": ["builder"],
+            "requested_at": "2026-07-19T00:00:00.000000Z",
+            "deadline_at": "2026-07-19T02:00:00.000000Z",
+            "age_seconds": 7201.0,
+            "default_eligible": True,
+        }
+        invalid = {
+            "mission_id": str(uuid.uuid4()),
+            "status": "INVALID/UNREADABLE",
+            "reason": "strict mission ledger validation failed",
+        }
+        stdout = io.StringIO()
+        with (
+            mock.patch.object(
+                fleet_status.fleet_decisions,
+                "decision_inventory",
+                return_value={
+                    "decisions": [pending],
+                    "invalid_missions": [invalid],
+                },
+            ),
+            mock.patch.object(fleet_status, "workspace_names", return_value={}),
+            mock.patch.object(fleet_status, "manifest_inventory", return_value={}),
+            mock.patch.object(fleet_status, "hook_sessions", return_value=[]),
+            redirect_stdout(stdout),
+        ):
+            result = fleet_status.main(
+                ["--runs-dir", str(self.runs), "--json"]
+            )
+
+        self.assertEqual(result, 2)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["authority"], "mission_ledger")
+        self.assertTrue(payload["read_only"])
+        self.assertEqual(payload["decisions"], [pending])
+        self.assertEqual(payload["invalid_missions"], [invalid])
+        serialized = stdout.getvalue()
+        self.assertNotIn("question", serialized)
+        self.assertNotIn("dissent", serialized)
+        self.assertNotIn("options", serialized)
+
+    def test_inventory_aggregates_pending_decisions_across_projects_in_one_root(
+        self,
+    ) -> None:
+        missions = self.runs / "missions"
+        missions.mkdir(mode=0o700)
+        mission_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+        for mission_id in mission_ids:
+            (missions / mission_id).mkdir(mode=0o700)
+
+        decision_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
+
+        def derived(events):
+            index = events[0]["index"]
+            return {
+                "feature": f"feature-{index}",
+                "target_repo": f"/srv/project-{index}",
+                "status": "running",
+                "pending_decisions": {
+                    decision_ids[index]: {
+                        "requested_at": "2026-07-19T00:00:00.000000Z",
+                        "deadline_at": "2026-07-19T02:00:00.000000Z",
+                        "request": {
+                            "impact": "checkpoint",
+                            "risk": "low" if index == 0 else "medium",
+                            "reversible": True,
+                            "default_option_id": "safe" if index == 0 else None,
+                            "affected_instances": ["builder"],
+                        },
+                    }
+                },
+            }
+
+        event_by_mission = {
+            mission_id: [{"index": index}]
+            for index, mission_id in enumerate(mission_ids)
+        }
+
+        def read_events(path, *, expected_mission_id=None):
+            del path
+            return event_by_mission[expected_mission_id]
+
+        with (
+            mock.patch.object(
+                fleet_decisions.mission_state,
+                "read_events",
+                side_effect=read_events,
+            ),
+            mock.patch.object(
+                fleet_decisions.mission_state,
+                "derive_state",
+                side_effect=derived,
+            ),
+        ):
+            inventory = fleet_decisions.decision_inventory(
+                self.runs,
+                now=datetime(2026, 7, 19, 3, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(len(inventory["decisions"]), 2)
+        self.assertEqual(
+            {item["project"] for item in inventory["decisions"]},
+            {"project-0", "project-1"},
+        )
+        self.assertEqual(
+            {item["status"] for item in inventory["decisions"]},
+            {"DEFAULT_ELIGIBLE", "OVERDUE"},
+        )
+        self.assertEqual(inventory["invalid_missions"], [])
 
     @unittest.skipUnless(Path("/dev/fd").exists(), "descriptor view unavailable")
     def test_repeated_reads_do_not_leak_descriptors(self) -> None:
