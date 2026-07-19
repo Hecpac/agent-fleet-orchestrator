@@ -18,7 +18,7 @@ jobs:
   portable:
     name: portable
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45
 
     steps:
       - name: Check out source
