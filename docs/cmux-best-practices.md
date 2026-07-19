@@ -25,15 +25,20 @@ alcance endurecido es una Mac/un UID; consulta `guia-uso-flota.md` para operar.
 4. **Recuperación.** Los hooks de agentes guardan sesiones; un pane cerrado por
    accidente se restauró con `claude --resume <id>` sin perder contexto.
 5. **Orquestación por eventos.** `fleet-wait` duerme hasta `agent.hook.Stop` /
-   notificación del worker. Cero polling, cero tokens quemados en re-leer
-   pantallas.
+   notificación del worker. Para Kimi, que no tiene hook CMUX nativo, un bridge
+   repo-owned traduce `TurnEnd` de Wire a un wake-up y la evidencia se verifica
+   en el log Wire. Cero polling, cero tokens quemados en re-leer pantallas.
 6. **Costo.** Una auditoría histórica costó < $1 (MiniMax $0.83), pero eso no
    constituye un límite. Un canary Claude posterior reportó USD 0.56816 pese a
    un cap CLI de USD 0.05. Ollama local no incurre costo de API; toda inferencia
    frontier se habilita deliberadamente y conserva su evidencia de uso cuando
    el proveedor la ofrece.
-7. **Es solo un terminal.** Cualquier agente CLI funciona; no hay lock-in;
-   open source (GPL). tmux cubre lo mismo en Linux/Windows.
+7. **La visualización es solo un terminal; la orquestación no.** Cualquier CLI
+   puede vivir en un pane, pero entrar al router exige además un adapter, modelo
+   fijado, transporte de prompt, límites de herramientas y evidencia terminal
+   estructurada. Kimi requirió un bridge Wire precisamente porque CMUX no lo
+   ofrece en `cmux hooks`. No hay lock-in visual; el control durable sí necesita
+   integración explícita.
 
 ## Buenas prácticas (cada una con su cicatriz)
 

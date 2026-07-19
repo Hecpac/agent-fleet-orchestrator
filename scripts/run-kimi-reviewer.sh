@@ -23,7 +23,7 @@ if [[ -z "$kimi_executable" ]]; then
   exit 2
 fi
 
-exec "$kimi_executable" \
+PYTHONPATH="$repo_root/scripts${PYTHONPATH:+:$PYTHONPATH}" exec "$kimi_executable" \
   --work-dir "$target_repo" \
   --model moonshot-ai/kimi-k3 \
   --thinking \

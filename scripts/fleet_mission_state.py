@@ -21,6 +21,10 @@ import fleet_safe_paths
 
 SCHEMA_VERSION = 1
 GENESIS_SHA256 = "0" * 64
+DECISION_TIMEOUT_SECONDS = 2 * 60 * 60
+DECISION_IMPACTS = frozenset({"blocking", "checkpoint"})
+DECISION_RISKS = frozenset({"low", "medium", "high", "unknown"})
+DECISION_RESOLUTION_KINDS = frozenset({"human", "automatic"})
 EVENT_FIELDS = {
     "schema_version",
     "event_id",
@@ -61,6 +65,7 @@ SAFE_KIND = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 SAFE_ACTOR = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,127}$")
 SAFE_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,191}$")
 SAFE_FEATURE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SAFE_DECISION_OPTION = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 MISSION_LEDGER_TEMP = re.compile(
@@ -277,6 +282,155 @@ def _require_uint(value: Any, where: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise MissionStateError(f"{where} must be a non-negative integer")
     return value
+
+
+def decision_deadline(requested_at: str) -> str:
+    """Return the deterministic two-hour deadline for one decision request."""
+
+    value = parse_timestamp(requested_at, "decision request timestamp") + timedelta(
+        seconds=DECISION_TIMEOUT_SECONDS
+    )
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _validate_decision_evidence(value: Any, where: str, *, recommendation: bool) -> None:
+    fields = {"artifact_id", "delegation_id", "instance"}
+    fields |= {"option_id", "rationale"} if recommendation else {"summary"}
+    if not isinstance(value, dict) or set(value) != fields:
+        raise MissionStateError(f"{where} fields do not match schema")
+    _require_sha(value["artifact_id"], f"{where} artifact_id")
+    _require_uuid(value["delegation_id"], f"{where} delegation_id")
+    if not SAFE_FEATURE.fullmatch(_require_nonempty(value["instance"], f"{where} instance")):
+        raise MissionStateError(f"{where} instance is invalid")
+    if recommendation:
+        if not SAFE_DECISION_OPTION.fullmatch(
+            _require_nonempty(value["option_id"], f"{where} option_id")
+        ):
+            raise MissionStateError(f"{where} option_id is invalid")
+        _require_nonempty(value["rationale"], f"{where} rationale")
+    else:
+        _require_nonempty(value["summary"], f"{where} summary")
+
+
+def validate_decision_request_payload(payload: dict[str, Any]) -> None:
+    """Validate the closed durable Decision Brief v1 request contract."""
+
+    kind = "human_decision_requested"
+    _require_fields(
+        kind,
+        payload,
+        {
+            "decision_id",
+            "title",
+            "question",
+            "affected_instances",
+            "impact",
+            "risk",
+            "reversible",
+            "options",
+            "recommendation",
+            "challenge",
+            "dissent",
+            "default_option_id",
+        },
+    )
+    _require_uuid(payload["decision_id"], "decision_id")
+    _require_nonempty(payload["title"], "decision title")
+    _require_nonempty(payload["question"], "decision question")
+    affected = _require_string_list(
+        payload["affected_instances"], "decision affected_instances", unique=True
+    )
+    if not affected or affected != sorted(affected) or any(
+        not SAFE_FEATURE.fullmatch(instance) for instance in affected
+    ):
+        raise MissionStateError(
+            "decision affected_instances must be a non-empty sorted instance list"
+        )
+    if payload["impact"] not in DECISION_IMPACTS:
+        raise MissionStateError("decision impact is invalid")
+    if payload["risk"] not in DECISION_RISKS:
+        raise MissionStateError("decision risk is invalid")
+    if payload["risk"] in {"high", "unknown"} and payload["impact"] != "blocking":
+        raise MissionStateError("high or unknown decision risk must be blocking")
+    if not isinstance(payload["reversible"], bool):
+        raise MissionStateError("decision reversible must be boolean")
+
+    options = payload["options"]
+    if not isinstance(options, list) or not 2 <= len(options) <= 3:
+        raise MissionStateError("decision options must contain two or three choices")
+    option_ids: list[str] = []
+    for index, option in enumerate(options):
+        if not isinstance(option, dict) or set(option) != {
+            "option_id",
+            "label",
+            "tradeoffs",
+        }:
+            raise MissionStateError(f"decision option[{index}] fields do not match schema")
+        option_id = _require_nonempty(
+            option["option_id"], f"decision option[{index}].option_id"
+        )
+        if not SAFE_DECISION_OPTION.fullmatch(option_id):
+            raise MissionStateError(f"decision option[{index}].option_id is invalid")
+        _require_nonempty(option["label"], f"decision option[{index}].label")
+        _require_nonempty(option["tradeoffs"], f"decision option[{index}].tradeoffs")
+        option_ids.append(option_id)
+    if len(option_ids) != len(set(option_ids)):
+        raise MissionStateError("decision option IDs must be unique")
+
+    _validate_decision_evidence(
+        payload["recommendation"], "decision recommendation", recommendation=True
+    )
+    _validate_decision_evidence(
+        payload["challenge"], "decision challenge", recommendation=False
+    )
+    if payload["recommendation"]["option_id"] not in option_ids:
+        raise MissionStateError("decision recommendation references an unknown option")
+    if (
+        payload["recommendation"]["artifact_id"]
+        == payload["challenge"]["artifact_id"]
+        or payload["recommendation"]["delegation_id"]
+        == payload["challenge"]["delegation_id"]
+        or payload["recommendation"]["instance"]
+        == payload["challenge"]["instance"]
+    ):
+        raise MissionStateError("decision challenger must be evidence-distinct")
+    _require_nonempty(payload["dissent"], "decision dissent")
+    default_option = payload["default_option_id"]
+    if default_option is not None:
+        if not isinstance(default_option, str) or default_option not in option_ids:
+            raise MissionStateError("decision default_option_id is invalid")
+        if payload["risk"] != "low" or not payload["reversible"]:
+            raise MissionStateError(
+                "only low-risk reversible decisions may declare a default option"
+            )
+
+
+def validate_decision_resolution_payload(payload: dict[str, Any]) -> None:
+    """Validate the closed durable Decision Brief v1 resolution contract."""
+
+    kind = "human_decision_resolved"
+    _require_fields(
+        kind,
+        payload,
+        {
+            "decision_id",
+            "request_event_sha256",
+            "option_id",
+            "reason",
+            "resolution_kind",
+        },
+    )
+    _require_uuid(payload["decision_id"], "decision resolution decision_id")
+    _require_sha(
+        payload["request_event_sha256"], "decision resolution request_event_sha256"
+    )
+    if not SAFE_DECISION_OPTION.fullmatch(
+        _require_nonempty(payload["option_id"], "decision resolution option_id")
+    ):
+        raise MissionStateError("decision resolution option_id is invalid")
+    _require_nonempty(payload["reason"], "decision resolution reason")
+    if payload["resolution_kind"] not in DECISION_RESOLUTION_KINDS:
+        raise MissionStateError("decision resolution kind is invalid")
 
 
 def _validate_assured_action(kind: str, payload: dict[str, Any]) -> None:
@@ -721,6 +875,10 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         _require_fields(kind, payload, {"reason", "scope"})
         _require_nonempty(payload["reason"], "human approval reason")
         _require_nonempty(payload["scope"], "human approval scope")
+    elif kind == "human_decision_requested":
+        validate_decision_request_payload(payload)
+    elif kind == "human_decision_resolved":
+        validate_decision_resolution_payload(payload)
     elif kind == "run_cancel_requested":
         _require_fields(kind, payload, {"run_id", "reason"})
         _require_uuid(payload["run_id"], "cancel run_id")
@@ -1109,6 +1267,15 @@ def _validate_event(
     if sha256(unsigned) != stored_hash:
         raise MissionStateError("mission event hash mismatch")
     _validate_payload(event["kind"], event["payload"])
+    if event["kind"] == "human_decision_requested":
+        expected_decision_id = str(
+            uuid.uuid5(
+                uuid.UUID(mission_id),
+                f"decision:{event['idempotency_key']}",
+            )
+        )
+        if event["payload"]["decision_id"] != expected_decision_id:
+            raise MissionStateError("human decision deterministic identity mismatch")
 
 
 def _events_from_bytes(
@@ -1467,6 +1634,50 @@ def _require_no_active_admissions(result: dict[str, Any], where: str) -> None:
         raise MissionConflict(f"{where} requires all admissions to be inactive")
 
 
+def _blocking_decision_ids(
+    result: dict[str, Any], *, recipient_instance: str | None = None
+) -> list[str]:
+    values: list[str] = []
+    for decision_id, decision in result.get("pending_decisions", {}).items():
+        request = decision.get("request") if isinstance(decision, dict) else None
+        if not isinstance(request, dict) or request.get("impact") != "blocking":
+            continue
+        if recipient_instance is None or recipient_instance in request.get(
+            "affected_instances", []
+        ):
+            values.append(str(decision_id))
+    return sorted(values)
+
+
+def _require_no_pending_decisions(result: dict[str, Any], where: str) -> None:
+    pending = sorted(str(value) for value in result.get("pending_decisions", {}))
+    if pending:
+        raise MissionConflict(
+            f"{where} is blocked by pending human decisions: {', '.join(pending)}"
+        )
+
+
+def _decision_evidence_identity(
+    result: dict[str, Any], evidence: dict[str, Any], where: str
+) -> tuple[str, str, str | None]:
+    delegation_id = evidence["delegation_id"]
+    recorded = result["results"].get(delegation_id)
+    delegation = result["delegations"].get(delegation_id)
+    if (
+        not isinstance(recorded, dict)
+        or not isinstance(delegation, dict)
+        or recorded.get("artifact_id") != evidence["artifact_id"]
+        or delegation.get("recipient_instance") != evidence["instance"]
+        or recorded.get("run_id") != delegation.get("run_id")
+    ):
+        raise MissionConflict(f"{where} lacks exact attested result lineage")
+    return (
+        str(recorded["provider"]),
+        str(recorded["model"]),
+        recorded.get("variant"),
+    )
+
+
 def _reserve_admissions(
     result: dict[str, Any], event: dict[str, Any], payload: dict[str, Any]
 ) -> None:
@@ -1509,6 +1720,12 @@ def _reserve_admissions(
         if run_id in result["run_claims"] or run_id in result["run_owners"]:
             raise MissionConflict("run_id is already owned or reserved")
         recipient = admission["recipient_instance"]
+        blocked = _blocking_decision_ids(result, recipient_instance=recipient)
+        if admission["run_kind"] == "specialist" and blocked:
+            raise MissionConflict(
+                "recipient is blocked by pending human decisions: "
+                + ", ".join(blocked)
+            )
         if recipient in result["active_recipients"]:
             raise MissionConflict("recipient already has an active delegation")
         if admission["writer"] and result["active_writer"] is not None:
@@ -1693,6 +1910,8 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
         "lead_result": None,
         "synthesis_result": None,
         "approval": None,
+        "decisions": {},
+        "pending_decisions": {},
         "delegations": {},
         "results": {},
         "admission_policy": None,
@@ -1850,6 +2069,7 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                 raise MissionStateError("mission completing requires running state")
             if kind == "mission_completing":
                 _require_no_active_admissions(result, "mission completing")
+                _require_no_pending_decisions(result, "mission completing")
             if kind == "archive_created" and result["status"] != "completing":
                 raise MissionStateError("archive creation requires completing state")
             if kind == "archive_created":
@@ -1918,6 +2138,124 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
             if approval["risk"] != result["risk"]:
                 raise MissionConflict("assurance approval renewal cannot widen risk")
             result["approval"] = {**payload, "event_sha256": event["event_sha256"]}
+        elif kind == "human_decision_requested":
+            if event["actor"] != "lead":
+                raise MissionStateError("human decision request requires lead actor")
+            if result["status"] not in {"running", "assured_running"}:
+                raise MissionConflict(
+                    "human decision request requires a running mission"
+                )
+            if result["lead_run_id"] is None:
+                raise MissionConflict("human decision request requires a bound Lead")
+            decision_id = payload["decision_id"]
+            expected_decision_id = str(
+                uuid.uuid5(
+                    uuid.UUID(result["mission_id"]),
+                    f"decision:{event['idempotency_key']}",
+                )
+            )
+            if decision_id != expected_decision_id:
+                raise MissionStateError("human decision deterministic identity mismatch")
+            if decision_id in result["decisions"]:
+                raise MissionConflict("human decision identity is immutable")
+            recommendation_identity = _decision_evidence_identity(
+                result, payload["recommendation"], "decision recommendation"
+            )
+            challenge_identity = _decision_evidence_identity(
+                result, payload["challenge"], "decision challenge"
+            )
+            challenge_delegation = result["delegations"][
+                payload["challenge"]["delegation_id"]
+            ]
+            if challenge_delegation.get("capability") not in {"challenge", "verify"}:
+                raise MissionConflict(
+                    "decision challenge requires challenge or verify capability"
+                )
+            challenge_owner = result["run_owners"].get(
+                challenge_delegation.get("run_id")
+            )
+            challenge_admission = (
+                result["admissions"].get(challenge_owner.get("owner_id"))
+                if isinstance(challenge_owner, dict)
+                and challenge_owner.get("owner_kind") == "admission"
+                else None
+            )
+            if not isinstance(challenge_admission, dict) or challenge_admission.get(
+                "writer"
+            ):
+                raise MissionConflict(
+                    "decision challenge requires a non-writing admission"
+                )
+            if recommendation_identity == challenge_identity:
+                raise MissionConflict(
+                    "decision challenger must use a distinct provider/model identity"
+                )
+            if payload["impact"] == "blocking":
+                active = sorted(
+                    set(payload["affected_instances"])
+                    & set(result["active_recipients"])
+                )
+                if active:
+                    raise MissionConflict(
+                        "blocking human decision requires quiescent affected instances: "
+                        + ", ".join(active)
+                    )
+            decision = {
+                "decision_id": decision_id,
+                "status": "pending",
+                "request": payload,
+                "request_event_sha256": event["event_sha256"],
+                "requested_at": event["timestamp"],
+                "deadline_at": decision_deadline(event["timestamp"]),
+                "resolution": None,
+            }
+            result["decisions"][decision_id] = decision
+            result["pending_decisions"][decision_id] = decision
+        elif kind == "human_decision_resolved":
+            decision_id = payload["decision_id"]
+            decision = result["pending_decisions"].get(decision_id)
+            if not isinstance(decision, dict):
+                raise MissionConflict("human decision is not pending")
+            request = decision["request"]
+            expected_actor = (
+                "HUMAN" if payload["resolution_kind"] == "human" else "CONTROL"
+            )
+            if event["actor"] != expected_actor:
+                raise MissionStateError(
+                    f"{payload['resolution_kind']} decision resolution requires {expected_actor} actor"
+                )
+            if payload["request_event_sha256"] != decision["request_event_sha256"]:
+                raise MissionConflict(
+                    "decision resolution does not reference the active request"
+                )
+            option_ids = {item["option_id"] for item in request["options"]}
+            if payload["option_id"] not in option_ids:
+                raise MissionConflict("decision resolution references an unknown option")
+            if payload["resolution_kind"] == "automatic":
+                if (
+                    request["risk"] != "low"
+                    or not request["reversible"]
+                    or request["default_option_id"] is None
+                    or payload["option_id"] != request["default_option_id"]
+                ):
+                    raise MissionConflict(
+                        "decision is not eligible for automatic resolution"
+                    )
+                if parse_timestamp(
+                    event["timestamp"], "automatic decision resolution timestamp"
+                ) < parse_timestamp(decision["deadline_at"], "decision deadline"):
+                    raise MissionConflict(
+                        "decision cannot resolve automatically before its deadline"
+                    )
+            resolution = {
+                **payload,
+                "event_sha256": event["event_sha256"],
+                "resolved_at": event["timestamp"],
+                "actor": event["actor"],
+            }
+            decision["status"] = "resolved"
+            decision["resolution"] = resolution
+            del result["pending_decisions"][decision_id]
         elif kind == "risk_escalated":
             if payload["from"] != result["risk"]:
                 raise MissionStateError(
@@ -2380,6 +2718,10 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                 == delegation_id
             ):
                 del result["active_recipients"][delegation["recipient_instance"]]
+        elif kind == "lead_completion_requested":
+            if event["actor"] != "lead":
+                raise MissionStateError("lead completion request requires lead actor")
+            _require_no_pending_decisions(result, "lead completion")
         elif kind == "run_cancel_requested":
             run_id = payload["run_id"]
             if run_id not in result["run_owners"]:

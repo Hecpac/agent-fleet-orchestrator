@@ -236,6 +236,24 @@
       "concurrency": 1,
       "instructions": "You review supplied diffs and evidence for security, architecture, regressions, and missing tests."
     },
+    "kimi": {
+      "phase": "VERIFY",
+      "runner": "interactive",
+      "provider": "moonshot-ai",
+      "model": "moonshot-ai/kimi-k3",
+      "hook_source": "kimi",
+      "command": ["kimi", "--model", "moonshot-ai/kimi-k3", "--thinking", "--agent-file", ".kimi/agents/fleet-reviewer/agent.yaml"],
+      "healthcheck": ["kimi", "info", "--json"],
+      "ready_pattern": "Welcome to Kimi Code CLI|💫[[:space:]]*$",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["independent_code_review", "long_context_review", "architecture_challenge"],
+      "tool_access": ["filesystem_read", "fleet_control"],
+      "authority": "verification",
+      "resource_class": "remote",
+      "display_rank": 50,
+      "concurrency": 1
+    },
     "claude_reviewer": {
       "phase": "VERIFY",
       "runner": "interactive",
@@ -300,6 +318,15 @@
         {"instance_id": "build", "role_type": "codex"},
         {"instance_id": "challenge", "role_type": "glm"},
         {"instance_id": "verify", "role_type": "claude_reviewer"}
+      ]
+    },
+    "kimi_review": {
+      "description": "One Codex writer followed by an independent read-only Kimi K3 verifier.",
+      "include_lead": true,
+      "identity_groups": [["build", "verify"]],
+      "instances": [
+        {"instance_id": "build", "role_type": "codex"},
+        {"instance_id": "verify", "role_type": "kimi"}
       ]
     },
     "fleet_dialogue": {

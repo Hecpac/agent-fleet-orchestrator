@@ -16,6 +16,14 @@ fleet_codex_home=""
 fleet_codex_home_helper="$repo_root/scripts/fleet_codex_home.py"
 codex_runtime_permission=""
 codex_runtime_permission_name=""
+kimi_bridge_pid=""
+kimi_bridge_python=""
+kimi_events_file=""
+kimi_config_file=""
+kimi_session_id=""
+kimi_share_dir=""
+kimi_state_root="${FLEET_KIMI_STATE_ROOT:-/tmp/agent-fleet-orchestrator-kimi}"
+kimi_work_dir=""
 
 case "$execution_profile" in
   native|sandboxed|regulated) ;;
@@ -82,6 +90,13 @@ for ((index=0; index<${#command_args[@]}; index++)); do
   fi
 done
 cleanup() {
+  if [[ -n "$kimi_bridge_pid" ]]; then
+    # Kimi flushes TurnEnd before returning to its prompt. Give the bridge one
+    # final polling interval before stopping it on pane shutdown.
+    sleep 0.2
+    kill "$kimi_bridge_pid" >/dev/null 2>&1 || true
+    wait "$kimi_bridge_pid" >/dev/null 2>&1 || true
+  fi
   rm -rf -- "$isolated_home"
 }
 trap cleanup EXIT HUP INT TERM
@@ -488,6 +503,94 @@ case "$role_type" in
         -c "default_permissions=\"$codex_runtime_permission_name\""
     fi
     ;;
+  kimi)
+    controller_kimi_config="$controller_home/.kimi/config.toml"
+    if [[ ! -f "$controller_kimi_config" || -L "$controller_kimi_config" ]]; then
+      echo "Kimi controller configuration is unavailable" >&2
+      exit 2
+    fi
+    if [[ "${FLEET_HEALTHCHECK:-0}" == "1" ]]; then
+      kimi_share_dir="$isolated_home/.kimi"
+    else
+      if [[ ! "${CMUX_WORKSPACE_ID:-}" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ \
+        || ! "${CMUX_SURFACE_ID:-}" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+        echo "Kimi Fleet launch requires canonical cmux workspace/surface identities" >&2
+        exit 2
+      fi
+      if [[ "$kimi_state_root" != /* || -L "$kimi_state_root" ]]; then
+        echo "Kimi evidence state root must not be a symlink" >&2
+        exit 2
+      fi
+      mkdir -p "$kimi_state_root"
+      chmod 700 "$kimi_state_root"
+      canonical_surface_id="$(printf '%s' "$CMUX_SURFACE_ID" | tr '[:lower:]' '[:upper:]')"
+      kimi_state_dir="$kimi_state_root/$canonical_surface_id"
+      if [[ -L "$kimi_state_dir" || ( -e "$kimi_state_dir" && ! -d "$kimi_state_dir" ) ]]; then
+        echo "Kimi evidence state is unsafe for surface $canonical_surface_id" >&2
+        exit 2
+      fi
+      mkdir -p "$kimi_state_dir"
+      chmod 700 "$kimi_state_dir"
+      kimi_share_dir="$kimi_state_dir/share"
+      kimi_events_file="$kimi_state_dir/events.jsonl"
+      kimi_session_id="$(printf '%s' "$CMUX_SURFACE_ID" | tr '[:upper:]' '[:lower:]')"
+      kimi_work_dir="$(pwd -P)"
+    fi
+    if [[ -L "$kimi_share_dir" || ( -e "$kimi_share_dir" && ! -d "$kimi_share_dir" ) ]]; then
+      echo "Kimi share state is unsafe" >&2
+      exit 2
+    fi
+    mkdir -p "$kimi_share_dir"
+    chmod 700 "$kimi_share_dir"
+    kimi_config_file="$isolated_home/kimi-config.toml"
+    cp "$controller_kimi_config" "$kimi_config_file"
+    chmod 600 "$kimi_config_file"
+    keep+=(
+      "KIMI_SHARE_DIR=$kimi_share_dir"
+      "KIMI_CLI_NO_AUTO_UPDATE=1"
+      "PYTHONPATH=$repo_root/scripts"
+    )
+    if [[ "$(basename "$1")" == "kimi" && "${FLEET_HEALTHCHECK:-0}" != "1" ]]; then
+      if (( fleet_agent_mcp_enabled != 1 )); then
+        echo "Kimi Fleet role requires an authenticated Fleet Control endpoint" >&2
+        exit 2
+      fi
+      kimi_agent_file="$repo_root/.kimi/agents/fleet-reviewer/agent.yaml"
+      if [[ ! -f "$kimi_agent_file" || -L "$kimi_agent_file" ]]; then
+        echo "Canonical Kimi Fleet agent is unavailable" >&2
+        exit 2
+      fi
+      kimi_command=()
+      skip_next=0
+      for argument in "$@"; do
+        if (( skip_next == 1 )); then
+          skip_next=0
+          continue
+        fi
+        if [[ "$argument" == "--agent-file" ]]; then
+          kimi_command+=("--agent-file" "$kimi_agent_file")
+          skip_next=1
+        else
+          kimi_command+=("$argument")
+        fi
+      done
+      kimi_mcp_config="$(python3 -c '
+import json
+import sys
+print(json.dumps({"mcpServers": {"fleet_control": {
+    "command": sys.argv[1], "args": [sys.argv[2]]
+}}}, separators=(",", ":")))
+' "$fleet_agent_mcp_python" "$fleet_agent_mcp_proxy")"
+      kimi_command+=(
+        "--config-file" "$kimi_config_file"
+        "--work-dir" "$kimi_work_dir"
+        "--session" "$kimi_session_id"
+        "--mcp-config" "$kimi_mcp_config"
+      )
+      set -- "${kimi_command[@]}"
+      kimi_bridge_python="$(command -v python3)"
+    fi
+    ;;
   glm|minimax|minimax_checker)
     xdg_config="$isolated_home/xdg/config"
     prepare_opencode_data_home
@@ -673,7 +776,8 @@ provider_basename="$(basename "$1")"
 provider_mcp_preflight=0
 if [[ "$role_type" =~ ^(glm|minimax|minimax_checker)$ && "$provider_basename" == "opencode" ]] \
   || [[ "$role_type" =~ ^(codex|codex_candidate)$ && "$provider_basename" == "codex" ]] \
-  || [[ "$role_type" =~ ^(claude|claude_reviewer|claude_checker)$ && "$provider_basename" == "claude" ]]; then
+  || [[ "$role_type" =~ ^(claude|claude_reviewer|claude_checker)$ && "$provider_basename" == "claude" ]] \
+  || [[ "$role_type" == "kimi" && "$provider_basename" == "kimi" ]]; then
   provider_mcp_preflight=1
 fi
 if (( fleet_agent_mcp_enabled == 1 && provider_mcp_preflight == 1 )); then
@@ -718,6 +822,30 @@ if (
     exit 2
   fi
   unset preflight_json preflight_env
+fi
+
+if [[ "$role_type" == "kimi" && "$provider_basename" == "kimi" \
+  && "${FLEET_HEALTHCHECK:-0}" != "1" ]]; then
+  /usr/bin/env -i "${keep[@]}" "$kimi_bridge_python" \
+    "$repo_root/scripts/kimi_hook_bridge.py" \
+    --share-dir "$kimi_share_dir" \
+    --work-dir "$kimi_work_dir" \
+    --session-id "$kimi_session_id" \
+    --workspace-id "$CMUX_WORKSPACE_ID" \
+    --surface-id "$CMUX_SURFACE_ID" \
+    --hook-dir "${CMUX_HOOK_DIR:-$controller_home/.cmuxterm}" \
+    --events-file "$kimi_events_file" \
+    --provider moonshot-ai \
+    --model moonshot-ai/kimi-k3 \
+    >/dev/null 2>&1 &
+  kimi_bridge_pid=$!
+  sleep 0.1
+  if ! kill -0 "$kimi_bridge_pid" >/dev/null 2>&1; then
+    wait "$kimi_bridge_pid" || true
+    kimi_bridge_pid=""
+    echo "Kimi hook bridge failed to start" >&2
+    exit 2
+  fi
 fi
 
 # OpenCode permissions are resolved after global and project configuration are

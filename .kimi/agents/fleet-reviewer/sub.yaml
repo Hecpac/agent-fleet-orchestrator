@@ -9,8 +9,8 @@ agent:
       Never modify files, execute shell commands, access external directories,
       or perform Git mutations.
   tools:
-    - "kimi_cli.tools.file:ReadFile"
-    - "kimi_cli.tools.file:ReadMediaFile"
+    - "kimi_fleet_tools:FleetReadFile"
+    - "kimi_fleet_tools:FleetReadMediaFile"
     - "kimi_cli.tools.file:Glob"
-    - "kimi_cli.tools.file:Grep"
+    - "kimi_fleet_tools:FleetGrep"
   subagents:

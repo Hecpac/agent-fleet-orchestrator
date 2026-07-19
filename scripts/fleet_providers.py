@@ -275,10 +275,11 @@ class ProviderRegistry:
 def default_adapters() -> list[ProviderAdapter]:
     from providers.claude import ClaudeAdapter
     from providers.codex import CodexAdapter
+    from providers.kimi import KimiAdapter
     from providers.ollama import OllamaAdapter
     from providers.opencode import OpenCodeAdapter
 
-    return [CodexAdapter(), ClaudeAdapter(), OpenCodeAdapter(), OllamaAdapter()]
+    return [CodexAdapter(), ClaudeAdapter(), KimiAdapter(), OpenCodeAdapter(), OllamaAdapter()]
 
 
 DEFAULT_REGISTRY = ProviderRegistry()
@@ -292,7 +293,12 @@ def identity(
 
 def infer_hook_source(provider: str) -> str:
     """Compatibility mapping for pre-adapter manifests that lack hook_source."""
-    return {"openai": "codex", "anthropic": "claude", "ollama": ""}.get(
+    return {
+        "openai": "codex",
+        "anthropic": "claude",
+        "moonshot-ai": "kimi",
+        "ollama": "",
+    }.get(
         provider, "opencode"
     )
 

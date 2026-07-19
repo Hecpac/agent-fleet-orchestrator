@@ -29,6 +29,45 @@ Escalate to the frontier orchestrator when:
 - verification fails,
 - a worker returns assumptions instead of evidence.
 
+## Team consensus and operator decisions
+
+Each Mission has exactly one Lead. Specialists investigate, propose, build, or
+challenge; they do not ask the operator directly and cannot publish a Decision
+Brief through their restricted MCP surface. When judgment is needed, the Lead
+collects two durable results: a recommendation and a real contrary review from
+a `CHALLENGE` or `VERIFY` member. Those results must come from different
+instances and different `provider/model/variant` identities. Agreement is not
+manufactured by asking the same model twice.
+
+The Lead publishes `human_decision_requested` with two or three choices,
+tradeoffs, recommendation, dissent, exact evidence lineage, risk,
+reversibility, and the affected specialist instances. `blocking` pauses new
+admissions only for those instances; unrelated work continues. `checkpoint`
+does not pause work, but every unresolved brief—blocking or checkpoint—prevents
+Lead and Mission completion. An already-active affected run must become
+quiescent before a blocking brief can be published, so the ledger never claims
+that running work was paused retroactively.
+
+The operator resolves an exact option durably as actor `HUMAN`:
+
+```bash
+just mission-decisions <mission-id> --pending
+just mission-decision-show <mission-id> <decision-id>
+just mission-decision-resolve <mission-id> <decision-id> <option-id> \
+  <stable-idempotency-key> "<reason>"
+```
+
+Only a low-risk reversible brief may declare a default. CONTROL applies that
+exact default after the durable two-hour deadline at the next reconciliation
+boundary (`dispatch`, `dispatch-many`, `complete`, or explicit
+`fleet-decision.py ... reconcile`). Medium/high/unknown or irreversible choices
+remain pending for the human; high/unknown choices must be blocking. A
+concurrent human resolution wins cleanly over lazy automatic reconciliation.
+The older `request_human` event remains for compatibility and free-form pauses,
+but it is not the evidence-bound team-consensus protocol. Under the documented
+single-Mac/same-UID S0 boundary, actor `HUMAN` is a durable local operator
+attestation, not cryptographic proof that a distinct human was present.
+
 ## Worker Contract
 
 Every worker must end with:

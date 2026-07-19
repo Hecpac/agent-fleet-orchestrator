@@ -11,15 +11,28 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run-kimi-reviewer.sh"
 AGENT_DIR = ROOT / ".kimi" / "agents" / "fleet-reviewer"
+TOOLS = ROOT / "scripts" / "kimi_fleet_tools.py"
 
 
 class KimiReviewerTests(unittest.TestCase):
+    def test_tool_dependencies_remain_runtime_types_for_kimi_loader(self) -> None:
+        source = TOOLS.read_text(encoding="utf-8")
+        self.assertNotIn("from __future__ import annotations", source)
+        self.assertIn("def __init__(self, runtime: Runtime)", source)
+        self.assertIn(
+            "def __init__(self, builtin_args: BuiltinSystemPromptArgs)", source
+        )
+
     def test_agent_specs_expose_only_read_only_tools(self) -> None:
         main = (AGENT_DIR / "agent.yaml").read_text(encoding="utf-8")
         sub = (AGENT_DIR / "sub.yaml").read_text(encoding="utf-8")
         for spec in (main, sub):
-            for allowed in ("ReadFile", "ReadMediaFile", "Glob", "Grep"):
-                self.assertIn(f'"kimi_cli.tools.file:{allowed}"', spec)
+            for allowed in ("FleetReadFile", "FleetReadMediaFile", "FleetGrep"):
+                self.assertIn(f'"kimi_fleet_tools:{allowed}"', spec)
+            self.assertIn('"kimi_cli.tools.file:Glob"', spec)
+            self.assertNotIn('"kimi_cli.tools.file:ReadFile"', spec)
+            self.assertNotIn('"kimi_cli.tools.file:ReadMediaFile"', spec)
+            self.assertNotIn('"kimi_cli.tools.file:Grep"', spec)
             for forbidden in ("Shell", "WriteFile", "StrReplaceFile"):
                 self.assertNotIn(forbidden, spec)
         self.assertIn("kimi_cli.tools.multiagent:Task", main)
@@ -36,7 +49,7 @@ class KimiReviewerTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import json, os, sys\n"
                 "with open(os.environ['KIMI_TEST_CAPTURE'], 'w', encoding='utf-8') as f:\n"
-                "    json.dump(sys.argv[1:], f)\n",
+                "    json.dump({'args': sys.argv[1:], 'pythonpath': os.environ.get('PYTHONPATH', '')}, f)\n",
                 encoding="utf-8",
             )
             fake_kimi.chmod(0o700)
@@ -54,7 +67,8 @@ class KimiReviewerTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            args = json.loads(capture.read_text(encoding="utf-8"))
+            captured = json.loads(capture.read_text(encoding="utf-8"))
+            args = captured["args"]
 
         self.assertEqual(
             args,
@@ -71,6 +85,7 @@ class KimiReviewerTests(unittest.TestCase):
         self.assertNotIn("--yolo", args)
         self.assertNotIn("--afk", args)
         self.assertNotIn("--print", args)
+        self.assertEqual(captured["pythonpath"].split(os.pathsep)[0], str(ROOT / "scripts"))
 
     def test_runner_rejects_relative_target(self) -> None:
         result = subprocess.run(

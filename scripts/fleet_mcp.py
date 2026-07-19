@@ -65,6 +65,73 @@ DISPATCH_ITEM_SCHEMA = {
     "required": DISPATCH_REQUIRED,
     "properties": DISPATCH_PROPERTIES,
 }
+DECISION_OPTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["option_id", "label", "tradeoffs"],
+    "properties": {
+        "option_id": {"type": "string"},
+        "label": {"type": "string"},
+        "tradeoffs": {"type": "string"},
+    },
+}
+DECISION_BRIEF_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": [
+        "title",
+        "question",
+        "affected_instances",
+        "impact",
+        "risk",
+        "reversible",
+        "options",
+        "recommendation",
+        "challenge",
+        "dissent",
+        "default_option_id",
+    ],
+    "properties": {
+        "title": {"type": "string"},
+        "question": {"type": "string"},
+        "affected_instances": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+        },
+        "impact": {"enum": ["blocking", "checkpoint"]},
+        "risk": {"enum": ["low", "medium", "high", "unknown"]},
+        "reversible": {"type": "boolean"},
+        "options": {
+            "type": "array",
+            "items": DECISION_OPTION_SCHEMA,
+            "minItems": 2,
+        },
+        "recommendation": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["option_id", "rationale", "artifact_id"],
+            "properties": {
+                "option_id": {"type": "string"},
+                "rationale": {"type": "string"},
+                "artifact_id": {"type": "string"},
+            },
+        },
+        "challenge": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["summary", "artifact_id"],
+            "properties": {
+                "summary": {"type": "string"},
+                "artifact_id": {"type": "string"},
+            },
+        },
+        "dissent": {"type": "string"},
+        # Null is meaningful here (no automatic choice); Fleet Control applies
+        # the strict nullable/option-membership contract after schema parsing.
+        "default_option_id": {},
+    },
+}
 TOOLS = [
     {
         "name": "dispatch",
@@ -172,6 +239,21 @@ TOOLS = [
             "properties": {
                 "reason": {"type": "string"},
                 "scope": {"type": "string"},
+                "idempotency_key": {"type": "string"},
+            },
+        },
+    },
+    {
+        "name": "request_decision",
+        "description": (
+            "Publish a Lead-only evidence-bound Decision Brief for human resolution."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["brief", "idempotency_key"],
+            "properties": {
+                "brief": DECISION_BRIEF_SCHEMA,
                 "idempotency_key": {"type": "string"},
             },
         },
@@ -322,6 +404,10 @@ def call_tool(
         )
     if name == "request_human":
         return control.request_human(**arguments, **guarded)
+    if name == "request_decision":
+        if caller_identity is not None:
+            raise FleetControlError("request_decision is restricted to the mission Lead")
+        return control.request_decision(**arguments)
     if name == "inspect_roster":
         if arguments:
             raise FleetControlError("inspect_roster accepts no arguments")

@@ -8,13 +8,18 @@ agent:
       working directory. Inspect files and report evidence, but never modify
       files, execute shell commands, access external directories, or perform
       Git mutations. Use only the tools declared in this agent specification.
+      The fleet_control MCP tools are the authenticated Mission Control plane:
+      use them only when the assigned task explicitly requires delegation,
+      waiting, result retrieval, assurance, or mission/roster inspection.
+      Preserve the exact FLEET_RESULT sentinel requested by every Fleet task as
+      the final visible line of your answer.
   tools:
     - "kimi_cli.tools.multiagent:Task"
     - "kimi_cli.tools.todo:SetTodoList"
-    - "kimi_cli.tools.file:ReadFile"
-    - "kimi_cli.tools.file:ReadMediaFile"
+    - "kimi_fleet_tools:FleetReadFile"
+    - "kimi_fleet_tools:FleetReadMediaFile"
     - "kimi_cli.tools.file:Glob"
-    - "kimi_cli.tools.file:Grep"
+    - "kimi_fleet_tools:FleetGrep"
   subagents:
     reviewer:
       path: ./sub.yaml

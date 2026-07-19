@@ -51,6 +51,10 @@ HOOK_SESSION_FILES = {
 TRANSCRIPT_EVIDENCE_ATTEMPTS = 4
 TRANSCRIPT_EVIDENCE_RETRY_SECONDS = 0.1
 OPENCODE_STATE_ROOT = Path("/tmp/agent-fleet-orchestrator-opencode")
+KIMI_STATE_ROOT = Path(
+    os.environ.get("FLEET_KIMI_STATE_ROOT", "/tmp/agent-fleet-orchestrator-kimi")
+)
+KIMI_WIRE_PROTOCOLS = {"1.2", "1.3"}
 SAFE_FEATURE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SAFE_RESULT_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -315,6 +319,7 @@ def prompt_with_contract(task: str, run_id: str, *, hook_source: str = "") -> st
     defaults = {
         "codex": ("openai", "compatibility-model"),
         "claude": ("anthropic", "compatibility-model"),
+        "kimi": ("moonshot-ai", "compatibility-model"),
         "opencode": ("compatibility-provider", "compatibility-model"),
     }
     provider, model = defaults[hook_source]
@@ -623,6 +628,170 @@ def _transcript_rows(session_id: str, hook_source: str) -> list[dict[str, Any]]:
             raise FrontierError(f"{hook_source} transcript row is not an object")
         rows.append(row)
     return rows
+
+
+def kimi_state_dir(surface_uuid: str) -> Path:
+    try:
+        canonical_surface = str(uuid.UUID(surface_uuid)).upper()
+    except ValueError as exc:
+        raise FrontierError("Kimi evidence surface id is invalid") from exc
+    if not KIMI_STATE_ROOT.is_absolute():
+        raise FrontierError("Kimi evidence state root must be absolute")
+    surface_root = KIMI_STATE_ROOT / canonical_surface
+    if KIMI_STATE_ROOT.is_symlink() or surface_root.is_symlink():
+        raise FrontierError("Kimi evidence state must not use symlinks")
+    try:
+        resolved_root = KIMI_STATE_ROOT.resolve(strict=True)
+        resolved_surface = surface_root.resolve(strict=True)
+        resolved_surface.relative_to(resolved_root)
+    except (OSError, ValueError) as exc:
+        raise FrontierError("Kimi evidence state is unavailable") from exc
+    return resolved_surface
+
+
+def kimi_hook_events(surface_uuid: str) -> list[dict[str, Any]]:
+    events_path = kimi_state_dir(surface_uuid) / "events.jsonl"
+    if events_path.is_symlink():
+        raise FrontierError("Kimi event evidence must not be a symlink")
+    try:
+        lines = events_path.read_bytes().splitlines()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise FrontierError("cannot read Kimi event evidence") from exc
+    events: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            event = fleet_json.loads(raw)
+        except fleet_json.FleetJSONError as exc:
+            raise FrontierError("Kimi event evidence contains invalid JSON") from exc
+        if not isinstance(event, dict):
+            raise FrontierError("Kimi event evidence row is not an object")
+        payload = event.get("payload")
+        event_id = event.get("id")
+        valid = bool(
+            event.get("type") == "event"
+            and isinstance(event_id, str)
+            and event_id
+            and event_id not in seen
+            and event.get("source") == "kimi"
+            and event.get("name")
+            in {"agent.hook.UserPromptSubmit", "agent.hook.Stop"}
+            and isinstance(event.get("boot_id"), str)
+            and str(event["boot_id"]).startswith("kimi-")
+            and isinstance(event.get("seq"), int)
+            and not isinstance(event.get("seq"), bool)
+            and int(event["seq"]) > 0
+            and str(event.get("surface_id") or "").upper()
+            == str(uuid.UUID(surface_uuid)).upper()
+            and timestamp_value(event.get("occurred_at")) is not None
+            and isinstance(payload, dict)
+            and payload.get("_source") == "kimi"
+            and payload.get("phase") in {"received", "completed"}
+            and isinstance(payload.get("session_id"), str)
+            and str(payload["session_id"]).startswith("kimi-")
+        )
+        if not valid:
+            raise FrontierError("Kimi event evidence contains an invalid event")
+        seen.add(str(event_id))
+        events.append(event)
+    return events
+
+
+def _kimi_wire_text(payload: Any) -> str:
+    if isinstance(payload, str):
+        return payload
+    if not isinstance(payload, list):
+        return ""
+    parts: list[str] = []
+    for part in payload:
+        if not isinstance(part, dict) or part.get("type") != "text":
+            continue
+        text = part.get("text")
+        if isinstance(text, str):
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def kimi_turn_evidence(
+    session_id: str, run_id: str, stop_occurred_at: str
+) -> tuple[str, str, str]:
+    raw_session_id = session_id.removeprefix("kimi-")
+    try:
+        if str(uuid.UUID(raw_session_id)) != raw_session_id.lower():
+            raise ValueError
+    except ValueError as exc:
+        raise FrontierError("Kimi session id is invalid") from exc
+    stop_time = timestamp_value(stop_occurred_at)
+    if stop_time is None:
+        raise FrontierError("Kimi Stop has no valid timestamp")
+    record = session_record(session_id, hook_source="kimi")
+    provider = record.get("provider") if record else None
+    model = record.get("model") if record else None
+    if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+        raise FrontierError("Kimi session lacks provider/model identity")
+    rows = _transcript_rows(session_id, "kimi")
+    metadata = [
+        row for row in rows
+        if row.get("type") == "metadata"
+        and row.get("protocol_version") in KIMI_WIRE_PROTOCOLS
+    ]
+    if len(metadata) != 1:
+        raise FrontierError("Kimi transcript has invalid Wire metadata")
+    marker = f"FLEET_RESULT:{run_id}:<STATUS>"
+    matching_turns: list[int] = []
+    for index, row in enumerate(rows):
+        message = row.get("message")
+        if (
+            isinstance(message, dict)
+            and message.get("type") == "TurnBegin"
+            and isinstance(message.get("payload"), dict)
+            and marker in _kimi_wire_text(message["payload"].get("user_input"))
+        ):
+            matching_turns.append(index)
+    if len(matching_turns) != 1:
+        raise FrontierError("Kimi transcript has ambiguous user binding")
+    begin = matching_turns[0]
+    end = len(rows)
+    for index in range(begin + 1, len(rows)):
+        message = rows[index].get("message")
+        if isinstance(message, dict) and message.get("type") == "TurnBegin":
+            end = index
+            break
+    turn_rows = rows[begin + 1 : end]
+    turn_end_indexes: list[int] = []
+    for index, row in enumerate(turn_rows):
+        timestamp = row.get("timestamp")
+        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+            raise FrontierError("Kimi transcript has an invalid timestamp")
+        message = row.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("payload"), dict):
+            raise FrontierError("Kimi transcript has an invalid message")
+        if message.get("type") == "TurnEnd":
+            try:
+                wire_stop = datetime.fromtimestamp(
+                    float(timestamp), timezone.utc
+                ).isoformat()
+            except (OSError, OverflowError, ValueError) as exc:
+                raise FrontierError("Kimi transcript has an invalid timestamp") from exc
+            if wire_stop == stop_time.isoformat():
+                turn_end_indexes.append(index)
+    if len(turn_end_indexes) != 1 or turn_end_indexes[0] != len(turn_rows) - 1:
+        raise FrontierError("Kimi transcript lacks one completed TurnEnd")
+    visible: list[str] = []
+    for row in turn_rows[: turn_end_indexes[0]]:
+        message = row["message"]
+        if message.get("type") == "ContentPart":
+            payload = message["payload"]
+            if payload.get("type") == "text" and isinstance(payload.get("text"), str):
+                visible.append(payload["text"])
+    response = "".join(visible)
+    if not response:
+        raise FrontierError("Kimi transcript has no final assistant response")
+    return response, provider, model
 
 
 def _message_text(content: Any, *, text_types: set[str]) -> str:
@@ -1333,6 +1502,11 @@ def process_event(
                     claude_turn_evidence, current_session, current_run, stopped
                 )
             ),
+            "kimi": lambda current_session, current_run, stopped: (
+                transcript_turn_evidence(
+                    kimi_turn_evidence, current_session, current_run, stopped
+                )
+            ),
             "opencode": lambda current_session, current_run, stopped: (
                 transcript_turn_evidence(
                     lambda session, run, occurred_at: opencode_turn_evidence(
@@ -1449,7 +1623,12 @@ def authorize_prompt_submission(
     deadline = time.monotonic() + timeout_seconds
     while True:
         matches: list[dict[str, Any]] = []
-        for event in audit_events():
+        source_events = (
+            kimi_hook_events(str(state["surface_uuid"]))
+            if hook_source == "kimi"
+            else audit_events()
+        )
+        for event in source_events:
             payload = event.get("payload") or {}
             session_id = str(payload.get("session_id") or "")
             if (
@@ -1497,6 +1676,47 @@ def authorize_prompt_submission(
                 "no UserPromptSubmit observed after dispatch; prompt transfer unconfirmed"
             )
         time.sleep(0.25)
+
+
+def reconcile_kimi_events(
+    runs_dir: Path,
+    state: dict[str, Any],
+    *,
+    workspace_ref: str,
+    surface_ref: str,
+) -> dict[str, Any] | None:
+    """Apply durable Kimi bridge events without claiming cmux-native hooks."""
+    if state.get("hook_source") != "kimi" or state.get("status") in TERMINAL_STATUSES:
+        return state if state.get("status") in TERMINAL_STATUSES else None
+    current = dict(state)
+    events = kimi_hook_events(str(state["surface_uuid"]))
+    events.sort(
+        key=lambda event: (
+            timestamp_value(event.get("occurred_at"))
+            or datetime.max.replace(tzinfo=timezone.utc),
+            int(event.get("seq") or 0),
+        )
+    )
+    for event in events:
+        terminal = process_event(
+            runs_dir,
+            current,
+            event,
+            workspace_ref=workspace_ref,
+            surface_ref=surface_ref,
+            allow_cross_boot=True,
+        )
+        refreshed = frontier_state(
+            ledger_path(runs_dir, str(state["feature"])),
+            run_id=str(state["run_id"]),
+            instance=str(state["instance"]),
+            runs_dir=runs_dir,
+        )
+        if refreshed:
+            current = refreshed
+        if terminal and terminal.get("status") in TERMINAL_STATUSES:
+            return terminal
+    return None
 
 
 def audit_events() -> list[dict[str, Any]]:

@@ -464,7 +464,7 @@ def validate_router(config: dict[str, Any]) -> None:
                 f"router.roles.{role_type}.hook_source",
                 allow_reserved=True,
             )
-            if hook_source not in {"codex", "claude", "opencode"}:
+            if hook_source not in {"codex", "claude", "kimi", "opencode"}:
                 raise RouterError(
                     f"router.roles.{role_type}.hook_source is not supported: {hook_source}"
                 )
@@ -560,6 +560,20 @@ def validate_router(config: dict[str, Any]) -> None:
                 if "--model" not in role["command"]:
                     raise RouterError(
                         f"router.roles.{role_type} claude role lacks command model"
+                    )
+                model_index = role["command"].index("--model") + 1
+                if model_index >= len(role["command"]) or role["command"][model_index] != model:
+                    raise RouterError(
+                        f"router.roles.{role_type} model must match command --model"
+                    )
+            elif hook_source == "kimi":
+                if role["provider"] != "moonshot-ai" or role["command"][0] != "kimi":
+                    raise RouterError(
+                        f"router.roles.{role_type} kimi source requires moonshot-ai/kimi"
+                    )
+                if "--model" not in role["command"]:
+                    raise RouterError(
+                        f"router.roles.{role_type} kimi role lacks command model"
                     )
                 model_index = role["command"].index("--model") + 1
                 if model_index >= len(role["command"]) or role["command"][model_index] != model:

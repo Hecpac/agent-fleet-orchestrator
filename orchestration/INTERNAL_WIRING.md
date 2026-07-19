@@ -241,6 +241,38 @@ static validation, including unique batch recipients, precedes token, intent,
 budget, or launch mutation. The core rejects every child attempt to reach the
 unique writer, and CMUX screen content is absent from the acceptance path.
 
+## Mission decisions are evidence-bound, Lead-only, and scope-selective
+
+`rule: mission_decisions_require_distinct_challenge_and_pause_only_declared_scope`
+
+`enforced_by:`
+
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_decision_brief_blocks_only_affected_then_human_cli_unblocks`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_challenge_must_be_identity_distinct_and_from_review_phase`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_durable_reducer_rejects_recon_evidence_forged_as_challenge`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_blocking_decision_requires_affected_scope_quiescent`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_checkpoint_allows_scoped_work_but_still_blocks_completion`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_automatic_resolution_is_rejected_before_exact_deadline`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_human_resolution_wins_cleanly_over_racing_auto_reconcile`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_decision_tool_is_management_only_not_specialist_discovery`
+
+`why:` A Decision Brief is a closed, hash-chained Mission event published only
+by the bound Lead. It references one attested recommendation and one attested
+contrary result with distinct artifact, delegation, instance, and configured
+provider/model identity; the challenger must occupy a non-writing CHALLENGE or
+VERIFY roster role. A blocking brief can be created only after its affected
+instances are quiescent, then admission linearization rejects new work for
+exactly those instances while unrelated specialists continue. A checkpoint
+does not pause admissions, but every unresolved brief blocks Lead and Mission
+completion. Resolution seals the exact request event hash and option. HUMAN may
+select any declared option; CONTROL may select only the declared default of a
+low-risk reversible brief, never before its deterministic two-hour deadline.
+Lazy reconciliation re-reads after a concurrent human win instead of turning
+that valid operator action into a dispatch failure. The management MCP exposes
+publication to the Lead, while the specialist discovery/proxy surface does not.
+As elsewhere in S0, `HUMAN` is an actor label inside the trusted same-UID
+boundary rather than out-of-band proof of human presence.
+
 ## Risk-proportional execution modes
 
 `rule: autonomous_dispatch_skips_routine_phase_gates_without_weakening_identity`

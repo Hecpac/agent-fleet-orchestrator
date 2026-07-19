@@ -5,13 +5,20 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
+import time
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
 FLEET_WAIT = ROOT / "scripts" / "fleet_wait.py"
+sys.path.insert(0, str(ROOT / "scripts"))
+
+import fleet_frontier  # noqa: E402
+import kimi_hook_bridge  # noqa: E402
 
 FAKE_CMUX = r'''#!/usr/bin/env python3
 import json
@@ -106,6 +113,7 @@ time.sleep(10)
 
 UUID_1 = "00000000-0000-0000-0000-000000000101"
 UUID_2 = "00000000-0000-0000-0000-000000000102"
+WORKSPACE_UUID = "00000000-0000-0000-0000-000000000001"
 
 
 class FleetWaitTestCase(unittest.TestCase):
@@ -239,7 +247,7 @@ class FleetWaitTestCase(unittest.TestCase):
         extra: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         command = [
-            "python3", str(FLEET_WAIT), "esc", str(self.manifest), timeout_sec,
+            sys.executable, str(FLEET_WAIT), "esc", str(self.manifest), timeout_sec,
             *(f"--run={mapping}" for mapping in runs),
             *extra,
             *roles,
@@ -276,6 +284,137 @@ class FleetWaitEscalationTests(FleetWaitTestCase):
 
 
 class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
+    def test_kimi_terminal_before_subscription_reconciles_from_wire_bridge(self) -> None:
+        self.add_frontier_instance()
+        with self.manifest.open("a", encoding="utf-8") as handle:
+            handle.write(
+                "manifest_contract_version=3\n"
+                f"workspace_uuid={WORKSPACE_UUID}\n"
+                "tracking_protocol=control-v1\n"
+                "frontier.role=kimi\n"
+            )
+        hooks = self.tmp / "hooks"
+        hooks.mkdir()
+        state_root = self.tmp / "kimi-state"
+        surface_state = state_root / UUID_2
+        surface_state.mkdir(parents=True)
+        events_file = surface_state / "events.jsonl"
+        work = self.tmp / "work"
+        share = self.tmp / "share"
+        work.mkdir()
+        share.mkdir()
+        run_id = "00000000-0000-4000-8000-000000000777"
+        session_id = UUID_2
+        ack = {
+            "type": "ack",
+            "protocol": "cmux-events",
+            "version": 1,
+            "boot_id": "boot-1",
+            "replay_count": 0,
+            "resume": {
+                "gap": False,
+                "oldest_seq": 1,
+                "latest_seq": 1,
+                "next_seq": 2,
+            },
+        }
+        with (
+            mock.patch.object(fleet_frontier, "KIMI_STATE_ROOT", state_root),
+            mock.patch.object(fleet_frontier, "event_ack", return_value=ack),
+            mock.patch.object(
+                fleet_frontier,
+                "acquire_frontier",
+                return_value=self.tmp / "locks" / "kimi.lock",
+            ),
+            mock.patch.dict(os.environ, {"CMUX_HOOK_DIR": str(hooks)}),
+        ):
+            prepared = fleet_frontier.prepare_run(
+                self.tmp,
+                feature="esc",
+                instance="frontier",
+                role="kimi",
+                phase="VERIFY",
+                task="Review the repository.",
+                workspace_uuid=WORKSPACE_UUID,
+                surface_uuid=UUID_2,
+                provider="moonshot-ai",
+                model="moonshot-ai/kimi-k3",
+                hook_source="kimi",
+                run_id=run_id,
+            )
+            timestamp = time.time() + 1
+            response = f"verified\nFLEET_RESULT:{run_id}:DONE"
+            transcript = kimi_hook_bridge.wire_path(share, work, session_id)
+            transcript.parent.mkdir(parents=True)
+            rows = (
+                {"type": "metadata", "protocol_version": "1.3"},
+                {
+                    "timestamp": timestamp,
+                    "message": {
+                        "type": "TurnBegin",
+                        "payload": {"user_input": prepared["prompt"]},
+                    },
+                },
+                {
+                    "timestamp": timestamp + 1,
+                    "message": {
+                        "type": "ContentPart",
+                        "payload": {"type": "text", "text": response},
+                    },
+                },
+                {
+                    "timestamp": timestamp + 2,
+                    "message": {"type": "TurnEnd", "payload": {}},
+                },
+            )
+            transcript.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            kimi_hook_bridge.record_session(
+                hooks,
+                session_id=session_id,
+                workspace_id=WORKSPACE_UUID,
+                surface_id=UUID_2,
+                transcript_path=transcript,
+                provider="moonshot-ai",
+                model="moonshot-ai/kimi-k3",
+            )
+            for record_index, row in ((2, rows[1]), (4, rows[3])):
+                event = kimi_hook_bridge.hook_event(
+                    record_index=record_index,
+                    record=row,
+                    session_id=session_id,
+                    workspace_id=WORKSPACE_UUID,
+                    surface_id=UUID_2,
+                )
+                assert event is not None
+                kimi_hook_bridge.append_event(events_file, event)
+            fleet_frontier.authorize_prompt_submission(
+                self.tmp,
+                feature="esc",
+                instance="frontier",
+                run_id=run_id,
+                workspace_uuid=WORKSPACE_UUID,
+                hook_source="kimi",
+                since=prepared["dispatched_at"],
+            )
+
+        self.env.update(
+            {
+                "CMUX_HOOK_DIR": str(hooks),
+                "FLEET_KIMI_STATE_ROOT": str(state_root),
+                "FAKE_SCENARIO": "blocking",
+            }
+        )
+        result = self.run_wait(
+            "10",
+            roles=("frontier",),
+            runs=(f"frontier={run_id}",),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"run_id={run_id} status=succeeded", result.stdout)
+
     def test_spurious_notification_is_ignored_until_exact_run_is_terminal(self) -> None:
         self.append_ledger("triage", "r1", "running")
         self.env["FAKE_SCENARIO"] = "spurious_then_done"

@@ -19,6 +19,7 @@ import fleet_admission
 import fleet_artifacts
 import fleet_budget
 import fleet_delegation
+import fleet_decisions
 import fleet_frontier
 import fleet_json
 import fleet_ledger
@@ -398,6 +399,14 @@ class FleetControl:
                 raise FleetControlError("artifact is not an attested mission result")
             fleet_artifacts.get_bytes(self.runs_dir, self.mission_id, artifact_id)
 
+    def _reconcile_expired_decisions(self) -> dict[str, Any]:
+        """Normalize lazy decision-reconciliation failures at the Control boundary."""
+
+        try:
+            return fleet_decisions.reconcile_expired(self.runs_dir, self.mission_id)
+        except (fleet_decisions.DecisionError, mission_state.MissionStateError) as exc:
+            raise FleetControlError(f"cannot reconcile pending decisions: {exc}") from exc
+
     def dispatch(
         self,
         *,
@@ -414,6 +423,7 @@ class FleetControl:
         remaining_budget: int = 1,
         _caller_identity: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._reconcile_expired_decisions()
         return self._dispatch(
             recipient_instance=recipient_instance,
             capability=capability,
@@ -1068,6 +1078,7 @@ class FleetControl:
         *,
         _caller_identity: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self._reconcile_expired_decisions()
         if not isinstance(requests, list) or not requests:
             raise FleetControlError("dispatch-many requires a non-empty request list")
         if any(not isinstance(request, dict) for request in requests):
@@ -1391,6 +1402,193 @@ class FleetControl:
             )
         return {"event": event, "appended": appended}
 
+    @staticmethod
+    def _decision_evidence_binding(
+        current: dict[str, Any], artifact_id: str
+    ) -> dict[str, Any]:
+        matches = [
+            (delegation_id, result)
+            for delegation_id, result in current.get("results", {}).items()
+            if isinstance(result, dict) and result.get("artifact_id") == artifact_id
+        ]
+        if len(matches) != 1:
+            raise FleetControlError(
+                "decision evidence must identify exactly one specialist result"
+            )
+        delegation_id, result = matches[0]
+        delegation = current.get("delegations", {}).get(delegation_id)
+        if not isinstance(delegation, dict):
+            raise FleetControlError("decision evidence lacks delegation lineage")
+        return {
+            "artifact_id": artifact_id,
+            "delegation_id": delegation_id,
+            "instance": delegation["recipient_instance"],
+            "provider": result["provider"],
+            "model": result["model"],
+            "variant": result.get("variant"),
+        }
+
+    def request_decision(
+        self,
+        *,
+        brief: dict[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Publish one Lead-only, evidence-bound Decision Brief v1."""
+
+        if not isinstance(brief, dict) or set(brief) != {
+            "title",
+            "question",
+            "affected_instances",
+            "impact",
+            "risk",
+            "reversible",
+            "options",
+            "recommendation",
+            "challenge",
+            "dissent",
+            "default_option_id",
+        }:
+            raise FleetControlError("decision brief fields do not match schema")
+        if not isinstance(idempotency_key, str) or not mission_state.SAFE_KEY.fullmatch(
+            idempotency_key
+        ):
+            raise FleetControlError("invalid decision idempotency key")
+        recommendation = brief.get("recommendation")
+        challenge = brief.get("challenge")
+        if not isinstance(recommendation, dict) or set(recommendation) != {
+            "option_id",
+            "rationale",
+            "artifact_id",
+        }:
+            raise FleetControlError("decision recommendation fields do not match schema")
+        if not isinstance(challenge, dict) or set(challenge) != {
+            "summary",
+            "artifact_id",
+        }:
+            raise FleetControlError("decision challenge fields do not match schema")
+        evidence_ids = [recommendation.get("artifact_id"), challenge.get("artifact_id")]
+        if any(
+            not isinstance(value, str) or not mission_state.SHA256.fullmatch(value)
+            for value in evidence_ids
+        ) or len(set(evidence_ids)) != 2:
+            raise FleetControlError(
+                "decision recommendation and challenge require distinct artifact IDs"
+            )
+        self._require_attested_artifacts(evidence_ids)
+        current = self.state()
+        recommendation_binding = self._decision_evidence_binding(
+            current, str(recommendation["artifact_id"])
+        )
+        challenge_binding = self._decision_evidence_binding(
+            current, str(challenge["artifact_id"])
+        )
+        members = self.members()
+        challenge_member = members.get(challenge_binding["instance"])
+        if not isinstance(challenge_member, dict) or challenge_member.get("phase") not in {
+            "CHALLENGE",
+            "VERIFY",
+        }:
+            raise FleetControlError(
+                "decision challenge evidence must come from a CHALLENGE or VERIFY member"
+            )
+        if challenge_member.get("authority") == "write":
+            raise FleetControlError("decision challenger cannot have write authority")
+        recommendation_identity = tuple(
+            recommendation_binding[field] for field in ("provider", "model", "variant")
+        )
+        challenge_identity = tuple(
+            challenge_binding[field] for field in ("provider", "model", "variant")
+        )
+        if (
+            recommendation_binding["instance"] == challenge_binding["instance"]
+            or recommendation_identity == challenge_identity
+        ):
+            raise FleetControlError(
+                "decision challenger must use a distinct instance and provider/model identity"
+            )
+        affected = brief.get("affected_instances")
+        if not isinstance(affected, list) or not affected:
+            raise FleetControlError("decision affected_instances must be non-empty")
+        if any(
+            not isinstance(instance, str)
+            or instance == "lead"
+            or instance not in members
+            for instance in affected
+        ):
+            raise FleetControlError(
+                "decision affected_instances must name compiled specialists"
+            )
+        if len(affected) != len(set(affected)):
+            raise FleetControlError("decision affected_instances must be unique")
+        decision_id = str(
+            uuid.uuid5(uuid.UUID(self.mission_id), f"decision:{idempotency_key}")
+        )
+        payload = {
+            "decision_id": decision_id,
+            "title": brief["title"],
+            "question": brief["question"],
+            "affected_instances": sorted(affected),
+            "impact": brief["impact"],
+            "risk": brief["risk"],
+            "reversible": brief["reversible"],
+            "options": brief["options"],
+            "recommendation": {
+                "option_id": recommendation["option_id"],
+                "rationale": recommendation["rationale"],
+                **{
+                    field: recommendation_binding[field]
+                    for field in ("artifact_id", "delegation_id", "instance")
+                },
+            },
+            "challenge": {
+                "summary": challenge["summary"],
+                **{
+                    field: challenge_binding[field]
+                    for field in ("artifact_id", "delegation_id", "instance")
+                },
+            },
+            "dissent": brief["dissent"],
+            "default_option_id": brief["default_option_id"],
+        }
+        try:
+            mission_state.validate_decision_request_payload(payload)
+            event, appended = mission_state.append_event(
+                self.runs_dir,
+                self.mission_id,
+                kind="human_decision_requested",
+                actor="lead",
+                idempotency_key=idempotency_key,
+                payload=payload,
+            )
+        except mission_state.MissionStateError as exc:
+            raise FleetControlError(str(exc)) from exc
+        refreshed = self.state()
+        decision = refreshed["decisions"][decision_id]
+        try:
+            formatted = fleet_decisions.format_brief(refreshed, decision)
+        except fleet_decisions.DecisionError as exc:
+            raise FleetControlError(str(exc)) from exc
+        return {
+            "event": event,
+            "appended": appended,
+            "decision": decision,
+            "brief": formatted,
+        }
+
+    def list_decisions(self, *, pending_only: bool = False) -> dict[str, Any]:
+        try:
+            current, decisions = fleet_decisions.list_decisions(
+                self.runs_dir, self.mission_id, pending_only=pending_only
+            )
+        except (fleet_decisions.DecisionError, mission_state.MissionStateError) as exc:
+            raise FleetControlError(str(exc)) from exc
+        return {
+            "mission_id": current["mission_id"],
+            "pending_only": pending_only,
+            "decisions": decisions,
+        }
+
     def request_assurance(
         self,
         *,
@@ -1518,6 +1716,7 @@ class FleetControl:
     def complete(
         self, *, artifact_id: str, summary: str, idempotency_key: str
     ) -> dict[str, Any]:
+        self._reconcile_expired_decisions()
         self._require_attested_artifacts([artifact_id])
         event, appended = mission_state.append_event(
             self.runs_dir,
@@ -1537,6 +1736,16 @@ def _load_requests(path: Path) -> list[dict[str, Any]]:
         raise FleetControlError(f"cannot load dispatch-many spec: {exc}") from exc
     if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
         raise FleetControlError("dispatch-many spec must be a JSON array of objects")
+    return value
+
+
+def _load_decision_brief(path: Path) -> dict[str, Any]:
+    try:
+        value = fleet_json.load(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise FleetControlError(f"cannot read decision brief: {exc}") from exc
+    if not isinstance(value, dict):
+        raise FleetControlError("decision brief must be a JSON object")
     return value
 
 
@@ -1583,6 +1792,11 @@ def _parser() -> argparse.ArgumentParser:
     human.add_argument("--reason", required=True)
     human.add_argument("--scope", required=True)
     human.add_argument("--idempotency-key", required=True)
+    decision = commands.add_parser("request-decision")
+    decision.add_argument("--brief-file", required=True)
+    decision.add_argument("--idempotency-key", required=True)
+    decisions = commands.add_parser("list-decisions")
+    decisions.add_argument("--pending", action="store_true")
     commands.add_parser("inspect-roster")
     commands.add_parser("inspect-mission")
     cancel = commands.add_parser("cancel")
@@ -1642,6 +1856,13 @@ def main(argv: list[str] | None = None) -> int:
                 scope=args.scope,
                 idempotency_key=args.idempotency_key,
             )
+        elif args.command == "request-decision":
+            value = control.request_decision(
+                brief=_load_decision_brief(Path(args.brief_file).expanduser().resolve()),
+                idempotency_key=args.idempotency_key,
+            )
+        elif args.command == "list-decisions":
+            value = control.list_decisions(pending_only=args.pending)
         elif args.command == "inspect-roster":
             value = control.inspect_roster()
         elif args.command == "inspect-mission":

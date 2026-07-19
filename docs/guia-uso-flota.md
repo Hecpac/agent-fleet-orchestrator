@@ -65,7 +65,10 @@ revisa su salida porque las herramientas opcionales ausentes se reportan sin
 convertir el comando en una prueba de salud de cada proveedor. El boot valida el
 roster completo antes del primer efecto CMUX. Los roles GLM y MiniMax requieren,
 respectivamente, `ZHIPU_API_KEY` y `MINIMAX_API_KEY`; Codex y Claude requieren
-sus sesiones autenticadas.
+sus sesiones autenticadas. El rol Kimi requiere `kimi` instalado y una
+configuración autenticada en `~/.kimi/config.toml`; el launcher fija
+`moonshot-ai/kimi-k3` y copia esa configuración únicamente al home efímero del
+proceso.
 
 Codex es el Lead predeterminado. Claude solo se selecciona con
 `--lead-provider claude` o mediante fallback explícitamente habilitado con
@@ -138,6 +141,11 @@ Todos los workflows con assurance resuelven `fleet_dialogue` como
   política resuelta antes de boot; solo se exceptúa el `tool-output` efímero y
   vacío de esa instancia. FDP-2 entrega Git mediante un evidence pack
   durable generado por CONTROL.
+- Kimi usa wrappers de `ReadFile`, `ReadMediaFile` y `Grep` confinados al
+  checkout objetivo, sin shell ni escritura. Como CMUX no ofrece hook Kimi
+  nativo, un bridge del controlador convierte `TurnBegin`/`TurnEnd` de Wire en
+  señales metadata-only; la respuesta completa se verifica en el log Wire, no
+  en el texto visible del pane.
 - `run_id`, UUID de workspace/surface, proveedor, modelo y, cuando aplica,
   variante deben coincidir. La ambigüedad falla cerrada.
 - Un preset que declara `identity_groups` exige tuplas
@@ -321,7 +329,8 @@ Lista los presets reales:
 ```
 
 Los presets disponibles son `dan`, `small`, `audit`, `implementation_review`,
-`frontier_verification`, `fleet_dialogue`, `hotfix_validated` y `research`.
+`frontier_verification`, `fleet_dialogue`, `hotfix_validated`, `kimi_review` y
+`research`.
 
 | Preset | Modo y roster | Uso |
 |---|---|---|
@@ -329,6 +338,7 @@ Los presets disponibles son `dan`, `small`, `audit`, `implementation_review`,
 | `small` | guiado: solo lead | Tarea acotada y secuencial. |
 | `audit` | guiado: analysis, challenge, verify | Perspectivas con identidad diversa y revisión supplied-diff. |
 | `implementation_review` | guiado: build, verify | Un writer y un reviewer local con identidad distinta. |
+| `kimi_review` | guiado: build, verify | Codex implementa y Kimi K3 hace revisión read-only de contexto largo. |
 | `frontier_verification` | guiado: build, challenge, verify | Writer, GLM read-only y Claude verifier. |
 | `fleet_dialogue` | asegurado: maker, checker, challenge, verify | FDP-2 y FDP-3 con gates completos. |
 | `hotfix_validated` | guiado: candidate_codex, candidate_minimax, verify | Candidatos paralelos que aún requieren verificación. |
@@ -339,6 +349,7 @@ Ejemplos:
 ```bash
 just fleet <feature>
 just fleet-preset <feature> audit
+just fleet-preset <feature> kimi_review
 ./scripts/fleet-up.sh <feature> --preset implementation_review \
   --target-repo <repo>
 ./scripts/fleet-up.sh <feature> --target-repo <repo> \

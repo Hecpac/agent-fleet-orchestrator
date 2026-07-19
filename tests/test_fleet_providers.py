@@ -41,7 +41,7 @@ class FleetProviderTests(unittest.TestCase):
             )
             self.assertEqual(spec["adapter"], adapter.name)
             seen.add(adapter.name)
-        self.assertEqual(seen, {"codex", "claude", "opencode", "ollama"})
+        self.assertEqual(seen, {"codex", "claude", "kimi", "opencode", "ollama"})
 
     def test_submission_transport_preserves_existing_prompt_contracts(self) -> None:
         run_id = "run-provider-contract"
@@ -49,6 +49,7 @@ class FleetProviderTests(unittest.TestCase):
         cases = (
             ("openai", "gpt-test", "codex", "pointer"),
             ("anthropic", "claude-test", "claude", "pointer"),
+            ("moonshot-ai", "kimi-test", "kimi", "inline-json"),
             ("minimax", "MiniMax-M3", "opencode", "inline-json"),
         )
         for provider, model, source, transport in cases:
@@ -63,7 +64,7 @@ class FleetProviderTests(unittest.TestCase):
                     fleet_frontier.prompt_with_contract(task, run_id, hook_source=source),
                 )
                 self.assertIn(f"FLEET_RESULT:{run_id}:<STATUS>", submission["prompt"])
-                if source == "opencode":
+                if source in {"kimi", "opencode"}:
                     self.assertNotIn("\n", submission["payload"])
                     logical = json.loads(submission["payload"].rsplit("FDP_PROMPT=", 1)[1])
                     self.assertTrue(logical.startswith(task))
@@ -79,6 +80,7 @@ class FleetProviderTests(unittest.TestCase):
             cases = (
                 (fleet_providers.identity("openai", "gpt", None, "codex"), (response, "openai", "gpt")),
                 (fleet_providers.identity("anthropic", "claude", None, "claude"), (response, "anthropic", "claude")),
+                (fleet_providers.identity("moonshot-ai", "kimi", None, "kimi"), (response, "moonshot-ai", "kimi")),
                 (fleet_providers.identity("zai", "glm", None, "opencode"), (response, "zai", "glm", None)),
             )
             for configured, raw in cases:
@@ -151,6 +153,7 @@ class FleetProviderTests(unittest.TestCase):
         cases = (
             ("openai", "gpt-test", "codex", ["codex", "--model", "gpt-test", "--model", "other"]),
             ("anthropic", "claude-test", "claude", ["claude", "--model", "claude-test", "--model", "other"]),
+            ("moonshot-ai", "kimi-test", "kimi", ["kimi", "--model", "kimi-test", "--model", "other", "--thinking", "--agent-file", ".kimi/agents/fleet-reviewer/agent.yaml"]),
             ("ollama", "local-test", "", ["ollama", "run", "other"]),
         )
         for provider, model, source, command in cases:
@@ -162,6 +165,7 @@ class FleetProviderTests(unittest.TestCase):
         for provider, executable, source in (
             ("openai", "codex", "codex"),
             ("anthropic", "claude", "claude"),
+            ("moonshot-ai", "kimi", "kimi"),
         ):
             identity = fleet_providers.identity(provider, "model", None, source)
             for command in (
@@ -171,6 +175,8 @@ class FleetProviderTests(unittest.TestCase):
                 with self.subTest(provider=provider, command=command), self.assertRaises(
                     fleet_providers.ProviderError
                 ):
+                    if source == "kimi":
+                        command += ["--thinking", "--agent-file", ".kimi/agents/fleet-reviewer/agent.yaml"]
                     fleet_providers.adapter_for(identity).validate_configuration(
                         identity, command=command, runner="interactive"
                     )
@@ -183,7 +189,7 @@ class FleetProviderTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             json.loads(result.stdout)["adapters"],
-            ["claude", "codex", "ollama", "opencode"],
+            ["claude", "codex", "kimi", "ollama", "opencode"],
         )
 
     def test_provider_cli_rejects_ambiguous_command_json(self) -> None:

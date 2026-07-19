@@ -75,6 +75,18 @@ mission-control-health mission_id:
 mission-control-stop mission_id:
     python3 scripts/fleet_control_service.py --runs-dir orchestration/runs --mission-id {{mission_id}} stop
 
+mission-decision-request mission_id brief key:
+    python3 scripts/fleet_control.py --runs-dir orchestration/runs --mission-id {{mission_id}} request-decision --brief-file {{brief}} --idempotency-key {{key}}
+
+mission-decisions mission_id *flags:
+    python3 scripts/fleet-decision.py --runs-dir orchestration/runs --mission-id {{mission_id}} list {{flags}}
+
+mission-decision-show mission_id decision_id *flags:
+    python3 scripts/fleet-decision.py --runs-dir orchestration/runs --mission-id {{mission_id}} {{flags}} show --decision-id {{decision_id}}
+
+mission-decision-resolve mission_id decision_id option_id key reason:
+    python3 scripts/fleet-decision.py --runs-dir orchestration/runs --mission-id {{mission_id}} resolve --decision-id {{decision_id}} --option-id {{option_id}} --idempotency-key {{key}} --reason "{{reason}}"
+
 manifest-inspect manifest:
     python3 scripts/fleet_manifest.py inspect {{manifest}}
 

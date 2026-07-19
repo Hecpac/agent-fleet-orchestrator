@@ -50,6 +50,7 @@ class RouterConfigTests(unittest.TestCase):
                 "small",
                 "audit",
                 "frontier_verification",
+                "kimi_review",
                 "fleet_dialogue",
                 "implementation_review",
                 "hotfix_validated",
@@ -330,6 +331,43 @@ class RouterConfigTests(unittest.TestCase):
         self.assertEqual(plan["instances"][1]["hook_source"], "opencode")
         self.assertEqual(plan["instances"][1]["model"], "glm-5.2")
 
+    def test_kimi_review_resolves_a_read_only_k3_verifier(self) -> None:
+        plan = router_config.build_plan(
+            self.config, preset_name="kimi_review", run_healthcheck=False
+        )
+        self.assertEqual(
+            [(item["instance_id"], item["role_type"]) for item in plan["instances"]],
+            [("build", "codex"), ("verify", "kimi")],
+        )
+        kimi = plan["instances"][1]
+        self.assertEqual(kimi["provider"], "moonshot-ai")
+        self.assertEqual(kimi["model"], "moonshot-ai/kimi-k3")
+        self.assertEqual(kimi["hook_source"], "kimi")
+        self.assertEqual(kimi["authority"], "verification")
+        self.assertEqual(kimi["tool_access"], ["filesystem_read", "fleet_control"])
+        self.assertIn("--thinking", kimi["command"])
+        self.assertNotIn("--yolo", kimi["command"])
+        self.assertNotIn("--print", kimi["command"])
+
+    def test_kimi_role_rejects_unsafe_or_unpinned_commands(self) -> None:
+        for mutation, error in (
+            (("append", "--print"), "unsafe/non-interactive"),
+            (("remove", "--thinking"), "enable thinking"),
+            (("replace_agent", "other.yaml"), "canonical reviewer"),
+        ):
+            with self.subTest(mutation=mutation):
+                config = copy.deepcopy(self.config)
+                command = config["roles"]["kimi"]["command"]
+                action, value = mutation
+                if action == "append":
+                    command.append(value)
+                elif action == "remove":
+                    command.remove(value)
+                else:
+                    command[command.index("--agent-file") + 1] = value
+                with self.assertRaisesRegex(router_config.RouterError, error):
+                    router_config.load_router(self.write_config(config))
+
     def test_interactive_roles_declare_supported_source_and_model_identity(self) -> None:
         interactive = {
             name: role
@@ -340,7 +378,7 @@ class RouterConfigTests(unittest.TestCase):
         self.assertTrue(all(role.get("model") for role in interactive.values()))
         self.assertEqual(
             {role["hook_source"] for role in interactive.values()},
-            {"codex", "claude", "opencode"},
+            {"codex", "claude", "kimi", "opencode"},
         )
         for name in ("glm", "minimax", "minimax_candidate", "minimax_checker"):
             with self.subTest(role=name):

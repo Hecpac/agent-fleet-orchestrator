@@ -234,7 +234,10 @@ but does not make them free. A 2026-07-16 Claude MCP canary reported USD
 explicitly authorized lane rather than an automatic smoke.
 Frontier roles run interactive agent CLIs tracked by cmux's agent panel:
 `codex`, `minimax` (opencode + MiniMax-M3, `MINIMAX_API_KEY`), and `glm`
-(opencode + GLM-5.2, `ZHIPU_API_KEY`).
+(opencode + GLM-5.2, `ZHIPU_API_KEY`). The `kimi` role pins
+`moonshot-ai/kimi-k3` and is available through the guided `kimi_review` preset.
+It requires an authenticated Kimi CLI configuration and may incur provider
+charges; boot/preflight does not submit an inference request.
 
 Panes are ordered by capability rank rather than argument accident:
 `CONTROL → RECON → BUILD → CHALLENGE → VERIFY`. `instance_id` is separate from
@@ -394,6 +397,26 @@ durable workspace/surface UUIDs.
 session (via cmux hook data) and surfaces the ones blocked waiting on a human,
 with age — check it whenever you return to the machine.
 
+Mission decisions use a stronger path than a free-form wait. The Lead must bind
+one recommendation and one dissenting `CHALLENGE`/`VERIFY` artifact from
+different instance and provider/model identities, then publish a closed
+Decision Brief with two or three options:
+
+```bash
+just mission-decision-request <mission-id> brief.json decision:<stable-key>
+just mission-decisions <mission-id> --pending
+just mission-decision-show <mission-id> <decision-id>
+just mission-decision-resolve <mission-id> <decision-id> <option-id> \
+  human:<stable-key> "<reason>"
+```
+
+A blocking brief stops only new admissions for its named instances; unrelated
+specialists continue. A checkpoint brief lets work continue. Both prevent
+Mission completion until resolution. Only low-risk reversible briefs may carry
+a default, and CONTROL can durably apply only that exact default after two
+hours. Specialists cannot discover or call `request_decision`; the management
+socket and Lead CLI share the same Fleet Control core.
+
 Coordination is event-driven, not polled: both `fleet-dispatch` and `fleet-send`
 return a durable `run_id`; pass every one back as `--run instance=run_id` to
 `fleet-wait`. Local notifications are wake-ups only. Frontier
@@ -408,9 +431,14 @@ eligible. Completion then binds the unique run-tagged user message to the last
 assistant completed before that Stop and reads full text plus provider/model
 through the read-only `opencode db` interface. Codex and Claude likewise bind
 the exact turn through their source-specific hook session and transcript files;
-their terminal chrome is never completion evidence. Every interactive role pins
-a model before dispatch, and the structured result must confirm it. Missing or
-mismatched evidence retains the lease as `indeterminate`.
+their terminal chrome is never completion evidence. Kimi has no native CMUX
+hook integration, so a controller-owned bridge tails its Wire 1.2/1.3 log,
+publishes metadata-only submit/stop events, and verifies the bounded
+`TurnBegin`/`TurnEnd` response before accepting the final sentinel. Kimi's Wire
+record does not embed model identity; the isolated launcher therefore attests
+the exact provider/model command in the per-surface session record. Every
+interactive role pins a model before dispatch. Missing or mismatched evidence
+retains the lease as `indeterminate`.
 OpenCode reviewers are additionally deny-by-default: only the built-in
 `read`, `glob`, and `grep` tools resolve enabled; Bash, external roots, and
 every unlisted/future tool remain denied. The only external exception is

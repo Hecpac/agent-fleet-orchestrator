@@ -16,6 +16,7 @@ from fleet_frontier import (
     FrontierError,
     frontier_state,
     process_event,
+    reconcile_kimi_events,
     recover_from_audit,
     validate_event_ack,
 )
@@ -266,6 +267,26 @@ def main(argv: list[str] | None = None) -> int:
                 return outcome
         return None
 
+    def reconcile_kimi() -> None:
+        for role, metadata in list(pending.items()):
+            if metadata["runner"] != "interactive":
+                continue
+            state = frontier_state(
+                ledger, run_id=str(metadata["run_id"]), instance=role
+            ) or metadata["state"]
+            metadata["state"] = state
+            if state.get("hook_source") != "kimi" or state.get("status") in TERMINAL_STATUSES:
+                continue
+            try:
+                reconcile_kimi_events(
+                    runs_dir,
+                    state,
+                    workspace_ref=workspace_ref,
+                    surface_ref=str(metadata["surface_ref"]),
+                )
+            except FrontierError as exc:
+                print(f"Kimi protocol error for {role}: {exc}", file=sys.stderr)
+
     frontier_after = [
         int(metadata["state"]["after_seq"])
         for metadata in pending.values()
@@ -366,13 +387,14 @@ def main(argv: list[str] | None = None) -> int:
                         bool(resume.get("gap"))
                         and not (oldest - 1 <= after_seq <= latest)
                     )
-                    if recover:
+                    if recover and state.get("hook_source") != "kimi":
                         recover_from_audit(
                             runs_dir,
                             state,
                             workspace_ref=workspace_ref,
                             surface_ref=str(metadata["surface_ref"]),
                         )
+                reconcile_kimi()
                 outcome = arbitrate()
                 if outcome is not None:
                     return outcome
@@ -404,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
                 if replay_remaining > 0:
                     replay_remaining -= 1
 
+            reconcile_kimi()
             outcome = arbitrate()
             if outcome is not None:
                 return outcome

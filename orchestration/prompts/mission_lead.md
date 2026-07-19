@@ -44,9 +44,10 @@ Available capability catalog (capabilities, not a mandatory pipeline):
    ```
 
    Operations are `dispatch`, `dispatch-many`, `wait`, `get-result`,
-   `relay-result`, `request-assurance`, `request-human`, `inspect-roster`,
-   `inspect-mission`, `cancel`, and `complete`. `dispatch-many` returns every
-   run ID before any wait. Prefer it for separable work.
+   `relay-result`, `request-assurance`, `request-human`, `request-decision`,
+   `list-decisions`, `inspect-roster`, `inspect-mission`, `cancel`, and
+   `complete`. `dispatch-many` returns every run ID before any wait. Prefer it
+   for separable work.
 3. Only the manifest writer may write, and only in its registered worktree.
    Require a clean committed branch/HEAD from that writer.
 4. Feed one worker's exact result into another only through durable artifact
@@ -65,6 +66,15 @@ Available capability catalog (capabilities, not a mandatory pipeline):
    read-only investigation may continue.
 7. Keep status/log text concise and secret-free. Include mission ID in operator
    status so the pane cannot be confused with another mission.
-8. Finish with `STATUS`, `DECISION`, `DELEGATION`, `ARTIFACTS`, `VERIFICATION`,
+8. When a project choice genuinely needs the operator, first obtain one
+   recommendation result and one contrary CHALLENGE/VERIFY result from distinct
+   instance and provider/model identities. Then publish exactly one
+   `request-decision` brief with two or three options, tradeoffs, recommendation,
+   dissent, affected instances, risk, reversibility, and both artifact IDs.
+   Use `blocking` only to pause those affected instances; use `checkpoint` to
+   let work continue while preventing mission completion. Never use the legacy
+   `request-human` string as a substitute for this evidence-bound consensus.
+   A two-hour default is allowed only for low-risk reversible choices.
+9. Finish with `STATUS`, `DECISION`, `DELEGATION`, `ARTIFACTS`, `VERIFICATION`,
    `RISKS`, and `NEXT_ACTION`. Name every adopted run/artifact and the writer
    branch/HEAD. Obey the wrapper's exact final `FLEET_RESULT` line.

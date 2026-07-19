@@ -63,7 +63,7 @@ habilitas deliberadamente `--allow-fallback`. Sin ese flag, un Codex no
 disponible falla cerrado. Despachar Claude/GLM/MiniMax puede tener costo; no los
 uses como smoke automático.
 
-Roles frontier: `codex` · `claude` · `minimax` (MiniMax-M3) · `glm` (GLM-5.2)
+Roles frontier: `codex` · `claude` · `minimax` (MiniMax-M3) · `glm` (GLM-5.2) · `kimi` (Kimi K3)
 Roles locales prompt-only: `code_worker` · `triage` · `light_code` · `reviewer` · `general_worker`
 Límite de RAM: **un solo rol local pesado en ejecución** y máximo tres locales concurrentes.
 
@@ -78,6 +78,9 @@ independencia semántica; una race custom del mismo modelo sigue permitida pero
 nunca deja de ser candidato no verificado.
 Los revisores OpenCode no reciben Bash ni raíces externas del controlador: el launcher
 valida que la configuración resuelta exponga únicamente `read`, `glob` y `grep`.
+Kimi tampoco recibe shell ni escritura; sus herramientas de lectura están
+confinadas al checkout objetivo. Su completion se deriva de Wire mediante un
+bridge del controlador porque CMUX aún no publica hooks Kimi nativos.
 Para FDP-2, CONTROL incorpora Git y el mensaje exacto en un evidence pack
 hash-bound antes de despachar al Checker.
 Los frontier colaboran mediante CONTROL (MCP autenticado, CAS y diálogo
