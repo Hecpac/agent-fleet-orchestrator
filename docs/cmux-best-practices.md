@@ -5,6 +5,10 @@ Destilado de la adopción real (2026-07-07/08): fleet heterogéneo verificado
 unknown-unknowns sobre QTS-ARCHITECT, orquestación por eventos y carrera de
 agentes. Cada práctica de abajo tiene un incidente o evidencia detrás.
 
+Los nombres/modelos/costos de ese párrafo son evidencia histórica, no defaults
+actuales. Hoy Codex es el Lead predeterminado, Claude/fallback es opt-in y el
+alcance endurecido es una Mac/un UID; consulta `guia-uso-flota.md` para operar.
+
 ## Beneficios comprobados
 
 1. **Acceso programático = velocidad agéntica.** Todo el ciclo (bootear
@@ -23,9 +27,11 @@ agentes. Cada práctica de abajo tiene un incidente o evidencia detrás.
 5. **Orquestación por eventos.** `fleet-wait` duerme hasta `agent.hook.Stop` /
    notificación del worker. Cero polling, cero tokens quemados en re-leer
    pantallas.
-6. **Costo.** Una auditoría frontier completa costó < $1 (MiniMax $0.83);
-   los workers locales son gratis. El lead frontier se reserva para síntesis
-   y verificación.
+6. **Costo.** Una auditoría histórica costó < $1 (MiniMax $0.83), pero eso no
+   constituye un límite. Un canary Claude posterior reportó USD 0.56816 pese a
+   un cap CLI de USD 0.05. Ollama local no incurre costo de API; toda inferencia
+   frontier se habilita deliberadamente y conserva su evidencia de uso cuando
+   el proveedor la ofrece.
 7. **Es solo un terminal.** Cualquier agente CLI funciona; no hay lock-in;
    open source (GPL). tmux cubre lo mismo en Linux/Windows.
 
@@ -52,7 +58,8 @@ agentes. Cada práctica de abajo tiene un incidente o evidencia detrás.
    con optimismo (gemma3 marcó DONE sin implementar nada) — el lead parsea y
    verifica, no confía.
 7. **Presupuesto de recursos codificado.** En 16 GB: 1 modelo local 7B+ máximo,
-   3 workers locales en paralelo. Vive en router.yaml y fleet-up advierte.
+   3 workers locales en paralelo. Mission añade admisión global durable; el
+   presupuesto local del router sigue siendo el gate standalone heredado.
 8. **Un workspace = una misión; teardown al cerrar.** `just fleet-down` al
    mergear/abandonar. Workspaces zombis acumulan confusión y sesiones idle.
 9. **Higiene de secretos.** Las notificaciones al teléfono pasan por servidores

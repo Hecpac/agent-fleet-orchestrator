@@ -10,14 +10,37 @@ Para una referencia visual breve de CMUX, consulta
 [`guia-operacion-cmux.md`](guia-operacion-cmux.md). Para la receta completa de
 WORM local, consulta [`local-worm.md`](local-worm.md).
 
+## Alcance soportado
+
+La ruta endurecida S0 supone una sola Mac confiable, un solo UID Unix confiable
+y un único árbol local de runs. No protege contra código hostil arbitrario que
+ya corra con ese UID, CONTROL/CMUX/CLI de proveedor comprometidos, coordinación
+multi-host ni custodia WORM externa. Sirve para exploración personal local; no
+es una frontera multiusuario ni una certificación regulatoria. Tampoco ofrece
+un límite duro de tokens totales: los adapters instalados no exponen esa
+capacidad.
+
+En pocas palabras, la mejora es comparativa: antes el router vivo, los
+lanzamientos y el presupuesto tenían puntos de decisión separados; ahora una
+Mission congela el snapshot completo del router y la política, admite cada run
+con ownership durable y publica al target solo después de quiescencia. El
+beneficio es poder reanudar y auditar sin que una edición tardía o un retry
+silencioso cambie lo que se autorizó.
+
+Dos deudas S0 deben conservarse visibles. El `source_event_sha256` de la
+evidencia terminal estructurada lo afirma CONTROL, que es confiable dentro de
+este alcance; no lo firma un verificador independiente. Además, una Mission
+legacy con admissions activas no se puede migrar en vivo sin inventar
+procedencia: conserva su evidencia y arranca una Mission actual.
+
 ## 1. Elige el flujo correcto
 
 | Necesidad | Entrada | Cuándo usarla |
 |---|---|---|
 | Misión durable canónica | `just mission` | Trabajo de repositorio que debe compilar política, evaluar riesgo, poder reanudarse y producir archivo verificable. |
 | Flota autónoma visible | `just dan` | Implementación, investigación o diagnóstico abiertos con un Lead que decide la delegación. |
-| Flota guiada | `just fleet` o `just fleet-preset` | Experimentos manuales donde el operador controla fases y despachos. |
-| Flujo asegurado | preset `fleet_dialogue` | Producción, dinero, secretos, destrucción u otros cambios de riesgo alto que requieren FDP-2, aprobación humana y FDP-3. |
+| Flota/preset manual | `just fleet` o `just fleet-preset` | Experimentos cuyo modo efectivo proviene del preset; la mayoría son guiados, pero `research` es autónomo. |
+| Flujo asegurado | preset `fleet_dialogue` | Evidencia local reforzada para dinero, secretos, destrucción u otros cambios de riesgo alto; producción sigue necesitando fronteras externas apropiadas. |
 | Carrera | `just race` | Obtener candidatos en paralelo cuando importa la latencia. El ganador todavía debe verificarse. |
 | Worker local aislado | `just triage`, `just review`, `just code` | Análisis prompt-only sobre evidencia suministrada; no recibe filesystem, shell ni Git. |
 
@@ -44,9 +67,16 @@ roster completo antes del primer efecto CMUX. Los roles GLM y MiniMax requieren,
 respectivamente, `ZHIPU_API_KEY` y `MINIMAX_API_KEY`; Codex y Claude requieren
 sus sesiones autenticadas.
 
+Codex es el Lead predeterminado. Claude solo se selecciona con
+`--lead-provider claude` o mediante fallback explícitamente habilitado con
+`--allow-fallback`; una falla de Codex no cambia de proveedor por sí sola. Los
+despachos Claude, GLM y MiniMax pueden tener costo. El canary Claude del
+2026-07-16 reportó USD 0.56816 aunque recibió `--max-budget-usd 0.05`; no uses
+inferencia pagada como smoke automático.
+
 El checkout objetivo debe ser un repositorio Git. Dan+ y Mission Control
 rechazan por defecto un baseline sucio. `--allow-dirty-baseline` solo reconoce
-explícitamente que los worktrees partirán del `HEAD` ya confirmado; no incorpora
+explícitamente que los clones aislados partirán del `HEAD` ya confirmado; no incorpora
 los cambios sin commit del checkout principal.
 
 ## 3. Modelo operativo
@@ -74,14 +104,31 @@ workflow declara política y capacidades disponibles; no puede introducir
 comandos, superficies CMUX, identidades de ejecución, autoridad o acceso a
 herramientas.
 
+El modo efectivo lo resuelve el preset compilado, no una descripción informal:
+
+| Workflow | Preset principal | Modo efectivo actual |
+|---|---|---|
+| `implementation` | `dan` | `autonomous` |
+| `research` | `research` | `autonomous` |
+| `hotfix` | `hotfix_validated` | `guided` |
+| `local-worm` | `dan` | `autonomous` |
+| `regulated` | `dan` | `autonomous`, solo validación estática por ahora |
+
+Todos los workflows con assurance resuelven `fleet_dialogue` como
+`assured`. Los presets sin `mode` explícito (`small`, `audit`,
+`implementation_review`, `frontier_verification`, `hotfix_validated`) son
+`guided` por contrato.
+
 ### Identidad, escritor y evidencia
 
 - Cada intento tiene un `run_id` durable. Guarda el valor exacto devuelto por
   `fleet-send` o `fleet-dispatch` y úsalo en `fleet-wait`.
 - Cuando se proporciona `--target-repo`, cada instancia con autoridad de
-  escritura obtiene la branch `fleet/<feature>/<instance>` y un worktree aislado
-  bajo `/tmp/fleet_workspaces-$UID`. Para trabajo de código, proporciona siempre
-  el repositorio objetivo.
+  escritura obtiene la branch privada `fleet/<feature>/<instance>` dentro de un
+  clone aislado bajo `/tmp/fleet_workspaces-$UID`. El target no recibe esa ref
+  hasta que CONTROL haya cerrado CMUX, confirmado quiescencia y publicado por
+  compare-and-swap. Para trabajo de código, proporciona siempre el repositorio
+  objetivo.
 - Solo puede existir un writer. Los challengers y verificadores no adquieren su
   autoridad.
 - Los paneles sirven para observar. Los archivos, ledgers, receipts y eventos
@@ -97,6 +144,63 @@ herramientas.
   `provider/model/variant` distintas dentro de cada grupo antes de tocar CMUX.
   El manifest conserva `identity_group.count` y cada grupo; esto es diversidad
   de identidad auditable, no independencia semántica.
+- Los especialistas frontier no se envían prompts entre sí. CONTROL media MCP,
+  grants de artefactos CAS y diálogo durable. Los workers Ollama son
+  prompt-only, no tienen cliente MCP autenticado y no pueden recuperar un
+  artifact ID por sí mismos; su prompt debe contener la evidencia necesaria.
+
+### Plan compilado y admisión
+
+El contrato compilado v2 contiene el `router_snapshot` canónico completo,
+`router_digest`, workflow y digests separados de lanzamiento principal y
+assurance. Todos los efectos posteriores se vuelven a resolver desde ese
+snapshot, no desde el `router.yaml` vivo. El snapshot es evidencia de integridad
+y no debe contener secretos. Un contrato v1 se puede leer históricamente pero
+no admite efectos nuevos.
+
+La Mission congela deadline, créditos de delegación, máximo de delegaciones
+activas, ownership de writer y política de tokens. Antes de cada lanzamiento
+Lead/especialista/batch/assured, la admisión avanza siempre así:
+
+```text
+reserved → committed → authorized → started → finalized
+```
+
+Esa es la ruta de un efecto externo. Un request `reserved` o `committed` que se
+abandona antes del launch se aborta con todos sus bindings exactos y no
+reembolsa créditos. Una falla `authorized` antes de `started` puede finalizar
+con evidencia terminal exacta, sin inventar un lanzamiento.
+
+`reserved` reclama run, destinatario, créditos y writer; `committed` enlaza la
+petición exacta. `effect_sha256` congela prompt/objetivo, inputs, contrato de
+salida, grants, identidad de proveedor, runner y, cuando aplica,
+wrapper/transporte; `task_sha256` congela la tarea enviada. `authorized` es el
+último gate durable y con deadline antes del efecto externo. `started`
+referencia esa autorización, incluso si el reloj vence justo después.
+`finalized` libera ownership solo con evidencia estructurada que
+usa schema version 1 y coincide en `source_event_sha256`, `run_id`,
+`task_sha256`, estado terminal, destinatario y writer. Los retries idempotentes
+reutilizan esa identidad; los créditos consumidos no se reembolsan y solo puede
+haber un writer activo.
+
+Hay dos lanes sin solapamiento: `CONTROL` para la flota principal y `ASSURED`
+para assurance. CONTROL no puede crear admissions ASSURED; ASSURED no puede
+heredar el Lead histórico ni mutar admissions CONTROL. No se solicita el cambio
+de lane, no se completa y no se archiva mientras quede una admission activa.
+
+La política de tokens distingue capacidad real del proveedor. Un soft budget
+positivo bloquea si el uso es desconocido; soft cero desactiva este gate. Hoy
+Codex, Claude y OpenCode no exponen totales confiables y Ollama solo puede
+limitar output, de modo que ningún adapter ofrece `hard_total`. El presupuesto
+local del router sigue existiendo para `fleet-dispatch` standalone, pero es el
+gate heredado por feature de `just dan`/`just fleet`/`just race`, no la admisión
+global de una Mission.
+
+Cada usage receipt es un sobre cerrado schema v1 con
+`state=observed|not_incurred|unknown`. Solo `not_incurred` representa cero
+exacto; `unknown` no lleva conteos. Si falta una fuente o aparece cualquier
+receipt `unknown`, el agregado conserva `total_tokens=null` y nunca lo convierte
+en cero.
 
 El contrato de salida de un worker es:
 
@@ -109,6 +213,25 @@ NEXT_ACTION:
 ```
 
 ## 4. Ejecución cotidiana
+
+### Receta local sin inferencia frontier
+
+Para aprender y comprobar el ciclo CMUX → dispatch → wait → teardown sin
+activar Codex, Claude, GLM ni MiniMax:
+
+```bash
+FLEET_NO_LEAD=1 ./scripts/fleet-up.sh local-safe triage=triage
+just advance local-safe RECON local-safe-scope
+dispatch="$(./scripts/fleet-dispatch.sh local-safe triage \
+  "Resume únicamente la evidencia incluida aquí." --json)"
+run_id="$(jq -er '.run_id' <<<"$dispatch")"
+./scripts/fleet-wait.sh local-safe triage \
+  --run "triage=$run_id" --timeout 600 --json
+./scripts/fleet-down.sh local-safe
+```
+
+`FLEET_NO_LEAD=1` crea un monitor CONTROL sin proveedor. El único turno de
+modelo es Ollama local; el worker no recibe MCP ni acceso al repositorio.
 
 ### Mission Control
 
@@ -140,6 +263,36 @@ just mission-approve <mission_id> <target-repo> \
 just mission-resume <mission_id>
 ```
 
+Si una aprobación expiró, renuévala explícitamente y después reanuda:
+
+```bash
+python3 scripts/fleet-approve.py --runs-dir <runs-dir> \
+  --mission-id <mission-id> --scope <target-repo> --renew \
+  --idempotency-key <clave-estable-de-esta-renovacion>
+just mission-resume <mission-id>
+```
+
+`--renew` funciona solo después de la expiración. Se admite antes del boot de
+assurance o en `assured_running` cuando no existen run claims, admissions
+activas ni writer activo; en el segundo caso sustituye la aprobación actual sin
+repetir boot/start. No amplía request, workflow, scope ni riesgo. No la uses para
+una aprobación todavía vigente ni mientras haya trabajo ASSURED activo: ambos
+casos fallan cerrados.
+
+Reutiliza la misma clave solo para reintentar esa renovación exacta. Si la
+aprobación renovada vuelve a expirar en otro ciclo, usa una clave nueva.
+
+La aprobación actual se vuelve a comprobar por workflow/scope/risk y expiración
+al boot/start y en cada `reserved`, `committed` y `authorized` ASSURED. La
+autorización sella el hash de ese evento de aprobación. Un run ya autorizado
+puede registrar su start y terminal exactos aunque la aprobación expire después;
+no cruza otro efecto con esa autoridad vencida.
+
+Cuando un Lead llama `request_assurance`, Fleet Control solo registra/eleva el
+riesgo. La Mission no cambia de lane mientras ese caller siga activo. El driver
+espera los terminales exactos, finaliza Lead e hijos y recién entonces registra
+`assurance_requested` para pedir la aprobación humana.
+
 Usa `sandboxed` explícitamente cuando necesites el perímetro efímero estricto:
 
 ```bash
@@ -159,7 +312,7 @@ El Lead decide cuáles necesita, delega y sintetiza. La flota queda visible al
 terminar; añade `--teardown` si quieres cierre automático tras éxito. No envíes
 manualmente otra misión al panel Lead: el primer envío ya es la misión rastreada.
 
-### Flota guiada
+### Flotas manuales y presets
 
 Lista los presets reales:
 
@@ -179,7 +332,7 @@ Los presets disponibles son `dan`, `small`, `audit`, `implementation_review`,
 | `frontier_verification` | guiado: build, challenge, verify | Writer, GLM read-only y Claude verifier. |
 | `fleet_dialogue` | asegurado: maker, checker, challenge, verify | FDP-2 y FDP-3 con gates completos. |
 | `hotfix_validated` | guiado: candidate_codex, candidate_minimax, verify | Candidatos paralelos que aún requieren verificación. |
-| `research` | guiado: triage_scope, triage_sources, research, challenge | Investigación sin writer con síntesis heterogénea. |
+| `research` | autónomo: triage_scope, triage_sources, research, challenge | Investigación sin writer con síntesis heterogénea. |
 
 Ejemplos:
 
@@ -255,10 +408,35 @@ just fleet-down <feature>
 ```
 
 El teardown valida identidad, impide nuevos despachos, rechaza leases activos y
-misiones no terminales y verifica los receipts requeridos. En una flota ligada a
-Mission también crea y verifica el archivo Mission antes de cerrar CMUX. El
-manifest, estado, ledgers y receipts de la flota se mueven a
+misiones no terminales y verifica los receipts requeridos. Primero cierra CMUX
+y retira cualquier clone writer del path visible al modelo; después publica el
+commit exacto mediante intent durable y compare-and-swap. En una flota ligada a
+Mission crea y verifica entonces el archivo Mission, y por último mueve el
+manifest, estado, ledgers y receipts de la flota a
 `orchestration/runs/archive/`.
+
+La transición interna a assurance es distinta del teardown final. `mission-run`
+usa `fleet-down.sh <feature> --handoff-assurance` solo después de que todas las
+admissions CONTROL estén finalizadas. Es idempotente y recuperable: detiene la
+generación principal `missions/<mission_id>/control/`, conserva manifest,
+estado, ledgers y receipts en
+`missions/<mission_id>/assurance-handoff/main-runtime/`, no crea el archivo
+final y no toca `missions/<mission_id>/control-assured/`. Como operador usa
+`just mission-resume`; invoca el flag directamente solo al seguir un diagnóstico
+de recuperación que identifique esa misma Mission. El handoff publica un
+marcador durable de quiescencia antes de drenar writers ya admitidos: una
+mutación que recibe `mission mutations are quiesced` no fue aplicada ni quedó
+encolada y debe reintentarse explícitamente con la misma idempotency key después
+del handoff o su recovery. Las esperas de READY y COMMIT tienen deadline y el
+timeout termina y reapea únicamente el proceso hijo exacto. La adquisición del
+boot-lock también tiene deadline; si el helper termina antes de responder, la
+espera falla inmediatamente. `mission-run` usa un límite exterior mayor que
+la suma de esas esperas y la gracia de teardown; si aun así vence, termina el
+grupo temporal completo para no dejar descendientes reteniendo la barrera. Los
+overrides `FLEET_BOOT_LOCK_READY_TIMEOUT_SECONDS`,
+`FLEET_HANDOFF_READY_TIMEOUT_SECONDS` y
+`FLEET_HANDOFF_COMMIT_TIMEOUT_SECONDS` se validan antes de CMUX, locks o
+publicación.
 
 ## 6. Completion y carreras
 
@@ -297,6 +475,12 @@ runs se conservan por defecto. `--cancel-losers` solo solicita interrupción; en
 frontier, la interrupción no confirmada queda `indeterminate` y retiene su lease.
 Verifica el candidato mediante tests deterministas y revisión con identidad distinta
 antes de actuar, integrar, cancelar evidencia o cerrar la flota.
+
+La cancelación local falla cerrada: hoy el worker Ollama no publica un handle de
+proceso ligado al `run_id`. Fleet Control rechaza el cancel y no envía `ctrl-c`
+a una superficie CMUX reutilizable, porque podría detener un run posterior.
+Espera o reconcilia el `run_id` exacto; un cancel rechazado no significa que el
+worker se haya detenido.
 
 ## 7. Recuperación
 
@@ -348,12 +532,14 @@ existe. Un error del probe conserva el lease.
 
 ### Writer, branches y flujos activos
 
-- Un writer dirty bloquea teardown. Revisa su worktree y conserva el trabajo en
-  su branch dedicada mediante un commit válido, o descártalo únicamente si el
-  propietario lo decide y ha identificado exactamente el worktree.
-- Si la branch del writer avanzó respecto al baseline, teardown elimina el
-  worktree limpio pero preserva la branch y registra su SHA final. No borres esa
-  branch para "limpiar" la flota.
+- Un writer dirty bloquea teardown. Revisa su clone aislado y conserva el
+  trabajo en su branch privada mediante un commit válido, o descártalo
+  únicamente si el propietario lo decide y ha identificado exactamente el
+  clone.
+- Si la branch privada avanzó respecto al baseline, teardown retira primero el
+  clone del path visible al modelo, persiste un intent de publicación, importa
+  el commit y crea la branch del target por compare-and-swap. No borres esa
+  branch ni el intent para "limpiar" una recuperación pendiente.
 - Una Mission no terminal bloquea teardown. Usa `mission-show` y
   `mission-resume` o terminalízala por el mecanismo explícito correspondiente.
 - Un FDP-2 activo bloquea teardown. Si la flota alcanzó CHALLENGE o VERIFY,
@@ -422,7 +608,8 @@ Este procedimiento es intencionalmente explícito. No elimines pasos ni gates.
    Ese comando es el camino standalone heredado y el valor es una etiqueta, no
    prueba criptográfica de presencia humana. Si el manifest contiene
    `mission_id`, `--approved-by` se rechaza: `mission-run` consume el
-   `assurance_approved` scoped y el assured runner pasa su
+   evento de aprobación scoped actual (`assurance_approved` o
+   `assurance_approval_renewed`) y el assured runner pasa su
    `--approval-event-sha256` exacto.
 
 ### FDP-3: GLM CHALLENGE y Claude VERIFY
@@ -504,11 +691,15 @@ discrepancia falla sin borrar recursos.
 
 ### WORM externo y regulated
 
-La ruta regulada exige infraestructura externa accesible por HTTPS, bucket con
-versionado y Object Lock `COMPLIANCE`, credenciales válidas y DNS que resuelva
-solo a direcciones públicas globales prevalidables. Rechaza localhost,
-loopback, link-local, redes privadas, respuestas DNS mixtas y cambios DNS después
-del preflight. No existe fallback externo→local ni WORM→signed.
+La ruta regulada no está disponible para efectos con los adapters actuales. Su
+workflow puede pasar validación estática, pero la compilación de efectos exige
+un presupuesto `hard_total`; Codex, Claude y OpenCode no aportan totales
+confiables y Ollama solo puede limitar output. Además exige infraestructura WORM
+externa e independiente accesible por HTTPS, bucket con versionado y Object Lock
+`COMPLIANCE`, credenciales válidas y DNS que resuelva solo a direcciones
+públicas globales prevalidables. Rechaza localhost, loopback, link-local, redes
+privadas, respuestas DNS mixtas y cambios DNS después del preflight. No existe
+fallback externo→local ni WORM→signed.
 
 ```bash
 just mission-dry <feature> "<objetivo regulado>" \
@@ -516,6 +707,11 @@ just mission-dry <feature> "<objetivo regulado>" \
 just mission <feature> "<objetivo regulado>" \
   --workflow regulated --execution-profile regulated --target-repo <repo>
 ```
+
+Hoy ambos comandos sirven para comprobar que la ruta falla cerrada antes de
+CMUX; no son una receta para completar una misión regulada. Solo serán
+operativos cuando todos los proveedores resolubles ofrezcan `hard_total` y se
+configure WORM externo real. RustFS local nunca cubre esa segunda condición.
 
 El backend se configura mediante `FLEET_WORM_BUCKET`, `FLEET_WORM_REGION` (o
 `AWS_REGION`/`AWS_DEFAULT_REGION`), `AWS_ACCESS_KEY_ID`,
@@ -541,7 +737,7 @@ Estas reglas no tienen atajos:
 4. Evidencia `local-development` nunca se presenta como regulatoria o
    `external-compliance`.
 5. El primer resultado de una race es un candidato, no un resultado verificado.
-6. No borres worktrees, branches, manifests, leases, sockets, snapshots,
+6. No borres clones/staging de writer, branches, intents, manifests, leases, sockets, snapshots,
    contenedores, volúmenes ni archivos sin demostrar identidad y ownership.
 7. No reclames recursos por antigüedad. Un probe fallido o ambiguo conserva el
    estado para investigación.

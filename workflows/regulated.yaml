@@ -37,5 +37,5 @@
     "include_final_tree": true,
     "include_git_delta": true
   },
-  "limits": {"deadline_seconds": 14400, "token_budget": 0, "budget_mode": "hard"}
+  "limits": {"deadline_seconds": 14400, "token_budget": 0, "budget_mode": "hard", "delegation_credits": 32, "max_active_delegations": 4}
 }

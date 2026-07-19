@@ -14,7 +14,8 @@ import sys
 from typing import Any
 
 import fleet_archive
-import fleet_mission
+import fleet_compiled
+import fleet_json
 import fleet_mission_state as mission_state
 import fleet_trace
 
@@ -58,15 +59,17 @@ def _jsonl(path: Path, *, required: bool = False) -> list[dict[str, Any]]:
     info = path.lstat()
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
         raise ReportError(f"durable evidence must be a regular file: {path.name}")
-    rows = path.read_bytes().splitlines(keepends=True)
+    try:
+        values = fleet_json.load_jsonl(
+            path.read_bytes(),
+            require_final_newline=True,
+        )
+    except fleet_json.FleetJSONError as exc:
+        if "final newline" in str(exc):
+            raise ReportError(f"partial durable JSONL at {path.name}") from exc
+        raise ReportError(f"invalid durable JSONL at {path.name}: {exc}") from exc
     result: list[dict[str, Any]] = []
-    for number, raw in enumerate(rows, 1):
-        if not raw.endswith(b"\n"):
-            raise ReportError(f"partial durable JSONL at {path.name}:{number}")
-        try:
-            value = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ReportError(f"invalid durable JSONL at {path.name}:{number}") from exc
+    for number, value in enumerate(values, 1):
         if not isinstance(value, dict):
             raise ReportError(f"durable JSONL row is not an object at {path.name}:{number}")
         result.append(value)
@@ -354,7 +357,18 @@ def build_report(runs_dir: Path, mission_id: str) -> dict[str, Any]:
     root = mission_state.mission_root(runs_dir, mission_id)
     ledger = mission_state.ledger_path(runs_dir, mission_id)
     events = mission_state.read_events(ledger, expected_mission_id=mission_id)
-    compiled = fleet_mission.load_compiled(root / "compiled-workflow.json")
+    try:
+        compiled = fleet_compiled.load(
+            root / "compiled-workflow.json", mode="read"
+        )
+    except fleet_compiled.CompiledError as exc:
+        raise ReportError(f"compiled workflow evidence is invalid: {exc}") from exc
+    current = mission_state.derive_state(events)
+    if (
+        compiled["workflow_digest"] != current["workflow_digest"]
+        or compiled["compiled_digest"] != current["compiled_digest"]
+    ):
+        raise ReportError("compiled workflow evidence is not bound to the mission ledger")
     feature = events[0]["payload"]["feature"]
     archive_report = _archive_report(root)
     legacy_path = runs_dir / f"fleet-{feature}.ledger.jsonl"
@@ -431,7 +445,6 @@ def main(argv: list[str] | None = None) -> int:
     except (
         ReportError,
         mission_state.MissionStateError,
-        fleet_mission.MissionError,
         OSError,
         json.JSONDecodeError,
     ) as exc:

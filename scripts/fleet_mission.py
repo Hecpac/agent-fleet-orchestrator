@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import timedelta
 import json
 from pathlib import Path
 import re
@@ -11,13 +12,18 @@ import sys
 from typing import Any
 import uuid
 
+import fleet_admission
+import fleet_compiled
+import fleet_json
 import fleet_mission_state as state
+import fleet_safe_paths
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RUNS_DIR = ROOT / "orchestration" / "runs"
 FEATURE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-GIT_SHA = re.compile(r"^[0-9a-f]{40,64}$")
+GIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+MAX_COMPILED_WORKFLOW_BYTES = 32 * 1024 * 1024
 
 
 class MissionError(state.MissionStateError):
@@ -25,31 +31,137 @@ class MissionError(state.MissionStateError):
 
 
 def validate_compiled(value: Any) -> dict[str, Any]:
-    if not isinstance(value, dict):
-        raise MissionError("compiled workflow must be an object")
-    required = {
-        "schema_version", "workflow", "workflow_digest", "router_digest",
-        "resolved", "compiled_digest",
-    }
-    if set(value) != required or value["schema_version"] != 1:
-        raise MissionError("compiled workflow fields do not match schema_version=1")
-    unsigned = {key: item for key, item in value.items() if key != "compiled_digest"}
-    if state.sha256(unsigned) != value["compiled_digest"]:
-        raise MissionError("compiled workflow digest mismatch")
-    if state.sha256(value["workflow"]) != value["workflow_digest"]:
-        raise MissionError("workflow digest mismatch")
-    workflow = value["workflow"]
-    risk = workflow.get("risk") if isinstance(workflow, dict) else None
-    if not isinstance(risk, dict) or risk.get("minimum") not in state.RISK_ORDER:
-        raise MissionError("compiled workflow risk.minimum is invalid")
-    return value
+    try:
+        return fleet_compiled.validate(value, mode="effect")
+    except fleet_compiled.CompiledError as exc:
+        raise MissionError(f"compiled workflow is not effect-authorized: {exc}") from exc
 
 
 def load_compiled(path: Path) -> dict[str, Any]:
+    """Load an operator-selected source before it enters the Mission store."""
+
     try:
-        return validate_compiled(json.loads(path.read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError) as exc:
+        return fleet_compiled.load(path, mode="effect")
+    except fleet_compiled.CompiledError as exc:
         raise MissionError(f"cannot load compiled workflow {path}: {exc}") from exc
+
+
+def load_mission_compiled(
+    runs_dir: Path,
+    mission_id: str,
+    *,
+    mode: fleet_compiled.LoadMode,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Load one durable compiled workflow from its descriptor-bound Mission path.
+
+    The caller selects only ``runs_dir`` and a canonical Mission UUID. Every
+    descendant is opened without following symlinks and with the physical
+    producer contract (0700/0700/0600, one link, bounded bytes). The parsed
+    artifact must also retain both digest bindings published by the Mission
+    ledger before it can authorize effects.
+    """
+
+    if mode not in {"read", "effect"}:
+        raise MissionError("compiled load mode must be 'read' or 'effect'")
+    normalized = state.normalize_uuid(mission_id, "mission_id")
+    try:
+        current = load_state(runs_dir, normalized)
+    except state.MissionStateError as exc:
+        raise MissionError(
+            f"cannot bind durable compiled workflow to Mission state: {exc}"
+        ) from exc
+    return _load_compiled_for_snapshot(
+        runs_dir,
+        normalized,
+        current,
+        mode=mode,
+    ), current
+
+
+def _load_compiled_for_snapshot(
+    runs_dir: Path,
+    mission_id: str,
+    current: dict[str, Any],
+    *,
+    mode: fleet_compiled.LoadMode,
+) -> dict[str, Any]:
+    """Load immutable compiled bytes against one caller-owned Mission snapshot."""
+
+    normalized = state.normalize_uuid(mission_id, "mission_id")
+    if not isinstance(current, dict) or current.get("mission_id") != normalized:
+        raise MissionError("compiled workflow snapshot Mission binding mismatch")
+    relative = Path("missions") / normalized / "compiled-workflow.json"
+    try:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            raw = rooted.read_regular(
+                relative,
+                directory_modes=(0o700, 0o700),
+                file_mode=0o600,
+                max_bytes=MAX_COMPILED_WORKFLOW_BYTES,
+                require_single_link=True,
+            )
+            try:
+                compiled = fleet_compiled.loads(raw, mode=mode)
+            except fleet_compiled.CompiledError as exc:
+                raise MissionError(
+                    f"durable compiled workflow is not authorized for {mode}: {exc}"
+                ) from exc
+            if raw != state.canonical_bytes(compiled) + b"\n":
+                raise MissionError(
+                    "durable compiled workflow bytes are not canonical"
+                )
+            if (
+                compiled["workflow_digest"] != current["workflow_digest"]
+                or compiled["compiled_digest"] != current["compiled_digest"]
+            ):
+                raise MissionError("compiled workflow differs from mission ledger")
+            rooted.assert_root_binding()
+            return compiled
+    except MissionError:
+        raise
+    except fleet_safe_paths.SafePathError as exc:
+        raise MissionError(f"unsafe durable compiled workflow: {exc}") from exc
+    except state.MissionStateError as exc:
+        raise MissionError(
+            f"cannot bind durable compiled workflow to Mission state: {exc}"
+        ) from exc
+
+
+def load_snapshot_compiled(
+    runs_dir: Path,
+    mission_id: str,
+    current: dict[str, Any],
+    *,
+    mode: fleet_compiled.LoadMode,
+) -> dict[str, Any]:
+    """Bind compiled bytes without re-reading a caller-owned Mission snapshot."""
+
+    if mode not in {"read", "effect"}:
+        raise MissionError("compiled load mode must be 'read' or 'effect'")
+    return _load_compiled_for_snapshot(
+        runs_dir,
+        mission_id,
+        current,
+        mode=mode,
+    )
+
+
+def load_transaction_compiled(
+    transaction: state.MissionTransaction,
+    *,
+    mode: fleet_compiled.LoadMode,
+) -> dict[str, Any]:
+    """Bind compiled bytes to the exact snapshot of an active transaction."""
+
+    current = transaction.current_state
+    if current is None:
+        raise MissionError("compiled workflow transaction has no Mission state")
+    return load_snapshot_compiled(
+        transaction.runs_dir,
+        transaction.mission_id,
+        current,
+        mode=mode,
+    )
 
 
 def _created_request(
@@ -76,14 +188,6 @@ def _mission_id_for_key(idempotency_key: str) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"fleet-mission:{idempotency_key}"))
 
 
-def _write_or_verify(path: Path, content: bytes) -> None:
-    if path.exists():
-        if path.is_symlink() or not path.is_file() or path.read_bytes() != content:
-            raise state.MissionConflict(f"durable mission file conflicts: {path.name}")
-        return
-    state.atomic_write(path, content)
-
-
 def create_mission(
     runs_dir: Path,
     *,
@@ -100,8 +204,10 @@ def create_mission(
         raise MissionError("invalid feature")
     if not objective.strip():
         raise MissionError("objective must be non-empty")
-    if not target_repo.is_absolute():
-        raise MissionError("target_repo must be absolute")
+    try:
+        state.validate_target_repo(str(target_repo))
+    except state.MissionStateError as exc:
+        raise MissionError(str(exc)) from exc
     if not GIT_SHA.fullmatch(base_sha):
         raise MissionError("base_sha must be a full Git object id")
     request = _created_request(
@@ -115,46 +221,89 @@ def create_mission(
     if not isinstance(options, dict):
         raise MissionError("runtime_options must be an object")
     mission_id = _mission_id_for_key(idempotency_key)
-    missions = state.missions_root(runs_dir)
-    state.ensure_private_directory(missions)
-    with state.exclusive_lock(missions / ".lock"):
-        root = state.mission_root(runs_dir, mission_id)
-        existed = root.exists()
-        state.ensure_private_directory(root)
-        creation = state.canonical_bytes(
-            {
-                "schema_version": 1,
-                "mission_id": mission_id,
-                "idempotency_key": idempotency_key,
-                "request": request,
-                "runtime_options": options,
-            }
-        ) + b"\n"
-        _write_or_verify(root / "creation-request.json", creation)
-        _write_or_verify(
-            root / "compiled-workflow.json", state.canonical_bytes(compiled) + b"\n"
-        )
-        _write_or_verify(root / "objective.txt", objective.encode("utf-8"))
-        _write_or_verify(
-            root / "runtime-options.json", state.canonical_bytes(options) + b"\n"
-        )
-        _, first_appended = state.append_event(
-            runs_dir,
-            mission_id,
-            kind="mission_created",
-            actor="CONTROL",
-            idempotency_key=idempotency_key,
-            payload=request,
-        )
-        state.append_event(
-            runs_dir,
-            mission_id,
-            kind="workflow_compiled",
-            actor="CONTROL",
-            idempotency_key=f"{idempotency_key}:compiled",
-            payload={"compiled_digest": compiled["compiled_digest"]},
-        )
-        return mission_id, first_appended and not existed
+    if not runs_dir.exists():
+        state.ensure_private_directory(runs_dir)
+    mission_relative = Path("missions") / mission_id
+    try:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            with rooted.exclusive_lock(
+                Path("missions") / ".lock",
+                directory_modes=(0o700,),
+                file_mode=0o600,
+            ):
+                existed = mission_id in rooted.list_directory(
+                    "missions", directory_modes=(0o700,)
+                )
+                creation = state.canonical_bytes(
+                    {
+                        "schema_version": 1,
+                        "mission_id": mission_id,
+                        "idempotency_key": idempotency_key,
+                        "request": request,
+                        "runtime_options": options,
+                    }
+                ) + b"\n"
+                for name, content in (
+                    ("creation-request.json", creation),
+                    (
+                        "compiled-workflow.json",
+                        state.canonical_bytes(compiled) + b"\n",
+                    ),
+                    ("objective.txt", objective.encode("utf-8")),
+                    (
+                        "runtime-options.json",
+                        state.canonical_bytes(options) + b"\n",
+                    ),
+                ):
+                    try:
+                        rooted.atomic_write(
+                            mission_relative / name,
+                            content,
+                            directory_modes=(0o700, 0o700),
+                            file_mode=0o600,
+                        )
+                    except fleet_safe_paths.SafePathError as exc:
+                        if "conflicts with requested bytes" in str(exc):
+                            raise state.MissionConflict(
+                                f"durable mission file conflicts: {name}"
+                            ) from exc
+                        raise
+                created_event, first_appended = state.append_event(
+                    runs_dir,
+                    mission_id,
+                    kind="mission_created",
+                    actor="CONTROL",
+                    idempotency_key=idempotency_key,
+                    payload=request,
+                )
+                state.append_event(
+                    runs_dir,
+                    mission_id,
+                    kind="workflow_compiled",
+                    actor="CONTROL",
+                    idempotency_key=f"{idempotency_key}:compiled",
+                    payload={"compiled_digest": compiled["compiled_digest"]},
+                )
+                limits = compiled["workflow"]["limits"]
+                deadline = state.parse_timestamp(
+                    created_event["timestamp"], "mission creation timestamp"
+                ) + timedelta(seconds=int(limits["deadline_seconds"]))
+                fleet_admission.freeze_policy(
+                    runs_dir,
+                    mission_id,
+                    workflow_digest=compiled["workflow_digest"],
+                    compiled_digest=compiled["compiled_digest"],
+                    deadline_at=deadline.isoformat(timespec="microseconds").replace(
+                        "+00:00", "Z"
+                    ),
+                    delegation_credits=int(limits["delegation_credits"]),
+                    max_active_delegations=int(limits["max_active_delegations"]),
+                    idempotency_key=f"{idempotency_key}:admission-policy",
+                )
+                rooted.assert_root_binding()
+                return mission_id, first_appended and not existed
+    except fleet_safe_paths.SafePathError as exc:
+        raise MissionError(f"unsafe mission store: {exc}") from exc
 
 
 def load_state(runs_dir: Path, mission_id: str) -> dict[str, Any]:
@@ -168,8 +317,8 @@ def load_state(runs_dir: Path, mission_id: str) -> dict[str, Any]:
 
 def _payload(value: str) -> dict[str, Any]:
     try:
-        result = json.loads(value)
-    except json.JSONDecodeError as exc:
+        result = fleet_json.loads(value)
+    except fleet_json.FleetJSONError as exc:
         raise MissionError(f"invalid --payload-json: {exc}") from exc
     if not isinstance(result, dict):
         raise MissionError("--payload-json must be an object")

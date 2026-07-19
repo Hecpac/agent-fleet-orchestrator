@@ -51,6 +51,34 @@ class FleetArtifactTests(unittest.TestCase):
         self.assertEqual(receipt["bytes"], 6)
         self.assertTrue(receipt["valid"])
 
+    def test_artifact_store_and_lock_reject_symlink_ancestors(self) -> None:
+        artifact = fleet_artifacts.put_bytes(self.runs, self.mission_id, b"rooted")
+        store = fleet_artifacts.store_path(self.runs, self.mission_id)
+        original_store = store.with_name("artifacts-original")
+        store.rename(original_store)
+        outside_store = self.tmp / "outside-store"
+        outside_store.mkdir(mode=0o700)
+        (outside_store / artifact["artifact_id"]).write_bytes(b"rooted")
+        store.symlink_to(outside_store, target_is_directory=True)
+
+        with self.assertRaisesRegex(fleet_artifacts.ArtifactError, "unsafe artifact store"):
+            fleet_artifacts.get_bytes(
+                self.runs, self.mission_id, artifact["artifact_id"]
+            )
+        with self.assertRaisesRegex(fleet_artifacts.ArtifactError, "unsafe artifact store"):
+            fleet_artifacts.verify_store(self.runs, self.mission_id)
+
+        store.unlink()
+        original_store.rename(store)
+        lock = fleet_artifacts.lock_path(self.runs, self.mission_id)
+        lock.unlink()
+        outside_lock = self.tmp / "outside-lock"
+        outside_lock.write_bytes(b"")
+        outside_lock.chmod(0o600)
+        lock.symlink_to(outside_lock)
+        with self.assertRaisesRegex(fleet_artifacts.ArtifactError, "unsafe artifact store"):
+            fleet_artifacts.put_bytes(self.runs, self.mission_id, b"new bytes")
+
 
 if __name__ == "__main__":
     unittest.main()

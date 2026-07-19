@@ -11,15 +11,20 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 import sys
-from typing import Any, Callable
+from typing import Any
 import uuid
 
 import fleet_dialogue
+import fleet_json
+import fleet_manifest
+import fleet_safe_paths
+import fleet_state
 from fleet_identity import validate as validate_identity
-from fleet_leases import closing_path, coordinator
-from fleet_ledger import append_record, events_for_run
+from fleet_leases import LeaseError, coordinator
+from fleet_ledger import LedgerError, append_record, events_for_run, read_records
 
 
 SCHEMA_VERSION = 1
@@ -30,8 +35,12 @@ MAX_REVISION_ROUNDS = 3
 RUN_TIMEOUT_SECONDS = 30 * 60
 DIALOGUE_DEADLINE_SECONDS = 4 * 60 * 60
 MAX_CHECKER_EVIDENCE_BYTES = fleet_dialogue.MAX_PAYLOAD_BYTES
+MAX_CONTROL_FILE_BYTES = fleet_dialogue.MAX_PAYLOAD_BYTES
+MAX_CONTROL_LEDGER_BYTES = 64 * 1024 * 1024
+MAX_RECEIPT_BYTES = 16 * 1024 * 1024
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+SAFE_CONTROL_FILE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 TERMINAL_STATES = {
     "accepted",
     "rejected",
@@ -174,7 +183,10 @@ def parse_timestamp(value: Any, where: str) -> datetime:
 
 
 def canonical(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    try:
+        return fleet_json.canonical_bytes(value)
+    except fleet_json.FleetJSONError as exc:
+        raise ControllerError("FDP-2 value is not strict JSON") from exc
 
 
 def digest(value: Any) -> str:
@@ -182,12 +194,18 @@ def digest(value: Any) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def _feature(value: str) -> str:
+    if not isinstance(value, str) or not fleet_dialogue.SAFE_FEATURE.fullmatch(value):
+        raise ControllerError("invalid feature")
+    return value
+
+
 def ledger_path(runs_dir: Path, feature: str) -> Path:
-    return runs_dir / f"fleet-{feature}.dialogue-control.jsonl"
+    return runs_dir / f"fleet-{_feature(feature)}.dialogue-control.jsonl"
 
 
 def prompt_root(runs_dir: Path, feature: str, conversation_id: str) -> Path:
-    return runs_dir / "dialogue" / feature / "control" / conversation_id / "prompts"
+    return runs_dir / _prompt_directory_relative(feature, conversation_id)
 
 
 def _uuid(value: Any, where: str) -> str:
@@ -197,9 +215,48 @@ def _uuid(value: Any, where: str) -> str:
         raise ControllerError(f"invalid {where}") from exc
 
 
+def _control_directory_relative(feature: str, conversation_id: str) -> Path:
+    return (
+        Path("dialogue")
+        / _feature(feature)
+        / "control"
+        / _uuid(conversation_id, "conversation_id")
+    )
+
+
+def _prompt_directory_relative(feature: str, conversation_id: str) -> Path:
+    return _control_directory_relative(feature, conversation_id) / "prompts"
+
+
+def _task_spec_relative(feature: str, conversation_id: str) -> Path:
+    return _control_directory_relative(feature, conversation_id) / "task-spec.json"
+
+
+def _prompt_relative(
+    feature: str, conversation_id: str, filename: str
+) -> Path:
+    if not isinstance(filename, str) or not SAFE_CONTROL_FILE.fullmatch(filename):
+        raise ControllerError("invalid FDP-2 prompt filename")
+    return _prompt_directory_relative(feature, conversation_id) / filename
+
+
+def _control_directory_modes(relative: Path) -> tuple[int, ...]:
+    modes = (0o755, 0o755, 0o755, 0o700)
+    if relative.parts[-1:] == ("prompts",) or relative.parts[-2:-1] == ("prompts",):
+        return (*modes, 0o700)
+    return modes
+
+
 def _validate_idempotency_key(value: str) -> None:
     if not fleet_dialogue.SAFE_IDEMPOTENCY_KEY.fullmatch(value):
         raise ControllerError("invalid idempotency key")
+
+
+def _lease_exists(store: Any, name: str) -> bool:
+    try:
+        return bool(store.exists_name(name))
+    except LeaseError as exc:
+        raise ControllerError(f"cannot inspect FDP-2 lease state: {exc}") from exc
 
 
 def _validate_expected(value: Any) -> None:
@@ -274,24 +331,16 @@ def _validate_snapshot(value: Any) -> None:
             raise ControllerError("active dialogue contains terminal fields")
 
 
-def load_events_from_path(path: Path, feature: str | None = None) -> list[dict[str, Any]]:
-    try:
-        raw_lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
-        raise ControllerError(f"cannot read dialogue control ledger: {path}") from exc
+def _validated_events(
+    records: list[dict[str, Any]], feature: str | None = None
+) -> list[dict[str, Any]]:
+    if feature is not None:
+        feature = _feature(feature)
     events: list[dict[str, Any]] = []
     previous_sha: str | None = None
     event_ids: set[str] = set()
     idempotency_keys: set[str] = set()
-    for line_number, raw in enumerate(raw_lines, start=1):
-        if not raw.strip():
-            raise ControllerError(f"blank dialogue control row at line {line_number}")
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ControllerError(f"invalid dialogue control JSON at line {line_number}") from exc
+    for line_number, event in enumerate(records, start=1):
         if not isinstance(event, dict) or set(event) != EVENT_FIELDS:
             raise ControllerError("dialogue control event fields do not match schema_version=1")
         if event.get("schema_version") != SCHEMA_VERSION or event.get("sequence") != line_number:
@@ -322,8 +371,80 @@ def load_events_from_path(path: Path, feature: str | None = None) -> list[dict[s
     return events
 
 
+def _load_events_rooted(
+    root: Path, ledger_leaf: str, feature: str | None = None
+) -> list[dict[str, Any]]:
+    if feature is not None:
+        feature = _feature(feature)
+        allowed = {"dialogue-control.jsonl", f"fleet-{feature}.dialogue-control.jsonl"}
+        if ledger_leaf not in allowed:
+            raise ControllerError("dialogue control ledger is outside its selected root")
+    elif ledger_leaf != "dialogue-control.jsonl":
+        prefix = "fleet-"
+        suffix = ".dialogue-control.jsonl"
+        candidate = (
+            ledger_leaf[len(prefix) : -len(suffix)]
+            if ledger_leaf.startswith(prefix) and ledger_leaf.endswith(suffix)
+            else ""
+        )
+        if not fleet_dialogue.SAFE_FEATURE.fullmatch(candidate):
+            raise ControllerError("dialogue control ledger is outside its selected root")
+    if Path(ledger_leaf).name != ledger_leaf:
+        raise ControllerError("dialogue control ledger is outside its selected root")
+    try:
+        records = read_records(root / ledger_leaf, runs_dir=root)
+    except LedgerError as exc:
+        raise ControllerError(f"cannot read dialogue control ledger: {exc}") from exc
+    return _validated_events(records, feature)
+
+
+def load_events_from_path(path: Path, feature: str | None = None) -> list[dict[str, Any]]:
+    if feature is not None:
+        feature = _feature(feature)
+    path = Path(path)
+    root = path.parent
+    if path != root / path.name:
+        raise ControllerError("dialogue control ledger is outside its selected root")
+    return _load_events_rooted(root, path.name, feature)
+
+
 def load_events(runs_dir: Path, feature: str) -> list[dict[str, Any]]:
-    return load_events_from_path(ledger_path(runs_dir, feature), feature)
+    feature = _feature(feature)
+    return _load_events_rooted(runs_dir, ledger_path(runs_dir, feature).name, feature)
+
+
+def publication_state_locked(
+    runs_dir: Path, feature: str
+) -> dict[str, Any] | None:
+    """Return the controller publication authority while coordinator is held.
+
+    The caller owns the fleet coordinator lock.  A present control ledger is
+    authoritative even after it reaches a terminal state; legacy publication
+    is allowed only when no controller ledger exists at all.
+    """
+
+    feature = _feature(feature)
+    path = ledger_path(runs_dir, feature)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ControllerError("cannot inspect FDP-2 publication state") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise ControllerError("FDP-2 publication state must be a regular file")
+    events = load_events(runs_dir, feature)
+    if not events:
+        raise ControllerError("FDP-2 publication state ledger is empty")
+    current = events[-1]
+    snapshot = current["snapshot"]
+    return {
+        "controller": "FDP-2",
+        "controller_id": current["conversation_id"],
+        "status": snapshot["status"],
+        "active": snapshot["status"] in ACTIVE_STATES,
+        "expected": copy.deepcopy(snapshot["expected"]),
+    }
 
 
 def _active_event(events: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -395,6 +516,7 @@ def _append_event_locked(
             or previous.get("event_id") == event["event_id"]
             or previous.get("idempotency_key") == idempotency_key
         ),
+        runs_dir=runs_dir,
     )
     if not appended:
         raise ControllerConflict("dialogue control ledger changed during append")
@@ -438,25 +560,72 @@ def _expire_locked(
     )
 
 
-def _manifest_values(path: Path) -> dict[str, str]:
+def _read_rooted_regular(
+    root: Path,
+    relative: Path | str,
+    *,
+    directory_modes: tuple[int, ...],
+    max_bytes: int,
+    where: str,
+) -> bytes:
     try:
-        values = dict(
-            line.split("=", 1)
-            for line in path.read_text(encoding="utf-8").splitlines()
-            if "=" in line
+        with fleet_safe_paths.RootedFS(root) as rooted:
+            payload = rooted.read_regular(
+                relative,
+                directory_modes=directory_modes,
+                file_mode=0o600,
+                max_bytes=max_bytes,
+            )
+            rooted.assert_root_binding()
+            return payload
+    except fleet_safe_paths.SafePathError as exc:
+        raise ControllerError(f"unsafe {where}: {exc}") from exc
+
+
+def _manifest_values_from_bytes(payload: bytes) -> dict[str, str]:
+    try:
+        return fleet_manifest.parse_bytes(payload)
+    except fleet_manifest.ManifestError as exc:
+        raise ControllerError(f"invalid fleet manifest: {exc}") from exc
+
+
+def _manifest_values(path: Path) -> dict[str, str]:
+    path = Path(path)
+    root = path.parent
+    leaf = path.name
+    if path != root / leaf:
+        raise ControllerError("fleet manifest is outside its selected root")
+    if leaf != "manifest":
+        prefix = "fleet-"
+        suffix = ".manifest"
+        feature = (
+            leaf[len(prefix) : -len(suffix)]
+            if leaf.startswith(prefix) and leaf.endswith(suffix)
+            else ""
         )
-    except OSError as exc:
-        raise ControllerError(f"missing fleet manifest: {path}") from exc
-    if not values:
-        raise ControllerError("fleet manifest is empty")
-    return values
+        if not fleet_dialogue.SAFE_FEATURE.fullmatch(feature):
+            raise ControllerError("fleet manifest is outside its selected root")
+    payload = _read_rooted_regular(
+        root,
+        leaf,
+        directory_modes=(),
+        max_bytes=MAX_CONTROL_FILE_BYTES,
+        where="fleet manifest path",
+    )
+    return _manifest_values_from_bytes(payload)
 
 
 def _load_live_manifest(runs_dir: Path, feature: str) -> dict[str, str]:
-    if not fleet_dialogue.SAFE_FEATURE.fullmatch(feature):
-        raise ControllerError("invalid feature")
-    path = runs_dir / f"fleet-{feature}.manifest"
-    manifest = _manifest_values(path)
+    feature = _feature(feature)
+    leaf = f"fleet-{feature}.manifest"
+    payload = _read_rooted_regular(
+        runs_dir,
+        leaf,
+        directory_modes=(),
+        max_bytes=MAX_CONTROL_FILE_BYTES,
+        where="live fleet manifest path",
+    )
+    manifest = _manifest_values_from_bytes(payload)
     if manifest.get("feature") != feature:
         raise ControllerError("manifest feature mismatch")
     instances = sorted(
@@ -493,31 +662,158 @@ def _validate_roster(manifest: dict[str, str]) -> None:
                 )
     if not manifest.get("target_repo"):
         raise ControllerError("FDP-2 requires --target-repo")
-    for field in ("worktree", "branch", "base_sha"):
+    for field in ("worktree", "branch", "base_sha", "git_isolation", "publication_state"):
         if not manifest.get(f"{MAKER_INSTANCE}.{field}"):
             raise ControllerError(f"FDP-2 maker lacks durable Git metadata: {field}")
+    if manifest[f"{MAKER_INSTANCE}.git_isolation"] != "isolated-clone":
+        raise ControllerError("FDP-2 maker must use an isolated Git clone")
+    if manifest[f"{MAKER_INSTANCE}.publication_state"] not in {"private", "published"}:
+        raise ControllerError("FDP-2 maker has an invalid publication state")
 
 
-def _state_phase(runs_dir: Path, feature: str) -> str:
-    path = runs_dir / f"fleet-{feature}.state.json"
+def _state_phase(
+    runs_dir: Path,
+    feature: str,
+    manifest: dict[str, str] | None = None,
+) -> str:
+    feature = _feature(feature)
+    manifest_path = runs_dir / f"fleet-{feature}.manifest"
     try:
-        state = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ControllerError(f"cannot read fleet state: {path}") from exc
+        live_manifest, state = fleet_state.load_live(manifest_path)
+    except (
+        OSError,
+        fleet_safe_paths.SafePathError,
+        fleet_state.PhaseStateError,
+    ) as exc:
+        raise ControllerError(
+            f"cannot read fleet state: {manifest_path.with_suffix('.state.json')}"
+        ) from exc
+    if manifest is not None and live_manifest != manifest:
+        raise ControllerError("fleet manifest changed before phase validation")
     phase = state.get("active_phase")
     if phase != "BUILD":
         raise ControllerError(f"FDP-2 start requires active_phase=BUILD, got {phase}")
     return str(phase)
 
 
-def _git(manifest: dict[str, str], *args: str, worktree: bool = False) -> str:
-    root = manifest[f"{MAKER_INSTANCE}.worktree"] if worktree else manifest["target_repo"]
+def _writer_git_root(manifest: dict[str, str]) -> str:
+    isolation = manifest.get(f"{MAKER_INSTANCE}.git_isolation")
+    publication_state = manifest.get(f"{MAKER_INSTANCE}.publication_state")
+    if isolation != "isolated-clone":
+        raise ContractError("maker Git store is not isolated")
+    if publication_state == "private":
+        if manifest.get(f"{MAKER_INSTANCE}.published_sha") or manifest.get("workspace.quiesced") == "1":
+            raise ContractError("private maker claims published or quiescent state")
+        branch = manifest[f"{MAKER_INSTANCE}.branch"]
+        target_ref = subprocess.run(
+            [
+                "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                "-c", "submodule.recurse=false", "-C", manifest["target_repo"],
+                "show-ref", "--verify", "--quiet",
+                f"refs/heads/{branch}",
+            ],
+            env=_safe_git_environment(),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if target_ref.returncode == 0:
+            raise ContractError("private maker branch already exists in target")
+        if target_ref.returncode not in {0, 1}:
+            raise ContractError("cannot verify private maker target branch absence")
+        return manifest[f"{MAKER_INSTANCE}.worktree"]
+    if publication_state == "published":
+        final_sha = manifest.get(f"{MAKER_INSTANCE}.final_sha", "")
+        if (
+            manifest.get("workspace.quiesced") != "1"
+            or not GIT_SHA.fullmatch(final_sha)
+            or manifest.get(f"{MAKER_INSTANCE}.published_sha") != final_sha
+        ):
+            raise ContractError("published maker Git metadata is inconsistent")
+        return manifest["target_repo"]
+    raise ContractError("maker publication state is invalid")
+
+
+def _safe_git_environment() -> dict[str, str]:
     environment = {
-        **os.environ,
-        "GIT_OPTIONAL_LOCKS": "0",
-        "GIT_PAGER": "cat",
-        "PAGER": "cat",
+        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
     }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_PAGER": "cat",
+            "PAGER": "cat",
+        }
+    )
+    return environment
+
+
+def _validate_private_git_metadata(root: Path) -> None:
+    try:
+        physical_root = root.resolve(strict=True)
+        git_dir = physical_root / ".git"
+        info = git_dir.lstat()
+    except OSError as exc:
+        raise ContractError("maker private Git store is unavailable") from exc
+    if physical_root != root or not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise ContractError("maker private Git store is not an exact physical directory")
+    for directory, directories, files in os.walk(git_dir, followlinks=False):
+        for name in [*directories, *files]:
+            path = Path(directory) / name
+            entry = path.lstat()
+            if stat.S_ISLNK(entry.st_mode):
+                raise ContractError("maker Git metadata contains a symlink")
+            if name in directories:
+                if not stat.S_ISDIR(entry.st_mode):
+                    raise ContractError("maker Git metadata contains a special directory")
+            elif not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                raise ContractError("maker Git metadata contains a special or shared file")
+    alternates = git_dir / "objects" / "info" / "alternates"
+    if alternates.exists() or alternates.is_symlink():
+        raise ContractError("maker Git object alternates are forbidden")
+    hooks = git_dir / "hooks"
+    if hooks.exists():
+        for hook in hooks.iterdir():
+            entry = hook.lstat()
+            if stat.S_ISLNK(entry.st_mode) or (
+                stat.S_ISREG(entry.st_mode)
+                and entry.st_mode & 0o111
+                and not hook.name.endswith(".sample")
+            ):
+                raise ContractError("maker Git metadata contains an executable hook")
+    config = subprocess.run(
+        [
+            "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+            "-c", "submodule.recurse=false", "config", "--no-includes", "--file",
+            str(git_dir / "config"), "--name-only", "--list",
+        ],
+        env=_safe_git_environment(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    allowed = {
+        "core.repositoryformatversion", "core.filemode", "core.bare",
+        "core.logallrefupdates", "core.ignorecase", "core.precomposeunicode",
+        "core.symlinks", "user.name", "user.email",
+    }
+    if config.returncode != 0 or any(
+        key not in allowed for key in config.stdout.splitlines()
+    ):
+        raise ContractError("maker Git config contains executable or indirect settings")
+
+
+def _git(manifest: dict[str, str], *args: str, worktree: bool = False) -> str:
+    root = (
+        manifest[f"{MAKER_INSTANCE}.worktree"]
+        if worktree
+        else _writer_git_root(manifest)
+    )
+    if worktree or manifest.get(f"{MAKER_INSTANCE}.publication_state") == "private":
+        _validate_private_git_metadata(Path(root))
     result = subprocess.run(
         [
             "git",
@@ -525,11 +821,13 @@ def _git(manifest: dict[str, str], *args: str, worktree: bool = False) -> str:
             "core.fsmonitor=false",
             "-c",
             "core.hooksPath=/dev/null",
+            "-c",
+            "submodule.recurse=false",
             "-C",
             root,
             *args,
         ],
-        env=environment,
+        env=_safe_git_environment(),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -540,11 +838,71 @@ def _git(manifest: dict[str, str], *args: str, worktree: bool = False) -> str:
     return result.stdout.strip()
 
 
+def _git_bytes(manifest: dict[str, str], *args: str, worktree: bool = False) -> bytes:
+    root = (
+        manifest[f"{MAKER_INSTANCE}.worktree"]
+        if worktree
+        else _writer_git_root(manifest)
+    )
+    if worktree or manifest.get(f"{MAKER_INSTANCE}.publication_state") == "private":
+        _validate_private_git_metadata(Path(root))
+    result = subprocess.run(
+        [
+            "git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+            "-c", "submodule.recurse=false", "-C", root, *args,
+        ],
+        env=_safe_git_environment(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise ContractError(f"git {' '.join(args)} failed: {detail}")
+    return result.stdout
+
+
 def _clean_writer_head(manifest: dict[str, str]) -> str:
     branch = manifest[f"{MAKER_INSTANCE}.branch"]
     worktree = Path(manifest[f"{MAKER_INSTANCE}.worktree"])
+    publication_state = manifest[f"{MAKER_INSTANCE}.publication_state"]
+    if publication_state == "published":
+        if worktree.exists() or worktree.is_symlink():
+            raise ContractError("published maker still has a mutable clone")
+        branch_head = _git(manifest, "rev-parse", "--verify", f"refs/heads/{branch}")
+        if branch_head != manifest.get(f"{MAKER_INSTANCE}.final_sha"):
+            raise ContractError("published maker branch differs from final_sha")
+        return branch_head
     if not worktree.is_dir():
         raise ContractError("maker worktree is missing")
+    git_common_dir = _git(
+        manifest,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+        worktree=True,
+    )
+    git_dir = _git(
+        manifest,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+        worktree=True,
+    )
+    top_level = _git(
+        manifest,
+        "rev-parse",
+        "--path-format=absolute",
+        "--show-toplevel",
+        worktree=True,
+    )
+    if (
+        Path(git_common_dir) != worktree / ".git"
+        or Path(git_dir) != worktree / ".git"
+        or Path(top_level) != worktree
+        or _git(manifest, "remote", worktree=True)
+    ):
+        raise ContractError("maker worktree does not have an isolated Git store")
     if _git(manifest, "symbolic-ref", "--quiet", "--short", "HEAD", worktree=True) != branch:
         raise ContractError("maker worktree is not attached to its durable branch")
     if _git(manifest, "status", "--porcelain", worktree=True):
@@ -566,13 +924,9 @@ def _validate_maker_commit(
     current = _clean_writer_head(manifest)
     if current != head_sha:
         raise ContractError("maker head_sha does not match the durable branch")
-    ancestor = subprocess.run(
-        ["git", "-C", manifest["target_repo"], "merge-base", "--is-ancestor", base_sha, head_sha],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if ancestor.returncode != 0:
+    try:
+        _git(manifest, "merge-base", "--is-ancestor", base_sha, head_sha)
+    except ContractError:
         raise ContractError("maker revision is not append-only from base_sha")
     if _git(manifest, "rev-list", "--count", f"{base_sha}..{head_sha}") != "1":
         raise ContractError("each Maker result must add exactly one commit")
@@ -614,41 +968,26 @@ def _write_prompt(
     filename: str,
     content: str,
 ) -> tuple[str, str]:
-    root = prompt_root(runs_dir, feature, conversation_id)
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    root.chmod(0o700)
-    path = root / filename
+    relative = _prompt_relative(feature, conversation_id, filename)
     payload = content.encode("utf-8")
-    if path.exists():
-        if path.is_symlink() or path.read_bytes() != payload:
-            raise ControllerConflict("durable FDP-2 prompt changed")
-    else:
-        temporary = root / f".{filename}.{uuid.uuid4().hex}.tmp"
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            directory_fd = os.open(root, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
-        finally:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-    return str(path), hashlib.sha256(payload).hexdigest()
-
-
-def _read_task_spec(path: Path) -> tuple[dict[str, Any], bytes, str]:
-    payload = fleet_dialogue._read_bounded_regular_file(path)
     try:
-        value = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            rooted.atomic_write(
+                relative,
+                payload,
+                directory_modes=_control_directory_modes(relative),
+                file_mode=0o600,
+            )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ControllerConflict(f"unsafe or changed durable FDP-2 prompt: {exc}") from exc
+    return str(runs_dir / relative), hashlib.sha256(payload).hexdigest()
+
+
+def _parse_task_spec_payload(payload: bytes) -> tuple[dict[str, Any], bytes, str]:
+    try:
+        value = fleet_json.loads(payload)
+    except fleet_json.FleetJSONError as exc:
         raise ControllerError("FDP-2 task spec is not valid UTF-8 JSON") from exc
     item = _strict_object(
         value,
@@ -665,39 +1004,35 @@ def _read_task_spec(path: Path) -> tuple[dict[str, Any], bytes, str]:
     return item, payload, hashlib.sha256(payload).hexdigest()
 
 
+def _read_task_spec(path: Path) -> tuple[dict[str, Any], bytes, str]:
+    try:
+        payload = fleet_dialogue._read_bounded_regular_file(path)
+    except fleet_dialogue.DialogueError as exc:
+        raise ControllerError("FDP-2 task spec is unavailable or invalid") from exc
+    return _parse_task_spec_payload(payload)
+
+
 def _write_task_spec(
     runs_dir: Path,
     feature: str,
     conversation_id: str,
     payload: bytes,
 ) -> str:
-    root = prompt_root(runs_dir, feature, conversation_id).parent
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    root.chmod(0o700)
-    path = root / "task-spec.json"
-    if path.exists():
-        if path.is_symlink() or path.read_bytes() != payload:
-            raise ControllerConflict("durable FDP-2 task spec changed")
-        return str(path)
-    temporary = root / f".task-spec.{uuid.uuid4().hex}.tmp"
+    relative = _task_spec_relative(feature, conversation_id)
     try:
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(root, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-    return str(path)
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            rooted.atomic_write(
+                relative,
+                payload,
+                directory_modes=_control_directory_modes(relative),
+                file_mode=0o600,
+            )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ControllerConflict(
+            f"unsafe or changed durable FDP-2 task spec: {exc}"
+        ) from exc
+    return str(runs_dir / relative)
 
 
 def _run_expected(
@@ -938,8 +1273,54 @@ def _revision_prompt(
     )
 
 
-def _bound_task_spec(snapshot: dict[str, Any]) -> dict[str, Any]:
-    task_spec, _, actual_sha = _read_task_spec(Path(snapshot["task_spec_file"]))
+def _assert_recorded_rooted_path(
+    rooted: fleet_safe_paths.RootedFS,
+    recorded: Any,
+    relative: Path,
+    where: str,
+) -> None:
+    if not isinstance(recorded, str) or not recorded:
+        raise ControllerError(f"{where} is missing")
+    recorded_path = Path(recorded)
+    try:
+        recorded_root = recorded_path.parents[len(relative.parts) - 1]
+    except IndexError as exc:
+        raise ControllerError(f"{where} is outside its selected root") from exc
+    if recorded_path != recorded_root / relative:
+        raise ControllerError(f"{where} is outside its selected root")
+    try:
+        physical_root = fleet_safe_paths.canonical_root(recorded_root)
+    except fleet_safe_paths.SafePathError as exc:
+        raise ControllerError(f"unsafe {where} root: {exc}") from exc
+    if physical_root != rooted.root:
+        raise ControllerError(f"{where} is outside its selected root")
+
+
+def _bound_task_spec(
+    runs_dir: Path,
+    feature: str,
+    conversation_id: str,
+    snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    relative = _task_spec_relative(feature, conversation_id)
+    try:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            _assert_recorded_rooted_path(
+                rooted,
+                snapshot["task_spec_file"],
+                relative,
+                "durable FDP-2 task spec",
+            )
+            payload = rooted.read_regular(
+                relative,
+                directory_modes=_control_directory_modes(relative),
+                file_mode=0o600,
+                max_bytes=MAX_CONTROL_FILE_BYTES,
+            )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ControllerError(f"unsafe durable FDP-2 task spec: {exc}") from exc
+    task_spec, _, actual_sha = _parse_task_spec_payload(payload)
     if actual_sha != snapshot["task_spec_sha256"]:
         raise ControllerError("durable FDP-2 task spec hash changed")
     return task_spec
@@ -968,8 +1349,8 @@ def _parse_result(payload: bytes, run_id: str) -> dict[str, Any]:
         raise ContractError("FDP-2 result must end with one exact DONE sentinel")
     body = "\n".join(lines[:-1])
     try:
-        value = json.loads(body)
-    except json.JSONDecodeError as exc:
+        value = fleet_json.loads(body)
+    except fleet_json.FleetJSONError as exc:
         raise ContractError("FDP-2 result body is not one JSON document") from exc
     if not isinstance(value, dict):
         raise ContractError("FDP-2 result JSON must be an object")
@@ -1152,15 +1533,11 @@ def _validate_evidence_refs(
         value = reference["ref"]
         if kind == "file":
             path, line_number = _file_reference(value)
-            blob = subprocess.run(
-                ["git", "-C", manifest["target_repo"], "show", f"{head_sha}:{path}"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-            )
-            if blob.returncode != 0:
+            try:
+                blob = _git_bytes(manifest, "show", f"{head_sha}:{path}")
+            except ContractError:
                 raise ContractError(f"file evidence does not exist at accepted head: {path}")
-            if line_number is not None and line_number > len(blob.stdout.splitlines()):
+            if line_number is not None and line_number > len(blob.splitlines()):
                 raise ContractError(f"file evidence line is outside the blob: {value}")
         elif kind == "run" and value not in run_ids:
             raise ContractError("run evidence does not belong to this conversation")
@@ -1202,6 +1579,7 @@ def start(
     spec_file: Path,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    feature = _feature(feature)
     task_spec, task_spec_payload, task_spec_sha256 = _read_task_spec(spec_file)
     request = {
         "command": "start",
@@ -1209,21 +1587,22 @@ def start(
         "task_spec_sha256": task_spec_sha256,
     }
     current_time = now or utc_now()
-    with coordinator(runs_dir):
+    with coordinator(runs_dir) as lease_store:
         events = load_events(runs_dir, feature)
         _expire_locked(runs_dir, feature, events, now=current_time)
         existing = _idempotent_event(events, idempotency_key, request)
         if existing is not None:
+            _verify_live_control_artifacts(runs_dir, feature, events)
             return existing
         if _active_event(events) is not None:
             raise ControllerConflict("feature already has an active FDP-2 conversation")
         manifest = _load_live_manifest(runs_dir, feature)
         _validate_roster(manifest)
-        _state_phase(runs_dir, feature)
-        if closing_path(runs_dir, feature).exists():
+        _state_phase(runs_dir, feature, manifest)
+        if _lease_exists(lease_store, f"{feature}.closing"):
             raise ControllerConflict(f"fleet '{feature}' is closing")
         for instance in (MAKER_INSTANCE, CHECKER_INSTANCE):
-            if (runs_dir / "locks" / f"{feature}.{instance}.lock").exists():
+            if _lease_exists(lease_store, f"{feature}.{instance}.lock"):
                 raise ControllerConflict(f"FDP-2 participant is busy: {instance}")
         head_sha = _clean_writer_head(manifest)
         conversation_id = str(uuid.uuid4())
@@ -1288,11 +1667,15 @@ def _run_terminal(
     manifest: dict[str, str],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     instance = expected["instance"]
-    events = events_for_run(
-        runs_dir / f"fleet-{feature}.ledger.jsonl",
-        run_id=run_id,
-        instance=instance,
-    )
+    try:
+        events = events_for_run(
+            runs_dir / f"fleet-{feature}.ledger.jsonl",
+            run_id=run_id,
+            instance=instance,
+            runs_dir=runs_dir,
+        )
+    except LedgerError as exc:
+        raise ControllerError(f"cannot read lifecycle ledger: {exc}") from exc
     if not events:
         raise ControllerError("run_id is absent from the lifecycle ledger")
     for event in events:
@@ -1481,7 +1864,9 @@ def _ingest_message_locked(
     next_snapshot["last_message_id"] = message_id
     stage = expected["stage"]
     if stage == "proposal":
-        task_spec = _bound_task_spec(snapshot)
+        task_spec = _bound_task_spec(
+            runs_dir, feature, current["conversation_id"], snapshot
+        )
         prompt_file, prompt_sha = _checker_prompt(
             runs_dir,
             feature,
@@ -1513,7 +1898,9 @@ def _ingest_message_locked(
         )
         return next_snapshot, "rebuttal_published"
     if stage == "revision":
-        task_spec = _bound_task_spec(snapshot)
+        task_spec = _bound_task_spec(
+            runs_dir, feature, current["conversation_id"], snapshot
+        )
         prompt_file, prompt_sha = _checker_prompt(
             runs_dir,
             feature,
@@ -1546,7 +1933,9 @@ def _ingest_message_locked(
     if snapshot["revision_round"] >= snapshot["max_revision_rounds"]:
         return _terminal(next_snapshot, "indeterminate", "max_revision_rounds_exhausted"), "rounds_exhausted"
     round_number = snapshot["revision_round"] + 1
-    task_spec = _bound_task_spec(snapshot)
+    task_spec = _bound_task_spec(
+        runs_dir, feature, current["conversation_id"], snapshot
+    )
     prompt_file, prompt_sha = _revision_prompt(
         runs_dir,
         feature,
@@ -1577,6 +1966,7 @@ def step(
     message_id: str | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    feature = _feature(feature)
     if (run_id is None) == (message_id is None):
         raise ControllerError("step requires exactly one of run_id or message_id")
     request = {
@@ -1585,18 +1975,19 @@ def step(
         "message_id": message_id,
     }
     current_time = now or utc_now()
-    with coordinator(runs_dir):
+    with coordinator(runs_dir) as lease_store:
         events = load_events(runs_dir, feature)
         _expire_locked(runs_dir, feature, events, now=current_time)
         existing = _idempotent_event(events, idempotency_key, request)
         if existing is not None:
+            _verify_live_control_artifacts(runs_dir, feature, events)
             return existing
         current = _current_event(events)
         if current is None or current["snapshot"]["status"] in TERMINAL_STATES:
             raise ControllerConflict("feature has no active FDP-2 conversation")
         manifest = _load_live_manifest(runs_dir, feature)
         _validate_roster(manifest)
-        if closing_path(runs_dir, feature).exists():
+        if _lease_exists(lease_store, f"{feature}.closing"):
             raise ControllerConflict(f"fleet '{feature}' is closing")
         if run_id is not None:
             next_snapshot, event_type = _ingest_run_locked(
@@ -1627,6 +2018,7 @@ def abandon(
     reason: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    feature = _feature(feature)
     _nonempty_string(reason, "abandon.reason")
     request = {"command": "abandon", "reason": reason}
     current_time = now or utc_now()
@@ -1658,12 +2050,14 @@ def show(
     feature: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    feature = _feature(feature)
     with coordinator(runs_dir):
         events = load_events(runs_dir, feature)
         _expire_locked(runs_dir, feature, events, now=now)
         current = _current_event(events)
         if current is None:
             raise ControllerError("feature has no FDP-2 conversation")
+        _verify_live_control_artifacts(runs_dir, feature, events)
         return current
 
 
@@ -1705,8 +2099,12 @@ def public_event(event: dict[str, Any]) -> dict[str, Any]:
 
 
 def accepted_build_gate(runs_dir: Path, feature: str, manifest: dict[str, str]) -> str:
-    _validate_roster(manifest)
+    feature = _feature(feature)
     with coordinator(runs_dir):
+        live_manifest = _load_live_manifest(runs_dir, feature)
+        _validate_roster(live_manifest)
+        if manifest != live_manifest:
+            raise ControllerError("caller manifest differs from the rooted live manifest")
         events = load_events(runs_dir, feature)
         if not events:
             raise ControllerError("FDP-2 BUILD gate requires a conversation")
@@ -1721,11 +2119,11 @@ def accepted_build_gate(runs_dir: Path, feature: str, manifest: dict[str, str]) 
             fleet_dialogue.ledger_path(runs_dir, feature),
             fleet_dialogue.store_path(runs_dir, feature),
             feature=feature,
-            instances=_manifest_instances(manifest),
+            instances=_manifest_instances(live_manifest),
         )
         _verify_live_control_artifacts(runs_dir, feature, events)
         _verify_message_bindings(events, messages)
-        head = _clean_writer_head(manifest)
+        head = _clean_writer_head(live_manifest)
         if head != snapshot["accepted_head_sha"]:
             raise ControllerError("maker branch drifted after FDP-2 acceptance")
         return head
@@ -1796,39 +2194,92 @@ def _control_artifact_expectations(
 def _verify_live_control_artifacts(
     runs_dir: Path, feature: str, events: list[dict[str, Any]]
 ) -> None:
+    feature = _feature(feature)
     artifacts = _control_artifact_expectations(events)
-    root = (runs_dir / "dialogue" / feature).resolve()
-    for logical, expected_sha in artifacts.items():
-        relative = PurePosixPath(logical).relative_to("dialogue")
-        path = root.joinpath(*relative.parts)
-        if _regular_file_hash(path)["sha256"] != expected_sha:
-            raise ControllerError(f"FDP-2 durable control artifact hash mismatch: {logical}")
+    try:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            for logical, expected_sha in artifacts.items():
+                archived_relative = PurePosixPath(logical).relative_to("dialogue")
+                relative = Path("dialogue") / feature / Path(*archived_relative.parts)
+                payload = rooted.read_regular(
+                    relative,
+                    directory_modes=_control_directory_modes(relative),
+                    file_mode=0o600,
+                    max_bytes=MAX_CONTROL_FILE_BYTES,
+                )
+                if hashlib.sha256(payload).hexdigest() != expected_sha:
+                    raise ControllerError(
+                        f"FDP-2 durable control artifact hash mismatch: {logical}"
+                    )
 
-    for event in events:
-        conversation_id = event["conversation_id"]
-        snapshot = event["snapshot"]
-        expected_task = root / "control" / conversation_id / "task-spec.json"
-        if Path(snapshot["task_spec_file"]).resolve() != expected_task:
-            raise ControllerError("FDP-2 task spec is outside its durable control directory")
-        expected = snapshot.get("expected")
-        if isinstance(expected, dict) and expected.get("type") == "run":
-            expected_prompt = (
-                root / "control" / conversation_id / "prompts" / Path(expected["prompt_file"]).name
-            )
-            if Path(expected["prompt_file"]).resolve() != expected_prompt:
-                raise ControllerError("FDP-2 prompt is outside its durable control directory")
+            for event in events:
+                conversation_id = event["conversation_id"]
+                snapshot = event["snapshot"]
+                task_relative = _task_spec_relative(feature, conversation_id)
+                _assert_recorded_rooted_path(
+                    rooted,
+                    snapshot["task_spec_file"],
+                    task_relative,
+                    "FDP-2 task spec",
+                )
+                expected = snapshot.get("expected")
+                if isinstance(expected, dict) and expected.get("type") == "run":
+                    prompt_relative = _prompt_relative(
+                        feature,
+                        conversation_id,
+                        Path(expected["prompt_file"]).name,
+                    )
+                    _assert_recorded_rooted_path(
+                        rooted,
+                        expected["prompt_file"],
+                        prompt_relative,
+                        "FDP-2 prompt",
+                    )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ControllerError(f"unsafe live FDP-2 control artifact: {exc}") from exc
 
 
 def _verify_archived_control_artifacts(
     archive: Path, events: list[dict[str, Any]]
 ) -> None:
-    for logical, expected_sha in _control_artifact_expectations(events).items():
-        if _regular_file_hash(archive / logical)["sha256"] != expected_sha:
-            raise ControllerError(f"archived FDP-2 control artifact hash mismatch: {logical}")
+    try:
+        with fleet_safe_paths.RootedFS(archive) as rooted:
+            for logical, expected_sha in _control_artifact_expectations(events).items():
+                relative = Path(*PurePosixPath(logical).parts)
+                directory_modes = (0o755, 0o755, 0o700)
+                if relative.parts[-2:-1] == ("prompts",):
+                    directory_modes = (*directory_modes, 0o700)
+                payload = rooted.read_regular(
+                    relative,
+                    directory_modes=directory_modes,
+                    file_mode=0o600,
+                    max_bytes=MAX_CONTROL_FILE_BYTES,
+                )
+                if hashlib.sha256(payload).hexdigest() != expected_sha:
+                    raise ControllerError(
+                        f"archived FDP-2 control artifact hash mismatch: {logical}"
+                    )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ControllerError(f"unsafe archived FDP-2 control artifact: {exc}") from exc
+
+
+def _manifest_identity_sha256(manifest: dict[str, str]) -> str:
+    mutable = {"workspace.handoff_state", "workspace.quiesced"}
+    projection = {
+        key: value
+        for key, value in manifest.items()
+        if key not in mutable
+        and not key.endswith((".final_sha", ".published_sha", ".publication_state"))
+    }
+    return digest(projection)
 
 
 def _control_summary(
-    events: list[dict[str, Any]], dialogue_summary: dict[str, int]
+    events: list[dict[str, Any]],
+    dialogue_summary: dict[str, int],
+    manifest: dict[str, str],
 ) -> dict[str, Any]:
     return {
         "events": len(events),
@@ -1838,7 +2289,34 @@ def _control_summary(
         "payloads": dialogue_summary["payloads"],
         "payload_bytes": dialogue_summary["payload_bytes"],
         "control_head_sha256": events[-1]["event_sha256"] if events else None,
+        "manifest_identity_sha256": _manifest_identity_sha256(manifest),
     }
+
+
+def _verify_live_locked(
+    runs_dir: Path,
+    feature: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    events = load_events(runs_dir, feature)
+    _expire_locked(runs_dir, feature, events, now=now)
+    manifest = _load_live_manifest(runs_dir, feature)
+    _validate_roster(manifest)
+    messages = fleet_dialogue.load_messages(runs_dir, feature)
+    dialogue_summary = fleet_dialogue.verify_storage(
+        fleet_dialogue.ledger_path(runs_dir, feature),
+        fleet_dialogue.store_path(runs_dir, feature),
+        feature=feature,
+        instances=_manifest_instances(manifest),
+    )
+    _verify_live_control_artifacts(runs_dir, feature, events)
+    _verify_message_bindings(events, messages)
+    summary = {
+        "feature": feature,
+        **_control_summary(events, dialogue_summary, manifest),
+    }
+    return summary, events, messages
 
 
 def verify_live(
@@ -1847,78 +2325,305 @@ def verify_live(
     feature: str,
     now: datetime | None = None,
 ) -> dict[str, Any]:
+    feature = _feature(feature)
     with coordinator(runs_dir):
-        events = load_events(runs_dir, feature)
-        _expire_locked(runs_dir, feature, events, now=now)
-        manifest = _load_live_manifest(runs_dir, feature)
-        _validate_roster(manifest)
-        messages = fleet_dialogue.load_messages(runs_dir, feature)
-        dialogue_summary = fleet_dialogue.verify_storage(
-            fleet_dialogue.ledger_path(runs_dir, feature),
-            fleet_dialogue.store_path(runs_dir, feature),
-            feature=feature,
-            instances=_manifest_instances(manifest),
-        )
-        _verify_live_control_artifacts(runs_dir, feature, events)
-        _verify_message_bindings(events, messages)
-        return {"feature": feature, **_control_summary(events, dialogue_summary)}
+        summary, _, _ = _verify_live_locked(runs_dir, feature, now=now)
+        return summary
 
 
-def _regular_file_hash(path: Path) -> dict[str, Any]:
-    if path.is_symlink() or not path.is_file():
-        raise ControllerError(f"verification receipt source is not a regular file: {path}")
-    payload = path.read_bytes()
+def _file_hash(payload: bytes) -> dict[str, Any]:
     return {"sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)}
 
 
-def _receipt_sources_live(runs_dir: Path, feature: str) -> dict[str, Path]:
-    sources = {
-        "dialogue-control.jsonl": ledger_path(runs_dir, feature),
-    }
-    dialogue_ledger = fleet_dialogue.ledger_path(runs_dir, feature)
-    if dialogue_ledger.exists():
-        sources["dialogue.jsonl"] = dialogue_ledger
-    else:
-        # A conversation abandoned before any publication legitimately has no
-        # dialogue ledger; payloads without a ledger never do.
-        payloads = runs_dir / "dialogue" / feature / "payloads"
-        if payloads.is_dir() and any(payloads.iterdir()):
-            raise ControllerError(
-                "FDP-2 dialogue ledger is missing while published payloads exist"
-            )
-    lifecycle = runs_dir / f"fleet-{feature}.ledger.jsonl"
-    if lifecycle.exists():
-        sources["ledger.jsonl"] = lifecycle
-    store = runs_dir / "dialogue" / feature
-    if not store.is_dir():
-        raise ControllerError("FDP-2 dialogue store is missing")
-    for path in sorted(store.rglob("*")):
-        if path.is_file() or path.is_symlink():
-            sources[f"dialogue/{path.relative_to(store).as_posix()}"] = path
-    return sources
+def _regular_file_hash(path: Path) -> dict[str, Any]:
+    """Compatibility leaf reader for FDP-3 callers with an already selected parent."""
+    path = Path(path)
+    if path != path.parent / path.name:
+        raise ControllerError("verification receipt path is unsafe")
+    return _file_hash(
+        _read_rooted_regular(
+            path.parent,
+            path.name,
+            directory_modes=(),
+            max_bytes=MAX_CONTROL_FILE_BYTES,
+            where="verification receipt source",
+        )
+    )
 
 
 def _write_atomic_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
+    """Compatibility writer for a caller-authorized receipt parent directory."""
+    path = Path(path)
+    if (
+        path != path.parent / path.name
+        or not SAFE_CONTROL_FILE.fullmatch(path.name)
+    ):
+        raise ControllerError("verification receipt path is unsafe")
     try:
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, indent=2, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        payload = fleet_json.canonical_bytes(value) + b"\n"
+    except fleet_json.FleetJSONError as exc:
+        raise ControllerError("verification receipt is not strict JSON") from exc
+    if len(payload) > MAX_RECEIPT_BYTES:
+        raise ControllerError(
+            f"verification receipt exceeds {MAX_RECEIPT_BYTES} bytes"
+        )
+    try:
+        with fleet_safe_paths.RootedFS(path.parent) as rooted:
+            rooted.replace_regular(
+                path.name,
+                payload,
+                directory_modes=(),
+                file_mode=0o600,
+            )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ControllerError(f"unsafe verification receipt path: {exc}") from exc
+
+
+def _validate_receipt_lifecycle(
+    records: list[dict[str, Any]],
+    feature: str,
+    events: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+) -> None:
+    bindings: dict[str, str] = {}
+    for event in events:
+        expected = event["snapshot"].get("expected")
+        if isinstance(expected, dict) and expected.get("type") == "message":
+            run_id = str(expected["source_run_id"])
+            instance = str(expected["source_instance"])
+            previous = bindings.setdefault(run_id, instance)
+            if previous != instance:
+                raise ControllerError("FDP-2 run identity binding is ambiguous")
+    for message in messages:
+        run_id = str(message["source_run_id"])
+        instance = str(message["source_instance"])
+        previous = bindings.setdefault(run_id, instance)
+        if previous != instance:
+            raise ControllerError("FDP-2 message run identity binding is ambiguous")
+    for run_id, instance in bindings.items():
+        run_records = [record for record in records if record.get("run_id") == run_id]
+        if not run_records:
+            raise ControllerError("FDP-2 receipt lacks lifecycle evidence for a bound run")
+        if any(
+            record.get("feature") != feature or record.get("instance") != instance
+            for record in run_records
+        ):
+            raise ControllerError("FDP-2 receipt lifecycle run identity changed")
+        terminals = [
+            record
+            for record in run_records
+            if record.get("status") in LIFECYCLE_TERMINALS
+        ]
+        if (
+            len(terminals) != 1
+            or terminals[0] is not run_records[-1]
+            or terminals[0].get("status") != "succeeded"
+        ):
+            raise ControllerError("FDP-2 receipt lacks one terminal successful bound run")
+
+
+def _receipt_file_hashes(
+    root: Path,
+    feature: str,
+    events: list[dict[str, Any]],
+    messages: list[dict[str, Any]],
+    *,
+    archived: bool,
+) -> dict[str, dict[str, Any]]:
+    feature = _feature(feature)
+    files: dict[str, dict[str, Any]] = {}
+    artifacts = _control_artifact_expectations(events)
+    digests = sorted({str(message["payload_sha256"]) for message in messages})
+    conversation_ids = sorted({event["conversation_id"] for event in events})
+    prompt_names: dict[str, set[str]] = {item: set() for item in conversation_ids}
+    for logical in artifacts:
+        parts = PurePosixPath(logical).parts
+        if len(parts) == 5 and parts[3] == "prompts":
+            prompt_names[parts[2]].add(parts[4])
+
+    try:
+        with fleet_safe_paths.RootedFS(root) as rooted:
+            control_leaf = (
+                "dialogue-control.jsonl"
+                if archived
+                else f"fleet-{feature}.dialogue-control.jsonl"
+            )
+            files["dialogue-control.jsonl"] = _file_hash(
+                rooted.read_regular(
+                    control_leaf,
+                    directory_modes=(),
+                    file_mode=0o600,
+                    max_bytes=MAX_CONTROL_LEDGER_BYTES,
+                )
+            )
+
+            dialogue_leaf = (
+                "dialogue.jsonl" if archived else f"fleet-{feature}.dialogue.jsonl"
+            )
+            dialogue_payload = rooted.read_regular_optional(
+                dialogue_leaf,
+                directory_modes=(),
+                file_mode=0o600,
+                max_bytes=MAX_CONTROL_LEDGER_BYTES,
+            )
+            if dialogue_payload is not None:
+                files["dialogue.jsonl"] = _file_hash(dialogue_payload)
+            elif messages:
+                raise ControllerError(
+                    "FDP-2 dialogue ledger is missing while messages exist"
+                )
+
+            lifecycle_leaf = "ledger.jsonl" if archived else f"fleet-{feature}.ledger.jsonl"
+            lifecycle_payload = rooted.read_regular_optional(
+                lifecycle_leaf,
+                directory_modes=(),
+                file_mode=0o600,
+                max_bytes=MAX_CONTROL_LEDGER_BYTES,
+            )
+            lifecycle_required = bool(messages) or any(
+                event["event_type"]
+                in {"run_ingested", "run_terminal", "run_timed_out", "run_after_deadline"}
+                for event in events
+            )
+            if lifecycle_payload is not None:
+                try:
+                    lifecycle_records = read_records(
+                        root / lifecycle_leaf, runs_dir=root
+                    )
+                except LedgerError as exc:
+                    raise ControllerError(
+                        f"cannot validate FDP-2 receipt lifecycle ledger: {exc}"
+                    ) from exc
+                if lifecycle_required and not lifecycle_records:
+                    raise ControllerError(
+                        "FDP-2 lifecycle ledger is empty while run evidence exists"
+                    )
+                _validate_receipt_lifecycle(
+                    lifecycle_records, feature, events, messages
+                )
+                files["ledger.jsonl"] = _file_hash(lifecycle_payload)
+            elif lifecycle_required:
+                raise ControllerError(
+                    "FDP-2 lifecycle ledger is missing while run evidence exists"
+                )
+
+            for logical in sorted(artifacts):
+                if archived:
+                    relative = Path(*PurePosixPath(logical).parts)
+                    modes: tuple[int, ...] = (0o755, 0o755, 0o700)
+                    if relative.parts[-2:-1] == ("prompts",):
+                        modes = (*modes, 0o700)
+                else:
+                    suffix = PurePosixPath(logical).relative_to("dialogue")
+                    relative = Path("dialogue") / feature / Path(*suffix.parts)
+                    modes = _control_directory_modes(relative)
+                files[logical] = _file_hash(
+                    rooted.read_regular(
+                        relative,
+                        directory_modes=modes,
+                        file_mode=0o600,
+                        max_bytes=MAX_CONTROL_FILE_BYTES,
+                    )
+                )
+
+            payload_root = (
+                Path("dialogue") / "payloads"
+                if archived
+                else Path("dialogue") / feature / "payloads"
+            )
+            payload_modes = (0o755, 0o700) if archived else (0o755, 0o755, 0o700)
+            for payload_sha in digests:
+                files[f"dialogue/payloads/{payload_sha}"] = _file_hash(
+                    rooted.read_regular(
+                        payload_root / payload_sha,
+                        directory_modes=payload_modes,
+                        file_mode=0o600,
+                        max_bytes=fleet_dialogue.MAX_PAYLOAD_BYTES,
+                    )
+                )
+
+            base = Path("dialogue") if archived else Path("dialogue") / feature
+            base_modes = (0o755,) if archived else (0o755, 0o755)
+            expected_base = {"control"}
+            if digests:
+                expected_base.add("payloads")
+            actual_base = set(rooted.list_directory(base, directory_modes=base_modes))
+            if not digests and "payloads" in actual_base:
+                raise ControllerError(
+                    "FDP-2 dialogue ledger is missing while published payloads exist"
+                )
+            if actual_base != expected_base:
+                raise ControllerError("FDP-2 dialogue store contains unexpected entries")
+
+            control = base / "control"
+            control_modes = (*base_modes, 0o755)
+            if set(rooted.list_directory(control, directory_modes=control_modes)) != set(
+                conversation_ids
+            ):
+                raise ControllerError("FDP-2 control store contains unexpected conversations")
+            for conversation_id in conversation_ids:
+                conversation = control / conversation_id
+                conversation_modes = (*control_modes, 0o700)
+                if set(
+                    rooted.list_directory(
+                        conversation, directory_modes=conversation_modes
+                    )
+                ) != {"task-spec.json", "prompts"}:
+                    raise ControllerError(
+                        "FDP-2 conversation store contains unexpected entries"
+                    )
+                prompts = conversation / "prompts"
+                if set(
+                    rooted.list_directory(
+                        prompts, directory_modes=(*conversation_modes, 0o700)
+                    )
+                ) != prompt_names[conversation_id]:
+                    raise ControllerError(
+                        "FDP-2 prompt store contains unexpected entries"
+                    )
+            if digests and set(
+                rooted.list_directory(payload_root, directory_modes=payload_modes)
+            ) != set(digests):
+                raise ControllerError("FDP-2 payload store contains unexpected entries")
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ControllerError(f"unsafe FDP-2 receipt source: {exc}") from exc
+    return files
+
+
+def _write_live_receipt(
+    runs_dir: Path,
+    feature: str,
+    receipt_path: Path,
+    receipt: dict[str, Any],
+) -> None:
+    relative = Path(f"fleet-{feature}.verification-receipt.json")
+    try:
+        payload = fleet_json.canonical_bytes(receipt) + b"\n"
+    except fleet_json.FleetJSONError as exc:
+        raise ControllerError("FDP-2 verification receipt is not strict JSON") from exc
+    if len(payload) > MAX_RECEIPT_BYTES:
+        raise ControllerError(
+            f"FDP-2 verification receipt exceeds {MAX_RECEIPT_BYTES} bytes"
+        )
+    try:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            _assert_recorded_rooted_path(
+                rooted,
+                str(receipt_path),
+                relative,
+                "FDP-2 verification receipt",
+            )
+            rooted.replace_regular(
+                relative,
+                payload,
+                directory_modes=(),
+                file_mode=0o600,
+            )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ControllerError(f"unsafe FDP-2 verification receipt path: {exc}") from exc
 
 
 def create_live_receipt(
@@ -1928,25 +2633,32 @@ def create_live_receipt(
     receipt_path: Path,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    summary = verify_live(runs_dir, feature=feature, now=now)
-    if summary["latest_status"] not in TERMINAL_STATES:
-        raise ControllerConflict("fleet-down refuses an active FDP-2 conversation")
-    files = {
-        logical: _regular_file_hash(path)
-        for logical, path in _receipt_sources_live(runs_dir, feature).items()
-    }
-    receipt = {
-        "schema_version": 1,
-        "feature": feature,
-        "created_at": timestamp(now or utc_now()),
-        "summary": summary,
-        "files": files,
-    }
-    _write_atomic_json(receipt_path, receipt)
-    return receipt
+    feature = _feature(feature)
+    with coordinator(runs_dir):
+        summary, events, messages = _verify_live_locked(
+            runs_dir, feature, now=now
+        )
+        if summary["latest_status"] not in TERMINAL_STATES:
+            raise ControllerConflict("fleet-down refuses an active FDP-2 conversation")
+        receipt = {
+            "schema_version": 1,
+            "feature": feature,
+            "created_at": timestamp(now or utc_now()),
+            "summary": summary,
+            "files": _receipt_file_hashes(
+                runs_dir,
+                feature,
+                events,
+                messages,
+                archived=False,
+            ),
+        }
+        _write_live_receipt(runs_dir, feature, receipt_path, receipt)
+        return receipt
 
 
 def verify_archive(archive: Path) -> dict[str, Any]:
+    archive = Path(archive)
     manifest = _manifest_values(archive / "manifest")
     feature = manifest.get("feature", "")
     if not fleet_dialogue.SAFE_FEATURE.fullmatch(feature):
@@ -1967,10 +2679,17 @@ def verify_archive(archive: Path) -> dict[str, Any]:
     )
     _verify_archived_control_artifacts(archive, events)
     _verify_message_bindings(events, messages)
-    receipt_path = archive / "verification-receipt.json"
     try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        receipt = fleet_json.loads(
+            _read_rooted_regular(
+                archive,
+                "verification-receipt.json",
+                directory_modes=(),
+                max_bytes=MAX_RECEIPT_BYTES,
+                where="archived FDP-2 verification receipt",
+            )
+        )
+    except fleet_json.FleetJSONError as exc:
         raise ControllerError("archived FDP-2 verification receipt is missing or invalid") from exc
     if not isinstance(receipt, dict) or set(receipt) != {
         "schema_version",
@@ -1987,13 +2706,33 @@ def verify_archive(archive: Path) -> dict[str, Any]:
     if not isinstance(files, dict) or not files:
         raise ControllerError("archived FDP-2 verification receipt has no file hashes")
     for logical, expected in files.items():
-        if not isinstance(logical, str) or logical.startswith("/") or ".." in PurePosixPath(logical).parts:
+        if (
+            not isinstance(logical, str)
+            or logical.startswith("/")
+            or ".." in PurePosixPath(logical).parts
+        ):
             raise ControllerError("archived FDP-2 receipt path is unsafe")
         if not isinstance(expected, dict) or set(expected) != {"sha256", "bytes"}:
             raise ControllerError("archived FDP-2 receipt hash entry is invalid")
-        if _regular_file_hash(archive / logical) != expected:
-            raise ControllerError(f"archived FDP-2 receipt hash mismatch: {logical}")
-    summary = {"feature": feature, **_control_summary(events, dialogue_summary)}
+        if (
+            not SHA256.fullmatch(str(expected.get("sha256", "")))
+            or type(expected.get("bytes")) is not int
+            or expected["bytes"] < 0
+        ):
+            raise ControllerError("archived FDP-2 receipt hash entry is invalid")
+    actual_files = _receipt_file_hashes(
+        archive,
+        feature,
+        events,
+        messages,
+        archived=True,
+    )
+    if files != actual_files:
+        raise ControllerError("archived FDP-2 receipt file set or hash changed")
+    summary = {
+        "feature": feature,
+        **_control_summary(events, dialogue_summary, manifest),
+    }
     if receipt.get("summary") != summary:
         raise ControllerError("archived FDP-2 verification summary changed")
     return summary

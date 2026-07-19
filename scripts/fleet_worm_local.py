@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 import fleet_audit_client  # noqa: E402
 import fleet_audit_control as audit  # noqa: E402
+import fleet_json  # noqa: E402
 import fleet_mission  # noqa: E402
 import fleet_mission_state as mission_state  # noqa: E402
 import workflow_config  # noqa: E402
@@ -182,11 +183,18 @@ def _load_state(state_dir: Path) -> dict[str, Any]:
         ):
             raise LocalWormError("local WORM state file is not a private regular file")
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            value = json.load(handle)
+        opened_info = os.fstat(fd)
+        if (opened_info.st_dev, opened_info.st_ino) != (
+            file_info.st_dev,
+            file_info.st_ino,
+        ):
+            os.close(fd)
+            raise LocalWormError("local WORM state file changed while opening")
+        with os.fdopen(fd, "rb") as handle:
+            value = fleet_json.loads(handle.read())
     except LocalWormError:
         raise
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, fleet_json.FleetJSONError) as exc:
         raise LocalWormError(f"local WORM state is missing or invalid: {path}") from exc
     required = {
         "schema_version", "marker", "state_dir", "container", "volume", "image",
@@ -420,7 +428,7 @@ def setup(state_dir: Path, port: int) -> dict[str, Any]:
         )
         _write(
             state_dir / STATE_FILE,
-            (json.dumps(state, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8"),
+            fleet_json.canonical_bytes(state) + b"\n",
             0o600,
         )
         _run(["docker", "pull", IMAGE], timeout=300)
@@ -485,12 +493,12 @@ def _configured_environment(state: dict[str, Any]) -> Iterator[None]:
 
 def _force_stop(lifecycle: fleet_audit_client.AuditLifecycle) -> None:
     try:
-        value = json.loads(lifecycle.lifecycle_path.read_text(encoding="utf-8"))
+        value = fleet_json.loads(lifecycle.lifecycle_path.read_bytes())
         if value.get("stopped_at") is not None:
             lifecycle.socket_path.unlink(missing_ok=True)
             return
         pid = int(value["pid"])
-    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+    except (OSError, ValueError, KeyError, fleet_json.FleetJSONError):
         return
     try:
         os.kill(pid, signal.SIGTERM)
@@ -554,6 +562,20 @@ def _prove_delete(
     }
 
 
+def _regulated_compile_negative() -> str:
+    """Prove the checked-in regulated workflow cannot authorize effects locally."""
+
+    try:
+        workflow_config.compile_path(ROOT / "workflows" / "regulated.yaml")
+    except workflow_config.WorkflowError as exc:
+        error = str(exc)
+    else:
+        raise LocalWormError("regulated workflow unexpectedly became effect-compilable")
+    if "not enforceable" not in error:
+        raise LocalWormError("regulated workflow failed for an unexpected policy reason")
+    return error
+
+
 def smoke(state_dir: Path) -> dict[str, Any]:
     state_dir = state_dir.expanduser().resolve()
     state = _load_state(state_dir)
@@ -603,7 +625,7 @@ def smoke(state_dir: Path) -> dict[str, Any]:
             events = fleet_audit_client.read_verified_public_chain(ledger_path)
             last = events[-1]
             anchor_path = lifecycle.anchor_receipts / f"{last['event_id']}.json"
-            anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+            anchor = fleet_json.loads(anchor_path.read_bytes())
             required_anchor = {
                 "worm": True,
                 "trust_scope": "local-development",
@@ -624,27 +646,7 @@ def smoke(state_dir: Path) -> dict[str, Any]:
                 str(anchor["event_sha256"]),
             )
 
-            regulated_compiled = workflow_config.compile_path(
-                ROOT / "workflows" / "regulated.yaml"
-            )
-            regulated_id, _ = fleet_mission.create_mission(
-                runs,
-                compiled=regulated_compiled,
-                feature=f"regulated-negative-{nonce}",
-                objective="reject local endpoint for external compliance",
-                target_repo=target.resolve(),
-                base_sha="0" * 40,
-                idempotency_key=f"create:regulated-negative:{nonce}",
-            )
-            regulated = fleet_audit_client.AuditLifecycle(runs, regulated_id)
-            try:
-                regulated.preflight()
-            except fleet_audit_client.AuditClientError as exc:
-                negative_error = str(exc)
-            else:
-                raise LocalWormError("regulated preflight accepted a loopback endpoint")
-            if "public global" not in negative_error or regulated.root.exists():
-                raise LocalWormError("regulated local-endpoint rejection was not fail-closed")
+            negative_error = _regulated_compile_negative()
 
             evidence = {
                 "schema_version": 1,
@@ -664,14 +666,14 @@ def smoke(state_dir: Path) -> dict[str, Any]:
                 "delete": delete,
                 "regulated_negative": {
                     "rejected": True,
-                    "audit_state_created": regulated.root.exists(),
+                    "audit_state_created": False,
                     "error_sha256": hashlib.sha256(negative_error.encode()).hexdigest(),
-                    "reason": "endpoint does not resolve only to public global addresses",
+                    "reason": "hard token policy is not effect-compilable",
                 },
             }
             _write(
                 state_dir / EVIDENCE_FILE,
-                (json.dumps(evidence, separators=(",", ":"), sort_keys=True) + "\n").encode(),
+                fleet_json.canonical_bytes(evidence) + b"\n",
                 0o600,
             )
             return evidence
@@ -685,9 +687,9 @@ def delete_test(state_dir: Path) -> dict[str, Any]:
     state_dir = state_dir.expanduser().resolve()
     state = _load_state(state_dir)
     try:
-        evidence = json.loads((state_dir / EVIDENCE_FILE).read_text(encoding="utf-8"))
+        evidence = fleet_json.loads((state_dir / EVIDENCE_FILE).read_bytes())
         anchor = evidence["anchor_receipt"]
-    except (OSError, KeyError, json.JSONDecodeError, TypeError) as exc:
+    except (OSError, KeyError, fleet_json.FleetJSONError, TypeError) as exc:
         raise LocalWormError("run smoke before delete-test") from exc
     return _prove_delete(
         _sink(state),

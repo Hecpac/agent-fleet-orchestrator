@@ -11,6 +11,9 @@ task_file="${7:-}"
 task_sha256="${8:-}"
 local_slot="${9:-}"
 role_slot="${10:-}"
+provider="${11:-}"
+model="${12:-}"
+variant="${13:-}"
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runs_dir="${FLEET_RUNS_DIR:-$repo_root/orchestration/runs}"
@@ -22,6 +25,7 @@ result_file="$result_dir/$run_id.txt"
 leases="$repo_root/scripts/fleet_leases.py"
 lease_args=(--lease "$instance_lock" --lease "$local_slot" --lease "$role_slot")
 [[ "$resource_class" == "local_heavy" ]] && lease_args+=(--lease "$heavy_lock")
+identity_args=(--provider "$provider" --model "$model" --variant "$variant")
 
 terminal_written=0
 cleanup() {
@@ -31,6 +35,7 @@ cleanup() {
       --run-id "$run_id" --feature "$feature" --instance "$instance_id" \
       --role "$role_type" --phase "$phase" --status abandoned \
       --task-sha256 "$task_sha256" --exit-code 4 \
+      "${identity_args[@]}" \
       --reason runner_exited_before_terminal >/dev/null 2>&1; then
       terminal_written=1
     else
@@ -46,6 +51,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [[ -z "$provider" || -z "$model" ]]; then
+  echo "Local run identity is missing for $run_id" >&2
+  exit 2
+fi
+
 if [[ ! -f "$task_file" ]] || ! python3 "$leases" validate "$runs_dir" \
   --run-id "$run_id" "${lease_args[@]}"; then
   echo "Task or dispatch lease missing for $run_id" >&2
@@ -59,13 +69,15 @@ mkdir -p "$result_dir"
 chmod 700 "$result_dir"
 python3 "$repo_root/scripts/fleet_ledger.py" "$ledger" \
   --run-id "$run_id" --feature "$feature" --instance "$instance_id" \
-  --role "$role_type" --phase "$phase" --status running --task-sha256 "$task_sha256"
+  --role "$role_type" --phase "$phase" --status running --task-sha256 "$task_sha256" \
+  "${identity_args[@]}"
 
 usage_file="$result_dir/$run_id.usage.json"
 export FLEET_USAGE_FILE="$usage_file"
 
 set +e
-"$repo_root/scripts/run-local-worker.sh" "$role_type" "$(<"$task_file")" | tee "$result_file"
+"$repo_root/scripts/run-local-worker.sh" "$role_type" "$(<"$task_file")" \
+  --provider "$provider" --model "$model" --variant "$variant" | tee "$result_file"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
 rc=${pipeline_status[0]}
@@ -84,9 +96,18 @@ if [[ $rc -eq 130 || $rc -eq 143 ]]; then
 fi
 token_args=()
 if [[ -f "$usage_file" ]]; then
-  tokens="$(python3 -c 'import json, sys
-data = json.load(open(sys.argv[1]))
-print(int(data.get("prompt_eval_count", 0)), int(data.get("eval_count", 0)))' "$usage_file" 2>/dev/null || true)"
+  tokens="$(PYTHONPATH="$repo_root/scripts" python3 -c 'import sys
+import fleet_json
+
+data = fleet_json.load(sys.argv[1])
+if type(data) is not dict or set(data) != {"prompt_eval_count", "eval_count"}:
+    raise SystemExit(2)
+values = (data["prompt_eval_count"], data["eval_count"])
+if values == (None, None):
+    raise SystemExit(0)
+if any(type(value) is not int or value < 0 for value in values):
+    raise SystemExit(2)
+print(*values)' "$usage_file" 2>/dev/null || true)"
   if [[ -n "$tokens" ]]; then
     read -r prompt_tokens completion_tokens <<< "$tokens"
     token_args=(--prompt-tokens "$prompt_tokens" --completion-tokens "$completion_tokens")
@@ -96,6 +117,7 @@ python3 "$repo_root/scripts/fleet_ledger.py" "$ledger" \
   --run-id "$run_id" --feature "$feature" --instance "$instance_id" \
   --role "$role_type" --phase "$phase" --status "$status" --task-sha256 "$task_sha256" \
   --exit-code "$ledger_rc" --result-file "$result_file" \
+  "${identity_args[@]}" \
   ${token_args[@]+"${token_args[@]}"}
 terminal_written=1
 exit "$rc"

@@ -13,6 +13,7 @@ import sys
 from typing import Any
 
 import fleet_mission_state as mission_state
+import fleet_safe_paths
 
 
 MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
@@ -34,6 +35,16 @@ def artifact_path(runs_dir: Path, mission_id: str, artifact_id: str) -> Path:
     if not mission_state.SHA256.fullmatch(artifact_id):
         raise ArtifactError("invalid artifact_id")
     return store_path(runs_dir, mission_id) / artifact_id
+
+
+def _artifact_relative(mission_id: str, artifact_id: str) -> str:
+    if not mission_state.SHA256.fullmatch(artifact_id):
+        raise ArtifactError("invalid artifact_id")
+    return f"missions/{mission_id}/artifacts/{artifact_id}"
+
+
+def _lock_relative(mission_id: str) -> str:
+    return f"missions/{mission_id}/.artifacts.lock"
 
 
 def read_regular(path: Path, *, max_bytes: int = MAX_ARTIFACT_BYTES) -> bytes:
@@ -68,13 +79,20 @@ def put_bytes(runs_dir: Path, mission_id: str, content: bytes) -> dict[str, Any]
     if len(content) > MAX_ARTIFACT_BYTES:
         raise ArtifactError(f"artifact exceeds {MAX_ARTIFACT_BYTES} bytes")
     digest = hashlib.sha256(content).hexdigest()
-    path = artifact_path(runs_dir, mission_id, digest)
-    with mission_state.exclusive_lock(lock_path(runs_dir, mission_id)):
-        if path.exists():
-            if path.is_symlink() or read_regular(path) != content:
-                raise ArtifactError("content-addressed artifact conflicts with stored bytes")
-        else:
-            mission_state.atomic_write(path, content)
+    try:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            with rooted.exclusive_lock(
+                _lock_relative(mission_id),
+                directory_modes=(0o700, 0o700),
+            ):
+                path = rooted.atomic_write(
+                    _artifact_relative(mission_id, digest),
+                    content,
+                    directory_modes=(0o700, 0o700, 0o700),
+                )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ArtifactError(f"unsafe artifact store: {exc}") from exc
     return {"artifact_id": digest, "bytes": len(content), "path": str(path)}
 
 
@@ -83,8 +101,18 @@ def put_file(runs_dir: Path, mission_id: str, source: Path) -> dict[str, Any]:
 
 
 def get_bytes(runs_dir: Path, mission_id: str, artifact_id: str) -> bytes:
-    path = artifact_path(runs_dir, mission_id, artifact_id)
-    content = read_regular(path)
+    mission_id = mission_state.normalize_uuid(mission_id, "mission_id")
+    relative = _artifact_relative(mission_id, artifact_id)
+    try:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            content = rooted.read_regular(
+                relative,
+                directory_modes=(0o700, 0o700, 0o700),
+                max_bytes=MAX_ARTIFACT_BYTES,
+            )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ArtifactError(f"unsafe artifact store: {exc}") from exc
     if hashlib.sha256(content).hexdigest() != artifact_id:
         raise ArtifactError("artifact bytes do not match artifact_id")
     return content
@@ -92,20 +120,45 @@ def get_bytes(runs_dir: Path, mission_id: str, artifact_id: str) -> bytes:
 
 def verify_store(runs_dir: Path, mission_id: str) -> dict[str, Any]:
     mission_id = mission_state.normalize_uuid(mission_id, "mission_id")
-    with mission_state.exclusive_lock(lock_path(runs_dir, mission_id)):
-        root = store_path(runs_dir, mission_id)
-        if not root.exists():
-            return {"mission_id": mission_id, "artifacts": 0, "bytes": 0, "valid": True}
-        if root.is_symlink() or not root.is_dir():
-            raise ArtifactError("artifact store is not a safe directory")
-        count = 0
-        total = 0
-        for path in sorted(root.iterdir()):
-            if path.name.startswith("."):
-                raise ArtifactError("artifact store contains unexpected hidden entry")
-            content = get_bytes(runs_dir, mission_id, path.name)
-            count += 1
-            total += len(content)
+    store_relative = f"missions/{mission_id}/artifacts"
+    try:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            with rooted.exclusive_lock(
+                _lock_relative(mission_id),
+                directory_modes=(0o700, 0o700),
+            ):
+                try:
+                    names = rooted.list_directory(
+                        store_relative,
+                        directory_modes=(0o700, 0o700, 0o700),
+                    )
+                except fleet_safe_paths.SafePathError as exc:
+                    if not str(exc).startswith("rooted directory is missing:"):
+                        raise
+                    names = []
+                count = 0
+                total = 0
+                for name in names:
+                    if name.startswith("."):
+                        raise ArtifactError(
+                            "artifact store contains unexpected hidden entry"
+                        )
+                    if not mission_state.SHA256.fullmatch(name):
+                        raise ArtifactError(
+                            "artifact store contains an invalid artifact name"
+                        )
+                    content = rooted.read_regular(
+                        _artifact_relative(mission_id, name),
+                        directory_modes=(0o700, 0o700, 0o700),
+                        max_bytes=MAX_ARTIFACT_BYTES,
+                    )
+                    if hashlib.sha256(content).hexdigest() != name:
+                        raise ArtifactError("artifact bytes do not match artifact_id")
+                    count += 1
+                    total += len(content)
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise ArtifactError(f"unsafe artifact store: {exc}") from exc
     return {"mission_id": mission_id, "artifacts": count, "bytes": total, "valid": True}
 
 

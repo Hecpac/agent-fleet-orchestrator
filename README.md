@@ -5,6 +5,34 @@ Hybrid orchestration scaffold for frontier and local open-weight models.
 The project is designed around one rule: frontier models coordinate and decide;
 local models explore, summarize, review, and verify in parallel.
 
+## Operational scope
+
+The hardened target is **S0: one trusted Mac, one trusted Unix UID, one local
+`FLEET_RUNS_DIR`**. It is the recommended path for personal experimentation on
+that machine, not a multi-tenant or distributed security boundary. It does not
+claim containment against arbitrary hostile code already running as the same
+UID, a compromised CONTROL/provider/CMUX process, multi-host coordination, or
+external regulatory retention. External WORM remains a separate dependency,
+and the installed providers do not expose a trustworthy hard total-token
+ceiling.
+
+| Before | Now | Practical benefit |
+|---|---|---|
+| Live router could be consulted again after compilation | The complete canonical router snapshot is embedded and digest-bound in compiled v2 policy | A later router edit cannot silently change an admitted Mission |
+| Provider fallback and launches could happen without one Mission-wide reservation record | Fallback is explicit opt-in; each Mission launch advances `reserved → committed → authorized → started → finalized` with exact effect, task, owner, and terminal bindings | Fewer surprise providers, duplicate effects, writer conflicts, and crossed-run finalization |
+| Writer work shared target Git internals | Writer uses an isolated clone and CONTROL publishes only after quiescence by durable intent + compare-and-swap | Model-visible work cannot advance target refs before controlled teardown |
+| Local token accounting was a standalone dispatch check | Mission policy gates every admitted launch with provider-aware usage semantics; standalone fleets keep the legacy local cap | Unknown usage fails closed when a positive soft limit matters, without pretending unsupported hard ceilings exist |
+| Main and assurance work could share one runtime generation | The CONTROL lane is closed before the ASSURED lane opens; the main runtime is preserved by an idempotent handoff | Assurance cannot silently inherit a still-live main Lead or its service state |
+| Ledger readers and handoff progress depended on `flock` fairness | Readers consume complete descriptor-pinned immutable snapshots; handoff publishes a durable mutation marker, cuts off late writers, drains admitted writers with a deadline, and then owns the barrier | Status polling cannot starve Mission mutations, and no late mutation can cross handoff silently |
+
+Two S0 debts remain explicit. The structured terminal
+`source_event_sha256` is asserted and recorded by trusted CONTROL; it is not a
+receipt from an independently controlled verifier. Historical ledgers remain
+readable, but there is no authority-preserving in-place migration for a legacy
+Mission with active admissions; preserve it as evidence and start a current
+Mission instead of upgrading it live. Hard total-token enforcement, multi-host
+coordination, and external WORM custody are also outside the implemented scope.
+
 ## Target Machine
 
 - MacBook Pro Apple M5
@@ -71,6 +99,24 @@ python3 orchestration/agents/local_worker.py \
   --prompt "Classify this task and return STATUS/SUMMARY/NEXT_ACTION."
 ```
 
+The cheapest end-to-end learning path uses only the installed local Ollama
+worker and deliberately omits a frontier Lead:
+
+```bash
+FLEET_NO_LEAD=1 ./scripts/fleet-up.sh local-safe triage=triage
+just advance local-safe RECON local-safe-scope
+dispatch="$(./scripts/fleet-dispatch.sh local-safe triage \
+  "Summarize the evidence supplied in this prompt." --json)"
+run_id="$(jq -er '.run_id' <<<"$dispatch")"
+./scripts/fleet-wait.sh local-safe triage \
+  --run "triage=$run_id" --timeout 600 --json
+./scripts/fleet-down.sh local-safe
+```
+
+This path incurs no frontier API inference. Local workers are prompt-only and
+have no authenticated MCP client, filesystem, shell, Git, or direct peer
+channel; put all required evidence in the prompt.
+
 ## cmux Fleet Layer
 
 Terminal orchestration is wired through the cmux CLI. The canonical roster,
@@ -107,15 +153,28 @@ requires a mission identity. Select either strict profile explicitly:
 just mission <feature> "<objective>" --execution-profile sandboxed --target-repo <repo>
 ```
 
-Fresh manifests use `manifest_contract_version=2` and
-`tracking_protocol=control-v1`. Legacy manifests are read as `native` plus
-`legacy-cmux`; migration never invents stronger provenance for an already-live
-fleet:
+Fresh manifests use `manifest_contract_version=3` and
+`tracking_protocol=control-v1`. Contracts v1 and v2 remain readable only for
+standalone fleets. A mission-bound v1/v2 manifest must be cut over by restarting
+the fleet; it cannot be migrated in place because doing so would invent the
+compiled launch binding after processes already exist. Standalone legacy
+manifests are read as `native` plus `legacy-cmux`, and migration never invents
+stronger provenance for an already-live fleet:
 
 ```bash
 just manifest-inspect orchestration/runs/fleet-<feature>.manifest
 just manifest-migrate orchestration/runs/fleet-<feature>.manifest --in-place
 ```
+
+Canonical Mission boot binds the live router plan to the compiled workflow with
+separate main and assurance `launch_digest` values. Each digest covers the
+complete private member plans, resolved provider adapters, capability/tool
+boundaries, readiness requirements, and plan limits. Compiled contract v2 also
+embeds the complete canonical `router_snapshot`, binds it with `router_digest`,
+and resolves every later main/assurance launch from that snapshot. It is an
+integrity record, not a secret container: do not put credentials in the router.
+Effect admission recomputes the selected plan and rejects a changed or resealed
+snapshot before any CMUX effect. Contract v1 remains read-only historical data.
 
 ### Dan+ autonomous mode (recommended product path)
 
@@ -138,7 +197,7 @@ still bound to an exact lead `run_id`, provider/model evidence, and durable
 
 `fleet-run.py` leaves the workspace visible by default. Add `--teardown` only
 when you want automatic cleanup. It refuses a dirty target checkout unless
-`--allow-dirty-baseline` explicitly acknowledges that writer worktrees start
+`--allow-dirty-baseline` explicitly acknowledges that writer clones start
 from committed `HEAD`. Preview the exact lead mission without CMUX effects:
 
 ```bash
@@ -149,9 +208,9 @@ Execution modes are intentionally separate:
 
 | Mode | Entry point | Control owner | Use for |
 |---|---|---|---|
-| `autonomous` | `just dan` | Lead LLM dynamically decides/delegates | open-ended coding, research, diagnosis |
-| `guided` | `just fleet[-preset]` | Operator/lead advances explicit phases | manual experiments and narrow workflows |
-| `assured` | preset `fleet_dialogue` | FDP-2/FDP-3 + scoped Mission approval provenance | production, money, secrets, destructive or high-risk work |
+| `autonomous` | `just dan` or preset `research` | Lead LLM dynamically decides/delegates | open-ended coding, research, diagnosis |
+| `guided` | custom fleet or a preset without explicit mode | Operator/lead advances explicit phases | manual experiments and narrow workflows |
+| `assured` | preset `fleet_dialogue` | FDP-2/FDP-3 + scoped Mission approval provenance | stronger local evidence for high-risk work; it does not create an external production boundary |
 
 The design rationale and source research live in `docs/dan-plus.md`.
 
@@ -165,9 +224,14 @@ just fleet <feature> build=codex verify=reviewer  # explicit instances
 just fleet-down <feature>            # tear down
 ```
 
-The default lead provider is Codex. Claude is an enabled fallback candidate:
-`fallback_policy: first_available` walks `lead.candidates` in order, so Claude
-leads only when Codex is unavailable or when you pass `--lead-provider claude`.
+The default lead provider is Codex. Although the router records Claude as a
+candidate, automatic fallback is disabled unless the operator explicitly adds
+`--allow-fallback`; a failed Codex preflight otherwise fails closed. Select
+Claude deliberately with `--lead-provider claude`. Claude, GLM, and MiniMax
+dispatches may incur provider charges; the `dan` roster makes them available
+but does not make them free. A 2026-07-16 Claude MCP canary reported USD
+0.56816 despite `--max-budget-usd 0.05`, so paid inference must remain an
+explicitly authorized lane rather than an automatic smoke.
 Frontier roles run interactive agent CLIs tracked by cmux's agent panel:
 `codex`, `minimax` (opencode + MiniMax-M3, `MINIMAX_API_KEY`), and `glm`
 (opencode + GLM-5.2, `ZHIPU_API_KEY`).
@@ -193,11 +257,15 @@ instance/heavy/slot leases so local concurrency limits hold at runtime;
 interactive agents launch through an environment allowlist
 (`run-interactive-agent.sh`), with per-authority Codex sandbox levels
 (writer → `workspace-write`, CONTROL → `danger-full-access`). Mission-bound
-read-only Codex specialists use an ephemeral Codex home and a named permission
-profile that extends `:read-only` while allowing only the mission's exact Fleet
-Control Unix socket. Existing Codex authentication is copied into it; hook
-commands come from a fixed controller-owned CMUX bridge, never arbitrary user
-hook text. Optional strict profiles narrow process-owned runtime paths; a
+read-only interactive specialists use isolated provider homes and a
+controller-owned `fleet_control` MCP proxy connected only to their exact
+per-instance Unix endpoint. Prompts receive capability IDs, never token/socket/
+CAS paths, and the server requires the exact dispatched lifecycle plus live
+frontier lease. Codex reuses the one canonical provider auth file through a
+descriptor-verified symlink in an ephemeral home; it never copies a single-use
+refresh token, and exact plus `/**` sandbox denies cover lexical and canonical
+auth/run paths. Hook commands come from fixed controller-owned CMUX bridges, never
+arbitrary user hook text. Optional strict profiles narrow process-owned runtime paths; a
 general OS/network sandbox remains provider- and
 platform-specific. Direct manual `cmux send` may change a visible pane, but it
 cannot create or bind a `control-v1` tracked result: CONTROL must durably
@@ -206,30 +274,115 @@ first successful completion as a candidate; it is not an acceptance gate.
 
 Write isolation: pass `--target-repo <path>` (or set `FLEET_TARGET_REPO`) to
 `fleet-up` and every write-authority instance gets a dedicated
-`fleet/<feature>/<instance>` branch and worktree, based on the target repo's
-current `HEAD`. Writer worktrees live under `/tmp/fleet_workspaces-<uid>` by default
+`fleet/<feature>/<instance>` branch inside an isolated clone based on the target
+repo's current `HEAD`. Writer clones live under `/tmp/fleet_workspaces-<uid>` by default
 (override with `FLEET_WORKTREES_DIR`) so agent-visible paths do not disclose the
-controller's home directory. Existing branch names fail closed. `fleet-down` refuses
-uncommitted changes, records the final SHA, preserves branches with commits,
-and removes branches that never advanced beyond their base SHA.
+controller's home directory. The clone has its own Git directory/object store,
+no remotes or alternates, and cannot mutate target refs. Existing target branch
+names fail closed. `fleet-down` first closes CMUX and retires the clone from the
+model-visible path, then records a durable publication intent, imports the
+clean descendant commit, creates the target ref by compare-and-swap, and
+archives only after the published SHA and quiescence marker are durable. A
+crash resumes that exact intent; drift preserves the evidence and fails closed.
 
-Execution economics: local worker runs record prompt/completion token counts
-in the per-feature ledger; `limits.local_token_budget_per_feature` in the
-router makes `fleet-dispatch` warn at 70% observed spend and refuse new
-dispatches at 100%. This is a soft dispatch-time cap, not a reservation, so
-already-concurrent runs may overshoot it. `fleet-wait` fires a `cmux notify`
-escalation (title `ESCALATION: ...`) naming the stuck instances when its
-deadline expires.
+Execution economics have two deliberately different paths. A Mission freezes
+its deadline, delegation credits, maximum active delegations, writer ownership,
+and workflow token policy. Every current Lead, specialist, batch member, and
+assured launch then follows one durable sequence:
+
+```text
+reserved → committed → authorized → started → finalized
+```
+
+That is the external-effect path. A `reserved` or `committed` request abandoned
+before launch is explicitly aborted with all bindings intact (spent credits are
+not refunded); an `authorized` failure before `started` may finalize with exact
+terminal evidence instead of inventing a launch.
+
+`effect_sha256` binds the complete effect contract (prompt/objective, inputs,
+output contract, grants, provider identity, runner and, when applicable,
+wrapper/transport), while
+`task_sha256` binds the exact logical task submitted to the tracked runtime.
+Authorization is the deadline-linearization point immediately before the
+external effect; a launch authorized before the deadline can record `started`
+after it without becoming an orphan. Finalization requires structured terminal
+evidence with `schema_version=1`, the exact `source_event_sha256`, `run_id`,
+`task_sha256`, and terminal `status`, then binds that evidence again to the
+admission, recipient, and writer claim.
+Reservations are exact, idempotent, parent-bound, and do not refund spent
+delegation credits. Positive soft token limits refuse a new launch when
+trustworthy usage is unknown; soft zero disables token admission. Current
+Codex, Claude, and OpenCode adapters do not provide trustworthy total-token
+enforcement, while Ollama can cap output only; none supports `hard_total`.
+Therefore no current workflow may honestly claim a hard total-token ceiling.
+Each usage receipt is a closed schema-v1 envelope with
+`state=observed|not_incurred|unknown`: only `not_incurred` means exact zero,
+`unknown` carries no invented counts, and any missing/unknown source keeps the
+aggregate `total_tokens=null`.
+
+Standalone `just dan`, `just fleet`, and `just race` remain compatibility paths:
+their local Ollama dispatches feed terminal receipts into
+`limits.local_token_budget_per_feature`, which warns at 70% and refuses at
+100%. That legacy per-feature check is not the Mission-wide admission ledger
+and is not a reservation, so concurrent local runs can overshoot it.
+`fleet-wait` fires a `cmux notify` escalation (title `ESCALATION: ...`) naming
+stuck instances when its deadline expires.
 
 Approval gate: a standalone `guided`/`assured` fleet records the legacy
 `--approved-by <operator-attestation>` label when leaving BUILD. That label is
 not proof of human presence. A Mission-bound `assured` fleet rejects the label
-and requires `--approval-event-sha256` for the exact active
-`assurance_approved` event; the gate revalidates its Mission, request, workflow,
-target scope, risk, and expiry before recording the reference. `autonomous`
+and requires `--approval-event-sha256` for the exact current approval event
+(`assurance_approved` or `assurance_approval_renewed`); the gate revalidates its
+Mission, request, workflow, target scope, risk, and expiry before recording the
+reference. The Fleet Control `request_assurance` tool only raises/records the
+risk request; it cannot
+switch authority lanes while its caller still owns an active admission. The
+Mission driver first waits for and finalizes every exact CONTROL admission,
+then records `assurance_requested`. An expired approval may be renewed after
+expiry either before assurance boot or from a quiescent `assured_running` lane
+with no run claims, active admission, or active writer:
+
+```bash
+python3 scripts/fleet-approve.py --runs-dir <runs-dir> \
+  --mission-id <mission-id> --scope <target-repo> --renew \
+  --idempotency-key <stable-key-for-this-renewal>
+```
+
+Renewal cannot widen the request, workflow, scope, or risk, and it cannot be
+used while the prior approval is still live. In `assured_running` it replaces
+the current approval without replaying assurance boot/start. `autonomous`
 fleets do not need phase advances: all manifest instances are dispatchable, and
 the lead escalates only risk-significant decisions defined by the Dan+ mission
 contract.
+
+Mission admissions are authority-laned. `CONTROL` may reserve and commit only
+while the main lane is open and may authorize launches only while the Mission
+is `running`. `ASSURED` receives a fresh root lane only after approval and the
+main lane has no active admissions; CONTROL cannot mint assured admissions and
+ASSURED cannot reuse historical CONTROL parents. `mission-run` performs the
+internal, crash-recoverable transition with
+`fleet-down.sh <feature> --handoff-assurance`. The command is idempotent, stops
+only the main Fleet Control generation, preserves the exact main manifest,
+state, ledgers, and receipts under
+`missions/<mission_id>/assurance-handoff/main-runtime/`, and never creates the
+ordinary final Mission archive. Service generations remain separate at
+`missions/<mission_id>/control/` and
+`missions/<mission_id>/control-assured/`. Operators normally run
+`mission-resume`; the handoff flag is an internal recovery primitive, not normal
+teardown. Handoff publishes `.mutation.quiescing` while holding its gate,
+rejects late mutations immediately as not-applied/not-queued, drains only the
+already-admitted writers within a bounded deadline, and retains the barrier
+through its exact receipt. Its READY and COMMIT channels are also bounded and
+terminate/reap only their exact child on timeout; boot-lock readiness is bounded
+as well, and an exited helper fails immediately rather than consuming the rest
+of its deadline. `mission-run` supervises the whole handoff with the sum of those
+deadlines plus teardown grace, in a dedicated process group that is terminated
+as a unit only if that outer bound is exceeded. The active approval is rechecked
+for exact workflow/scope/risk and
+expiry at assurance boot/start and at every ASSURED reservation, commit, and
+launch authorization. Authorization seals its exact approval event hash. Work
+already authorized may still record its exact start/terminal evidence after
+expiry, but no new ASSURED effect can cross the expired authority.
 
 `scripts/fleet-up.sh` resolves and validates the complete plan before touching
 cmux, creates workspace `fleet-<feature>`, verifies the rendered pane order,
@@ -268,10 +421,12 @@ Catch-up requires the recorded baseline and continuous boot-scoped audit
 sequence; truncated or corrupt audit evidence is rejected. Event ACKs are
 schema-validated before readiness is published.
 Local and frontier dispatch leases are owner-checked; frontier exclusivity is
-enforced by surface UUID across manifest aliases. Every Fleet Codex process
-copies controller authentication into an ephemeral home with one
-controller-owned cmux hook bridge, so legacy and current hook trees cannot
-double-submit a turn. Its automation-only hook trust bypass applies only to
+enforced by surface UUID across manifest aliases. Every mission-bound Fleet
+Codex specialist uses one descriptor-verified symlink to the canonical
+controller authentication file inside its ephemeral home; the OAuth refresh
+token is never copied or forked. One controller-owned CMUX hook bridge prevents
+legacy and current hook trees from double-submitting a turn. Its
+automation-only hook trust bypass applies only to
 the three hard-coded repo-owned overrides; user hook command text is never
 copied into the process. Mission-bound read-only specialists additionally use the
 filtered permission profile described above. The router pins `gpt-5.6-sol`
@@ -287,6 +442,13 @@ with `scripts/fleet-abandon.sh <feature> <instance> <run_id> [reason]` only
 after confirming the agent is quiescent. Unconfirmed partial sends and race
 interrupts retain the lease under the same rule.
 
+Cancellation also fails closed. Interactive frontier cancellation uses the
+exact tracked run and preserves uncertainty when quiescence is not proven.
+Local workers currently expose no exact run-scoped process handle, so Fleet
+Control refuses local cancellation and never sends `ctrl-c` to a reusable CMUX
+surface that may already belong to a newer run. Wait for/reconcile the exact
+`run_id`; do not interpret a rejected cancel as a stopped worker.
+
 `fleet-send` and `fleet-dispatch` accept `--json` for callers such as
 `fleet-race`; machine ownership never depends on parsing human-readable output.
 
@@ -300,6 +462,10 @@ CONTROL preassigns and token-binds a specialist `run_id` before transferring its
 prompt, so a fast tool call cannot race delegation registration. OpenCode result
 extraction tolerates only a bounded database-visibility delay and otherwise
 fails closed.
+Frontier specialists never message one another directly: CONTROL mediates
+their authenticated MCP calls, CAS artifact grants, and durable dialogue
+envelopes. Local Ollama workers have no MCP client; they receive only bounded
+prompt evidence and cannot retrieve CAS artifacts by themselves.
 The service is reconciled across Mission runner restarts and stopped before
 teardown. Health and lifecycle commands are:
 
@@ -312,11 +478,15 @@ just mission-control-stop <mission_id>
 After completion, `just mission-report <mission_id>`,
 `just mission-trace <mission_id>`, and
 `just mission-archive-verify <archive>` read durable evidence only. Reports and
-exporters never decide completion. Assured workflows require
-signed audit; a workflow declaring WORM fails closed unless a real S3 Object
-Lock COMPLIANCE sink supplies versioned, verifiable anchor receipts.
-Use `--workflow regulated --execution-profile regulated` for that path; its
-backend configuration is preflighted before any CMUX fleet is created.
+exporters never decide completion. Assured workflows require signed audit; a
+workflow declaring WORM fails closed unless a real S3 Object Lock COMPLIANCE
+sink supplies versioned, verifiable anchor receipts. `regulated.yaml` can be
+schema-validated for inspection, but effect compilation/execution is
+intentionally unavailable today: its hard token policy requires `hard_total`,
+which none of the current provider adapters implements, and an honest regulated
+run also requires independently controlled external WORM. Supplying
+`--workflow regulated --execution-profile regulated` therefore fails before
+CMUX effects until both dependencies exist.
 The additive `local-worm` workflow proves the same Object Lock mechanics on an
 HTTPS loopback backend but records `trust_scope=local-development`; it can never
 satisfy `regulated` or any `external-compliance` requirement. See

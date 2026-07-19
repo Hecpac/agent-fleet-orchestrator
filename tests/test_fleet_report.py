@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -10,16 +11,17 @@ import urllib.error
 import uuid
 from unittest import mock
 
+from tests.mission_control_test_support import legacy_v1_compiled, write_compiled
+
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import fleet_export_trace
-import fleet_mission
-import fleet_mission_state as state
-import fleet_report
-import fleet_trace
-import workflow_config
+import fleet_export_trace  # noqa: E402
+import fleet_mission  # noqa: E402
+import fleet_mission_state as state  # noqa: E402
+import fleet_report  # noqa: E402
+import workflow_config  # noqa: E402
 
 
 def synthetic_evidence() -> tuple[list[dict], dict, list[dict]]:
@@ -100,9 +102,10 @@ def synthetic_evidence() -> tuple[list[dict], dict, list[dict]]:
         }),
         event(11, "result_relayed", "2026-07-14T00:00:24Z", {
             "artifact_id": "2" * 64, "recipient_run_id": verify_run,
-            "recipient_instance": "verifier", "secret": "must-not-export",
+            "recipient_instance": "verifier",
         }),
     ]
+    events[-1]["secret"] = "must-not-export"
 
     def run_event(
         run_id: str, instance: str, provider: str, model: str,
@@ -129,6 +132,56 @@ def synthetic_evidence() -> tuple[list[dict], dict, list[dict]]:
 
 
 class FleetReportTests(unittest.TestCase):
+    def test_build_report_accepts_only_bound_historical_v1_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tmp = Path(temporary)
+            runs = tmp / "runs"
+            runs.mkdir(mode=0o700)
+            target = tmp / "target"
+            target.mkdir()
+            mission_id = str(uuid.uuid4())
+            compiled = legacy_v1_compiled(
+                workflow_config.compile_path(
+                    ROOT / "workflows" / "implementation.yaml"
+                )
+            )
+            state.append_event(
+                runs,
+                mission_id,
+                kind="mission_created",
+                actor="CONTROL",
+                idempotency_key="historical:create",
+                payload={
+                    "feature": "historical-report",
+                    "objective_sha256": "a" * 64,
+                    "target_repo": str(target.resolve()),
+                    "base_sha": "b" * 40,
+                    "workflow_digest": compiled["workflow_digest"],
+                    "initial_risk": "low",
+                },
+            )
+            state.append_event(
+                runs,
+                mission_id,
+                kind="workflow_compiled",
+                actor="CONTROL",
+                idempotency_key="historical:compiled",
+                payload={"compiled_digest": compiled["compiled_digest"]},
+            )
+            compiled_path = runs / "missions" / mission_id / "compiled-workflow.json"
+            write_compiled(compiled_path, compiled)
+
+            report = fleet_report.build_report(runs, mission_id)
+            self.assertEqual(report["mission_id"], mission_id)
+            self.assertEqual(report["status"], "compiled")
+
+            foreign = legacy_v1_compiled(
+                workflow_config.compile_path(ROOT / "workflows" / "research.yaml")
+            )
+            write_compiled(compiled_path, foreign)
+            with self.assertRaisesRegex(fleet_report.ReportError, "not bound"):
+                fleet_report.build_report(runs, mission_id)
+
     def test_orchestration_eval_cases_match_expected_metrics(self) -> None:
         fixtures = json.loads(
             (ROOT / "evals" / "fixtures" / "orchestration-cases.json").read_text()
@@ -272,6 +325,97 @@ class FleetReportTests(unittest.TestCase):
             legacy.write_text('{"run_id":"partial"}', encoding="utf-8")
             with self.assertRaisesRegex(fleet_report.ReportError, "partial"):
                 fleet_report.build_report(runs, mission_id)
+
+    def test_durable_jsonl_is_strict_deterministic_and_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            tmp = Path(temporary)
+            runs = tmp / "runs"
+            target = tmp / "target"
+            target.mkdir()
+            compiled = workflow_config.compile_path(
+                ROOT / "workflows" / "implementation.yaml"
+            )
+            mission_id, _ = fleet_mission.create_mission(
+                runs,
+                compiled=compiled,
+                feature="report-strict",
+                objective="private",
+                target_repo=target.resolve(),
+                base_sha="a" * 40,
+                idempotency_key="report:strict",
+            )
+            legacy = runs / "fleet-report-strict.ledger.jsonl"
+            cases = {
+                "duplicate": b'{"run_id":"first","run_id":"second"}\n',
+                "nonfinite": b'{"run_id":"nan","tokens":NaN}\n',
+                "overflow": b'{"run_id":"overflow","tokens":1e999}\n',
+                "bom": b'\xef\xbb\xbf{"run_id":"bom"}\n',
+                "invalid-utf8": b'{"run_id":"\xff"}\n',
+                "surrogate": b'{"run_id":"\\ud800"}\n',
+                "crlf": b'{"run_id":"crlf"}\r\n',
+                "partial": b'{"run_id":"partial"}',
+                "non-object": b'[]\n',
+            }
+            command = [
+                sys.executable,
+                str(ROOT / "scripts" / "fleet_report.py"),
+                "--runs-dir",
+                str(runs),
+                "--mission-id",
+                mission_id,
+                "--json",
+            ]
+            environment = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+            for name, raw in cases.items():
+                with self.subTest(name=name):
+                    legacy.write_bytes(raw)
+                    before_files = {
+                        path.relative_to(runs): path.read_bytes()
+                        for path in runs.rglob("*")
+                        if path.is_file()
+                    }
+                    before_paths = {
+                        path.relative_to(runs) for path in runs.rglob("*")
+                    }
+
+                    with self.assertRaises(fleet_report.ReportError):
+                        fleet_report.build_report(runs, mission_id)
+                    first = subprocess.run(
+                        command,
+                        cwd=ROOT,
+                        env=environment,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+                    second = subprocess.run(
+                        command,
+                        cwd=ROOT,
+                        env=environment,
+                        text=True,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        check=False,
+                    )
+
+                    self.assertEqual(first.returncode, 2)
+                    self.assertEqual(first.stdout, "")
+                    self.assertEqual(first.stderr, second.stderr)
+                    self.assertTrue(first.stderr.startswith("fleet-report: "))
+                    self.assertNotIn("Traceback", first.stderr)
+                    self.assertEqual(
+                        {path.relative_to(runs) for path in runs.rglob("*")},
+                        before_paths,
+                    )
+                    self.assertEqual(
+                        {
+                            path.relative_to(runs): path.read_bytes()
+                            for path in runs.rglob("*")
+                            if path.is_file()
+                        },
+                        before_files,
+                    )
 
     def test_report_uses_verified_unified_archive_ledger_after_teardown(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

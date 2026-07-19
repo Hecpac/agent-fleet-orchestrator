@@ -7,7 +7,7 @@ awesome-agent-orchestrators (60+ orquestadores), betterstack.com (guía cmux).
 ## El marco de 3 niveles (Addy Osmani)
 
 Por qué multi-agente multiplica: paralelismo (3× throughput), especialización
-(contexto enfocado por agente), aislamiento (worktrees), aprendizaje compuesto
+(contexto enfocado por agente), aislamiento (clones Git separados), aprendizaje compuesto
 (reglas acumuladas entre sesiones — nuestra skill de cmux).
 
 - **Tier 1** — subagentes / Agent Teams dentro de una sesión.
@@ -49,5 +49,7 @@ Uso maduro en 2026 = los tres a la vez.
 - **Escalación a humano como infraestructura** (patrón 5dive): implementado en
   este repo — ver `just status` (colas de decisión) y la regla DECISION en la
   skill de cmux.
-- **Sandboxing pendiente**: los agentes que toquen Claw (dinero real) deberían
-  correr con menos permisos que los de laptop.
+- **Sandboxing tiene un límite explícito**: los perfiles y clones reducen la
+  superficie visible al modelo dentro de una Mac/un UID, pero dinero real exige
+  además un broker de efectos o principal OS separado; S0 no contiene código
+  hostil arbitrario del mismo UID.

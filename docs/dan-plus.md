@@ -21,7 +21,7 @@ It implements a three-level operating model:
 caller / top orchestrator
   └─ visible fleet lead (owns decomposition and synthesis)
        ├─ scout
-       ├─ builder (only writer, isolated worktree)
+       ├─ builder (only writer, isolated clone)
        ├─ challenger
        └─ verifier
 ```
@@ -29,6 +29,12 @@ caller / top orchestrator
 The roster is capability, not a mandatory pipeline. The lead may use one worker,
 several in parallel, or none. Pre-booting visible panes makes capacity available;
 it does not justify spending tokens on every pane.
+
+Codex is the default Lead and provider fallback is opt-in. Claude must be
+selected explicitly or enabled with `--allow-fallback`; GLM, MiniMax, and Claude
+specialist turns can also incur provider charges. For a zero-frontier-cost
+lifecycle smoke, use the no-Lead Ollama recipe in `guia-uso-flota.md` rather
+than booting Dan+.
 
 ## Research translated into design
 
@@ -60,7 +66,8 @@ it does not justify spending tokens on every pane.
 - [Anthropic Managed Agents](https://www.anthropic.com/engineering/managed-agents)
   argues for stable session, harness, and sandbox interfaces while model
   assumptions evolve. This repo's manifests, run IDs, result files, and
-  worktrees remain stable below both autonomous and assured modes.
+  isolated writer clones and durable publication contracts remain stable below
+  both autonomous and assured modes.
 
 ## What was deliberately removed from the default path
 
@@ -72,18 +79,21 @@ it does not justify spending tokens on every pane.
 - Dispatching every available model merely because its pane exists.
 
 The last two are reliability rules, not ceremony, so they remain: exact run IDs,
-event-driven waiting, provider/model-bound results, one writer, and worktree
-isolation.
+event-driven waiting, provider/model-bound results, one writer, and isolated
+clone storage. The writer's branch remains private to its clone until CONTROL has
+quiesced the workspace and publishes the exact commit by durable intent and
+compare-and-swap.
 
 ## Collaboration model
 
 Raw peer prompts are unsafe in this harness because a second terminal submission
-can make the active run ambiguous. In a contract-v2 fleet, raw CMUX input also
-cannot become a tracked result: CONTROL must authorize the exact submit event
-before session binding. Dan+ uses result-driven collaboration:
+can make the active run ambiguous. In a `control-v1` fleet (manifest contract v2
+or v3), raw CMUX input also cannot become a tracked result: CONTROL must authorize
+the exact submit event before session binding. Dan+ uses result-driven
+collaboration:
 
 1. separately tracked agents return a durable result;
-2. the lead can route that exact result file to any peer in a later tracked run;
+2. the lead can route that exact artifact ID to any peer in a later tracked run;
 3. the recipient challenges, revises, or verifies it;
 4. every adopted contribution retains its run identity.
 
@@ -91,6 +101,11 @@ This preserves lateral intellectual collaboration while improving Dan's raw
 “any pane prompts any pane” mechanism with deterministic turn ownership. Native
 provider teams can still be used inside a specialist when their own harness
 provides safe teammate messaging.
+
+In this fleet, frontier specialists reach one another only through
+CONTROL-mediated MCP, CAS artifact grants, or durable dialogue. Local Ollama
+workers are prompt-only and have no MCP client, so CONTROL must embed their
+evidence directly instead of handing them an artifact ID.
 
 ## Human interruption policy
 
@@ -119,6 +134,11 @@ Mission-bound operations can cross the private Fleet Control Unix socket only
 after kernel peer-UID validation plus Lead run identity or a ledger-bound
 specialist capability token. This makes CMUX the visible execution plane while
 Mission/Fleet ledgers remain the authority for dispatch, result, and lineage.
+
+The Mission freezes one global admission envelope and commit-binds every Lead,
+specialist, batch, and assured launch before the external effect. Standalone
+Dan/fleet compatibility commands still have their older local lease/budget
+checks and should not be described as equivalent to Mission-wide admission.
 
 ## Improvement loop
 

@@ -15,6 +15,7 @@ from typing import Any
 
 import fleet_mission_state as mission_state
 import fleet_audit_client
+import fleet_compiled
 import fleet_trace
 
 
@@ -36,10 +37,42 @@ def verified_audit_events(root: Path, mission_id: str) -> list[dict[str, Any]]:
     if not receipt.is_file() or not public_key.is_file() or not anchors.is_dir():
         raise TraceExportError("audit trace lacks a complete public verification envelope")
     try:
-        compiled = json.loads((root / "compiled-workflow.json").read_text(encoding="utf-8"))
-        require_worm = compiled["workflow"]["audit"]["mode"] == "worm"
-        required_trust_scope = compiled["workflow"]["audit"]["trust_scope"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        compiled = fleet_compiled.load(
+            root / "compiled-workflow.json", mode="read"
+        )
+        current = mission_state.derive_state(
+            mission_state.read_events(
+                root / "mission.jsonl", expected_mission_id=mission_id
+            )
+        )
+        if (
+            compiled["workflow_digest"] != current["workflow_digest"]
+            or compiled["compiled_digest"] != current["compiled_digest"]
+        ):
+            raise TraceExportError(
+                "audit trace compiled policy is not bound to the mission ledger"
+            )
+        audit_policy = compiled["workflow"]["audit"]
+        audit_mode = audit_policy["mode"]
+        if audit_mode not in {"signed", "worm"}:
+            raise TraceExportError("audit trace compiled policy has an invalid mode")
+        require_worm = audit_mode == "worm"
+        required_trust_scope = audit_policy.get("trust_scope")
+        if (
+            required_trust_scope is not None
+            and required_trust_scope not in fleet_audit_client.audit.TRUST_SCOPES
+        ):
+            raise TraceExportError(
+                "audit trace compiled policy has an invalid trust scope"
+            )
+    except TraceExportError:
+        raise
+    except (
+        fleet_compiled.CompiledError,
+        mission_state.MissionStateError,
+        KeyError,
+        TypeError,
+    ) as exc:
         raise TraceExportError("audit trace lacks a valid compiled trust policy") from exc
     fleet_audit_client.verify_offline(
         ledger,

@@ -1,5 +1,10 @@
 # Final live verification — 2026-07-16
 
+> **HISTORICAL / SUPERSEDED.** This evidence belongs to the dated tree and
+> predates compiled-v2, current admission, and current locking/handoff. It is
+> not acceptance of the final working tree; see
+> `s0-single-mac-operational-truth-20260717.md`.
+
 This record closes the previously missing live checks. It does not upgrade the
 threat-model claim from partial to complete: remote CI, external audit delivery,
 and the heterogeneous specialist-relay lane remain separate operational gates.

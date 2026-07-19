@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+import re
 import sys
 import unittest
 
@@ -40,6 +41,17 @@ class MissionSchemaContractTests(unittest.TestCase):
                 self.assertFalse(schema["additionalProperties"])
                 self.assertEqual(schema["type"], "object")
                 self.assertTrue(schema["required"])
+
+    def test_archive_schema_accepts_only_full_sha1_or_sha256_object_ids(self) -> None:
+        schema = json.loads(
+            (ORCHESTRATION / "archive-index.schema.json").read_text(encoding="utf-8")
+        )
+        pattern = schema["$defs"]["gitSha"]["pattern"]
+        self.assertIsNotNone(re.fullmatch(pattern, "a" * 40))
+        self.assertIsNotNone(re.fullmatch(pattern, "a" * 64))
+        for length in range(41, 64):
+            with self.subTest(length=length):
+                self.assertIsNone(re.fullmatch(pattern, "a" * length))
 
     def test_workflow_schema_has_no_runtime_or_authority_escape_hatches(self) -> None:
         schema = json.loads((ORCHESTRATION / "workflow.schema.json").read_text(encoding="utf-8"))

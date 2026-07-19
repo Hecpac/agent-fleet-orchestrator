@@ -223,6 +223,7 @@ class FleetWaitTestCase(unittest.TestCase):
                 "status": status,
                 "timestamp": timestamp,
             }) + "\n")
+        self.ledger.chmod(0o600)
 
     def calls(self) -> list[list[str]]:
         if not self.log.exists():

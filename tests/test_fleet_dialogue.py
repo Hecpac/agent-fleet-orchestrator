@@ -77,9 +77,12 @@ class FleetDialogueTests(unittest.TestCase):
         status: str = "succeeded",
         result_file: bool = True,
     ) -> Path:
-        path = self.runs / "results" / self.feature / f"{run_id}.txt"
-        path.parent.mkdir(parents=True, exist_ok=True)
+        results_root = self.runs / "results"
+        results_root.mkdir(mode=0o755, exist_ok=True)
+        path = results_root / self.feature / f"{run_id}.txt"
+        path.parent.mkdir(mode=0o700, exist_ok=True)
         path.write_bytes(payload)
+        path.chmod(0o600)
         event = {
             "timestamp": "2026-07-13T00:00:00+00:00",
             "run_id": run_id,
@@ -92,7 +95,11 @@ class FleetDialogueTests(unittest.TestCase):
         }
         if result_file:
             event["result_file"] = str(path)
-        append_event(self.runs / f"fleet-{self.feature}.ledger.jsonl", event)
+        append_event(
+            self.runs / f"fleet-{self.feature}.ledger.jsonl",
+            event,
+            runs_dir=self.runs,
+        )
         return path
 
     def publish(self, run_id: str, **overrides):
@@ -146,6 +153,49 @@ class FleetDialogueTests(unittest.TestCase):
         with self.assertRaises(fleet_dialogue.DialogueConflict):
             self.publish(run_id, kind="challenge")
 
+    def test_feature_traversal_is_rejected_before_read_or_effect(self) -> None:
+        attacked_runs = self.runs.parent / "dialogue-attack-runs"
+        attacked_runs.mkdir(mode=0o700)
+        traversal_anchor = attacked_runs / "fleet-x"
+        traversal_anchor.mkdir(mode=0o700)
+        escaped = self.runs.parent / "escaped.dialogue.jsonl"
+        escaped.write_text("must-not-be-read-or-changed\n", encoding="utf-8")
+        unsafe_feature = "x/../../escaped"
+        unsafe_path = traversal_anchor / ".." / ".." / escaped.name
+        before_tree = tuple(
+            sorted(str(path.relative_to(attacked_runs)) for path in attacked_runs.rglob("*"))
+        )
+        before_outside = escaped.read_bytes()
+
+        with mock.patch.object(
+            Path,
+            "read_text",
+            side_effect=AssertionError("invalid feature reached filesystem read"),
+        ) as read_text:
+            with self.assertRaisesRegex(fleet_dialogue.DialogueError, "invalid feature"):
+                fleet_dialogue.load_messages_from_path(unsafe_path, unsafe_feature)
+            with self.assertRaisesRegex(fleet_dialogue.DialogueError, "invalid feature"):
+                fleet_dialogue.load_messages(attacked_runs, unsafe_feature)
+            read_text.assert_not_called()
+
+        with self.assertRaisesRegex(fleet_dialogue.DialogueError, "invalid feature"):
+            fleet_dialogue.publish(
+                attacked_runs,
+                feature=unsafe_feature,
+                kind="proposal",
+                recipient="checker",
+                source_instance="maker",
+                source_run_id="run-traversal",
+                idempotency_key="proposal:traversal",
+            )
+
+        after_tree = tuple(
+            sorted(str(path.relative_to(attacked_runs)) for path in attacked_runs.rglob("*"))
+        )
+        self.assertEqual(after_tree, before_tree)
+        self.assertEqual(escaped.read_bytes(), before_outside)
+        self.assertFalse((attacked_runs / "locks").exists())
+
     def test_reply_must_name_prior_message_in_same_ledger(self) -> None:
         first_run = "run-first"
         second_run = "run-second"
@@ -183,7 +233,7 @@ class FleetDialogueTests(unittest.TestCase):
             self.publish(missing_run)
 
         outside_run = "run-outside"
-        expected = self.seed_result(outside_run, b"inside")
+        self.seed_result(outside_run, b"inside")
         outside = self.runs / "outside.txt"
         outside.write_bytes(b"outside")
         ledger = self.runs / f"fleet-{self.feature}.ledger.jsonl"
@@ -192,6 +242,104 @@ class FleetDialogueTests(unittest.TestCase):
         ledger.write_text("".join(json.dumps(row) + "\n" for row in rows))
         with self.assertRaisesRegex(fleet_dialogue.DialogueError, "outside"):
             self.publish(outside_run)
+
+    def test_result_ancestor_symlink_rejects_external_read_without_effect(self) -> None:
+        run_id = "run-result-ancestor"
+        outside = self.runs.parent / "outside-results"
+        outside.mkdir(mode=0o700)
+        outside_feature = outside / self.feature
+        outside_feature.mkdir(mode=0o700)
+        external_result = outside_feature / f"{run_id}.txt"
+        external_result.write_bytes(b"outside-secret")
+        external_result.chmod(0o600)
+        (self.runs / "results").symlink_to(outside, target_is_directory=True)
+        recorded = self.runs / "results" / self.feature / f"{run_id}.txt"
+        append_event(
+            self.runs / f"fleet-{self.feature}.ledger.jsonl",
+            {
+                "timestamp": "2026-07-13T00:00:00+00:00",
+                "run_id": run_id,
+                "feature": self.feature,
+                "instance": "maker",
+                "role": "codex_candidate",
+                "phase": "BUILD",
+                "status": "succeeded",
+                "task_sha256": "a" * 64,
+                "result_file": str(recorded),
+            },
+            runs_dir=self.runs,
+        )
+        before = external_result.read_bytes()
+
+        with self.assertRaisesRegex(
+            fleet_dialogue.DialogueError, "unsafe|symlink"
+        ):
+            self.publish(run_id)
+
+        self.assertEqual(external_result.read_bytes(), before)
+        self.assertFalse(fleet_dialogue.ledger_path(self.runs, self.feature).exists())
+        self.assertFalse((self.runs / "dialogue").exists())
+
+    def test_payload_ancestor_symlink_rejects_external_write_without_effect(self) -> None:
+        run_id = "run-payload-ancestor"
+        self.seed_result(run_id, b"trusted-result")
+        outside = self.runs.parent / "outside-dialogue"
+        outside.mkdir(mode=0o700)
+        sentinel = outside / "sentinel"
+        sentinel.write_bytes(b"unchanged")
+        sentinel.chmod(0o600)
+        before_names = sorted(path.name for path in outside.iterdir())
+        before_bytes = sentinel.read_bytes()
+        (self.runs / "dialogue").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(fleet_dialogue.DialogueError, "unsafe"):
+            self.publish(run_id)
+
+        self.assertEqual(sorted(path.name for path in outside.iterdir()), before_names)
+        self.assertEqual(sentinel.read_bytes(), before_bytes)
+        self.assertFalse(fleet_dialogue.ledger_path(self.runs, self.feature).exists())
+
+    def test_payload_ancestor_symlink_rejects_external_read(self) -> None:
+        run_id = "run-payload-read-ancestor"
+        payload = b"trusted-inside"
+        self.seed_result(run_id, payload)
+        message = self.publish(run_id)
+        dialogue = self.runs / "dialogue"
+        dialogue.rename(self.runs / "dialogue-original")
+        outside = self.runs.parent / "outside-dialogue-read"
+        external_store = outside / self.feature / "payloads"
+        external_store.mkdir(parents=True, mode=0o700)
+        outside.chmod(0o700)
+        (outside / self.feature).chmod(0o700)
+        external_payload = external_store / message["payload_sha256"]
+        external_payload.write_bytes(b"external-substitution")
+        external_payload.chmod(0o600)
+        dialogue.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(fleet_dialogue.DialogueError, "unsafe"):
+            fleet_dialogue.read_message(
+                self.runs,
+                feature=self.feature,
+                message_id=message["message_id"],
+            )
+
+        self.assertEqual(external_payload.read_bytes(), b"external-substitution")
+
+    def test_dialogue_ledger_symlink_rejects_external_read(self) -> None:
+        run_id = "run-ledger-symlink"
+        self.seed_result(run_id, b"trusted")
+        self.publish(run_id)
+        ledger = fleet_dialogue.ledger_path(self.runs, self.feature)
+        outside = self.runs.parent / "outside-dialogue.jsonl"
+        outside.write_bytes(ledger.read_bytes())
+        outside.chmod(0o600)
+        ledger.rename(self.runs / "dialogue-ledger-original.jsonl")
+        ledger.symlink_to(outside)
+
+        with self.assertRaisesRegex(fleet_dialogue.DialogueError, "unsafe|ledger"):
+            fleet_dialogue.load_messages(self.runs, self.feature)
+
+        self.assertEqual(outside.read_bytes(), (self.runs / "dialogue-ledger-original.jsonl").read_bytes())
 
     def test_payload_limit_and_close_marker_fail_closed(self) -> None:
         oversized = "run-oversized"

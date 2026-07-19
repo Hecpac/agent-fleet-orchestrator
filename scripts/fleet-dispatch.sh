@@ -7,12 +7,31 @@ set -euo pipefail
 # wake-up. The terminal ledger event for the returned run_id is authoritative.
 #
 # Usage:
-#   ./scripts/fleet-dispatch.sh <feature> <instance-id> "<task>"
+#   ./scripts/fleet-dispatch.sh <feature> <instance-id> "<task>" [--run-id <uuid>] [--json]
 
 feature="${1:-}"
 instance_id="${2:-}"
 task="${3:-}"
-output_mode="${4:-}"
+shift 3 || true
+output_mode=""
+run_id_override=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --json)
+      output_mode="--json"
+      shift
+      ;;
+    --run-id)
+      [[ $# -ge 2 ]] || { echo "--run-id requires a canonical UUID" >&2; exit 2; }
+      run_id_override="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runs_dir="${FLEET_RUNS_DIR:-$repo_root/orchestration/runs}"
@@ -21,31 +40,87 @@ identity="$repo_root/scripts/fleet_identity.py"
 leases="$repo_root/scripts/fleet_leases.py"
 export CMUX_QUIET=1
 
-if [[ -z "$feature" || -z "$instance_id" || -z "$task" \
-  || ( -n "$output_mode" && "$output_mode" != "--json" ) ]]; then
-  echo "Usage: $0 <feature> <instance-id> \"<task>\" [--json]" >&2
+if [[ -z "$feature" || -z "$instance_id" || -z "$task" ]]; then
+  echo "Usage: $0 <feature> <instance-id> \"<task>\" [--run-id <uuid>] [--json]" >&2
   exit 2
+fi
+if [[ -n "$run_id_override" ]]; then
+  if ! python3 -c \
+    'import sys, uuid; value=sys.argv[1]; parsed=str(uuid.UUID(value)); raise SystemExit(0 if value == parsed else 2)' \
+    "$run_id_override" 2>/dev/null; then
+    echo "--run-id requires a canonical lowercase UUID" >&2
+    exit 2
+  fi
 fi
 if [[ ! -f "$manifest" ]]; then
   echo "No manifest at $manifest" >&2
   exit 2
 fi
+manifest_value() {
+  local key="$1"
+  awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$manifest"
+}
+
+compiled_workflow="${FLEET_COMPILED_WORKFLOW:-}"
+inherited_compiled_digest="${FLEET_COMPILED_DIGEST:-}"
+manifest_compiled_digest="$(manifest_value compiled_digest)"
+manifest_mission_id="$(manifest_value mission_id)"
+if [[ -n "$manifest_mission_id" ]]; then
+  if [[ ! "$manifest_mission_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
+    echo "Mission-bound fleet manifest has an invalid mission_id." >&2
+    exit 2
+  fi
+  mission_compiled_workflow="$(python3 -c \
+    'from pathlib import Path; import sys; print(Path(sys.argv[1]).expanduser().resolve(strict=True) / "missions" / sys.argv[2] / "compiled-workflow.json")' \
+    "$runs_dir" "$manifest_mission_id")"
+  if [[ -n "$compiled_workflow" ]]; then
+    inherited_compiled_workflow="$(python3 -c \
+      'import os, sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' \
+      "$compiled_workflow")"
+    if [[ "$inherited_compiled_workflow" != "$mission_compiled_workflow" ]]; then
+      echo "Mission-bound fleet dispatch rejects non-canonical compiled authority." >&2
+      exit 2
+    fi
+  fi
+  compiled_workflow="$mission_compiled_workflow"
+fi
+if [[ -n "$manifest_compiled_digest" ]]; then
+  if [[ -z "$compiled_workflow" ]]; then
+    echo "Compiled fleet dispatch lacks FLEET_COMPILED_WORKFLOW authority." >&2
+    exit 2
+  fi
+  if [[ -n "$inherited_compiled_digest" \
+    && "$inherited_compiled_digest" != "$manifest_compiled_digest" ]]; then
+    echo "Compiled fleet dispatch digest conflicts with its manifest." >&2
+    exit 2
+  fi
+  export FLEET_COMPILED_WORKFLOW="$compiled_workflow"
+  export FLEET_COMPILED_DIGEST="$manifest_compiled_digest"
+elif [[ -n "$compiled_workflow" ]]; then
+  echo "Legacy fleet manifest cannot inherit compiled router authority." >&2
+  exit 2
+fi
+if [[ -n "$compiled_workflow" ]]; then
+  python3 "$repo_root/scripts/router_config.py" validate >/dev/null || exit 2
+fi
+
 python3 "$leases" reconcile "$runs_dir" >/dev/null || exit $?
 python3 "$identity" validate "$manifest" "$instance_id" >/dev/null || exit 2
 python3 "$repo_root/scripts/fleet_state.py" check "$manifest" "$instance_id" >/dev/null || exit $?
 
-token_budget="$(python3 "$repo_root/scripts/router_config.py" limits-field local_token_budget_per_feature 2>/dev/null || true)"
+if [[ -z "$manifest_mission_id" && -n "$compiled_workflow" ]]; then
+  token_budget="$(python3 "$repo_root/scripts/router_config.py" limits-field local_token_budget_per_feature)" || exit 2
+elif [[ -z "$manifest_mission_id" ]]; then
+  token_budget="$(python3 "$repo_root/scripts/router_config.py" limits-field local_token_budget_per_feature 2>/dev/null || true)"
+else
+  token_budget=""
+fi
 if [[ -n "$token_budget" ]]; then
   python3 "$repo_root/scripts/fleet_budget.py" check \
     "$runs_dir/fleet-$feature.ledger.jsonl" "$token_budget" || exit $?
 fi
 
 ws_ref="$(grep '^workspace=' "$manifest" | cut -d= -f2)"
-manifest_value() {
-  local key="$1"
-  awk -F= -v key="$key" '$1 == key { print substr($0, index($0, "=") + 1); exit }' "$manifest"
-}
-
 surface="$(manifest_value "$instance_id")"
 if [[ -z "$surface" ]]; then
   echo "Instance '$instance_id' not in manifest $manifest" >&2
@@ -55,14 +130,26 @@ role_type="$(manifest_value "$instance_id.role_type")"
 runner="$(manifest_value "$instance_id.runner")"
 phase="$(manifest_value "$instance_id.phase")"
 resource_class="$(manifest_value "$instance_id.resource_class")"
+provider="$(manifest_value "$instance_id.provider")"
+model="$(manifest_value "$instance_id.model")"
+hook_source="$(manifest_value "$instance_id.hook_source")"
+variant="$(manifest_value "$instance_id.variant")"
 workspace_uuid="$(manifest_value workspace_uuid)"
 surface_uuid="$(manifest_value "$instance_id.uuid")"
 if [[ -z "$role_type" || "$runner" != "local" ]]; then
   echo "Instance '$instance_id' is not a configured local worker." >&2
   exit 2
 fi
+if [[ -z "$provider" || -z "$model" ]]; then
+  echo "Instance '$instance_id' lacks provider/model identity." >&2
+  exit 2
+fi
+python3 "$repo_root/scripts/fleet_providers.py" validate \
+  --provider "$provider" --model "$model" --variant "$variant" \
+  --hook-source "$hook_source" --runner local >/dev/null || exit 2
+identity_args=(--provider "$provider" --model "$model" --variant "$variant")
 
-run_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+run_id="${run_id_override:-$(python3 -c 'import uuid; print(uuid.uuid4())')}"
 task_dir="$runs_dir/tasks/$feature"
 lock_dir="$runs_dir/locks"
 mkdir -p "$task_dir" "$lock_dir"
@@ -102,6 +189,7 @@ cleanup_untransferred_lease() {
         --run-id "$run_id" --feature "$feature" --instance "$instance_id" \
         --role "$role_type" --phase "$phase" --status abandoned \
         --task-sha256 "$task_sha256" --exit-code 4 --reason dispatch_not_transferred \
+        "${identity_args[@]}" \
         >/dev/null 2>&1; then
         terminal_durable=0
         echo "ERROR: terminal ledger write failed; preserving leases for $run_id" >&2
@@ -117,10 +205,26 @@ trap cleanup_untransferred_lease EXIT
 
 python3 "$repo_root/scripts/fleet_ledger.py" "$runs_dir/fleet-$feature.ledger.jsonl" \
   --run-id "$run_id" --feature "$feature" --instance "$instance_id" \
-  --role "$role_type" --phase "$phase" --status dispatched --task-sha256 "$task_sha256"
+  --role "$role_type" --phase "$phase" --status dispatched --task-sha256 "$task_sha256" \
+  "${identity_args[@]}"
 ledger_dispatched=1
 
-runner_command="./scripts/run-local-task.sh $feature $instance_id $role_type $phase $resource_class $run_id $task_file $task_sha256 $local_slot $role_slot"
+runner_parts=(/usr/bin/env "FLEET_RUNS_DIR=$runs_dir")
+if [[ -n "${FLEET_COMPILED_WORKFLOW:-}" ]]; then
+  runner_parts+=(
+    "FLEET_COMPILED_WORKFLOW=$FLEET_COMPILED_WORKFLOW"
+    "FLEET_COMPILED_DIGEST=$FLEET_COMPILED_DIGEST"
+  )
+elif [[ -n "${FLEET_ROUTER_PATH:-}" ]]; then
+  runner_parts+=("FLEET_ROUTER_PATH=$FLEET_ROUTER_PATH")
+fi
+runner_parts+=(
+  "$repo_root/scripts/run-local-task.sh" "$feature" "$instance_id" "$role_type" "$phase"
+  "$resource_class" "$run_id" "$task_file" "$task_sha256" "$local_slot" "$role_slot"
+  "$provider" "$model" "$variant"
+)
+printf -v runner_command '%q ' "${runner_parts[@]}"
+runner_command="${runner_command% }"
 
 if ! cmux send --surface "$surface" --workspace "$ws_ref" \
   "$runner_command; rc=\$?; cmux notify --title 'fleet-$feature:$instance_id' --body \"run_id=$run_id exit=\$rc\"; printf 'run_id=$run_id exit=%s\\n' \"\$rc\"" >/dev/null; then

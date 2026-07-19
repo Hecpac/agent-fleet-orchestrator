@@ -18,6 +18,7 @@ import fleet_audit_client as client
 import fleet_mission
 import fleet_mission_state as state
 import workflow_config
+from tests.mission_control_test_support import legacy_v1_compiled, write_compiled
 
 
 class FleetAuditIntegrationTests(unittest.TestCase):
@@ -46,6 +47,22 @@ class FleetAuditIntegrationTests(unittest.TestCase):
         )
         self.lifecycle = client.AuditLifecycle(self.runs, self.mission_id)
         self.addCleanup(self.force_cleanup)
+
+    def test_historical_compiled_policy_is_rejected_before_audit_effects(self) -> None:
+        path = self.runs / "missions" / self.mission_id / "compiled-workflow.json"
+        compiled = client.fleet_compiled.load(path, mode="read")
+        write_compiled(path, legacy_v1_compiled(compiled))
+        with (
+            mock.patch.object(state, "ensure_private_directory") as effect,
+            mock.patch.object(client.subprocess, "Popen") as process,
+            self.assertRaisesRegex(
+                client.AuditClientError, "historical read-only.*require v2"
+            ),
+        ):
+            client.AuditLifecycle(self.runs, self.mission_id)
+        effect.assert_not_called()
+        process.assert_not_called()
+        self.assertFalse(self.lifecycle.root.exists())
 
     def force_cleanup(self) -> None:
         try:
@@ -246,8 +263,8 @@ class FleetAuditIntegrationTests(unittest.TestCase):
                 "retained_until": "2030-01-01T00:00:00Z",
                 "version_id": f"version-{index}",
             }
-            (self.lifecycle.anchor_receipts / f"{event['event_id']}.json").write_text(
-                json.dumps(anchor, sort_keys=True) + "\n", encoding="utf-8"
+            (self.lifecycle.anchor_receipts / f"{event['event_id']}.json").write_bytes(
+                state.canonical_bytes(anchor) + b"\n"
             )
         ledger.write_text(
             "".join(json.dumps(item, separators=(",", ":"), sort_keys=True) + "\n" for item in rows),
@@ -269,9 +286,9 @@ class FleetAuditIntegrationTests(unittest.TestCase):
             "verified_at": "2026-07-14T00:00:00Z",
         }
         receipt["ed25519_signature"] = client._sign_receipt(self.lifecycle.private_key, receipt)
-        self.lifecycle.receipt_path.write_text(
-            json.dumps(receipt, separators=(",", ":"), sort_keys=True) + "\n",
-            encoding="utf-8",
+        state.atomic_write(
+            self.lifecycle.receipt_path,
+            state.canonical_bytes(receipt) + b"\n",
         )
         verified = client.verify_offline(
             ledger,
@@ -286,18 +303,16 @@ class FleetAuditIntegrationTests(unittest.TestCase):
         last_anchor_path = self.lifecycle.anchor_receipts / f"{rows[-1]['event_id']}.json"
         last_anchor = json.loads(last_anchor_path.read_text(encoding="utf-8"))
         last_anchor.pop("version_id")
-        last_anchor_path.write_text(
-            json.dumps(last_anchor, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        last_anchor_path.write_bytes(state.canonical_bytes(last_anchor) + b"\n")
         receipt["anchor_receipts_sha256"] = client._anchor_envelope(
             rows, self.lifecycle.anchor_receipts
         )[1]
         receipt["ed25519_signature"] = client._sign_receipt(
             self.lifecycle.private_key, receipt
         )
-        self.lifecycle.receipt_path.write_text(
-            json.dumps(receipt, separators=(",", ":"), sort_keys=True) + "\n",
-            encoding="utf-8",
+        state.atomic_write(
+            self.lifecycle.receipt_path,
+            state.canonical_bytes(receipt) + b"\n",
         )
         with self.assertRaisesRegex(client.AuditClientError, "incomplete"):
             client.verify_offline(
@@ -317,7 +332,7 @@ class FleetAuditIntegrationTests(unittest.TestCase):
         anchor_path = self.lifecycle.anchor_receipts / f"{events[0]['event_id']}.json"
         anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
         anchor["trust_scope"] = "external-compliance"
-        anchor_path.write_text(json.dumps(anchor, sort_keys=True) + "\n", encoding="utf-8")
+        anchor_path.write_bytes(state.canonical_bytes(anchor) + b"\n")
         with self.assertRaisesRegex(client.AuditClientError, "envelope hash mismatch"):
             client.verify_offline(
                 ledger,
@@ -351,6 +366,7 @@ class FleetAuditIntegrationTests(unittest.TestCase):
     def test_external_compliance_preflight_rejects_loopback_without_state(self) -> None:
         workflow_value = json.loads((ROOT / "workflows" / "regulated.yaml").read_text())
         workflow_value["name"] = "external-test"
+        workflow_value["limits"]["budget_mode"] = "soft"
         path = self.tmp / "external.yaml"
         path.write_text(json.dumps(workflow_value), encoding="utf-8")
         compiled = workflow_config.compile_path(path)

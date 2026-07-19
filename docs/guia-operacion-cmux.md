@@ -23,7 +23,8 @@ con `just fleet-down <feature>`; la X del sidebar omite la reconciliación.
 ## 1 · Decide si necesitas un fleet
 
 - **"Haz esto"** (tarea acotada, secuencial, verificable con un test) →
-  sesión normal de Claude, sin fleet. Es el ~95% de los casos.
+  un solo agente apropiado, sin fleet. Es la mayoría de los casos y evita
+  activar proveedores pagados que no aportan paralelismo útil.
 - **"Resuelve esto de punta a punta"** (cambio abierto, varias perspectivas,
   implementación + verificación) → `just dan`: lead autónomo y fleet visible.
 - **"¿Qué se me escapa?"** (auditoría, review pre-merge, diagnóstico raro,
@@ -57,8 +58,10 @@ just fleet sse                              # default small: solo lead
 
 El router canónico es `orchestration/router.yaml`: allí viven commands, modelos,
 capacidades, permisos declarativos, ranks y presets. Codex es el lead por defecto;
-Claude está habilitado como fallback y también puede seleccionarse explícitamente
-con `--lead-provider claude`.
+Claude solo entra como Lead si lo seleccionas con `--lead-provider claude` o si
+habilitas deliberadamente `--allow-fallback`. Sin ese flag, un Codex no
+disponible falla cerrado. Despachar Claude/GLM/MiniMax puede tener costo; no los
+uses como smoke automático.
 
 Roles frontier: `codex` · `claude` · `minimax` (MiniMax-M3) · `glm` (GLM-5.2)
 Roles locales prompt-only: `code_worker` · `triage` · `light_code` · `reviewer` · `general_worker`
@@ -77,6 +80,9 @@ Los revisores OpenCode no reciben Bash ni raíces externas del controlador: el l
 valida que la configuración resuelta exponga únicamente `read`, `glob` y `grep`.
 Para FDP-2, CONTROL incorpora Git y el mensaje exacto en un evidence pack
 hash-bound antes de despachar al Checker.
+Los frontier colaboran mediante CONTROL (MCP autenticado, CAS y diálogo
+durable), no enviándose mensajes directos. Los roles Ollama son prompt-only y
+no reciben MCP ni acceso a artifacts del controlador.
 
 Qué pasa solo: el plan completo se valida antes de tocar cmux, los panes quedan
 ordenados `CONTROL → RECON → BUILD → CHALLENGE → VERIFY`, se verifican contra
@@ -147,6 +153,10 @@ cmux read-screen --surface <su surface> --workspace <ws> --lines 50
 ```
 
 `read-screen` es observacional; consume el `result_file` durable para decisiones.
+
+Para un smoke sin inferencia frontier usa la receta
+`FLEET_NO_LEAD=1 ... triage=triage` de
+[`guia-uso-flota.md`](guia-uso-flota.md#receta-local-sin-inferencia-frontier).
 
 **Esperar a varios / al primero:**
 ```bash

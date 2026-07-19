@@ -22,6 +22,7 @@ from fleet_frontier import (
 from fleet_ledger import TERMINAL_STATUSES, latest_event
 from fleet_ledger import events_for_run
 import fleet_tracking
+import fleet_json
 import fleet_manifest
 
 
@@ -115,9 +116,13 @@ def signal_ready(frame: dict[str, Any]) -> bool:
     path = Path(path_value)
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump({"status": "ready", "resume": frame.get("resume", {})}, handle)
-            handle.write("\n")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(
+                fleet_json.canonical_bytes(
+                    {"status": "ready", "resume": frame.get("resume", {})}
+                )
+                + b"\n"
+            )
             handle.flush()
             os.fsync(handle.fileno())
     except OSError as exc:
@@ -330,8 +335,8 @@ def main(argv: list[str] | None = None) -> int:
         acknowledged = False
         for line in proc.stdout:
             try:
-                frame = json.loads(line)
-            except json.JSONDecodeError:
+                frame = fleet_json.loads(line)
+            except fleet_json.FleetJSONError:
                 continue
             if frame.get("type") == "ack":
                 try:

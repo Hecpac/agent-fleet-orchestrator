@@ -13,6 +13,11 @@ una instalación local de hooks de Claude se marcan explícitamente como
 omitidos en runners hospedados y permanecen cubiertos por el lane live de
 macOS; no se sustituyen por credenciales ni servicios falsos.
 
+La validación de `workflows/regulated.yaml` en CI es estática. No implica que
+pueda admitir efectos: el compilador de ejecución exige `hard_total` en todos
+los proveedores resolubles y el run regulado exige WORM externo, dependencias
+que el S0 local no declara disponibles.
+
 El mismo contrato se puede ejecutar localmente con:
 
 ```bash

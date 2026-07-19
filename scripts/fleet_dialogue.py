@@ -15,15 +15,16 @@ import sys
 from typing import Any
 import uuid
 
+import fleet_safe_paths
 from fleet_identity import validate as validate_identity
 from fleet_leases import closing_path, coordinator
-from fleet_ledger import append_record, latest_event
+from fleet_ledger import LedgerError, append_record, latest_event, read_records
 
 
 SCHEMA_VERSION = 1
 MAX_PAYLOAD_BYTES = 1024 * 1024
 MESSAGE_KINDS = {"proposal", "challenge", "rebuttal", "revision", "verification"}
-SAFE_FEATURE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+SAFE_FEATURE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 SAFE_IDEMPOTENCY_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -42,6 +43,14 @@ ENVELOPE_FIELDS = {
     "payload_sha256",
     "payload_bytes",
 }
+CONTROLLED_PUBLICATION_FIELDS = (
+    "kind",
+    "recipient",
+    "source_instance",
+    "source_run_id",
+    "reply_to",
+    "payload_sha256",
+)
 
 
 class DialogueError(RuntimeError):
@@ -60,28 +69,26 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _feature(value: str) -> str:
+    if not isinstance(value, str) or not SAFE_FEATURE.fullmatch(value):
+        raise DialogueError("invalid feature")
+    return value
+
+
 def manifest_path(runs_dir: Path, feature: str) -> Path:
-    return runs_dir / f"fleet-{feature}.manifest"
+    return runs_dir / f"fleet-{_feature(feature)}.manifest"
 
 
 def ledger_path(runs_dir: Path, feature: str) -> Path:
-    return runs_dir / f"fleet-{feature}.dialogue.jsonl"
+    return runs_dir / f"fleet-{_feature(feature)}.dialogue.jsonl"
 
 
 def store_path(runs_dir: Path, feature: str) -> Path:
-    return runs_dir / "dialogue" / feature / "payloads"
+    return runs_dir / "dialogue" / _feature(feature) / "payloads"
 
 
 def payload_path(runs_dir: Path, feature: str, digest: str) -> Path:
-    return store_path(runs_dir, feature) / digest
-
-
-def _fsync_directory(path: Path) -> None:
-    directory_fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+    return runs_dir / _payload_relative(feature, digest)
 
 
 def _manifest_values(path: Path) -> dict[str, str]:
@@ -104,8 +111,7 @@ def _instances(manifest: dict[str, str]) -> set[str]:
 
 
 def _load_manifest(runs_dir: Path, feature: str) -> tuple[dict[str, str], set[str]]:
-    if not SAFE_FEATURE.fullmatch(feature):
-        raise DialogueError(f"invalid feature: {feature}")
+    feature = _feature(feature)
     manifest = _manifest_values(manifest_path(runs_dir, feature))
     if manifest.get("feature") != feature:
         raise DialogueError("manifest feature does not match requested feature")
@@ -122,6 +128,7 @@ def _load_manifest(runs_dir: Path, feature: str) -> tuple[dict[str, str], set[st
 
 
 def _validate_envelope(message: dict[str, Any], feature: str) -> None:
+    feature = _feature(feature)
     if set(message) != ENVELOPE_FIELDS:
         raise DialogueError("dialogue envelope fields do not match schema_version=1")
     if message.get("schema_version") != SCHEMA_VERSION:
@@ -158,25 +165,14 @@ def _validate_envelope(message: dict[str, Any], feature: str) -> None:
             raise DialogueError(f"invalid dialogue {field}")
 
 
-def load_messages_from_path(path: Path, feature: str) -> list[dict[str, Any]]:
-    try:
-        raw_lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
-        raise DialogueError(f"cannot read dialogue ledger: {path}") from exc
+def _validated_messages(
+    records: list[dict[str, Any]], feature: str
+) -> list[dict[str, Any]]:
+    feature = _feature(feature)
     messages: list[dict[str, Any]] = []
     message_ids: set[str] = set()
     idempotency_keys: set[str] = set()
-    for line_number, raw in enumerate(raw_lines, start=1):
-        if not raw.strip():
-            raise DialogueError(f"blank dialogue ledger row at line {line_number}")
-        try:
-            message = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise DialogueError(f"invalid dialogue JSON at line {line_number}") from exc
-        if not isinstance(message, dict):
-            raise DialogueError(f"dialogue row is not an object at line {line_number}")
+    for message in records:
         _validate_envelope(message, feature)
         message_id = str(message["message_id"])
         idempotency_key = str(message["idempotency_key"])
@@ -191,11 +187,41 @@ def load_messages_from_path(path: Path, feature: str) -> list[dict[str, Any]]:
     return messages
 
 
+def _load_messages_rooted(
+    root: Path, ledger_leaf: str, feature: str
+) -> list[dict[str, Any]]:
+    feature = _feature(feature)
+    allowed = {"dialogue.jsonl", f"fleet-{feature}.dialogue.jsonl"}
+    if ledger_leaf not in allowed or Path(ledger_leaf).name != ledger_leaf:
+        raise DialogueError("dialogue ledger is outside its selected root")
+    try:
+        records = read_records(root / ledger_leaf, runs_dir=root)
+    except LedgerError as exc:
+        raise DialogueError(f"cannot read dialogue ledger: {exc}") from exc
+    return _validated_messages(records, feature)
+
+
+def load_messages_from_path(path: Path, feature: str) -> list[dict[str, Any]]:
+    feature = _feature(feature)
+    path = Path(path)
+    root = path.parent
+    if path != root / path.name:
+        raise DialogueError("dialogue ledger is outside its selected root")
+    return _load_messages_rooted(root, path.name, feature)
+
+
 def load_messages(runs_dir: Path, feature: str) -> list[dict[str, Any]]:
-    return load_messages_from_path(ledger_path(runs_dir, feature), feature)
+    feature = _feature(feature)
+    return _load_messages_rooted(
+        runs_dir, ledger_path(runs_dir, feature).name, feature
+    )
 
 
-def _read_bounded_regular_file(path: Path, *, expected_size: int | None = None) -> bytes:
+def _read_bounded_regular_file(
+    path: Path, *, expected_size: int | None = None
+) -> bytes:
+    """Read an explicitly selected external source without following its leaf."""
+
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
@@ -204,16 +230,21 @@ def _read_bounded_regular_file(path: Path, *, expected_size: int | None = None) 
     try:
         metadata = os.fstat(fd)
         if not stat.S_ISREG(metadata.st_mode):
-            raise DialogueError(f"dialogue payload source is not a regular file: {path}")
+            raise DialogueError(
+                f"dialogue payload source is not a regular file: {path}"
+            )
         if metadata.st_size <= 0:
             raise DialogueError("dialogue payload is empty")
         if metadata.st_size > MAX_PAYLOAD_BYTES:
             raise DialogueError(
-                f"dialogue payload exceeds {MAX_PAYLOAD_BYTES} bytes: {metadata.st_size}"
+                f"dialogue payload exceeds {MAX_PAYLOAD_BYTES} bytes: "
+                f"{metadata.st_size}"
             )
         payload = b""
         while len(payload) <= MAX_PAYLOAD_BYTES:
-            chunk = os.read(fd, min(65536, MAX_PAYLOAD_BYTES + 1 - len(payload)))
+            chunk = os.read(
+                fd, min(65536, MAX_PAYLOAD_BYTES + 1 - len(payload))
+            )
             if not chunk:
                 break
             payload += chunk
@@ -226,19 +257,70 @@ def _read_bounded_regular_file(path: Path, *, expected_size: int | None = None) 
         os.close(fd)
 
 
+def _payload_store_relative(feature: str, *, archived: bool = False) -> Path:
+    feature = _feature(feature)
+    if archived:
+        return Path("dialogue") / "payloads"
+    return Path("dialogue") / feature / "payloads"
+
+
+def _payload_relative(feature: str, digest: str, *, archived: bool = False) -> Path:
+    if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+        raise DialogueError("invalid dialogue payload digest")
+    return _payload_store_relative(feature, archived=archived) / digest
+
+
+def _payload_directory_modes(store_relative: Path) -> tuple[int, ...]:
+    """Keep public traversal directories read-only and the payload store private."""
+
+    return tuple(0o755 for _ in store_relative.parts[:-1]) + (0o700,)
+
+
+def _read_rooted_payload(
+    root: Path,
+    store_relative: Path,
+    message: dict[str, Any],
+) -> tuple[Path, bytes]:
+    digest = str(message["payload_sha256"])
+    if not SHA256.fullmatch(digest):
+        raise DialogueError("invalid dialogue payload digest")
+    relative = store_relative / digest
+    try:
+        with fleet_safe_paths.RootedFS(root) as rooted:
+            payload = rooted.read_regular(
+                relative,
+                directory_modes=_payload_directory_modes(store_relative),
+                file_mode=0o600,
+                max_bytes=MAX_PAYLOAD_BYTES,
+            )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise DialogueError(f"unsafe dialogue payload path: {exc}") from exc
+    if len(payload) != int(message["payload_bytes"]):
+        raise DialogueError("dialogue payload size does not match envelope")
+    if hashlib.sha256(payload).hexdigest() != digest:
+        raise DialogueError("dialogue payload hash does not match envelope")
+    return root / relative, payload
+
+
 def _source_payload(
     runs_dir: Path,
     feature: str,
     source_instance: str,
     source_run_id: str,
 ) -> bytes:
+    feature = _feature(feature)
     if not SAFE_RUN_ID.fullmatch(source_run_id):
         raise DialogueError(f"invalid source run_id: {source_run_id}")
-    event = latest_event(
-        runs_dir / f"fleet-{feature}.ledger.jsonl",
-        run_id=source_run_id,
-        instance=source_instance,
-    )
+    try:
+        event = latest_event(
+            runs_dir / f"fleet-{feature}.ledger.jsonl",
+            run_id=source_run_id,
+            instance=source_instance,
+            runs_dir=runs_dir,
+        )
+    except LedgerError as exc:
+        raise DialogueError(f"cannot read source lifecycle ledger: {exc}") from exc
     if not event:
         raise DialogueError("source run is absent from the lifecycle ledger")
     if event.get("feature") != feature or event.get("instance") != source_instance:
@@ -248,56 +330,80 @@ def _source_payload(
     recorded = event.get("result_file")
     if not isinstance(recorded, str) or not recorded:
         raise DialogueError("source run has no durable result_file")
-    expected = runs_dir / "results" / feature / f"{source_run_id}.txt"
+    relative = Path("results") / feature / f"{source_run_id}.txt"
     recorded_path = Path(recorded)
-    if recorded_path.is_symlink() or expected.is_symlink():
-        raise DialogueError("source result_file must not be a symlink")
     try:
-        actual = expected.resolve(strict=True)
-        recorded_actual = recorded_path.resolve(strict=True)
-    except OSError as exc:
-        raise DialogueError("source result_file is missing") from exc
-    if actual != recorded_actual:
+        recorded_root = recorded_path.parents[2]
+    except IndexError as exc:
+        raise DialogueError(
+            "source result_file is outside the fleet result store"
+        ) from exc
+    if recorded_path != recorded_root / relative:
         raise DialogueError("source result_file is outside the fleet result store")
-    return _read_bounded_regular_file(actual)
-
-
-def _write_payload(path: Path, payload: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path.parent.chmod(0o700)
-    if path.exists():
-        existing = _read_bounded_regular_file(path, expected_size=len(payload))
-        if existing != payload:
-            raise DialogueError("content-addressed payload does not match its digest")
-        return
-    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
     try:
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            if fleet_safe_paths.canonical_root(recorded_root) != rooted.root:
+                raise DialogueError(
+                    "source result_file is outside the fleet result store"
+                )
+            payload = rooted.read_regular(
+                relative,
+                directory_modes=(0o755, 0o700),
+                file_mode=0o600,
+                max_bytes=MAX_PAYLOAD_BYTES,
+            )
+            rooted.assert_root_binding()
+    except fleet_safe_paths.SafePathError as exc:
+        raise DialogueError(
+            f"source result_file is unsafe or symlinked: {exc}"
+        ) from exc
+    if not payload:
+        raise DialogueError("dialogue payload is empty")
+    return payload
+
+
+def _write_payload(
+    runs_dir: Path, feature: str, digest: str, payload: bytes
+) -> Path:
+    relative = _payload_relative(feature, digest)
+    try:
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            path = rooted.atomic_write(
+                relative,
+                payload,
+                directory_modes=_payload_directory_modes(relative.parent),
+                file_mode=0o600,
+            )
+            rooted.assert_root_binding()
+            return path
+    except fleet_safe_paths.SafePathError as exc:
+        raise DialogueError(f"unsafe dialogue payload publication: {exc}") from exc
 
 
 def _verified_payload(runs_dir: Path, feature: str, message: dict[str, Any]) -> tuple[Path, bytes]:
-    return _verified_payload_from_store(store_path(runs_dir, feature), message)
+    feature = _feature(feature)
+    return _read_rooted_payload(
+        runs_dir, _payload_store_relative(feature), message
+    )
 
 
 def _verified_payload_from_store(
     store: Path, message: dict[str, Any]
 ) -> tuple[Path, bytes]:
-    path = store / str(message["payload_sha256"])
-    payload = _read_bounded_regular_file(path, expected_size=int(message["payload_bytes"]))
-    if hashlib.sha256(payload).hexdigest() != message["payload_sha256"]:
-        raise DialogueError("dialogue payload hash does not match envelope")
-    return path, payload
+    feature = _feature(str(message.get("feature") or ""))
+    store = Path(store)
+    live_relative = _payload_store_relative(feature)
+    archived_relative = _payload_store_relative(feature, archived=True)
+    candidates: list[tuple[Path, Path]] = []
+    try:
+        candidates.append((store.parents[2], live_relative))
+        candidates.append((store.parents[1], archived_relative))
+    except IndexError:
+        pass
+    for root, relative in candidates:
+        if store == root / relative:
+            return _read_rooted_payload(root, relative, message)
+    raise DialogueError("dialogue payload store is outside its selected root")
 
 
 def verify_storage(
@@ -307,7 +413,27 @@ def verify_storage(
     feature: str,
     instances: set[str] | None = None,
 ) -> dict[str, int]:
-    messages = load_messages_from_path(dialogue_ledger, feature)
+    feature = _feature(feature)
+    dialogue_ledger = Path(dialogue_ledger)
+    payload_store = Path(payload_store)
+    root = dialogue_ledger.parent
+    live_store = _payload_store_relative(feature)
+    archived_store = _payload_store_relative(feature, archived=True)
+    if (
+        dialogue_ledger == root / f"fleet-{feature}.dialogue.jsonl"
+        and payload_store == root / live_store
+    ):
+        ledger_leaf = dialogue_ledger.name
+        store_relative = live_store
+    elif (
+        dialogue_ledger == root / "dialogue.jsonl"
+        and payload_store == root / archived_store
+    ):
+        ledger_leaf = dialogue_ledger.name
+        store_relative = archived_store
+    else:
+        raise DialogueError("dialogue storage is outside its selected root")
+    messages = _load_messages_rooted(root, ledger_leaf, feature)
     verified: set[str] = set()
     total_bytes = 0
     for message in messages:
@@ -317,7 +443,7 @@ def verify_storage(
         ):
             raise DialogueError("dialogue message references an unknown manifest instance")
         if message["payload_sha256"] not in verified:
-            _, payload = _verified_payload_from_store(payload_store, message)
+            _, payload = _read_rooted_payload(root, store_relative, message)
             verified.add(message["payload_sha256"])
             total_bytes += len(payload)
     return {
@@ -325,6 +451,92 @@ def verify_storage(
         "payloads": len(verified),
         "payload_bytes": total_bytes,
     }
+
+
+def _entry_exists(path: Path, *, where: str) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise DialogueError(f"cannot inspect {where}") from exc
+    return True
+
+
+def _controller_publication_state_locked(
+    runs_dir: Path, feature: str
+) -> dict[str, Any] | None:
+    """Resolve the one durable controller allowed to authorize publication.
+
+    Imports are intentionally local: the controller modules depend on this
+    transport module, while publication is called only after all imports have
+    completed and while the fleet coordinator lock is already held.
+    """
+
+    fdp2_path = runs_dir / f"fleet-{feature}.dialogue-control.jsonl"
+    fdp3_path = runs_dir / f"fleet-{feature}.assurance-control.jsonl"
+    has_fdp2 = _entry_exists(fdp2_path, where="FDP-2 publication state")
+    has_fdp3 = _entry_exists(fdp3_path, where="FDP-3 publication state")
+    if not has_fdp2 and not has_fdp3:
+        return None
+
+    states: list[dict[str, Any]] = []
+    if has_fdp2:
+        import fleet_dialogue_controller as fdp2
+
+        try:
+            state = fdp2.publication_state_locked(runs_dir, feature)
+        except fdp2.ControllerError as exc:
+            raise DialogueError(f"cannot validate FDP-2 publication state: {exc}") from exc
+        if state is None:
+            raise DialogueError("FDP-2 publication state disappeared while locked")
+        states.append(state)
+    if has_fdp3:
+        import fleet_assurance_controller as fdp3
+
+        try:
+            state = fdp3.publication_state_locked(runs_dir, feature)
+        except fdp3.AssuranceError as exc:
+            raise DialogueError(f"cannot validate FDP-3 publication state: {exc}") from exc
+        if state is None:
+            raise DialogueError("FDP-3 publication state disappeared while locked")
+        states.append(state)
+
+    active = [state for state in states if state["active"]]
+    if len(active) > 1:
+        raise DialogueConflict("multiple active controllers make publication authority ambiguous")
+    if not active:
+        raise DialogueConflict(
+            "controller state exists but no active controller authorizes publication"
+        )
+    return active[0]
+
+
+def _authorize_publication_locked(
+    runs_dir: Path,
+    feature: str,
+    request_identity: dict[str, Any],
+) -> None:
+    state = _controller_publication_state_locked(runs_dir, feature)
+    if state is None:
+        return
+    expected = state["expected"]
+    if not isinstance(expected, dict) or expected.get("type") != "message":
+        raise DialogueConflict(
+            f"{state['controller']} controller {state['controller_id']} is not awaiting publication"
+        )
+    mismatches = [
+        field
+        for field in CONTROLLED_PUBLICATION_FIELDS
+        if request_identity.get(field) != expected.get(field)
+    ]
+    if mismatches:
+        stage = expected.get("stage")
+        raise DialogueConflict(
+            f"{state['controller']} controller {state['controller_id']} stage {stage} "
+            "does not authorize publication fields: "
+            + ", ".join(mismatches)
+        )
 
 
 def publish(
@@ -338,6 +550,7 @@ def publish(
     idempotency_key: str,
     reply_to: str | None = None,
 ) -> dict[str, Any]:
+    feature = _feature(feature)
     if kind not in MESSAGE_KINDS:
         raise DialogueError(f"invalid message kind: {kind}")
     if not SAFE_IDEMPOTENCY_KEY.fullmatch(idempotency_key):
@@ -378,8 +591,12 @@ def publish(
                 raise DialogueConflict("idempotency key was already used for another message")
             _verified_payload(runs_dir, feature, existing)
             return existing
-        path = payload_path(runs_dir, feature, digest)
-        _write_payload(path, payload)
+        _authorize_publication_locked(
+            runs_dir,
+            feature,
+            request_identity,
+        )
+        _write_payload(runs_dir, feature, digest, payload)
         message = {
             "schema_version": SCHEMA_VERSION,
             "timestamp": utc_now(),
@@ -402,6 +619,7 @@ def publish(
                 previous.get("message_id") == message["message_id"]
                 or previous.get("idempotency_key") == idempotency_key
             ),
+            runs_dir=runs_dir,
         )
         if not appended:
             raise DialogueConflict("dialogue identity changed during publication")
@@ -415,6 +633,7 @@ def query(
     recipient: str | None = None,
     kind: str | None = None,
 ) -> list[dict[str, Any]]:
+    feature = _feature(feature)
     with coordinator(runs_dir):
         _, instances = _load_manifest(runs_dir, feature)
         if recipient is not None and recipient not in instances:
@@ -434,6 +653,7 @@ def query(
 
 
 def get_message(runs_dir: Path, *, feature: str, message_id: str) -> dict[str, Any]:
+    feature = _feature(feature)
     messages = query(runs_dir, feature=feature)
     message = next((item for item in messages if item["message_id"] == message_id), None)
     if message is None:
@@ -442,6 +662,7 @@ def get_message(runs_dir: Path, *, feature: str, message_id: str) -> dict[str, A
 
 
 def read_message(runs_dir: Path, *, feature: str, message_id: str) -> bytes:
+    feature = _feature(feature)
     with coordinator(runs_dir):
         _, instances = _load_manifest(runs_dir, feature)
         messages = load_messages(runs_dir, feature)
@@ -455,6 +676,7 @@ def read_message(runs_dir: Path, *, feature: str, message_id: str) -> bytes:
 
 
 def verify(runs_dir: Path, *, feature: str) -> dict[str, int]:
+    feature = _feature(feature)
     with coordinator(runs_dir):
         _, instances = _load_manifest(runs_dir, feature)
         return verify_storage(

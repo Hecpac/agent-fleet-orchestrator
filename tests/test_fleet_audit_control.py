@@ -5,7 +5,9 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -15,6 +17,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "fleet_audit_control.py"
+sys.path.insert(0, str(ROOT / "scripts"))
 SPEC = importlib.util.spec_from_file_location("fleet_audit_control", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 audit = importlib.util.module_from_spec(SPEC)
@@ -59,6 +62,34 @@ class FleetAuditControlTests(unittest.TestCase):
             },
             os.geteuid(),
         )
+
+    @staticmethod
+    def tree_snapshot(
+        root: Path,
+    ) -> dict[Path, tuple[str, int, int, bytes | str]]:
+        snapshot: dict[Path, tuple[str, int, int, bytes | str]] = {}
+        for path in root.rglob("*"):
+            info = path.lstat()
+            relative = path.relative_to(root)
+            if stat.S_ISLNK(info.st_mode):
+                kind = "symlink"
+                payload: bytes | str = os.readlink(path)
+            elif stat.S_ISREG(info.st_mode):
+                kind = "file"
+                payload = path.read_bytes()
+            elif stat.S_ISDIR(info.st_mode):
+                kind = "directory"
+                payload = b""
+            else:
+                kind = "special"
+                payload = b""
+            snapshot[relative] = (
+                kind,
+                stat.S_IMODE(info.st_mode),
+                info.st_nlink,
+                payload,
+            )
+        return snapshot
 
     def test_control_writer_hashes_payloads_and_signs_complete_chain(self) -> None:
         started = self.start_run()
@@ -149,6 +180,274 @@ class FleetAuditControlTests(unittest.TestCase):
         path.write_text(json.dumps(event, separators=(",", ":")) + "\n")
         with self.assertRaisesRegex(RuntimeError, "signature"):
             self.ledger.read_verified(self.run_id)
+
+    def test_durable_ledger_jsonl_is_strict_canonical_and_read_only(self) -> None:
+        self.start_run()
+        path = self.root / self.run_id / "a2a_ledger.jsonl"
+        valid = path.read_bytes()
+        cases = {
+            "duplicate-key": b'{"event_type":"duplicate",' + valid[1:],
+            "nan": b'{"ambiguous":NaN,' + valid[1:],
+            "infinity": b'{"ambiguous":Infinity,' + valid[1:],
+            "overflow": b'{"ambiguous":1e999,' + valid[1:],
+            "bom": b"\xef\xbb\xbf" + valid,
+            "invalid-utf8": b'{"ambiguous":"\xff",' + valid[1:],
+            "surrogate": b'{"ambiguous":"\\ud800",' + valid[1:],
+            "trailing-data": valid.rstrip(b"\n") + b" trailing\n",
+            "missing-final-lf": valid.rstrip(b"\n"),
+            "crlf": valid.rstrip(b"\n") + b"\r\n",
+            "blank-row": valid + b"\n",
+            "non-object": b"[]\n",
+            "non-canonical": b" " + valid,
+        }
+        for name, corrupt in cases.items():
+            with self.subTest(name=name):
+                path.write_bytes(corrupt)
+                before = self.tree_snapshot(Path(self.temp.name))
+                errors = []
+                for _ in range(2):
+                    with self.assertRaises(audit.AuditControlError) as raised:
+                        self.ledger.read_verified(self.run_id)
+                    errors.append(str(raised.exception))
+                    self.assertEqual(
+                        self.tree_snapshot(Path(self.temp.name)),
+                        before,
+                    )
+                self.assertEqual(errors[0], errors[1])
+                path.write_bytes(valid)
+
+        self.assertEqual(self.ledger.read_verified(self.run_id)[0]["sequence"], 1)
+
+    def test_pending_anchor_requires_strict_canonical_json_before_unlink(self) -> None:
+        ledger_root = Path(self.temp.name) / "pending-ledger"
+        anchor_root = Path(self.temp.name) / "pending-anchor"
+        receipts = Path(self.temp.name) / "pending-receipts"
+        ledger_root.mkdir(mode=0o700)
+        anchor_root.mkdir(mode=0o700)
+        ledger = audit.AuditLedger(
+            ledger_root,
+            self.key,
+            audit.DirectoryTestSink(anchor_root),
+            receipt_root=receipts,
+        )
+        event_id = str(uuid.uuid4())
+        event = ledger.append(
+            self.run_id,
+            {"event_id": event_id, "event_type": "RunStarted"},
+        )
+        pending = {
+            "schema_version": 1,
+            "event_id": event["event_id"],
+            "object_key": event["worm_object_key"],
+            "event_sha256": event["event_sha256"],
+            "payload_sha256": audit.hashlib.sha256(
+                audit.canonical(event) + b"\n"
+            ).hexdigest(),
+        }
+        pending_path = receipts / f".{event_id}.pending.json"
+        valid = audit.canonical(pending) + b"\n"
+        corrupt_cases = {
+            "duplicate-key": b'{"schema_version":1,' + valid[1:],
+            "non-canonical": b" " + valid,
+            "partial": valid.rstrip(b"\n") + b" trailing",
+        }
+        for name, corrupt in corrupt_cases.items():
+            with self.subTest(name=name):
+                pending_path.write_bytes(corrupt)
+                pending_path.chmod(0o600)
+                before = self.tree_snapshot(Path(self.temp.name))
+                with self.assertRaises(audit.AuditControlError):
+                    ledger._complete_existing_pending(event)
+                self.assertEqual(
+                    self.tree_snapshot(Path(self.temp.name)),
+                    before,
+                )
+
+        pending_path.write_bytes(valid)
+        ledger._complete_existing_pending(event)
+        self.assertFalse(pending_path.exists())
+
+    def test_socket_request_framing_is_strict_and_invalid_input_has_no_effect(
+        self,
+    ) -> None:
+        def exchange(raw: bytes) -> dict[str, object]:
+            handler = object.__new__(audit.AuditRequestHandler)
+            handler.request = mock.Mock(spec=["settimeout"])
+            handler.rfile = io.BytesIO(raw)
+            handler.wfile = io.BytesIO()
+            handler.server = mock.Mock(audit_service=self.service)
+            with mock.patch.object(
+                audit,
+                "peer_credentials",
+                return_value=(os.geteuid(), os.getegid()),
+            ):
+                handler.handle()
+            return audit._strict_json_frame(
+                handler.wfile.getvalue(),
+                where="test audit response",
+            )
+
+        valid = b'{"operation":"health"}\n'
+        success = exchange(valid)
+        self.assertIs(success["ok"], True)
+        self.assertEqual(success["result"]["status"], "ok")
+        cases = {
+            "duplicate-key": b'{"operation":"health","operation":"verify"}\n',
+            "nan": b'{"operation":"health","bad":NaN}\n',
+            "infinity": b'{"operation":"health","bad":Infinity}\n',
+            "overflow": b'{"operation":"health","bad":1e999}\n',
+            "bom": b"\xef\xbb\xbf" + valid,
+            "invalid-utf8": b'{"operation":"health","bad":"\xff"}\n',
+            "surrogate": b'{"operation":"health","bad":"\\ud800"}\n',
+            "trailing-data": b'{"operation":"health"} trailing\n',
+            "missing-lf": valid.rstrip(b"\n"),
+            "crlf": valid.rstrip(b"\n") + b"\r\n",
+            "blank": b"\n",
+            "two-records": valid + valid,
+            "non-object": b"[]\n",
+        }
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                before = self.tree_snapshot(self.root)
+                first = exchange(raw)
+                second = exchange(raw)
+                self.assertIs(first["ok"], False)
+                self.assertEqual(first, second)
+                self.assertEqual(self.tree_snapshot(self.root), before)
+
+    def test_socket_response_and_outbound_request_are_strict_before_effects(
+        self,
+    ) -> None:
+        with mock.patch.object(audit.socket, "socket") as constructor:
+            with self.assertRaises(audit.AuditControlError):
+                audit.send_request(
+                    Path(self.temp.name) / "unused.sock",
+                    {"operation": "health", "bad": float("nan")},
+                )
+        constructor.assert_not_called()
+
+        valid = b'{"ok":true,"result":{"status":"ok"}}\n'
+        responses = {
+            "duplicate-key": b'{"ok":true,"ok":false,"result":{}}\n',
+            "nan": b'{"ok":true,"result":{"bad":NaN}}\n',
+            "infinity": b'{"ok":true,"result":{"bad":Infinity}}\n',
+            "overflow": b'{"ok":true,"result":{"bad":1e999}}\n',
+            "bom": b"\xef\xbb\xbf" + valid,
+            "invalid-utf8": b'{"ok":true,"result":{"bad":"\xff"}}\n',
+            "surrogate": b'{"ok":true,"result":{"bad":"\\ud800"}}\n',
+            "trailing": valid.rstrip(b"\n") + b" trailing\n",
+            "missing-lf": valid.rstrip(b"\n"),
+            "crlf": valid.rstrip(b"\n") + b"\r\n",
+            "blank": b"\n",
+            "two-records": valid + valid,
+            "non-object": b"[]\n",
+        }
+
+        class FakeSocket:
+            def __init__(self, response: bytes) -> None:
+                self.response = response
+                self.sent = b""
+                self.shutdown_mode = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def settimeout(self, _timeout):
+                return None
+
+            def connect(self, _path):
+                return None
+
+            def sendall(self, payload):
+                self.sent = payload
+
+            def shutdown(self, mode):
+                self.shutdown_mode = mode
+
+            def makefile(self, _mode):
+                return io.BytesIO(self.response)
+
+        for name, response in responses.items():
+            with self.subTest(name=name):
+                fake = FakeSocket(response)
+                with mock.patch.object(audit.socket, "socket", return_value=fake):
+                    with self.assertRaises(audit.AuditControlError):
+                        audit.send_request(
+                            Path(self.temp.name) / "fake.sock",
+                            {"operation": "health"},
+                        )
+                self.assertEqual(fake.sent, b'{"operation":"health"}\n')
+                self.assertEqual(fake.shutdown_mode, audit.socket.SHUT_WR)
+
+    def test_stdin_json_is_strict_deterministic_and_never_connects_when_invalid(
+        self,
+    ) -> None:
+        cases = {
+            "duplicate-key": b'{"operation":"health","operation":"verify"}',
+            "nan": b'{"operation":"health","bad":NaN}',
+            "infinity": b'{"operation":"health","bad":Infinity}',
+            "overflow": b'{"operation":"health","bad":1e999}',
+            "bom": b'\xef\xbb\xbf{"operation":"health"}',
+            "invalid-utf8": b'{"operation":"health","bad":"\xff"}',
+            "surrogate": b'{"operation":"health","bad":"\\ud800"}',
+            "trailing": b'{"operation":"health"} true',
+            "blank": b"",
+            "non-object": b"[]",
+        }
+        socket_path = Path(self.temp.name) / "must-not-be-created.sock"
+        command = [
+            sys.executable,
+            str(MODULE_PATH),
+            "request",
+            "--socket",
+            str(socket_path),
+        ]
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                before = self.tree_snapshot(Path(self.temp.name))
+                first = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    input=raw,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    check=False,
+                )
+                second = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    input=raw,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                    check=False,
+                )
+                self.assertEqual((first.returncode, second.returncode), (2, 2))
+                self.assertEqual(first.stdout, b"")
+                self.assertEqual(first.stderr, second.stderr)
+                self.assertTrue(first.stderr.startswith(b"audit request failed: "))
+                self.assertNotIn(b"Traceback", first.stderr)
+                self.assertEqual(
+                    self.tree_snapshot(Path(self.temp.name)),
+                    before,
+                )
+
+    def test_canonical_hash_contract_rejects_non_json_values(self) -> None:
+        value = {"unicode": "caf\u00e9", "a": 1}
+        encoded = b'{"a":1,"unicode":"caf\xc3\xa9"}'
+        self.assertEqual(audit.canonical(value), encoded)
+        self.assertEqual(
+            audit.digest(value),
+            audit.hashlib.sha256(encoded).hexdigest(),
+        )
+        for invalid in (float("nan"), float("inf"), "\ud800", {1: "value"}):
+            with self.subTest(invalid=repr(invalid)):
+                with self.assertRaises(audit.AuditControlError):
+                    audit.canonical(invalid)
 
     def test_verify_marks_test_sink_non_compliant(self) -> None:
         self.start_run()
