@@ -1943,8 +1943,13 @@ class ControlLifecyclePhysicalStateTests(unittest.TestCase):
                     )
 
     def test_partial_endpoint_publish_crash_reconciles_exact_inodes(self) -> None:
-        socket_root = self.tmp / "partial-publish-sockets"
-        socket_root.mkdir(mode=0o700)
+        # A macOS per-test temp root exceeds the AF_UNIX path budget, which
+        # fails the start before any rename and made this scenario vacuous;
+        # a short root runs the real partial-publish crash on every platform.
+        socket_root = Path(
+            tempfile.mkdtemp(prefix="fc-partial-", dir=os.path.realpath("/tmp"))
+        )
+        self.addCleanup(shutil.rmtree, socket_root, ignore_errors=True)
         socket_root.chmod(0o700)
         crashed = subprocess.run(
             [
@@ -1966,7 +1971,9 @@ class ControlLifecyclePhysicalStateTests(unittest.TestCase):
             check=False,
             timeout=10,
         )
-        self.assertNotEqual(crashed.returncode, 0)
+        # Exactly 137 proves the injected mid-publish crash actually ran;
+        # any other nonzero exit is an earlier failure and a vacuous test.
+        self.assertEqual(crashed.returncode, 137, crashed.stderr)
         with mock.patch.dict(
             os.environ, {"FLEET_CONTROL_SOCKET_DIR": str(socket_root)}
         ):

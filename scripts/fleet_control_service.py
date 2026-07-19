@@ -1832,6 +1832,35 @@ class ControlLifecycle:
                 "cannot remove exact Fleet Control endpoints"
             ) from exc
 
+    def _unlink_crashed_launch_staging(self, lifecycle: dict[str, Any]) -> None:
+        """Remove exact staged leaves left by a launch that crashed mid-publish.
+
+        The lifecycle records final endpoint paths only, so a crash between
+        the first publish rename and gate release strands the unpublished
+        staging inodes; they are located and removed through their exact
+        startup-journal identities.
+        """
+
+        matching = [
+            journal
+            for journal in self._read_startup_journals()
+            if journal["launch_id"] == lifecycle["launch_id"]
+        ]
+        if len(matching) != 1:
+            raise ControlServiceError(
+                "crashed Fleet Control lifecycle lacks one exact startup journal"
+            )
+        journal = matching[0]
+        staged = {
+            key: location
+            for key, location in self._startup_locations(
+                journal, allow_absent=True
+            ).items()
+            if location == "staging"
+        }
+        if staged:
+            self._unlink_startup_endpoints(journal, staged)
+
     def _send_bound_request(
         self,
         lifecycle: dict[str, Any],
@@ -2373,6 +2402,7 @@ class ControlLifecycle:
                 self._unlink_bound_endpoints(
                     lifecycle["socket_root_identity"], endpoint_identities
                 )
+            self._unlink_crashed_launch_staging(lifecycle)
             self._wait_for_quiescence(lifecycle, require_receipt=False, timeout=1.0)
             return self._record_stopped(lifecycle)
         lifecycle = self._read_lifecycle()

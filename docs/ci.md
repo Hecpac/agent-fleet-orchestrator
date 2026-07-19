@@ -25,7 +25,7 @@ just ci
 ```
 
 El workflow tiene permisos `contents: read`, cancela ejecuciones obsoletas,
-tiene un timeout de 15 minutos y conserva los diagnósticos por 14 días. No
+tiene un timeout de 45 minutos y conserva los diagnósticos por 14 días. No
 instala CMUX, no arranca proveedores y no recibe credenciales de Codex, Claude,
 GLM, MiniMax, S3 o WORM.
 

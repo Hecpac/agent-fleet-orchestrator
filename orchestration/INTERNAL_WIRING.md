@@ -1147,3 +1147,39 @@ sleep/wake paths remain explicit live lanes. S0 is one trusted Mac, UID, and
 runs root; hard total-token enforcement, multi-host coordination, independently
 controlled source-event attestation, and external WORM custody remain outside
 this implementation.
+
+## Control socket peer credentials attest the exact server process
+
+`rule: control_peer_credentials_bind_to_exact_server_listen`
+
+`enforced_by:`
+
+- `tests/test_fleet_agent_mcp.py::FleetAgentMCPUnixIntegrationTests::test_authenticated_preflight_proves_real_socket_callability`
+- `tests/test_fleet_control_socket.py::FleetControlSocketTests::test_base_socket_substitution_is_rejected_and_not_unlinked`
+
+`why:` Clients authenticate the control server by comparing the kernel peer
+PID against the lifecycle PID. Linux pins `SO_PEERCRED` at `listen(2)`, so the
+descriptor staged listening by the launching parent would answer every peer
+check with the parent's credentials forever. The server therefore re-listens
+on the adopted descriptor after validating it, binding the kernel attestation
+to the exact authenticated process; macOS `LOCAL_PEERPID` reports the live
+peer directly and the extra listen only restates the backlog. Removing the
+re-listen breaks every Linux client peer authentication while macOS keeps
+passing, which is exactly the drift the hosted portable gate exists to catch.
+
+## Crashed mid-publish stop removes the exact staged endpoints
+
+`rule: crashed_partial_publish_stop_unlinks_exact_staged_leaves`
+
+`enforced_by:`
+
+- `tests/test_fleet_control_socket.py::ControlLifecyclePhysicalStateTests::test_partial_endpoint_publish_crash_reconciles_exact_inodes`
+
+`why:` The lifecycle records final endpoint paths only. A controller crash
+between the first publish rename and gate release strands the unpublished
+staging inodes, which `_unlink_bound_endpoints` never visits. The crashed-stop
+branch therefore resolves the launch's one exact startup journal and unlinks
+the remaining staged leaves by durable identity. The locking test pins exit
+code 137 and a short socket root so the injected crash really executes on
+every platform; without the sweep, every mid-publish crash leaves stale
+staged sockets behind and the stop's emptiness contract is false.
