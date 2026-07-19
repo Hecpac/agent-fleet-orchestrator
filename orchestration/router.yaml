@@ -89,7 +89,7 @@
       "enabled": true,
       "requires_env": [],
       "capabilities": ["implementation", "deep_diagnosis", "code_review", "second_opinion"],
-      "tool_access": ["filesystem", "shell", "git"],
+      "tool_access": ["filesystem", "shell", "git", "fleet_control"],
       "authority": "write",
       "resource_class": "remote",
       "display_rank": 30,
@@ -107,7 +107,7 @@
       "enabled": true,
       "requires_env": [],
       "capabilities": ["candidate_generation", "deep_diagnosis", "second_opinion"],
-      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read", "fleet_control"],
       "authority": "advisory",
       "resource_class": "remote",
       "display_rank": 30,
@@ -125,7 +125,7 @@
       "enabled": true,
       "requires_env": [],
       "capabilities": ["planning", "architecture", "implementation", "deep_diagnosis"],
-      "tool_access": ["filesystem", "shell", "git"],
+      "tool_access": ["filesystem", "shell", "git", "fleet_control"],
       "authority": "write",
       "resource_class": "remote",
       "display_rank": 31,
@@ -158,7 +158,7 @@
       "enabled": true,
       "requires_env": ["ZHIPU_API_KEY"],
       "capabilities": ["diverse_perspective", "parallel_validation", "architecture_challenge"],
-      "tool_access": ["filesystem_read"],
+      "tool_access": ["filesystem_read", "fleet_control"],
       "authority": "advisory",
       "resource_class": "remote",
       "display_rank": 40,
@@ -177,7 +177,7 @@
       "enabled": true,
       "requires_env": ["MINIMAX_API_KEY"],
       "capabilities": ["diverse_perspective", "parallel_validation", "architecture_challenge"],
-      "tool_access": ["filesystem_read"],
+      "tool_access": ["filesystem_read", "fleet_control"],
       "authority": "advisory",
       "resource_class": "remote",
       "display_rank": 40,
@@ -196,7 +196,7 @@
       "enabled": true,
       "requires_env": ["MINIMAX_API_KEY"],
       "capabilities": ["candidate_generation", "parallel_validation", "diverse_perspective"],
-      "tool_access": ["filesystem_read"],
+      "tool_access": ["filesystem_read", "fleet_control"],
       "authority": "advisory",
       "resource_class": "remote",
       "display_rank": 31,
@@ -215,7 +215,7 @@
       "enabled": true,
       "requires_env": ["MINIMAX_API_KEY"],
       "capabilities": ["contract_checking", "parallel_validation", "diverse_perspective"],
-      "tool_access": ["filesystem_read"],
+      "tool_access": ["filesystem_read", "fleet_control"],
       "authority": "advisory",
       "resource_class": "remote",
       "display_rank": 31,
@@ -248,7 +248,7 @@
       "enabled": true,
       "requires_env": [],
       "capabilities": ["independent_code_review", "test_reproduction", "architecture_challenge"],
-      "tool_access": ["filesystem_read", "shell_read", "git_read"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read", "fleet_control"],
       "authority": "verification",
       "resource_class": "remote",
       "display_rank": 50,
@@ -262,7 +262,7 @@
       "include_lead": true,
       "identity_groups": [["builder", "challenger", "verifier"]],
       "instances": [
-        {"instance_id": "scout", "role_type": "codex_candidate", "display_rank": 20, "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read"]},
+        {"instance_id": "scout", "role_type": "codex_candidate", "display_rank": 20, "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read", "fleet_control"]},
         {"instance_id": "builder", "role_type": "codex"},
         {"instance_id": "challenger", "role_type": "glm"},
         {"instance_id": "verifier", "role_type": "claude_reviewer"}
@@ -278,7 +278,7 @@
       "include_lead": true,
       "identity_groups": [["analysis", "challenge", "verify"]],
       "instances": [
-        {"instance_id": "analysis", "role_type": "codex", "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read"]},
+        {"instance_id": "analysis", "role_type": "codex", "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read", "fleet_control"]},
         {"instance_id": "challenge", "role_type": "minimax"},
         {"instance_id": "verify", "role_type": "reviewer"}
       ]
@@ -326,12 +326,13 @@
     },
     "research": {
       "description": "Two uniquely addressed local triage instances plus heterogeneous frontier synthesis.",
+      "mode": "autonomous",
       "include_lead": true,
       "identity_groups": [["research", "challenge"]],
       "instances": [
         {"instance_id": "triage_scope", "role_type": "triage"},
         {"instance_id": "triage_sources", "role_type": "triage"},
-        {"instance_id": "research", "role_type": "codex", "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read"]},
+        {"instance_id": "research", "role_type": "codex", "authority": "advisory", "phase": "RECON", "tool_access": ["filesystem_read", "shell_read", "git_read", "fleet_control"]},
         {"instance_id": "challenge", "role_type": "glm"}
       ]
     }

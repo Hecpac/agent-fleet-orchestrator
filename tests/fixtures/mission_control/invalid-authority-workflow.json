@@ -9,5 +9,5 @@
   "assurance": {"profile": "proportional", "preset": "fleet_dialogue", "minimum_gates": []},
   "audit": {"mode": "signed", "trust_scope": "local-development", "worm_required_for": []},
   "archive": {"mode": "incremental", "content_policy": "full", "include_final_tree": true, "include_git_delta": true},
-  "limits": {"deadline_seconds": 3600, "token_budget": 0, "budget_mode": "soft"}
+  "limits": {"deadline_seconds": 3600, "token_budget": 0, "budget_mode": "soft", "delegation_credits": 8, "max_active_delegations": 3}
 }

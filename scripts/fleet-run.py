@@ -13,6 +13,7 @@ import sys
 from typing import Any
 
 import fleet_artifacts
+import fleet_json
 import fleet_manifest
 
 
@@ -55,19 +56,12 @@ def run_command(command: list[str], *, timeout: int | None = None) -> subprocess
 
 def last_json_object(text: str, *, source: str) -> dict[str, Any]:
     try:
-        value = json.loads(text)
-    except json.JSONDecodeError:
-        value = None
+        value = fleet_json.loads(text)
+    except fleet_json.FleetJSONError as exc:
+        raise MissionError(f"{source} returned invalid strict JSON: {exc}") from exc
     if isinstance(value, dict):
         return value
-    for line in reversed(text.splitlines()):
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            return value
-    raise MissionError(f"{source} returned no JSON object")
+    raise MissionError(f"{source} returned a non-object JSON value")
 
 
 def render_prompt(

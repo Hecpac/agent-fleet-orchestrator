@@ -13,6 +13,7 @@ import uuid
 
 PRE_HOOK = Path.home() / ".claude" / "hooks" / "pre_tool.sh"
 POST_HOOK = Path.home() / ".claude" / "hooks" / "post_tool.sh"
+HOST_CLAUDE_HOOKS_AVAILABLE = PRE_HOOK.is_file() and POST_HOOK.is_file()
 GENESIS = "0" * 64
 
 
@@ -25,6 +26,10 @@ def canonical(value: object) -> bytes:
     ).encode("utf-8")
 
 
+@unittest.skipUnless(
+    HOST_CLAUDE_HOOKS_AVAILABLE,
+    "requires the host Claude audit hooks; exercised by the controlled macOS live lane",
+)
 class ClaudeAuditHookTests(unittest.TestCase):
     def setUp(self) -> None:
         self.audit_temp = tempfile.TemporaryDirectory(prefix="fleet-audit-test-")

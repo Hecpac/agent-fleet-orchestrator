@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Read(/__FLEET_REPO_ROOT__/orchestration/runs/prompts/**)"
+      "Read(/__FLEET_REPO_ROOT__/orchestration/runs/prompts/**)",
+      "mcp__fleet_control__*"
     ],
     "deny": [
       "Bash(sudo *)",

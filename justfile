@@ -1,6 +1,10 @@
 check:
     ./scripts/check-env.sh
 
+# Portable contract used by hosted CI and safe to run locally.
+ci:
+    ./scripts/check-ci.sh
+
 # Validate every typed Mission Control workflow without CMUX effects.
 workflow-validate:
     python3 scripts/workflow_config.py validate workflows/*.yaml

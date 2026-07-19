@@ -12,16 +12,21 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import stat
 import subprocess
 import sys
 from typing import Any
 import uuid
 
+import fleet_clone_guard
 import fleet_dialogue
 import fleet_dialogue_controller as fdp2
+import fleet_json
+import fleet_mission_state as mission_state
+import fleet_safe_paths
 import fleet_state
 from fleet_leases import closing_path, coordinator
-from fleet_ledger import append_record, events_for_run
+from fleet_ledger import LedgerError, append_record, events_for_run, read_records
 
 
 SCHEMA_VERSION = 1
@@ -93,6 +98,21 @@ SNAPSHOT_FIELDS = {
     "expected",
     "terminal_reason",
 }
+SNAPSHOT_RECORD_FIELDS_V1 = {
+    "instance",
+    "phase",
+    "path",
+    "target_repo",
+    "head_sha",
+    "detached",
+}
+SNAPSHOT_RECORD_FIELDS_V2 = SNAPSHOT_RECORD_FIELDS_V1 | {
+    "source_repo",
+    "publication_state",
+    "git_isolation",
+    "root_device",
+    "root_inode",
+}
 RUN_EXPECTED_FIELDS = {
     "type",
     "stage",
@@ -143,7 +163,10 @@ def parse_timestamp(value: Any, where: str) -> datetime:
 
 
 def canonical(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    try:
+        return fleet_json.canonical_bytes(value)
+    except fleet_json.FleetJSONError as exc:
+        raise AssuranceError("FDP-3 value is not strict JSON") from exc
 
 
 def digest(value: Any) -> str:
@@ -280,23 +303,44 @@ def _validate_snapshot(value: Any) -> None:
 
 
 def load_events_from_path(path: Path, feature: str | None = None) -> list[dict[str, Any]]:
+    path = Path(path)
+    root = path.parent
+    if path != root / path.name:
+        raise AssuranceError("assurance control ledger is outside its selected root")
+    if feature is not None:
+        if not isinstance(feature, str) or not fleet_dialogue.SAFE_FEATURE.fullmatch(
+            feature
+        ):
+            raise AssuranceError("invalid feature")
+        allowed = {
+            "assurance-control.jsonl",
+            f"fleet-{feature}.assurance-control.jsonl",
+        }
+        if path.name not in allowed:
+            raise AssuranceError(
+                "assurance control ledger is outside its selected root"
+            )
+    elif path.name != "assurance-control.jsonl":
+        prefix = "fleet-"
+        suffix = ".assurance-control.jsonl"
+        candidate = (
+            path.name[len(prefix) : -len(suffix)]
+            if path.name.startswith(prefix) and path.name.endswith(suffix)
+            else ""
+        )
+        if not fleet_dialogue.SAFE_FEATURE.fullmatch(candidate):
+            raise AssuranceError(
+                "assurance control ledger is outside its selected root"
+            )
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
+        records = read_records(path, runs_dir=root)
+    except LedgerError as exc:
         raise AssuranceError(f"cannot read assurance control ledger: {path}") from exc
     events: list[dict[str, Any]] = []
     previous_sha: str | None = None
     event_ids: set[str] = set()
     idempotency_keys: set[str] = set()
-    for line_number, raw in enumerate(lines, start=1):
-        if not raw.strip():
-            raise AssuranceError(f"blank assurance control row at line {line_number}")
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise AssuranceError(f"invalid assurance control JSON at line {line_number}") from exc
+    for line_number, event in enumerate(records, start=1):
         if not isinstance(event, dict) or set(event) != EVENT_FIELDS:
             raise AssuranceError("assurance control event fields do not match schema_version=1")
         if event.get("schema_version") != SCHEMA_VERSION or event.get("sequence") != line_number:
@@ -329,6 +373,38 @@ def load_events_from_path(path: Path, feature: str | None = None) -> list[dict[s
 
 def load_events(runs_dir: Path, feature: str) -> list[dict[str, Any]]:
     return load_events_from_path(ledger_path(runs_dir, feature), feature)
+
+
+def publication_state_locked(
+    runs_dir: Path, feature: str
+) -> dict[str, Any] | None:
+    """Return FDP-3 publication authority while the coordinator is held."""
+
+    if not isinstance(feature, str) or not fleet_dialogue.SAFE_FEATURE.fullmatch(
+        feature
+    ):
+        raise AssuranceError("invalid feature")
+    path = ledger_path(runs_dir, feature)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise AssuranceError("cannot inspect FDP-3 publication state") from exc
+    if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        raise AssuranceError("FDP-3 publication state must be a regular file")
+    events = load_events(runs_dir, feature)
+    if not events:
+        raise AssuranceError("FDP-3 publication state ledger is empty")
+    current = events[-1]
+    snapshot = current["snapshot"]
+    return {
+        "controller": "FDP-3",
+        "controller_id": current["assurance_id"],
+        "status": snapshot["status"],
+        "active": snapshot["status"] in ACTIVE_STATES,
+        "expected": copy.deepcopy(snapshot["expected"]),
+    }
 
 
 def _request_hash(request: dict[str, Any]) -> str:
@@ -460,14 +536,45 @@ def _write_immutable(path: Path, payload: bytes) -> None:
 
 
 def _write_json_immutable(path: Path, value: Any) -> str:
-    payload = json.dumps(value, indent=2, sort_keys=True).encode("utf-8") + b"\n"
+    try:
+        payload = fleet_json.canonical_bytes(value) + b"\n"
+    except fleet_json.FleetJSONError as exc:
+        raise AssuranceError("durable FDP-3 artifact is not strict JSON") from exc
     _write_immutable(path, payload)
     return hashlib.sha256(payload).hexdigest()
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(
+        path,
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _git(root: str | Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(
-        ["git", "-C", str(root), *args],
+        [
+            "git",
+            "--no-replace-objects",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "init.templateDir=/dev/null",
+            "-C",
+            str(root),
+            *args,
+        ],
+        env=fdp2._safe_git_environment(),
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -480,37 +587,366 @@ def _git(root: str | Path, *args: str, check: bool = True) -> subprocess.Complet
     return result
 
 
+def _validate_snapshot_tree(
+    path: Path,
+    *,
+    allowed_root_modes: frozenset[int] | None = frozenset({0o500}),
+    require_read_only: bool = True,
+) -> None:
+    try:
+        physical = path.resolve(strict=True)
+        root_info = path.lstat()
+    except OSError as exc:
+        raise AssuranceContractError(f"assurance snapshot is unavailable: {path}") from exc
+    if (
+        physical != path
+        or not stat.S_ISDIR(root_info.st_mode)
+        or stat.S_ISLNK(root_info.st_mode)
+        or root_info.st_uid != os.geteuid()
+        or (
+            allowed_root_modes is not None
+            and stat.S_IMODE(root_info.st_mode) not in allowed_root_modes
+        )
+    ):
+        raise AssuranceContractError(
+            f"assurance snapshot root mode or binding is unsafe: {path}"
+        )
+    expected_device = root_info.st_dev
+    for directory, directories, files in os.walk(path, followlinks=False):
+        directory_path = Path(directory)
+        try:
+            directory_info = directory_path.lstat()
+        except OSError as exc:
+            raise AssuranceContractError(
+                f"assurance snapshot tree changed: {directory_path}"
+            ) from exc
+        if (
+            not stat.S_ISDIR(directory_info.st_mode)
+            or stat.S_ISLNK(directory_info.st_mode)
+            or directory_info.st_uid != os.geteuid()
+            or directory_info.st_dev != expected_device
+            or (require_read_only and directory_info.st_mode & 0o222)
+        ):
+            raise AssuranceContractError(
+                f"assurance snapshot contains an unsafe directory: {directory_path}"
+            )
+        for name in [*directories, *files]:
+            entry = directory_path / name
+            try:
+                info = entry.lstat()
+            except OSError as exc:
+                raise AssuranceContractError(
+                    f"assurance snapshot tree changed: {entry}"
+                ) from exc
+            if info.st_uid != os.geteuid() or info.st_dev != expected_device:
+                raise AssuranceContractError(
+                    f"assurance snapshot contains foreign filesystem content: {entry}"
+                )
+            if stat.S_ISLNK(info.st_mode):
+                raise AssuranceContractError(
+                    f"assurance snapshot contains a symlink: {entry}"
+                )
+            if stat.S_ISREG(info.st_mode):
+                if info.st_nlink != 1:
+                    raise AssuranceContractError(
+                        f"assurance snapshot contains a hardlinked file: {entry}"
+                    )
+                if require_read_only and info.st_mode & 0o222:
+                    raise AssuranceContractError(
+                        f"assurance snapshot contains a writable file: {entry}"
+                    )
+            elif stat.S_ISDIR(info.st_mode):
+                if require_read_only and info.st_mode & 0o222:
+                    raise AssuranceContractError(
+                        f"assurance snapshot contains a writable directory: {entry}"
+                    )
+            else:
+                raise AssuranceContractError(
+                    f"assurance snapshot contains a special file: {entry}"
+                )
+
+
+def _make_snapshot_read_only(path: Path) -> None:
+    _validate_snapshot_tree(
+        path,
+        allowed_root_modes=None,
+        require_read_only=False,
+    )
+    for directory, directories, files in os.walk(
+        path,
+        topdown=False,
+        followlinks=False,
+    ):
+        directory_path = Path(directory)
+        for name in files:
+            entry = directory_path / name
+            info = entry.lstat()
+            os.chmod(entry, stat.S_IMODE(info.st_mode) & ~0o222)
+        for name in directories:
+            entry = directory_path / name
+            info = entry.lstat()
+            os.chmod(entry, stat.S_IMODE(info.st_mode) & ~0o222)
+    os.chmod(path, 0o500)
+    _validate_snapshot_tree(path)
+
+
 def _validate_snapshot_worktree(path: Path, head_sha: str) -> None:
-    if not path.is_dir():
-        raise AssuranceContractError(f"assurance snapshot is missing: {path}")
+    _validate_snapshot_tree(path)
+    try:
+        fdp2._validate_private_git_metadata(path)
+    except fdp2.ContractError as exc:
+        raise AssuranceContractError(str(exc)) from exc
+    git_common = _git(
+        path,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+    ).stdout.strip()
+    git_dir = _git(
+        path,
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-dir",
+    ).stdout.strip()
+    top_level = _git(
+        path,
+        "rev-parse",
+        "--path-format=absolute",
+        "--show-toplevel",
+    ).stdout.strip()
+    if (
+        Path(git_common) != path / ".git"
+        or Path(git_dir) != path / ".git"
+        or Path(top_level) != path
+        or _git(path, "remote").stdout.strip()
+    ):
+        raise AssuranceContractError(
+            f"assurance snapshot does not have an isolated Git store: {path}"
+        )
+    alternates = path / ".git" / "objects" / "info" / "alternates"
+    hooks = path / ".git" / "hooks"
+    if alternates.exists() or alternates.is_symlink():
+        raise AssuranceContractError(f"assurance snapshot has Git alternates: {path}")
+    if hooks.is_symlink() or (hooks.exists() and any(hooks.iterdir())):
+        raise AssuranceContractError(f"assurance snapshot has Git hooks: {path}")
+    _reject_git_history_overrides(path)
     if _git(path, "rev-parse", "--verify", "HEAD").stdout.strip() != head_sha:
         raise AssuranceContractError(f"assurance snapshot HEAD drifted: {path}")
     attached = _git(path, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
     if attached.returncode == 0:
         raise AssuranceContractError(f"assurance snapshot is not detached: {path}")
+    # Git deliberately hides worktree drift for entries carrying
+    # skip-worktree or assume-unchanged.  A read-only filesystem mode does not
+    # make those index promises trustworthy, so snapshots must contain only
+    # ordinary cached entries.  Check both views because ``-v`` exposes
+    # assume-unchanged while ``-f`` exposes fsmonitor-valid state.
+    for option in ("-v", "-f"):
+        records = _git(path, "ls-files", option, "-z").stdout.split("\0")
+        if any(record and not record.startswith("H ") for record in records):
+            raise AssuranceContractError(
+                f"assurance snapshot contains hidden Git index flags: {path}"
+            )
     if _git(path, "status", "--porcelain", "--ignored").stdout.strip():
         raise AssuranceContractError(f"assurance snapshot is dirty: {path}")
 
 
-def _ensure_snapshot(target_repo: str, path: Path, head_sha: str) -> None:
-    if path.exists():
+def _reject_git_history_overrides(root: Path) -> None:
+    grafts = Path(
+        _git(
+            root,
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "info/grafts",
+        ).stdout.strip()
+    )
+    if grafts.exists() or grafts.is_symlink():
+        raise AssuranceContractError(
+            f"assurance Git history grafts are forbidden: {root}"
+        )
+    if _git(
+        root,
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/replace",
+    ).stdout.strip():
+        raise AssuranceContractError(
+            f"assurance Git replace refs are forbidden: {root}"
+        )
+
+
+def _snapshot_source(manifest: dict[str, str], head_sha: str) -> tuple[Path, str]:
+    try:
+        current_head = fdp2._clean_writer_head(manifest)
+        source = Path(fdp2._writer_git_root(manifest))
+    except fdp2.ContractError as exc:
+        raise AssuranceContractError(str(exc)) from exc
+    if current_head != head_sha:
+        raise AssuranceContractError("assurance snapshot source HEAD drifted")
+    try:
+        physical_source = source.resolve(strict=True)
+    except OSError as exc:
+        raise AssuranceContractError("assurance snapshot source is unavailable") from exc
+    if physical_source != source:
+        raise AssuranceContractError("assurance snapshot source binding drifted")
+    _reject_git_history_overrides(source)
+    base_sha = manifest.get(f"{fdp2.MAKER_INSTANCE}.base_sha", "")
+    if not GIT_SHA.fullmatch(base_sha):
+        raise AssuranceContractError("assurance snapshot source base SHA is invalid")
+    if (
+        _git(source, "rev-parse", "--verify", f"{base_sha}^{{commit}}").stdout.strip()
+        != base_sha
+        or _git(source, "rev-parse", "--verify", f"{head_sha}^{{commit}}").stdout.strip()
+        != head_sha
+    ):
+        raise AssuranceContractError("assurance snapshot source object binding drifted")
+    _git(source, "merge-base", "--is-ancestor", base_sha, head_sha)
+    publication_state = manifest.get(f"{fdp2.MAKER_INSTANCE}.publication_state", "")
+    if publication_state == "private":
+        target = Path(manifest["target_repo"])
+        branch = manifest[f"{fdp2.MAKER_INSTANCE}.branch"]
+        _git(target, "cat-file", "-e", f"{base_sha}^{{commit}}")
+        target_ref = _git(
+            target,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            check=False,
+        )
+        if target_ref.returncode == 0:
+            raise AssuranceContractError(
+                "private assurance source branch is already published"
+            )
+        target_object = _git(
+            target,
+            "cat-file",
+            "-e",
+            f"{head_sha}^{{commit}}",
+            check=False,
+        )
+        if target_object.returncode == 0:
+            raise AssuranceContractError(
+                "private assurance source object is already present in target"
+            )
+    elif publication_state != "published":
+        raise AssuranceContractError("assurance snapshot publication state is invalid")
+    return source, publication_state
+
+
+def _clone_snapshot(source: Path, path: Path, head_sha: str) -> None:
+    pending = path.parent / f".{path.name}.creating"
+    if path.exists() or path.is_symlink():
+        if pending.exists() or pending.is_symlink():
+            raise AssuranceContractError("assurance snapshot exists with pending clone")
         _validate_snapshot_worktree(path, head_sha)
         return
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    result = _git(
-        target_repo,
-        "worktree",
-        "add",
-        "--detach",
-        str(path),
-        head_sha,
+    if pending.exists() or pending.is_symlink():
+        _validate_snapshot_worktree(pending, head_sha)
+        os.replace(pending, path)
+        _fsync_directory(path.parent)
+        _validate_snapshot_worktree(path, head_sha)
+        return
+    result = subprocess.run(
+        [
+            "git",
+            "--no-replace-objects",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "init.templateDir=/dev/null",
+            "clone",
+            "--no-local",
+            "--no-hardlinks",
+            "--no-checkout",
+            "--no-tags",
+            "--",
+            str(source),
+            str(pending),
+        ],
+        env=fdp2._safe_git_environment(),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         check=False,
     )
     if result.returncode != 0:
         raise AssuranceContractError(
-            f"cannot create detached assurance snapshot: {result.stderr.strip()}"
+            f"cannot create isolated assurance snapshot: {result.stderr.strip()}"
         )
+    _git(pending, "remote", "remove", "origin")
+    _git(pending, "checkout", "--detach", "--force", head_sha)
+    _make_snapshot_read_only(pending)
+    _validate_snapshot_worktree(pending, head_sha)
+    os.replace(pending, path)
+    _fsync_directory(path.parent)
     _validate_snapshot_worktree(path, head_sha)
+
+
+def _ensure_snapshot(
+    manifest: dict[str, str],
+    path: Path,
+    head_sha: str,
+) -> tuple[Path, str]:
+    source, publication_state = _snapshot_source(manifest, head_sha)
+    _clone_snapshot(source, path, head_sha)
+    base_sha = manifest[f"{fdp2.MAKER_INSTANCE}.base_sha"]
+    _git(path, "merge-base", "--is-ancestor", base_sha, head_sha)
+    source_after, state_after = _snapshot_source(manifest, head_sha)
+    if source_after != source or state_after != publication_state:
+        raise AssuranceContractError("assurance snapshot source changed during clone")
+    return source, publication_state
+
+
+def _snapshot_guard_args(
+    runs_dir: Path,
+    *,
+    feature: str,
+    assurance_id: str,
+    stage: str,
+    head_sha: str,
+    mode: str = "",
+) -> argparse.Namespace:
+    short_id = assurance_id.split("-", 1)[0]
+    return argparse.Namespace(
+        runs_dir=runs_dir,
+        worktrees_root=runs_dir / "worktrees",
+        feature=feature,
+        instance=f"fdp3-{short_id}-{stage}",
+        workspace_uuid=assurance_id,
+        kind="reader",
+        expected_sha=head_sha,
+        branch="-",
+        mode=mode,
+    )
+
+
+def _snapshot_guard_paths(
+    args: argparse.Namespace,
+) -> tuple[Path, Path, Path, Path]:
+    workspace_uuid = str(uuid.UUID(args.workspace_uuid)).upper()
+    stage_name, tombstone_name, _ = fleet_clone_guard._intent_names(
+        args.feature,
+        args.instance,
+        workspace_uuid,
+    )
+    root = Path(args.worktrees_root).resolve(strict=True)
+    source = root / f"{args.feature}-{args.instance}"
+    staged = (
+        root
+        / ".fleet-control-staging"
+        / f"{args.feature}--{args.instance}--{workspace_uuid}"
+    )
+    return (
+        source,
+        staged,
+        Path(args.runs_dir).resolve() / stage_name,
+        Path(args.runs_dir).resolve() / tombstone_name,
+    )
 
 
 def _template_path(name: str) -> Path:
@@ -599,16 +1035,24 @@ def _load_manifest(runs_dir: Path, feature: str, *, live_identity: bool) -> dict
     return manifest
 
 
-def _state(runs_dir: Path, feature: str) -> dict[str, Any]:
-    path = runs_dir / f"fleet-{feature}.state.json"
+def _state(
+    runs_dir: Path,
+    feature: str,
+    manifest: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    manifest_path = runs_dir / f"fleet-{feature}.manifest"
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AssuranceError(f"cannot read fleet state: {path}") from exc
-    if not isinstance(value, dict) or value.get("feature") != feature:
-        raise AssuranceError("fleet state identity is invalid")
-    if not isinstance(value.get("history"), list):
-        raise AssuranceError("fleet state history is invalid")
+        live_manifest, value = fleet_state.load_live(manifest_path)
+    except (
+        OSError,
+        fleet_safe_paths.SafePathError,
+        fleet_state.PhaseStateError,
+    ) as exc:
+        raise AssuranceError(
+            f"cannot read fleet state: {manifest_path.with_suffix('.state.json')}"
+        ) from exc
+    if manifest is not None and live_manifest != manifest:
+        raise AssuranceError("fleet manifest changed before phase validation")
     return value
 
 
@@ -620,7 +1064,7 @@ def _require_challenge_start_state(
     now: datetime | None = None,
     validate_approval: bool = True,
 ) -> dict[str, Any]:
-    value = _state(runs_dir, feature)
+    value = _state(runs_dir, feature, manifest)
     if value.get("active_phase") != "CHALLENGE":
         raise AssuranceError(
             f"FDP-3 start requires active_phase=CHALLENGE, got {value.get('active_phase')}"
@@ -660,9 +1104,10 @@ def _require_verify_state(
     runs_dir: Path,
     feature: str,
     *,
+    manifest: dict[str, str],
     control_head_sha256: str,
 ) -> dict[str, Any]:
-    value = _state(runs_dir, feature)
+    value = _state(runs_dir, feature, manifest)
     if value.get("active_phase") != "VERIFY":
         raise AssuranceError(
             f"FDP-3 phase acknowledgement requires active_phase=VERIFY, got {value.get('active_phase')}"
@@ -754,12 +1199,29 @@ def _file_record(root: Path, path: Path) -> dict[str, Any]:
     }
 
 
+def _context_lifecycle_rows(
+    runs_dir: Path,
+    feature: str,
+    run_ids: list[str],
+) -> list[dict[str, Any]]:
+    lifecycle_path = runs_dir / f"fleet-{feature}.ledger.jsonl"
+    try:
+        records = read_records(lifecycle_path, runs_dir=runs_dir)
+    except LedgerError as exc:
+        raise AssuranceError("FDP-2 lifecycle ledger is invalid") from exc
+    selected = [row for row in records if row.get("run_id") in run_ids]
+    if run_ids and {row.get("run_id") for row in selected} != set(run_ids):
+        raise AssuranceError("FDP-2 context lacks lifecycle evidence for a bound run")
+    return selected
+
+
 def _write_context(
     runs_dir: Path,
     feature: str,
     assurance_id: str,
     accepted: dict[str, Any],
     snapshots_file: Path,
+    lifecycle_rows: list[dict[str, Any]],
 ) -> tuple[str, str]:
     root = assurance_root(runs_dir, feature, assurance_id)
     context_dir = root / "context"
@@ -792,28 +1254,11 @@ def _write_context(
             }
         )
 
-    lifecycle_path = runs_dir / f"fleet-{feature}.ledger.jsonl"
-    lifecycle_rows: list[dict[str, Any]] = []
-    if lifecycle_path.exists():
-        try:
-            lifecycle_lines = lifecycle_path.read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
-            raise AssuranceError("cannot copy FDP-2 lifecycle evidence") from exc
-        for raw in lifecycle_lines:
-            if not raw.strip():
-                continue
-            try:
-                row = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise AssuranceError("FDP-2 lifecycle ledger is invalid") from exc
-            if isinstance(row, dict) and row.get("run_id") in accepted["run_ids"]:
-                lifecycle_rows.append(row)
-    if accepted["run_ids"] and {
-        row.get("run_id") for row in lifecycle_rows
-    } != set(accepted["run_ids"]):
-        raise AssuranceError("FDP-2 context lacks lifecycle evidence for a bound run")
     lifecycle_copy = context_dir / "fdp2-lifecycle.jsonl"
-    lifecycle_payload = b"".join(canonical(row) + b"\n" for row in lifecycle_rows)
+    try:
+        lifecycle_payload = fleet_json.canonical_jsonl(lifecycle_rows)
+    except fleet_json.FleetJSONError as exc:
+        raise AssuranceError("FDP-2 lifecycle evidence is not strict JSON") from exc
     _write_immutable(lifecycle_copy, lifecycle_payload)
     copied_paths.append(lifecycle_copy)
 
@@ -842,30 +1287,38 @@ def _write_context(
 def _snapshot_records(
     *,
     target_repo: str,
+    source_repo: str,
+    publication_state: str,
     accepted_head_sha: str,
     challenge_path: Path,
     verify_path: Path,
 ) -> dict[str, Any]:
+    def record(path: Path, instance: str, phase: str) -> dict[str, Any]:
+        info = path.lstat()
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise AssuranceContractError(
+                f"assurance snapshot root binding is unsafe: {path}"
+            )
+        return {
+            "instance": instance,
+            "phase": phase,
+            "path": str(path),
+            "target_repo": target_repo,
+            "source_repo": source_repo,
+            "publication_state": publication_state,
+            "git_isolation": "isolated-clone",
+            "head_sha": accepted_head_sha,
+            "detached": True,
+            "root_device": info.st_dev,
+            "root_inode": info.st_ino,
+        }
+
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "accepted_head_sha": accepted_head_sha,
         "snapshots": [
-            {
-                "instance": CHALLENGE_INSTANCE,
-                "phase": "CHALLENGE",
-                "path": str(challenge_path),
-                "target_repo": target_repo,
-                "head_sha": accepted_head_sha,
-                "detached": True,
-            },
-            {
-                "instance": VERIFY_INSTANCE,
-                "phase": "VERIFY",
-                "path": str(verify_path),
-                "target_repo": target_repo,
-                "head_sha": accepted_head_sha,
-                "detached": True,
-            },
+            record(challenge_path, CHALLENGE_INSTANCE, "CHALLENGE"),
+            record(verify_path, VERIFY_INSTANCE, "VERIFY"),
         ],
     }
 
@@ -1093,6 +1546,11 @@ def start(
             if (runs_dir / "locks" / f"{feature}.{instance}.lock").exists():
                 raise AssuranceConflict(f"FDP-3 participant is busy: {instance}")
         accepted = _accepted_fdp2_context_locked(runs_dir, feature, manifest)
+        lifecycle_rows = _context_lifecycle_rows(
+            runs_dir,
+            feature,
+            accepted["run_ids"],
+        )
         assurance_id = str(
             uuid.uuid5(
                 uuid.NAMESPACE_URL,
@@ -1100,12 +1558,40 @@ def start(
             )
         )
         short_id = assurance_id.split("-", 1)[0]
-        challenge_path = runs_dir / "worktrees" / f"{feature}-fdp3-{short_id}-challenge"
-        verify_path = runs_dir / "worktrees" / f"{feature}-fdp3-{short_id}-verify"
-        _ensure_snapshot(manifest["target_repo"], challenge_path, accepted["accepted_head_sha"])
-        _ensure_snapshot(manifest["target_repo"], verify_path, accepted["accepted_head_sha"])
+        source_repo, publication_state = _snapshot_source(
+            manifest,
+            accepted["accepted_head_sha"],
+        )
+        try:
+            worktrees_root = fleet_clone_guard.ensure_root(
+                runs_dir / "worktrees",
+                [Path(manifest["target_repo"]), source_repo],
+            )
+        except fleet_clone_guard.CloneGuardError as exc:
+            raise AssuranceContractError(str(exc)) from exc
+        challenge_path = worktrees_root / f"{feature}-fdp3-{short_id}-challenge"
+        verify_path = worktrees_root / f"{feature}-fdp3-{short_id}-verify"
+        challenge_source, challenge_state = _ensure_snapshot(
+            manifest,
+            challenge_path,
+            accepted["accepted_head_sha"],
+        )
+        verify_source, verify_state = _ensure_snapshot(
+            manifest,
+            verify_path,
+            accepted["accepted_head_sha"],
+        )
+        if (
+            challenge_source != source_repo
+            or verify_source != source_repo
+            or challenge_state != publication_state
+            or verify_state != publication_state
+        ):
+            raise AssuranceContractError("assurance snapshot source binding changed")
         snapshots = _snapshot_records(
             target_repo=manifest["target_repo"],
+            source_repo=str(source_repo),
+            publication_state=publication_state,
             accepted_head_sha=accepted["accepted_head_sha"],
             challenge_path=challenge_path,
             verify_path=verify_path,
@@ -1118,6 +1604,7 @@ def start(
             assurance_id,
             accepted,
             snapshots_file,
+            lifecycle_rows,
         )
         prompt_file, prompt_sha = _challenge_prompt(
             runs_dir,
@@ -1454,6 +1941,7 @@ def _ingest_phase_advance_locked(
     runs_dir: Path,
     feature: str,
     current: dict[str, Any],
+    manifest: dict[str, str],
 ) -> tuple[dict[str, Any], str]:
     snapshot = current["snapshot"]
     expected = snapshot["expected"]
@@ -1462,6 +1950,7 @@ def _ingest_phase_advance_locked(
     _require_verify_state(
         runs_dir,
         feature,
+        manifest=manifest,
         control_head_sha256=current["event_sha256"],
     )
     if not snapshot.get("challenge_message_id"):
@@ -1559,6 +2048,7 @@ def step(
                 runs_dir,
                 feature,
                 current,
+                manifest,
             )
         return _append_event_locked(
             runs_dir,
@@ -1696,7 +2186,7 @@ def challenge_phase_gate(
             )
         if evidence != latest["event_sha256"]:
             raise AssuranceError("FDP-3 CHALLENGE gate evidence is not the exact control head")
-        if _state(runs_dir, feature).get("active_phase") != "CHALLENGE":
+        if _state(runs_dir, feature, manifest).get("active_phase") != "CHALLENGE":
             raise AssuranceError("FDP-3 CHALLENGE gate requires active_phase=CHALLENGE")
         try:
             messages = fleet_dialogue.load_messages(runs_dir, feature)
@@ -1789,12 +2279,38 @@ def _regular_file_hash(path: Path) -> dict[str, Any]:
         raise AssuranceError(str(exc).replace("verification receipt", "assurance")) from exc
 
 
-def _verify_context_tree(root: Path, assurance_id: str) -> dict[str, Any]:
-    context_path = root / assurance_id / "context" / "fdp2-context.json"
+def _load_rooted_json(
+    root: Path,
+    relative: Path | str,
+    *,
+    directory_modes: tuple[int, ...],
+    max_bytes: int,
+    error_message: str,
+) -> Any:
     try:
-        context = json.loads(context_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AssuranceError("FDP-3 copied context is missing or invalid") from exc
+        payload = fdp2._read_rooted_regular(
+            root,
+            relative,
+            directory_modes=directory_modes,
+            max_bytes=max_bytes,
+            where=error_message,
+        )
+        value = fleet_json.loads(payload)
+    except (fdp2.ControllerError, fleet_json.FleetJSONError) as exc:
+        raise AssuranceError(error_message) from exc
+    if type(value) is not dict:
+        raise AssuranceError(error_message)
+    return value
+
+
+def _verify_context_tree(root: Path, assurance_id: str) -> dict[str, Any]:
+    context = _load_rooted_json(
+        root,
+        Path(assurance_id) / "context" / "fdp2-context.json",
+        directory_modes=(0o700, 0o700),
+        max_bytes=fdp2.MAX_CONTROL_FILE_BYTES,
+        error_message="FDP-3 copied context is missing or invalid",
+    )
     if not isinstance(context, dict) or set(context) != {
         "schema_version",
         "feature",
@@ -1880,32 +2396,33 @@ def _verify_context_tree(root: Path, assurance_id: str) -> dict[str, Any]:
         copied_ids.append(str(envelope.get("message_id")))
     if copied_ids != fdp2_context["message_ids"]:
         raise AssuranceError("FDP-3 copied message order/identity changed")
-    snapshots_path = root / assurance_id / "snapshots.json"
-    try:
-        snapshots = json.loads(snapshots_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AssuranceError("FDP-3 snapshot metadata is invalid") from exc
+    snapshots = _load_rooted_json(
+        root,
+        Path(assurance_id) / "snapshots.json",
+        directory_modes=(0o700,),
+        max_bytes=fdp2.MAX_CONTROL_FILE_BYTES,
+        error_message="FDP-3 snapshot metadata is invalid",
+    )
     if not isinstance(snapshots, dict) or set(snapshots) != {
         "schema_version",
         "accepted_head_sha",
         "snapshots",
     }:
         raise AssuranceError("FDP-3 snapshot metadata fields are invalid")
-    if snapshots.get("schema_version") != 1 or snapshots.get("accepted_head_sha") != context["accepted_head_sha"]:
+    snapshot_schema = snapshots.get("schema_version")
+    if snapshot_schema not in {1, 2} or snapshots.get("accepted_head_sha") != context["accepted_head_sha"]:
         raise AssuranceError("FDP-3 snapshot metadata identity is invalid")
     records = snapshots.get("snapshots")
     if not isinstance(records, list) or len(records) != 2:
         raise AssuranceError("FDP-3 requires exactly two snapshot records")
     expected = [(CHALLENGE_INSTANCE, "CHALLENGE"), (VERIFY_INSTANCE, "VERIFY")]
     for record, (instance, phase) in zip(records, expected, strict=True):
-        if not isinstance(record, dict) or set(record) != {
-            "instance",
-            "phase",
-            "path",
-            "target_repo",
-            "head_sha",
-            "detached",
-        }:
+        expected_fields = (
+            SNAPSHOT_RECORD_FIELDS_V2
+            if snapshot_schema == 2
+            else SNAPSHOT_RECORD_FIELDS_V1
+        )
+        if not isinstance(record, dict) or set(record) != expected_fields:
             raise AssuranceError("FDP-3 snapshot record fields are invalid")
         if (
             record.get("instance") != instance
@@ -1917,6 +2434,34 @@ def _verify_context_tree(root: Path, assurance_id: str) -> dict[str, Any]:
         for field in ("path", "target_repo"):
             if not isinstance(record.get(field), str) or not record[field]:
                 raise AssuranceError(f"FDP-3 snapshot {field} is invalid")
+        if snapshot_schema == 2:
+            if (
+                record.get("publication_state") not in {"private", "published"}
+                or record.get("git_isolation") != "isolated-clone"
+            ):
+                raise AssuranceError("FDP-3 snapshot record identity is invalid")
+            if (
+                not isinstance(record.get("source_repo"), str)
+                or not record["source_repo"]
+            ):
+                raise AssuranceError("FDP-3 snapshot source_repo is invalid")
+            for field in ("root_device", "root_inode"):
+                value = record.get(field)
+                if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                    raise AssuranceError(
+                        f"FDP-3 snapshot {field} is invalid"
+                    )
+    if snapshot_schema == 2 and any(
+        record[field] != records[0][field]
+        for record in records[1:]
+        for field in (
+            "target_repo",
+            "source_repo",
+            "publication_state",
+            "git_isolation",
+        )
+    ):
+        raise AssuranceError("FDP-3 snapshot source bindings are inconsistent")
     return context
 
 
@@ -2111,55 +2656,353 @@ def create_live_receipt(
     return receipt
 
 
-def cleanup_snapshots(runs_dir: Path, *, feature: str) -> dict[str, Any]:
-    manifest = _load_manifest(runs_dir, feature, live_identity=False)
-    events = load_events(runs_dir, feature)
-    if not events or events[-1]["snapshot"]["status"] not in TERMINAL_STATES:
-        raise AssuranceConflict("snapshot cleanup requires terminal FDP-3 assurance")
-    snapshot = events[-1]["snapshot"]
-    paths = [
-        Path(snapshot["challenge_snapshot_path"]),
-        Path(snapshot["verification_snapshot_path"]),
-    ]
-    registered = {
-        Path(line.removeprefix("worktree ")).resolve()
-        for line in _git(
-            manifest["target_repo"],
-            "worktree",
-            "list",
-            "--porcelain",
-        ).stdout.splitlines()
-        if line.startswith("worktree ")
-    }
-    existing: list[Path] = []
-    for path in paths:
-        if path.exists():
-            _validate_snapshot_worktree(path, snapshot["accepted_head_sha"])
-            existing.append(path)
-        elif path.resolve() in registered:
-            raise AssuranceConflict(
-                f"missing assurance snapshot remains registered; retained: {path}"
-            )
-    removed: list[str] = []
-    for path in existing:
-        result = _git(
-            manifest["target_repo"],
-            "worktree",
-            "remove",
-            str(path),
-            check=False,
+def _bound_path_present(path: Path, where: str) -> bool:
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AssuranceContractError(f"cannot inspect {where}: {path}") from exc
+
+
+def _assert_snapshot_root_identity(
+    path: Path,
+    *,
+    expected_device: int,
+    expected_inode: int,
+) -> None:
+    try:
+        info = path.lstat()
+    except OSError as exc:
+        raise AssuranceContractError(
+            f"cannot inspect exact assurance snapshot: {path}"
+        ) from exc
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_dev != expected_device
+        or info.st_ino != expected_inode
+    ):
+        raise AssuranceContractError(
+            f"assurance snapshot root identity changed: {path}"
         )
-        if result.returncode != 0:
-            raise AssuranceConflict(
-                f"could not remove clean assurance snapshot; retained: {path}"
+
+
+def _live_snapshot_identity_records(
+    runs_dir: Path,
+    *,
+    feature: str,
+    assurance_id: str,
+    snapshot: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    expected_path = assurance_root(runs_dir, feature, assurance_id) / "snapshots.json"
+    recorded_path = Path(snapshot["snapshots_file"])
+    if recorded_path != expected_path:
+        raise AssuranceContractError(
+            "assurance snapshot identity record path changed"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(recorded_path, flags)
+    except OSError as exc:
+        raise AssuranceContractError(
+            "cannot open assurance snapshot identity records"
+        ) from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o600
+        ):
+            raise AssuranceContractError(
+                "assurance snapshot identity record binding is unsafe"
             )
-        removed.append(str(path))
-    _git(manifest["target_repo"], "worktree", "prune")
-    return {
-        "feature": feature,
-        "removed_snapshots": removed,
-        "already_absent": [str(path) for path in paths if path not in existing],
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, 64 * 1024)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > 1024 * 1024:
+                raise AssuranceContractError(
+                    "assurance snapshot identity records are oversized"
+                )
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+            raise AssuranceContractError(
+                "assurance snapshot identity records changed while reading"
+            )
+    finally:
+        os.close(descriptor)
+    raw = b"".join(chunks)
+    if hashlib.sha256(raw).hexdigest() != snapshot["snapshots_sha256"]:
+        raise AssuranceContractError(
+            "assurance snapshot identity record hash changed"
+        )
+    try:
+        value = mission_state.loads_strict(raw)
+    except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise AssuranceContractError(
+            "assurance snapshot identity records are invalid"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"schema_version", "accepted_head_sha", "snapshots"}
+        or value.get("schema_version") != 2
+        or value.get("accepted_head_sha") != snapshot["accepted_head_sha"]
+        or not isinstance(value.get("snapshots"), list)
+        or len(value["snapshots"]) != 2
+    ):
+        raise AssuranceContractError(
+            "exact assurance snapshot identity records are unavailable"
+        )
+    records: dict[str, dict[str, Any]] = {}
+    expected_paths = {
+        CHALLENGE_INSTANCE: snapshot["challenge_snapshot_path"],
+        VERIFY_INSTANCE: snapshot["verification_snapshot_path"],
     }
+    expected_phases = {
+        CHALLENGE_INSTANCE: "CHALLENGE",
+        VERIFY_INSTANCE: "VERIFY",
+    }
+    for record in value["snapshots"]:
+        if not isinstance(record, dict) or set(record) != SNAPSHOT_RECORD_FIELDS_V2:
+            raise AssuranceContractError(
+                "assurance snapshot identity record fields are invalid"
+            )
+        instance = record.get("instance")
+        if (
+            instance not in expected_paths
+            or instance in records
+            or record.get("phase") != expected_phases[instance]
+            or record.get("path") != expected_paths[instance]
+            or record.get("head_sha") != snapshot["accepted_head_sha"]
+        ):
+            raise AssuranceContractError(
+                "assurance snapshot identity record does not match control state"
+            )
+        for field in ("root_device", "root_inode"):
+            field_value = record.get(field)
+            if (
+                isinstance(field_value, bool)
+                or not isinstance(field_value, int)
+                or field_value < 1
+            ):
+                raise AssuranceContractError(
+                    "assurance snapshot root identity is invalid"
+                )
+        records[instance] = record
+    if set(records) != set(expected_paths):
+        raise AssuranceContractError(
+            "assurance snapshot identity records are incomplete"
+        )
+    return records
+
+
+def _retirement_intent_present(path: Path) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise AssuranceContractError(
+            f"cannot inspect assurance retirement intent: {path}"
+        ) from exc
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or stat.S_ISLNK(info.st_mode)
+        or info.st_uid != os.geteuid()
+        or info.st_nlink != 1
+    ):
+        raise AssuranceContractError(
+            f"assurance retirement intent binding is unsafe: {path}"
+        )
+    return True
+
+
+def _snapshot_retirement_preflight(
+    args: argparse.Namespace,
+    *,
+    recorded_path: Path,
+    head_sha: str,
+    expected_device: int,
+    expected_inode: int,
+) -> dict[str, Any]:
+    source, staged, stage_intent, tombstone = _snapshot_guard_paths(args)
+    if recorded_path != source:
+        raise AssuranceContractError(
+            f"assurance snapshot path binding drifted: {recorded_path}"
+        )
+    source_present = _bound_path_present(source, "assurance snapshot")
+    staged_present = _bound_path_present(staged, "staged assurance snapshot")
+    stage_intent_present = _retirement_intent_present(stage_intent)
+    tombstone_present = _retirement_intent_present(tombstone)
+    if source_present and staged_present:
+        raise AssuranceConflict("assurance snapshot exists at source and staging paths")
+    if source_present:
+        _assert_snapshot_root_identity(
+            source,
+            expected_device=expected_device,
+            expected_inode=expected_inode,
+        )
+    if staged_present:
+        _assert_snapshot_root_identity(
+            staged,
+            expected_device=expected_device,
+            expected_inode=expected_inode,
+        )
+    if tombstone_present:
+        if source_present:
+            raise AssuranceConflict(
+                "retired assurance snapshot returned to its model-visible path"
+            )
+        if staged_present:
+            _validate_snapshot_tree(
+                staged,
+                allowed_root_modes=frozenset({0o500, 0o700}),
+                require_read_only=False,
+            )
+    elif source_present or staged_present:
+        if staged_present and not stage_intent_present:
+            raise AssuranceConflict(
+                "staged assurance snapshot lacks its durable stage intent"
+            )
+        candidate = source if source_present else staged
+        if stage_intent_present:
+            _validate_snapshot_tree(
+                candidate,
+                allowed_root_modes=frozenset({0o500, 0o700}),
+                require_read_only=False,
+            )
+        else:
+            _validate_snapshot_worktree(candidate, head_sha)
+    elif stage_intent_present:
+        raise AssuranceConflict("staged assurance snapshot is unexpectedly absent")
+    return {
+        "args": args,
+        "recorded_path": recorded_path,
+        "source": source,
+        "staged": staged,
+        "stage_intent": stage_intent_present,
+        "tombstone": tombstone_present,
+        "present": source_present or staged_present,
+        "pending": stage_intent_present or tombstone_present,
+        "expected_device": expected_device,
+        "expected_inode": expected_inode,
+    }
+
+
+def cleanup_snapshots(runs_dir: Path, *, feature: str) -> dict[str, Any]:
+    with coordinator(runs_dir):
+        manifest = _load_manifest(runs_dir, feature, live_identity=False)
+        events = load_events(runs_dir, feature)
+        if not events or events[-1]["snapshot"]["status"] not in TERMINAL_STATES:
+            raise AssuranceConflict("snapshot cleanup requires terminal FDP-3 assurance")
+        event = events[-1]
+        snapshot = event["snapshot"]
+        assurance_id = event["assurance_id"]
+        identity_records = _live_snapshot_identity_records(
+            runs_dir,
+            feature=feature,
+            assurance_id=assurance_id,
+            snapshot=snapshot,
+        )
+        try:
+            fleet_clone_guard.ensure_root(
+                runs_dir / "worktrees",
+                [
+                    Path(manifest["target_repo"]),
+                    Path(manifest[f"{fdp2.MAKER_INSTANCE}.worktree"]),
+                ],
+            )
+        except fleet_clone_guard.CloneGuardError as exc:
+            raise AssuranceContractError(str(exc)) from exc
+        bindings: list[dict[str, Any]] = []
+        for stage, instance, field in (
+            ("challenge", CHALLENGE_INSTANCE, "challenge_snapshot_path"),
+            ("verify", VERIFY_INSTANCE, "verification_snapshot_path"),
+        ):
+            identity = identity_records[instance]
+            args = _snapshot_guard_args(
+                runs_dir,
+                feature=feature,
+                assurance_id=assurance_id,
+                stage=stage,
+                head_sha=snapshot["accepted_head_sha"],
+            )
+            bindings.append(
+                _snapshot_retirement_preflight(
+                    args,
+                    recorded_path=Path(snapshot[field]),
+                    head_sha=snapshot["accepted_head_sha"],
+                    expected_device=identity["root_device"],
+                    expected_inode=identity["root_inode"],
+                )
+            )
+
+        removed: list[str] = []
+        already_absent: list[str] = []
+        for binding in bindings:
+            path = binding["recorded_path"]
+            if not binding["present"] and not binding["pending"]:
+                already_absent.append(str(path))
+                continue
+            args = binding["args"]
+            try:
+                if binding["tombstone"]:
+                    args.mode = "require"
+                    fleet_clone_guard.tombstone(args)
+                else:
+                    staged = fleet_clone_guard.stage_clone(args)
+                    _assert_snapshot_root_identity(
+                        staged,
+                        expected_device=binding["expected_device"],
+                        expected_inode=binding["expected_inode"],
+                    )
+                    _validate_snapshot_worktree(
+                        staged,
+                        snapshot["accepted_head_sha"],
+                    )
+                    args.mode = "ensure"
+                    fleet_clone_guard.tombstone(args)
+                    _validate_snapshot_tree(
+                        staged,
+                        allowed_root_modes=frozenset({0o500, 0o700}),
+                        require_read_only=False,
+                    )
+                    _assert_snapshot_root_identity(
+                        staged,
+                        expected_device=binding["expected_device"],
+                        expected_inode=binding["expected_inode"],
+                    )
+                args.mode = "remove"
+                fleet_clone_guard.tombstone(args)
+                fleet_clone_guard.clear_stage_intent(args)
+                args.mode = "clear"
+                fleet_clone_guard.tombstone(args)
+            except fleet_clone_guard.CloneGuardError as exc:
+                raise AssuranceConflict(
+                    f"could not retire exact assurance snapshot; retained: {path}: {exc}"
+                ) from exc
+            if _bound_path_present(binding["source"], "assurance snapshot") or _bound_path_present(
+                binding["staged"],
+                "staged assurance snapshot",
+            ):
+                raise AssuranceConflict(
+                    f"assurance snapshot remains after retirement: {path}"
+                )
+            removed.append(str(path))
+        return {
+            "feature": feature,
+            "removed_snapshots": removed,
+            "already_absent": already_absent,
+        }
 
 
 def verify_archive(archive: Path) -> dict[str, Any]:
@@ -2187,11 +3030,13 @@ def verify_archive(archive: Path) -> dict[str, Any]:
     )
     _verify_artifacts(archive / "assurance", events, live_paths=False)
     _verify_message_bindings(events, messages)
-    receipt_path = archive / "assurance-receipt.json"
-    try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AssuranceError("archived FDP-3 receipt is missing or invalid") from exc
+    receipt = _load_rooted_json(
+        archive,
+        "assurance-receipt.json",
+        directory_modes=(),
+        max_bytes=fdp2.MAX_RECEIPT_BYTES,
+        error_message="archived FDP-3 receipt is missing or invalid",
+    )
     if not isinstance(receipt, dict) or set(receipt) != {
         "schema_version",
         "feature",

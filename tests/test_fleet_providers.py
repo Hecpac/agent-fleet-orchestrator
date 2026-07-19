@@ -10,9 +10,9 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
-import fleet_frontier
-import fleet_providers
-import router_config
+import fleet_frontier  # noqa: E402
+import fleet_providers  # noqa: E402
+import router_config  # noqa: E402
 
 
 class FakeAdapter(fleet_providers.BaseAdapter):
@@ -185,6 +185,38 @@ class FleetProviderTests(unittest.TestCase):
             json.loads(result.stdout)["adapters"],
             ["claude", "codex", "ollama", "opencode"],
         )
+
+    def test_provider_cli_rejects_ambiguous_command_json(self) -> None:
+        base = [
+            "python3",
+            str(ROOT / "scripts" / "fleet_providers.py"),
+            "validate",
+            "--provider",
+            "ollama",
+            "--model",
+            "gemma3:4b",
+            "--runner",
+            "local",
+            "--command-json",
+        ]
+        for payload in (
+            '["ollama","run","gemma3:4b",1e999]',
+            '\ufeff["ollama","run","gemma3:4b"]',
+            r'["ollama","run","\ud800"]',
+            '["ollama","run","gemma3:4b"][]',
+        ):
+            result = subprocess.run(
+                [*base, payload],
+                cwd=ROOT,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            with self.subTest(payload=payload):
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("fleet-providers:", result.stderr)
 
 
 if __name__ == "__main__":

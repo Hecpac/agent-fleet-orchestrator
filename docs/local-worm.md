@@ -109,10 +109,14 @@ on:
 - `retention_mode=COMPLIANCE` and a future retain-until value;
 - the event SHA-256 digest.
 
-It then signs and verifies the aggregate audit receipt offline. Finally it
-compiles `workflows/regulated.yaml` and preflights the same endpoint. That
-negative smoke must reject the loopback DNS resolution before creating audit
-state.
+It then signs and verifies the aggregate audit receipt offline. This proves only
+`trust_scope=local-development`. Finally, the helper attempts effect compilation
+of `workflows/regulated.yaml` and requires rejection of its unenforceable hard
+token policy because no current provider adapter implements `hard_total`; no
+regulated audit state may be created. Loopback DNS rejection remains covered by
+the AuditService tests, not by this live helper. Static schema validation of the
+regulated file can pass, but neither that validation nor this local smoke makes
+the regulated workflow operational.
 
 ## Prove exact-version deletion is rejected
 

@@ -3,6 +3,33 @@ set -euo pipefail
 
 role_type="${1:-}"
 task="${2:-}"
+shift 2 || true
+provider=""
+model=""
+variant=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --provider)
+      [[ $# -ge 2 ]] || { echo "--provider requires a value" >&2; exit 2; }
+      provider="$2"
+      shift 2
+      ;;
+    --model)
+      [[ $# -ge 2 ]] || { echo "--model requires a value" >&2; exit 2; }
+      model="$2"
+      shift 2
+      ;;
+    --variant)
+      [[ $# -ge 2 ]] || { echo "--variant requires a value" >&2; exit 2; }
+      variant="$2"
+      shift 2
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      exit 2
+      ;;
+  esac
+done
 
 if [[ -z "$role_type" || -z "$task" ]]; then
   echo "Usage: $0 <local-role-type> <task>" >&2
@@ -23,7 +50,8 @@ if [[ "$enabled" != "true" ]]; then
   exit 2
 fi
 
-model="$(python3 "$router" role-field "$role_type" model)" || exit 2
+[[ -n "$provider" ]] || provider="$(python3 "$router" role-field "$role_type" provider)" || exit 2
+[[ -n "$model" ]] || model="$(python3 "$router" role-field "$role_type" model)" || exit 2
 instruction="$(python3 "$router" role-field "$role_type" instructions)" || exit 2
 
 usage_args=()
@@ -33,7 +61,9 @@ fi
 
 python3 "$repo_root/orchestration/agents/local_worker.py" \
   --role "$role_type" \
+  --provider "$provider" \
   --model "$model" \
+  --variant "$variant" \
   --instruction "$instruction" \
   --prompt "$task" \
   ${usage_args[@]+"${usage_args[@]}"}

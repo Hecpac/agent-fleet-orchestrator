@@ -1,8 +1,10 @@
 # Fleet threat model
 
-This document defines the security boundary for the local CMUX fleet. It is a
-contract about which adversary the runtime is designed to contain; it is not a
-claim that an LLM answer is semantically correct.
+This document defines the S0 security boundary for the local CMUX fleet: one
+trusted Mac, one trusted Unix UID, and one local runs root. It is a contract
+about which adversary the runtime is designed to contain; it is not a claim
+that an LLM answer is semantically correct or that the host is multi-tenant
+safe.
 
 ## Selected boundary: model-injection containment
 
@@ -33,9 +35,15 @@ Current conformance is **partial**, not complete:
 
 | Provider path | Current evidence | Status |
 |---|---|---|
-| Codex advisory | Router pins `read-only` plus `--ask-for-approval never`; live canaries remained absent, but Codex narrated `BLOCKED` without a visible tool event. | Declared and statically locked; direct denial unverified. |
-| Claude reviewer | Plan mode, minimal allowlist, and fail-closed sandbox are locked; the live probe made no tool call and provider drift terminalized `indeterminate`. | Safe no-effect and identity fail-closed; direct denial unverified. |
+| Codex advisory | Router pins `read-only` plus `--ask-for-approval never`; the direct canary attempted the requested operation, the provider returned `Operation not permitted`, and the sentinel remained absent. | Declared, statically locked, and live-verified fail-closed. |
+| Claude reviewer | Minimal allowlist and fail-closed sandbox are locked; the direct `stream-json` canary emitted a real `Bash` tool request followed by a denied tool result, and the sentinel remained absent. | Declared, statically locked, and live-verified fail-closed. |
 | OpenCode reviewers | P1-OC1 defaults every tool to deny, enables only built-in `read`/`glob`/`grep`, denies external roots except a fresh isolated tool-output directory, and validates the resolved provider policy before TUI boot. FDP-2 receives CONTROL-generated Git evidence instead of shell access. | Implemented, test-locked, and live-verified in `orchestration/smoke-evidence/p1-oc1-opencode-boundary-20260716.md`. |
+
+Those provider canaries are dated evidence from before the final integrated S0
+smoke. In particular, the Claude MCP attempt connected and discovered tools but
+did not complete the requested envelope; it reported USD 0.56816 despite a
+USD 0.05 CLI cap. Paid inference is therefore opt-in evidence, not part of the
+automatic local acceptance lane.
 
 ## Trusted computing base
 
@@ -54,12 +62,35 @@ be described as covered by this boundary.
 
 | Asset | Required property under boundary A |
 |---|---|
-| Target repository and writer worktree | Only the declared writer may mutate it during its active phase. |
+| Target repository and isolated writer clone | Only the declared writer may mutate its private clone; only CONTROL may publish the quiescent commit into the target repository. |
 | CONTROL plane and CMUX surfaces | Non-CONTROL model tools cannot redirect another pane or claim tracked completion through raw input. |
 | Hook maps and provider transcripts | Model tools cannot edit controller evidence; completion reads the exact source-specific record. |
 | Fleet and Mission ledgers | Supported wrappers append durably and reject ambiguous or later terminal states. |
+| Compiled workflow and router | Effect consumers use the complete digest-bound router snapshot embedded in compiled v2; later edits to the live router cannot change the admitted plan. |
+| Mission admission | Deadline, delegation credits, active slots, writer ownership, run identity, and token policy are frozen; every current launch is exact-bound through `reserved → committed → authorized → started → finalized`. |
 | Credentials and controller dotfiles | Agent tool environments do not inherit broad credentials and provider sandboxes deny controller-private roots. |
 | Final decision | A model result remains advisory until deterministic evidence or the applicable verification gate accepts it. |
+
+The admission state machine separates authority from observation.
+`effect_sha256` binds the complete requested effect and `task_sha256` binds the
+submitted logical task before launch authorization. The authorization event is
+the deadline-linearization point; only its exact proof can become `started`.
+Finalization requires a closed schema-version-1 terminal envelope bound to the
+admission's source event, run, task, status, recipient, and writer ownership
+before claims are released. Its `source_event_sha256` remains an attestation
+made by trusted CONTROL inside S0, not an independently controlled receipt.
+
+The main and assurance admission lanes are disjoint. `CONTROL` owns the main
+lane and `ASSURED` owns the assured lane; neither actor may mutate the other's
+admissions. The assurance request cannot transition state until every main
+admission is inactive. The idempotent handoff stops the main control generation
+and preserves its runtime below
+`missions/<mission_id>/assurance-handoff/main-runtime/`; the assured service
+uses a separate `control-assured/` generation. A descriptor-rooted quiescing
+marker cuts off new cooperative writers before the mutation barrier drains
+in-flight writers with a deadline; rejected mutations are not queued. This is a
+correctness/liveness guarantee inside trusted S0, not containment against a
+hostile same-UID process.
 
 ## P1-OC1 OpenCode containment
 
@@ -116,12 +147,22 @@ claim, demonstrating why tuple diversity is not semantic verification.
 ## P1-HITL1A approval provenance
 
 Mission-bound assured fleets do not accept a free-form `--approved-by` string
-for BUILD exit. They require the exact active
-`assurance_approved.event_sha256`; `fleet_state.py` re-derives the Mission chain
-and validates assured-running state, feature, target scope, and expiry before
-recording the reference. `fleet_assured_runner.py` propagates that event hash,
-and FDP-3 revalidates it at start. A foreign, stale, expired, or label-only
-approval fails closed.
+for BUILD exit. They require the exact current `event_sha256` from
+`assurance_approved` or `assurance_approval_renewed`; `fleet_state.py`
+re-derives the Mission chain and validates assured-running state, feature,
+target scope, and expiry before recording the reference.
+`fleet_assured_runner.py` propagates that event hash, and FDP-3 revalidates it
+at start. A foreign, stale, expired, or label-only approval fails closed.
+
+Approval is rechecked at assurance boot/start and at each ASSURED reservation,
+commit, and launch authorization; authorization binds its exact event hash.
+Renewal is a distinct HUMAN event after the prior approval expires. It cannot
+widen the request, workflow, target scope, or risk, and is allowed either before
+assurance boot or from a quiescent `assured_running` lane with no run claims,
+active admissions, or writer claim. Already-authorized work may finish after
+expiry, but new effects fail closed. The operator command is
+`fleet-approve.py ... --renew`; the canonical guide describes the recovery
+sequence.
 
 Standalone guided fleets retain `--approved-by` as a compatibility attestation
 and cannot claim Mission-bound provenance. Neither path proves out-of-band
@@ -155,6 +196,16 @@ The following are **OUT OF SCOPE** for boundary A:
    leases require one shared `FLEET_RUNS_DIR` on one host.
 6. **Semantic truth from agreement.** Two matching model answers, including
    answers from distinct providers, are evidence to investigate, not proof.
+7. **External WORM custody or regulatory compliance.** Local signed receipts
+   and loopback Object Lock are useful development evidence but are controlled
+   by the same machine owner. The current provider set also lacks `hard_total`,
+   so `regulated.yaml` cannot admit effects honestly.
+8. **Independent source-event attestation.** Structured terminal evidence binds
+   the hash asserted by trusted CONTROL. A compromised CONTROL process can lie
+   about that source, which is already outside boundary A.
+9. **Authority-preserving migration of an active legacy admission ledger.**
+   Historical formats remain readable, but the runtime does not invent current
+   effect/task/authorization provenance for an already-active legacy Mission.
 
 If resistance to same-UID or compromised-CONTROL attacks becomes required,
 the next design must use a separate OS principal or effect broker and an
@@ -171,6 +222,7 @@ not establish that boundary.
 | 4 | CONTROL calls a direct worker entrypoint and bypasses tracked dispatch. | The path exists and is trusted/operator-only; it must never be described as enforced against CONTROL. | `test_control_is_trusted_and_can_reach_direct_entrypoints` |
 | 5 | A custom race uses the same role/model twice. | It remains permitted but is only an unverified candidate. Default race identities and declared preset groups fail closed on duplicate `provider/model/variant` tuples. | `test_same_model_custom_race_is_permitted_but_never_claims_assurance` and the router identity-group tests |
 | 6 | The waiter process is suspended beyond its alarm deadline. | `fleet_wait.py` uses POSIX `alarm`; a separate primitive probe confirms the signal becomes pending across process stop/resume. The actual waiter path and full Mac sleep/wake remain open live lanes. | `test_wait_uses_posix_alarm_and_alarm_is_pending_after_process_stop` |
+| 7 | Local run A finishes and run B reuses its CMUX surface while a late cancel targets A. | Fleet Control refuses local cancellation because no exact run-scoped process handle exists; it never sends pane-level `ctrl-c` that could stop B. | `test_local_cancel_rejects_without_signalling_reused_surface` |
 
 ## Operator rules
 

@@ -9,6 +9,13 @@ controller_home="${HOME:?HOME must be set by CONTROL}"
 controller_user="${USER:-fleet_controller}"
 controller_user_sha256="$(printf '%s' "$controller_user" | shasum -a 256 | awk '{print $1}')"
 execution_profile="${FLEET_EXECUTION_PROFILE:-native}"
+fleet_agent_mcp_proxy="$repo_root/scripts/fleet_agent_mcp.py"
+fleet_agent_mcp_python=""
+fleet_agent_mcp_enabled=0
+fleet_codex_home=""
+fleet_codex_home_helper="$repo_root/scripts/fleet_codex_home.py"
+codex_runtime_permission=""
+codex_runtime_permission_name=""
 
 case "$execution_profile" in
   native|sandboxed|regulated) ;;
@@ -26,6 +33,36 @@ shift 3 || true
 if [[ -z "$role_type" || -z "$authority" || $# -eq 0 ]]; then
   echo "Usage: $0 <role-type> <authority> <required-env-csv|-> <command> [args...]" >&2
   exit 2
+fi
+
+# A provider receives the specialist proxy only when CONTROL supplied one
+# already-bound Unix endpoint. Lead/control gets the health-only base endpoint
+# and must never receive this specialist surface.
+if [[ "$authority" != "control" \
+  && -f "$fleet_agent_mcp_proxy" \
+  && ! -L "$fleet_agent_mcp_proxy" ]] \
+  && python3 - "${FLEET_CONTROL_SOCKET:-}" <<'PY'
+import os
+import stat
+import sys
+
+path = sys.argv[1]
+if not path or not os.path.isabs(path):
+    raise SystemExit(1)
+try:
+    info = os.lstat(path)
+except OSError:
+    raise SystemExit(1)
+if (
+    not stat.S_ISSOCK(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or stat.S_IMODE(info.st_mode) != 0o600
+):
+    raise SystemExit(1)
+PY
+then
+  fleet_agent_mcp_python="$(command -v python3)"
+  fleet_agent_mcp_enabled=1
 fi
 
 isolated_home="$(mktemp -d /tmp/fleet_home.XXXXXX)"
@@ -102,30 +139,114 @@ codex_hook_override() {
   printf 'hooks.%s=[{hooks=[{type="command",command=%s}]}]' "$event" "$command_json"
 }
 
+codex_mission_permission_profile() {
+  local fleet_codex_home="$1" controller_codex_home="$2" fleet_runs_dir="$3"
+  python3 -c '
+import json
+import os
+import sys
+
+socket, authority, controller_home, controller_codex_home, fleet_codex_home, fleet_runs_dir = sys.argv[1:]
+profile = "fleet_writer" if authority == "write" else "fleet_reader"
+workspace_access = "write" if authority == "write" else "read"
+denied = []
+for path in (controller_home, controller_codex_home, fleet_codex_home, fleet_runs_dir):
+    lexical = os.path.abspath(path)
+    canonical = os.path.realpath(lexical)
+    for candidate in (lexical, canonical):
+        if candidate not in denied:
+            denied.append(candidate)
+rules = []
+for path in denied:
+    rules.extend((path, path.rstrip("/") + "/**"))
+for auth_home in (controller_codex_home, fleet_codex_home):
+    rules.append(os.path.join(os.path.abspath(auth_home), "auth.json"))
+    rules.append(os.path.join(os.path.realpath(auth_home), "auth.json"))
+rules = list(dict.fromkeys(rules))
+filesystem = (
+    "filesystem={glob_scan_max_depth=64,\":minimal\"=\"read\","
+    + "\":workspace_roots\"={\".\"=\"" + workspace_access + "\"},"
+    + ",".join(json.dumps(path) + "=\"deny\"" for path in rules)
+    + "},"
+)
+print(
+    "permissions={" + profile
+    + "={description=\"Mission-scoped Fleet Control client with credential roots denied.\","
+    + filesystem
+    + "network={enabled=true,mode=\"limited\",unix_sockets={"
+    + json.dumps(socket) + "=\"allow\"}}}}"
+)
+' "${FLEET_CONTROL_SOCKET:-}" "$authority" "$controller_home" \
+    "$controller_codex_home" "$fleet_codex_home" "$fleet_runs_dir"
+}
+
 provision_fleet_codex_home() {
-  local controller_codex_home fleet_codex_home project_key
+  local controller_codex_home codex_sqlite_home
   controller_codex_home="${CODEX_HOME:-$controller_home/.codex}"
-  if [[ ! -f "$controller_codex_home/auth.json" || -L "$controller_codex_home/auth.json" ]]; then
-    echo "Fleet Codex role requires a regular $controller_codex_home/auth.json" >&2
+  if [[ ! -f "$fleet_codex_home_helper" || -L "$fleet_codex_home_helper" ]]; then
+    echo "Fleet Codex auth-home helper is unavailable" >&2
     exit 2
   fi
-
-  fleet_codex_home="$isolated_home/.codex"
-  mkdir -p "$fleet_codex_home"
-  chmod 700 "$fleet_codex_home"
-  cp "$controller_codex_home/auth.json" "$fleet_codex_home/auth.json"
-  chmod 600 "$fleet_codex_home/auth.json"
-  project_key="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "$repo_root")"
-  printf '[features]\nhooks = true\n\n[projects.%s]\ntrust_level = "untrusted"\n' \
-    "$project_key" > "$fleet_codex_home/config.toml"
-  chmod 600 "$fleet_codex_home/config.toml"
+  if ! fleet_codex_home="$(python3 "$fleet_codex_home_helper" provision \
+    "$controller_codex_home" "$isolated_home")"; then
+    exit 2
+  fi
+  codex_sqlite_home="$isolated_home/codex-sqlite"
+  mkdir -m 700 "$codex_sqlite_home"
+  if (( fleet_agent_mcp_enabled == 1 )) && [[ -n "${FLEET_MISSION_ID:-}" ]]; then
+    if [[ "${FLEET_RUNS_DIR:-}" != /* ]]; then
+      echo "Mission Codex role requires an absolute FLEET_RUNS_DIR" >&2
+      exit 2
+    fi
+    codex_runtime_permission_name="fleet_reader"
+    [[ "$authority" != "write" ]] || codex_runtime_permission_name="fleet_writer"
+    codex_runtime_permission="$(codex_mission_permission_profile \
+      "$fleet_codex_home" "$controller_codex_home" "$FLEET_RUNS_DIR")"
+  fi
   keep+=(
     "CODEX_HOME=$fleet_codex_home"
+    "CODEX_SQLITE_HOME=$codex_sqlite_home"
     # cmux injects its own Codex hooks through CLI `-c` flags. Disable those
     # in the shim, then install the repo-owned overrides below with the
     # surface identity embedded in each command.
     "CMUX_CODEX_HOOKS_DISABLED=1"
   )
+}
+
+codex_session_override() {
+  local section="$1"
+  python3 -c '
+import json
+import os
+import sys
+
+section, workspace, command, proxy = sys.argv[1:]
+if section == "projects":
+    value = {os.path.realpath(workspace): {"trust_level": "untrusted"}}
+elif section == "mcp_servers":
+    value = {"fleet_control": {
+        "command": command,
+        "args": [proxy],
+        "required": True,
+        "startup_timeout_sec": 10,
+        "tool_timeout_sec": 1815,
+    }}
+else:
+    raise SystemExit(2)
+
+def toml(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value)
+    if isinstance(value, list):
+        return "[" + ",".join(toml(item) for item in value) + "]"
+    return "{" + ",".join(json.dumps(key) + "=" + toml(item) for key, item in value.items()) + "}"
+
+print(section + "=" + toml(value))
+' "$section" "$PWD" "$fleet_agent_mcp_python" "$fleet_agent_mcp_proxy"
 }
 
 prepare_opencode_data_home() {
@@ -156,10 +277,28 @@ prepare_opencode_data_home() {
   xdg_data="$opencode_state_dir/data"
 }
 
+compiled_workflow="${FLEET_COMPILED_WORKFLOW:-}"
+compiled_digest="${FLEET_COMPILED_DIGEST:-}"
+if [[ -n "$compiled_workflow" || -n "$compiled_digest" ]]; then
+  if [[ -z "$compiled_workflow" || -z "$compiled_digest" ]]; then
+    echo "Compiled workflow path and digest must be inherited together." >&2
+    exit 2
+  fi
+  if [[ "$compiled_workflow" != /* ]]; then
+    echo "FLEET_COMPILED_WORKFLOW must be an absolute path." >&2
+    exit 2
+  fi
+  if [[ ! "$compiled_digest" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "FLEET_COMPILED_DIGEST must be a lowercase SHA-256 digest." >&2
+    exit 2
+  fi
+fi
+
 keep=()
 for name in PATH SHELL TERM COLORTERM LANG LC_ALL LC_CTYPE TMPDIR \
   CLAUDE_CODE_NO_FLICKER HOMEBREW_PREFIX HOMEBREW_CELLAR HOMEBREW_REPOSITORY \
-  FLEET_RUNS_DIR FLEET_MISSION_ID FLEET_CONTROL_SOCKET; do
+  FLEET_RUNS_DIR FLEET_MISSION_ID FLEET_CONTROL_SOCKET \
+  FLEET_COMPILED_WORKFLOW FLEET_COMPILED_DIGEST; do
   if [[ -n "${!name:-}" ]]; then
     keep+=("$name=${!name}")
   fi
@@ -245,7 +384,16 @@ case "$role_type" in
       .sandbox.filesystem.denyWrite += [($home + "/.claude")]
     ' "$repo_root/orchestration/claude-fleet-settings.json" > "$claude_config/settings.json"
     chmod 600 "$claude_config/settings.json"
-    jq -n '{mcpServers: {}}' > "$claude_config/mcp.json"
+    if (( fleet_agent_mcp_enabled == 1 )); then
+      jq -n \
+        --arg command "$fleet_agent_mcp_python" \
+        --arg proxy "$fleet_agent_mcp_proxy" \
+        '{mcpServers: {fleet_control: {
+          type: "stdio", command: $command, args: [$proxy]
+        }}}' > "$claude_config/mcp.json"
+    else
+      jq -n '{mcpServers: {}}' > "$claude_config/mcp.json"
+    fi
     chmod 600 "$claude_config/mcp.json"
     # Claude's interactive TUI consults ~/.claude.json after applying the
     # session HOME override. A fresh isolated HOME otherwise re-enters
@@ -294,14 +442,50 @@ case "$role_type" in
   codex|codex_candidate)
     # Fleet Codex processes must never merge controller and legacy hook trees:
     # current Codex releases can otherwise emit two physical submit events for
-    # one Enter. Copy authentication only and install one controller-owned
-    # CMUX bridge in an ephemeral home for every authority/profile.
+    # one Enter. Bind the canonical auth file once (never copy its single-use
+    # refresh token) and install one controller-owned CMUX bridge.
     provision_fleet_codex_home
     if [[ "$(basename "$1")" == "codex" && "${FLEET_HEALTHCHECK:-0}" != "1" ]]; then
-      set -- "$@" --enable hooks --dangerously-bypass-hook-trust
+      set -- "$@" --strict-config -c "$(codex_session_override projects)"
+      if (( fleet_agent_mcp_enabled == 1 )); then
+        set -- "$@" -c "$(codex_session_override mcp_servers)"
+      fi
+    elif [[ "$(basename "$1")" == "codex" \
+      && "${FLEET_HEALTHCHECK:-0}" == "1" \
+      && "${2:-}" == "mcp" ]]; then
+      # `login status` rejects --strict-config in Codex 0.144.5. MCP discovery
+      # accepts a config layer when it is placed before the subcommand.
+      codex_health_command=("$1" -c "$(codex_session_override projects)")
+      if (( fleet_agent_mcp_enabled == 1 )); then
+        codex_health_command+=(-c "$(codex_session_override mcp_servers)")
+      fi
+      codex_health_command+=("${@:2}")
+      set -- "${codex_health_command[@]}"
+    fi
+    if [[ "$(basename "$1")" == "codex" && "${FLEET_HEALTHCHECK:-0}" != "1" ]]; then
+      hook_trust_bypass=0
+      for argument in "$@"; do
+        if [[ "$argument" == "--dangerously-bypass-hook-trust" ]]; then
+          hook_trust_bypass=1
+          break
+        fi
+      done
+      set -- "$@" --enable hooks
+      if (( hook_trust_bypass == 0 )); then
+        set -- "$@" --dangerously-bypass-hook-trust
+      fi
       for event in SessionStart UserPromptSubmit Stop; do
         set -- "$@" -c "$(codex_hook_override "$event")"
       done
+    fi
+    # The final profile is generated only after the ephemeral CODEX_HOME
+    # exists. Start from Codex's minimal runtime roots, reopen only the active
+    # workspace, and deny CONTROL/auth/run-state roots exactly.
+    if [[ "$(basename "$1")" == "codex" \
+      && "${FLEET_HEALTHCHECK:-0}" != "1" \
+      && -n "$codex_runtime_permission" ]]; then
+      set -- "$@" -c "$codex_runtime_permission" \
+        -c "default_permissions=\"$codex_runtime_permission_name\""
     fi
     ;;
   glm|minimax|minimax_checker)
@@ -332,6 +516,83 @@ case "$role_type" in
         validate_isolated_provider_tree "$destination_root/$(basename "$source_dir")"
       fi
     done
+    # The canonical fleet agents live in the orchestrator repository, not in
+    # an arbitrary --target-repo checkout. Install the fixed role set into the
+    # isolated global OpenCode config so `--agent` resolves identically from
+    # every launch cwd. Without this overlay OpenCode can silently fall back to
+    # its generic Build agent and prompt for Bash or external-directory access.
+    fleet_opencode_agents="$repo_root/.opencode/agents"
+    isolated_opencode_agents="$xdg_config/opencode/agents"
+    if [[ ! -d "$fleet_opencode_agents" || -L "$fleet_opencode_agents" ]]; then
+      echo "Canonical OpenCode fleet agent directory is unavailable" >&2
+      exit 2
+    fi
+    mkdir -p "$isolated_opencode_agents"
+    for agent_name in fleet-reviewer glm-challenger minimax-checker; do
+      source_agent="$fleet_opencode_agents/$agent_name.md"
+      destination_agent="$isolated_opencode_agents/$agent_name.md"
+      if [[ ! -f "$source_agent" || -L "$source_agent" ]]; then
+        echo "Canonical OpenCode fleet agent is unavailable: $agent_name" >&2
+        exit 2
+      fi
+      if [[ -L "$destination_agent" \
+        || ( -e "$destination_agent" && ! -f "$destination_agent" ) ]]; then
+        echo "Isolated OpenCode fleet agent path is unsafe: $agent_name" >&2
+        exit 2
+      fi
+      cp "$source_agent" "$destination_agent"
+      chmod 600 "$destination_agent"
+    done
+    validate_isolated_provider_tree "$xdg_config/opencode"
+    if (( fleet_agent_mcp_enabled == 1 )); then
+      command -v jq >/dev/null 2>&1 || {
+        echo "jq is required to provision isolated OpenCode MCP settings" >&2
+        exit 2
+      }
+      opencode_config_dir="$xdg_config/opencode"
+      opencode_config="$opencode_config_dir/opencode.json"
+      mkdir -p "$opencode_config_dir"
+      if [[ -L "$opencode_config" \
+        || ( -e "$opencode_config" && ! -f "$opencode_config" ) ]]; then
+        echo "OpenCode MCP config must be a regular isolated file" >&2
+        exit 2
+      fi
+      opencode_config_tmp="$(mktemp "$opencode_config_dir/.opencode.json.XXXXXX")"
+      if [[ -f "$opencode_config" ]]; then
+        jq \
+          --arg command "$fleet_agent_mcp_python" \
+          --arg proxy "$fleet_agent_mcp_proxy" \
+          '.mcp = {fleet_control: {
+            type: "local", command: [$command, $proxy], enabled: true,
+            timeout: 10000
+          }}' "$opencode_config" > "$opencode_config_tmp"
+      else
+        jq -n \
+          --arg command "$fleet_agent_mcp_python" \
+          --arg proxy "$fleet_agent_mcp_proxy" \
+          '{mcp: {fleet_control: {
+            type: "local", command: [$command, $proxy], enabled: true,
+            timeout: 10000
+          }}}' > "$opencode_config_tmp"
+      fi
+      chmod 600 "$opencode_config_tmp"
+      mv "$opencode_config_tmp" "$opencode_config"
+      opencode_inline_config="$(jq -nc \
+        --arg command "$fleet_agent_mcp_python" \
+        --arg proxy "$fleet_agent_mcp_proxy" \
+        '{
+          mcp: {fleet_control: {
+            type: "local", command: [$command, $proxy], enabled: true,
+            timeout: 10000
+          }},
+          agent: {
+            "fleet-reviewer": {permission: {"fleet_control_*": "allow"}},
+            "glm-challenger": {permission: {"fleet_control_*": "allow"}},
+            "minimax-checker": {permission: {"fleet_control_*": "allow"}}
+          }
+        }')"
+      keep+=("OPENCODE_CONFIG_CONTENT=$opencode_inline_config")
+    fi
     # OpenCode may allow its own truncated-output directory after the agent's
     # catch-all external deny. Never seed that exception with controller
     # history; the isolated process may populate only its fresh copy.
@@ -383,6 +644,80 @@ if [[ -n "$required_csv" && "$required_csv" != "-" ]]; then
     keep+=("$name=${!name}")
   done
   IFS="$old_ifs"
+fi
+
+# A Fleet Codex role follows one descriptor-verified symlink to the controller
+# auth file. It never copies or injects OAuth material; all refreshes therefore
+# update the one canonical store instead of forking a single-use refresh token.
+if [[ "$role_type" =~ ^(codex|codex_candidate)$ ]] \
+  && [[ "$(basename "$1")" == "codex" ]]; then
+  if ! /usr/bin/env -i "${keep[@]}" "$1" login status \
+    >/dev/null 2>&1; then
+    echo "Fleet Codex canonical authentication is unavailable" >&2
+    exit 2
+  fi
+  if ! python3 "$fleet_codex_home_helper" verify \
+    "${CODEX_HOME:-$controller_home/.codex}" "$isolated_home" >/dev/null; then
+    exit 2
+  fi
+fi
+
+# OpenCode's debug policy view can omit dynamically discovered MCP tools, so
+# it is not readiness evidence by itself. Before the policy/TUI gate, exercise
+# the exact repo-owned proxy: MCP initialize, ping, exact nine-tool discovery,
+# and one real round-trip to this instance's AF_UNIX socket. At fleet boot no
+# delegated identity exists yet, so the expected socket proof is a well-formed
+# authentication denial; a complete caller identity can opt into an
+# authenticated ping without ever being printed.
+provider_basename="$(basename "$1")"
+provider_mcp_preflight=0
+if [[ "$role_type" =~ ^(glm|minimax|minimax_checker)$ && "$provider_basename" == "opencode" ]] \
+  || [[ "$role_type" =~ ^(codex|codex_candidate)$ && "$provider_basename" == "codex" ]] \
+  || [[ "$role_type" =~ ^(claude|claude_reviewer|claude_checker)$ && "$provider_basename" == "claude" ]]; then
+  provider_mcp_preflight=1
+fi
+if (( fleet_agent_mcp_enabled == 1 && provider_mcp_preflight == 1 )); then
+  preflight_env=("${keep[@]}")
+  [[ -z "${FLEET_PREFLIGHT_RUN_ID:-}" ]] \
+    || preflight_env+=("FLEET_PREFLIGHT_RUN_ID=$FLEET_PREFLIGHT_RUN_ID")
+  [[ -z "${FLEET_PREFLIGHT_TOKEN_ID:-}" ]] \
+    || preflight_env+=("FLEET_PREFLIGHT_TOKEN_ID=$FLEET_PREFLIGHT_TOKEN_ID")
+  if ! preflight_json="$(/usr/bin/env -i "${preflight_env[@]}" \
+    "$fleet_agent_mcp_python" "$fleet_agent_mcp_proxy" --preflight)"; then
+    echo "Specialist MCP preflight failed closed" >&2
+    exit 2
+  fi
+  if ! python3 -c '
+import json
+import sys
+
+expected = {
+    "dispatch", "dispatch_many", "wait", "get_result", "relay_result",
+    "request_assurance", "request_human", "inspect_roster", "inspect_mission",
+}
+try:
+    value = json.loads(sys.argv[1])
+except (json.JSONDecodeError, UnicodeDecodeError):
+    raise SystemExit(1)
+if (
+    not isinstance(value, dict)
+    or set(value) != {
+        "schema_version", "status", "protocol_version", "tool_names", "socket_probe"
+    }
+    or value["schema_version"] != 1
+    or value["status"] != "ready"
+    or value["protocol_version"] != "2024-11-05"
+    or not isinstance(value["tool_names"], list)
+    or len(value["tool_names"]) != len(expected)
+    or set(value["tool_names"]) != expected
+    or value["socket_probe"] not in {"denial_ping", "authenticated_ping"}
+):
+    raise SystemExit(1)
+' "$preflight_json"; then
+    echo "Specialist MCP preflight evidence is malformed" >&2
+    exit 2
+  fi
+  unset preflight_json preflight_env
 fi
 
 # OpenCode permissions are resolved after global and project configuration are

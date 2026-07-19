@@ -54,6 +54,21 @@ Event stream (prefer listening over polling when waiting on many agents):
    it had to be restored with `claude --resume <session-id>`).
 6. Interactive agents (Claude, Codex, OpenCode) need `send` followed by
    `enter`; interrupt interactive TUIs with `escape` and one-shot shells with ctrl-c.
+7. **Never launch a fleet OpenCode role directly from the target repository.**
+   A raw `opencode ... --agent glm-challenger` can silently fall back to the
+   generic `Build` agent when the target does not contain this repo's agent
+   definition; that fallback asks for Bash or external-directory permissions
+   and can leave the pane waiting. Launch through `fleet-up.sh` or
+   `scripts/run-interactive-agent.sh`, then verify the resolved role/policy.
+   The supported wrapper copies the dedicated agent into isolated config and
+   fails closed unless `external_directory` is denied.
+8. **Launch Kimi review panes with the repo-owned read-only agent file.** Use
+   model alias `moonshot-ai/kimi-k3`, `--thinking`, the exact target
+   `--work-dir`, and
+   `.kimi/agents/fleet-reviewer/agent.yaml`. Never use `--yolo`, `--afk`, or
+   `--print` for a review: those modes auto-approve shell commands and file
+   mutations. A permission granted in one interactive session is not the
+   launch contract for a new session; the reduced tool set is.
 
 ## This repo's fleet pattern
 

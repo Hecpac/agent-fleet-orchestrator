@@ -95,11 +95,13 @@
     "limits": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["deadline_seconds", "token_budget", "budget_mode"],
+      "required": ["deadline_seconds", "token_budget", "budget_mode", "delegation_credits", "max_active_delegations"],
       "properties": {
         "deadline_seconds": {"type": "integer", "minimum": 60, "maximum": 604800},
         "token_budget": {"type": "integer", "minimum": 0},
-        "budget_mode": {"enum": ["soft", "hard"]}
+        "budget_mode": {"enum": ["soft", "hard"]},
+        "delegation_credits": {"type": "integer", "minimum": 1, "maximum": 10000},
+        "max_active_delegations": {"type": "integer", "minimum": 1, "maximum": 256}
       }
     }
   },

@@ -1,6 +1,10 @@
 # Plan de implementación: Mission Control multi-agente
 
-Estado: listo para iniciar implementación por slices.
+Estado: **registro histórico de diseño**. La implementación por slices ya
+avanzó; este archivo no es una guía operativa ni una matriz de estado actual.
+Para la verdad ejecutable usa `README.md`, `docs/guia-uso-flota.md`,
+`orchestration/INTERNAL_WIRING.md` y la evidencia S0 fechada. Las secciones de
+rollout y “smokes requeridos” conservan la intención original.
 
 Fecha de congelación: 2026-07-14.
 
@@ -51,7 +55,7 @@ las misiones autónomas.
 | D11 | Framework externo | No introducir LangGraph, AutoGen o Temporal en el kernel inicial. Se adoptan sus patrones detrás de interfaces propias. |
 | D12 | CMUX | Plano visible y programable; nunca fuente de verdad de completion. |
 | D13 | Herramientas del modelo | No se reduce el toolset intelectual. Las restricciones se aplican a identidad, destino de escritura y efectos externos. |
-| D14 | Compatibilidad | Todos los contratos actuales de run_id, provider/model, sentinel, leases y worktrees permanecen vigentes. |
+| D14 | Compatibilidad | Todos los contratos de run_id, provider/model, sentinel y leases permanecen vigentes; el writer evolucionó de worktree compartido a clone Git aislado con publicación CONTROL. |
 
 ## 3. Principios no negociables
 
@@ -69,7 +73,8 @@ las misiones autónomas.
 ### 3.2 Control de efectos
 
 - Sólo una instancia conserva authority=write.
-- Toda escritura ocurre en la rama/worktree registrada.
+- Toda escritura ocurre en la branch del clone Git aislado registrado; CONTROL
+  publica el commit quiescente al target por intent durable y compare-and-swap.
 - Acciones sobre producción, dinero, credenciales, datos privados o destrucción
   solicitan aprobación durable antes del efecto, no antes del razonamiento.
 - Un prompt enviado manualmente con cmux puede existir visualmente, pero no puede
@@ -263,7 +268,8 @@ La subdelegación no concede write. El writer continúa siendo único.
 Se implementa una única librería de control con dos fachadas:
 
 - CLI JSON para cualquier agente con shell;
-- MCP local para proveedores que soporten herramientas MCP.
+- MCP local del controlador para especialistas frontier cuyos proveedores
+  soporten herramientas MCP. Ollama local permanece prompt-only.
 
 Operaciones:
 
@@ -313,7 +319,8 @@ Reglas:
 - el Lead puede seguir investigando read-only mientras espera;
 - la aprobación queda ligada a mission_id, workflow_digest, scope y expiración;
 - una aprobación no autoriza acciones fuera de su scope;
-- no hay aprobación humana para edición, pruebas o revisión dentro del worktree.
+- no hay aprobación humana para edición, pruebas o revisión ordinaria dentro
+  del clone aislado del writer.
 
 ### 5.6 Assured driver
 
@@ -853,7 +860,8 @@ antes de que el archive verifier exista.
 
 - workflows research e implementation usan Mission Control;
 - feature flag FLEET_MISSION_ENGINE=1;
-- just dan permanece como fallback.
+- `just dan` permanece como interfaz de compatibilidad autónoma; el fallback de
+  proveedor es una decisión separada y requiere opt-in explícito.
 
 ### Etapa 3 — Default
 

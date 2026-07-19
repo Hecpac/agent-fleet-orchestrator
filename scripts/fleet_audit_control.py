@@ -12,7 +12,6 @@ import hashlib
 import hmac
 import http.client
 import ipaddress
-import json
 import os
 from pathlib import Path
 import pwd
@@ -29,6 +28,8 @@ import urllib.parse
 import urllib.request
 import uuid
 
+import fleet_json
+
 
 GENESIS_SHA256 = "0" * 64
 MAX_REQUEST_BYTES = 2_000_000
@@ -36,6 +37,10 @@ SAFE_AUDIT_EVENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 SAFE_METADATA_KEY = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 FORBIDDEN_METADATA = {"prompt", "payload", "content", "secret", "credential", "environment", "raw"}
 TRUST_SCOPES = {"local-development", "external-compliance"}
+
+
+class AuditControlError(RuntimeError):
+    """An audit trust-boundary value is malformed or ambiguous."""
 
 
 def _connect_pinned(
@@ -121,16 +126,48 @@ def utc_now() -> str:
 
 
 def canonical(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
+    try:
+        return fleet_json.canonical_bytes(value)
+    except fleet_json.FleetJSONError as exc:
+        raise AuditControlError("audit value is not strict canonical JSON") from exc
 
 
 def digest(value: Any) -> str:
     return hashlib.sha256(canonical(value)).hexdigest()
+
+
+def _strict_json_object(
+    raw: bytes | bytearray | memoryview | str,
+    *,
+    where: str,
+) -> dict[str, Any]:
+    try:
+        value = fleet_json.loads(raw)
+    except fleet_json.FleetJSONError as exc:
+        raise AuditControlError(f"{where} is invalid strict JSON") from exc
+    if type(value) is not dict:
+        raise AuditControlError(f"{where} must be a JSON object")
+    return value
+
+
+def _strict_json_frame(
+    raw: bytes | bytearray | memoryview | str,
+    *,
+    where: str,
+) -> dict[str, Any]:
+    try:
+        values = fleet_json.load_jsonl(raw, require_nonempty=True)
+    except fleet_json.FleetJSONError as exc:
+        raise AuditControlError(
+            f"{where} is not one strict LF-terminated JSON record"
+        ) from exc
+    if len(values) != 1:
+        raise AuditControlError(
+            f"{where} is not one strict LF-terminated JSON record"
+        )
+    if type(values[0]) is not dict:
+        raise AuditControlError(f"{where} must be a JSON object")
+    return values[0]
 
 
 def file_sha256(path: Path) -> str:
@@ -697,9 +734,17 @@ class AuditLedger:
             "payload_sha256": hashlib.sha256(canonical(event) + b"\n").hexdigest(),
         }
         try:
-            pending = json.loads(path.read_bytes())
-        except (OSError, json.JSONDecodeError) as exc:
-            raise RuntimeError("durable audit pending anchor is invalid") from exc
+            raw = path.read_bytes()
+        except OSError as exc:
+            raise AuditControlError(
+                "durable audit pending anchor is invalid"
+            ) from exc
+        try:
+            pending = _strict_json_object(raw, where="durable audit pending anchor")
+        except AuditControlError as exc:
+            raise AuditControlError("durable audit pending anchor is invalid") from exc
+        if raw != canonical(pending) + b"\n":
+            raise AuditControlError("durable audit pending anchor is not canonical")
         if pending != expected:
             raise RuntimeError("durable audit pending anchor conflicts with ledger")
         receipt = self.receipt_root / f"{event['event_id']}.json"
@@ -725,12 +770,21 @@ class AuditLedger:
 
     def _load_and_verify(self, handle: BinaryIO) -> list[dict[str, Any]]:
         handle.seek(0)
+        payload = handle.read()
+        try:
+            records = fleet_json.load_jsonl(payload)
+        except fleet_json.FleetJSONError as exc:
+            raise AuditControlError(
+                "durable audit ledger is invalid strict JSONL"
+            ) from exc
         events: list[dict[str, Any]] = []
         previous = GENESIS_SHA256
-        for line_number, raw in enumerate(handle, start=1):
-            if not raw.strip():
-                raise RuntimeError(f"blank audit record at line {line_number}")
-            event = json.loads(raw)
+        for line_number, record in enumerate(records, start=1):
+            if type(record) is not dict:
+                raise AuditControlError(
+                    f"audit record at line {line_number} must be a JSON object"
+                )
+            event = dict(record)
             signature = str(event.pop("control_signature", ""))
             if not hmac.compare_digest(
                 signature, hmac_hex(self.key, "event-signature", canonical(event))
@@ -745,6 +799,14 @@ class AuditLedger:
             event["control_signature"] = signature
             previous = stored_digest
             events.append(event)
+        try:
+            canonical_payload = fleet_json.canonical_jsonl(records)
+        except fleet_json.FleetJSONError as exc:
+            raise AuditControlError(
+                "durable audit ledger cannot be canonicalized"
+            ) from exc
+        if payload != canonical_payload:
+            raise AuditControlError("durable audit ledger is not canonical JSONL")
         return events
 
     def read_verified(self, run_id: str) -> list[dict[str, Any]]:
@@ -755,6 +817,12 @@ class AuditLedger:
             return self._load_and_verify(handle)
 
     def append(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if type(payload) is not dict:
+            raise AuditControlError("audit payload must be a JSON object")
+        try:
+            fleet_json.canonical_bytes(payload)
+        except fleet_json.FleetJSONError as exc:
+            raise AuditControlError("audit payload is not strict JSON") from exc
         run_directory = self._run_directory(run_id)
         ledger_path = run_directory / "a2a_ledger.jsonl"
         flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
@@ -1021,6 +1089,12 @@ class AuditService:
         return {"event_id": event["event_id"]}
 
     def handle(self, request: dict[str, Any], peer_uid: int) -> dict[str, Any]:
+        if type(request) is not dict:
+            raise AuditControlError("audit request must be a JSON object")
+        try:
+            fleet_json.canonical_bytes(request)
+        except fleet_json.FleetJSONError as exc:
+            raise AuditControlError("audit request is not strict JSON") from exc
         operation = str(request.get("operation", ""))
         if operation == "run_started":
             return self._run_started(request, peer_uid)
@@ -1058,12 +1132,10 @@ class AuditRequestHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         try:
             self.request.settimeout(5.0)
-            raw = self.rfile.readline(MAX_REQUEST_BYTES + 1)
-            if not raw or len(raw) > MAX_REQUEST_BYTES or not raw.endswith(b"\n"):
-                raise RuntimeError("invalid or oversized request")
-            request = json.loads(raw)
-            if not isinstance(request, dict):
-                raise RuntimeError("request must be a JSON object")
+            raw = self.rfile.read(MAX_REQUEST_BYTES + 1)
+            if not raw or len(raw) > MAX_REQUEST_BYTES:
+                raise AuditControlError("invalid or oversized audit request")
+            request = _strict_json_frame(raw, where="audit socket request")
             peer_uid, _ = peer_credentials(self.request)
             result = self.server.audit_service.handle(request, peer_uid)
             response = {"ok": True, "result": result}
@@ -1081,16 +1153,27 @@ class AuditUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer
 
 
 def send_request(socket_path: Path, request: dict[str, Any]) -> dict[str, Any]:
+    if type(request) is not dict:
+        raise AuditControlError("audit request must be a JSON object")
+    encoded = canonical(request) + b"\n"
+    if len(encoded) > MAX_REQUEST_BYTES:
+        raise AuditControlError("audit request exceeds its maximum size")
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(5.0)
         client.connect(str(socket_path))
-        client.sendall(canonical(request) + b"\n")
-        response_file = client.makefile("rb")
-        raw = response_file.readline(MAX_REQUEST_BYTES + 1)
-    response = json.loads(raw)
+        client.sendall(encoded)
+        client.shutdown(socket.SHUT_WR)
+        with client.makefile("rb") as response_file:
+            raw = response_file.read(MAX_REQUEST_BYTES + 1)
+    if not raw or len(raw) > MAX_REQUEST_BYTES:
+        raise AuditControlError("invalid or oversized audit response")
+    response = _strict_json_frame(raw, where="audit socket response")
     if not response.get("ok"):
         raise RuntimeError(str(response.get("error") or "audit request failed"))
-    return dict(response.get("result") or {})
+    result = response.get("result")
+    if type(result) is not dict:
+        raise AuditControlError("audit socket response result must be a JSON object")
+    return result
 
 
 def serve(args: argparse.Namespace) -> int:
@@ -1162,9 +1245,13 @@ def main() -> int:
             parser.error("--test-anchor-root is required with --allow-local-test")
         return serve(args)
     try:
-        request = json.load(sys.stdin)
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        raw = stream.read(MAX_REQUEST_BYTES + 1)
+        if not raw or len(raw) > MAX_REQUEST_BYTES:
+            raise AuditControlError("invalid or oversized audit stdin request")
+        request = _strict_json_object(raw, where="audit stdin request")
         result = send_request(Path(args.socket), request)
-        print(json.dumps(result, sort_keys=True))
+        print(canonical(result).decode("utf-8"))
         return 0
     except Exception as exc:
         print(f"audit request failed: {exc}", file=sys.stderr)

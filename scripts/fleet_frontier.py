@@ -18,7 +18,9 @@ import time
 import uuid
 from typing import Any
 
+import fleet_json
 import fleet_providers
+import fleet_safe_paths
 from fleet_leases import (
     LeaseError,
     acquire_frontier,
@@ -49,6 +51,8 @@ HOOK_SESSION_FILES = {
 TRANSCRIPT_EVIDENCE_ATTEMPTS = 4
 TRANSCRIPT_EVIDENCE_RETRY_SECONDS = 0.1
 OPENCODE_STATE_ROOT = Path("/tmp/agent-fleet-orchestrator-opencode")
+SAFE_FEATURE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+SAFE_RESULT_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class FrontierError(RuntimeError):
@@ -71,20 +75,89 @@ def timestamp_value(raw: Any) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+def _safe_component(value: str, field: str, *, feature: bool = False) -> str:
+    pattern = SAFE_FEATURE_COMPONENT if feature else SAFE_RESULT_COMPONENT
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise FrontierError(f"invalid frontier {field}")
+    return value
+
+
+def _canonical_uuid(value: str, field: str) -> str:
+    if not isinstance(value, str):
+        raise FrontierError(f"frontier {field} must be a canonical UUID")
+    try:
+        parsed = str(uuid.UUID(value))
+    except ValueError as exc:
+        raise FrontierError(f"frontier {field} must be a canonical UUID") from exc
+    if parsed != value.lower():
+        raise FrontierError(f"frontier {field} must be a canonical UUID")
+    return parsed.upper()
+
+
 def ledger_path(runs_dir: Path, feature: str) -> Path:
-    return runs_dir / f"fleet-{feature}.ledger.jsonl"
+    safe_feature = _safe_component(feature, "feature", feature=True)
+    return runs_dir / f"fleet-{safe_feature}.ledger.jsonl"
 
 
 def result_path(runs_dir: Path, feature: str, run_id: str) -> Path:
-    return runs_dir / "results" / feature / f"{run_id}.txt"
+    return runs_dir / _result_relative(feature, run_id)
 
 
-def _fsync_directory(path: Path) -> None:
-    directory_fd = os.open(path, os.O_RDONLY)
+def _result_relative(feature: str, run_id: str) -> str:
+    if not isinstance(feature, str) or not SAFE_FEATURE_COMPONENT.fullmatch(feature):
+        raise FrontierError("invalid result feature")
+    if not isinstance(run_id, str) or not SAFE_RESULT_COMPONENT.fullmatch(run_id):
+        raise FrontierError("invalid result run_id")
+    return f"results/{feature}/{run_id}.txt"
+
+
+def _prompt_relative(feature: str, run_id: str) -> str:
+    if not isinstance(feature, str) or not SAFE_FEATURE_COMPONENT.fullmatch(feature):
+        raise FrontierError("invalid prompt feature")
+    if not isinstance(run_id, str) or not SAFE_RESULT_COMPONENT.fullmatch(run_id):
+        raise FrontierError("invalid prompt run_id")
+    return f"prompts/{feature}/{run_id}.txt"
+
+
+def read_frontier_result(
+    runs_dir: Path,
+    *,
+    feature: str,
+    run_id: str,
+    recorded_path: Path | None = None,
+) -> bytes:
+    """Read only the exact nominal result beneath a descriptor-pinned runs root."""
+
+    relative = _result_relative(feature, run_id)
     try:
-        os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
+        with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+            if recorded_path is not None:
+                if not recorded_path.is_absolute() or len(recorded_path.parents) < 3:
+                    raise FrontierError(
+                        "result_file is outside the exact fleet result store"
+                    )
+                # Accept a trusted root alias such as macOS /var -> /private/var,
+                # while keeping every descendant comparison lexical.  Resolving
+                # the complete recorded path would silently follow a hostile
+                # symlink below the selected runs root.
+                recorded_root = recorded_path.parents[2]
+                if recorded_path != recorded_root / relative:
+                    raise FrontierError(
+                        "result_file is outside the exact fleet result store"
+                    )
+                if fleet_safe_paths.canonical_root(recorded_root) != rooted.root:
+                    raise FrontierError(
+                        "result_file is outside the exact fleet result store"
+                    )
+            content = rooted.read_regular(
+                relative,
+                directory_modes=(0o755, 0o700),
+                max_bytes=16 * 1024 * 1024,
+            )
+            rooted.assert_root_binding()
+            return content
+    except fleet_safe_paths.SafePathError as exc:
+        raise FrontierError(f"unsafe frontier result path: {exc}") from exc
 
 
 def persist_frontier_result(
@@ -96,34 +169,19 @@ def persist_frontier_result(
     if not response:
         raise FrontierError("frontier result is empty")
     payload = response.encode("utf-8")
-    path = result_path(runs_dir, str(state["feature"]), str(state["run_id"]))
-    with coordinator(runs_dir):
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if path.exists():
-            if path.is_symlink() or not path.is_file():
-                raise FrontierError(f"frontier result is not a regular file: {path}")
-            try:
-                existing = path.read_bytes()
-            except OSError as exc:
-                raise FrontierError(f"cannot read existing frontier result: {path}") from exc
-            if existing != payload:
-                raise FrontierError(f"frontier result mismatch: {path}")
-            return path
-        temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
-        try:
-            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-            _fsync_directory(path.parent)
-        finally:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
-        return path
+    relative = _result_relative(str(state["feature"]), str(state["run_id"]))
+    try:
+        with coordinator(runs_dir):
+            with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+                path = rooted.atomic_write(
+                    relative,
+                    payload,
+                    directory_modes=(0o755, 0o700),
+                )
+                rooted.assert_root_binding()
+                return path
+    except fleet_safe_paths.SafePathError as exc:
+        raise FrontierError(f"unsafe frontier result path: {exc}") from exc
 
 
 def frontier_state(
@@ -131,8 +189,14 @@ def frontier_state(
     *,
     run_id: str,
     instance: str,
+    runs_dir: Path | None = None,
 ) -> dict[str, Any] | None:
-    events = events_for_run(ledger, run_id=run_id, instance=instance)
+    events = events_for_run(
+        ledger,
+        run_id=run_id,
+        instance=instance,
+        runs_dir=runs_dir,
+    )
     if not events:
         return None
     merged: dict[str, Any] = {}
@@ -168,10 +232,10 @@ def event_ack(timeout: float = 10.0) -> dict[str, Any]:
         readable, _, _ = select.select([proc.stdout], [], [], timeout)
         if not readable:
             raise FrontierError("cmux event snapshot ACK timed out")
-        raw = proc.stdout.readline()
         try:
-            frame = json.loads(raw)
-        except json.JSONDecodeError as exc:
+            raw = proc.stdout.readline()
+            frame = fleet_json.loads(raw)
+        except (UnicodeError, fleet_json.FleetJSONError) as exc:
             raise FrontierError("cmux event snapshot returned invalid JSON") from exc
         validate_event_ack(frame)
         return frame
@@ -183,7 +247,9 @@ def event_ack(timeout: float = 10.0) -> dict[str, Any]:
             pass
 
 
-def validate_event_ack(frame: dict[str, Any]) -> None:
+def validate_event_ack(frame: Any) -> None:
+    if not isinstance(frame, dict):
+        raise FrontierError("invalid cmux-events ACK")
     resume = frame.get("resume")
     valid = bool(
         frame.get("type") == "ack"
@@ -206,19 +272,21 @@ def validate_event_ack(frame: dict[str, Any]) -> None:
         raise FrontierError("invalid cmux-events ACK")
 
 
-def session_record(
-    session_id: str, *, hook_source: str = ""
-) -> dict[str, Any] | None:
+def session_record(session_id: str, *, hook_source: str = "") -> dict[str, Any] | None:
     hook_dir = os.environ.get("CMUX_HOOK_DIR", os.path.expanduser("~/.cmuxterm"))
     filename = HOOK_SESSION_FILES.get(hook_source)
     prefix = f"{hook_source}-"
     if filename is None or not session_id.startswith(prefix):
         return None
     try:
-        data = json.loads((Path(hook_dir) / filename).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        data = fleet_json.loads((Path(hook_dir) / filename).read_bytes())
+    except (OSError, fleet_json.FleetJSONError):
+        return None
+    if not isinstance(data, dict):
         return None
     sessions = data.get("sessions") or {}
+    if not isinstance(sessions, dict):
+        return None
     raw_session_id = session_id.removeprefix(prefix)
     value = sessions.get(raw_session_id)
     if not isinstance(value, dict) or value.get("sessionId") != raw_session_id:
@@ -254,13 +322,13 @@ def prompt_with_contract(task: str, run_id: str, *, hook_source: str = "") -> st
     adapter = fleet_providers.DEFAULT_REGISTRY.resolve(
         hook_source=hook_source, provider=provider
     )
-    return adapter.prepare_submission(configured, task, run_id, Path("/prompt"))["prompt"]
+    return adapter.prepare_submission(configured, task, run_id, Path("/prompt"))[
+        "prompt"
+    ]
 
 
 def sentinel_status(screen: str, run_id: str) -> tuple[str, str]:
-    pattern = re.compile(
-        rf"FLEET_RESULT:{re.escape(run_id)}:(DONE|BLOCKED|FAILED)"
-    )
+    pattern = re.compile(rf"FLEET_RESULT:{re.escape(run_id)}:(DONE|BLOCKED|FAILED)")
     lines = screen.splitlines()
     matches = [
         (index, match)
@@ -268,7 +336,11 @@ def sentinel_status(screen: str, run_id: str) -> tuple[str, str]:
         if (match := pattern.fullmatch(line.strip()))
     ]
     if len(matches) != 1:
-        reason = "frontier_sentinel_missing" if not matches else "frontier_sentinel_ambiguous"
+        reason = (
+            "frontier_sentinel_missing"
+            if not matches
+            else "frontier_sentinel_ambiguous"
+        )
         return "indeterminate", reason
     sentinel_index, match = matches[0]
     trailing = [line.strip() for line in lines[sentinel_index + 1 :] if line.strip()]
@@ -290,9 +362,7 @@ def sentinel_status(screen: str, run_id: str) -> tuple[str, str]:
 
 
 def structured_sentinel_status(response: str, run_id: str) -> tuple[str, str]:
-    pattern = re.compile(
-        rf"FLEET_RESULT:{re.escape(run_id)}:(DONE|BLOCKED|FAILED)"
-    )
+    pattern = re.compile(rf"FLEET_RESULT:{re.escape(run_id)}:(DONE|BLOCKED|FAILED)")
     lines = response.splitlines()
     matches = [
         (index, match)
@@ -300,7 +370,11 @@ def structured_sentinel_status(response: str, run_id: str) -> tuple[str, str]:
         if (match := pattern.fullmatch(line.strip()))
     ]
     if len(matches) != 1:
-        reason = "frontier_sentinel_missing" if not matches else "frontier_sentinel_ambiguous"
+        reason = (
+            "frontier_sentinel_missing"
+            if not matches
+            else "frontier_sentinel_ambiguous"
+        )
         return "indeterminate", reason
     sentinel_index, match = matches[0]
     if any(line.strip() for line in lines[sentinel_index + 1 :]):
@@ -324,7 +398,11 @@ def opencode_data_home(surface_uuid: str) -> Path:
         raise FrontierError("OpenCode evidence surface id is invalid") from exc
     surface_root = OPENCODE_STATE_ROOT / canonical_surface
     data_home = surface_root / "data"
-    if OPENCODE_STATE_ROOT.is_symlink() or surface_root.is_symlink() or data_home.is_symlink():
+    if (
+        OPENCODE_STATE_ROOT.is_symlink()
+        or surface_root.is_symlink()
+        or data_home.is_symlink()
+    ):
         raise FrontierError("OpenCode evidence state must not use symlinks")
     try:
         resolved_root = OPENCODE_STATE_ROOT.resolve(strict=True)
@@ -395,14 +473,20 @@ def opencode_turn_evidence(
             check=False,
             env={**os.environ, "XDG_DATA_HOME": str(data_home)},
         )
+    except UnicodeError as exc:
+        raise FrontierError(
+            "OpenCode turn evidence query returned invalid JSON"
+        ) from exc
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise FrontierError(f"cannot query OpenCode turn evidence: {exc}") from exc
     if result.returncode != 0:
         raise FrontierError("OpenCode turn evidence query failed")
     try:
-        rows = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise FrontierError("OpenCode turn evidence query returned invalid JSON") from exc
+        rows = fleet_json.loads(result.stdout)
+    except fleet_json.FleetJSONError as exc:
+        raise FrontierError(
+            "OpenCode turn evidence query returned invalid JSON"
+        ) from exc
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         raise FrontierError("OpenCode turn evidence query returned invalid rows")
 
@@ -415,9 +499,11 @@ def opencode_turn_evidence(
         if isinstance(message_created, bool) or not isinstance(message_created, int):
             raise FrontierError("OpenCode turn evidence has invalid message timestamp")
         try:
-            message_data = json.loads(row.get("message_data") or "")
-        except json.JSONDecodeError as exc:
-            raise FrontierError("OpenCode turn evidence has invalid message data") from exc
+            message_data = fleet_json.loads(row.get("message_data") or "")
+        except fleet_json.FleetJSONError as exc:
+            raise FrontierError(
+                "OpenCode turn evidence has invalid message data"
+            ) from exc
         if not isinstance(message_data, dict):
             raise FrontierError("OpenCode turn evidence message is not an object")
         message = messages.setdefault(
@@ -435,8 +521,8 @@ def opencode_turn_evidence(
         if part_data_raw is None:
             continue
         try:
-            part_data = json.loads(part_data_raw)
-        except json.JSONDecodeError as exc:
+            part_data = fleet_json.loads(part_data_raw)
+        except fleet_json.FleetJSONError as exc:
             raise FrontierError("OpenCode turn evidence has invalid part data") from exc
         if not isinstance(part_data, dict) or part_data.get("type") != "text":
             raise FrontierError("OpenCode turn evidence has invalid text part")
@@ -454,9 +540,7 @@ def opencode_turn_evidence(
             raise FrontierError("OpenCode turn evidence text part lacks text")
         message["parts"].append((part_created, part_id, text))
 
-    ordered = sorted(
-        messages.values(), key=lambda item: (item["created"], item["id"])
-    )
+    ordered = sorted(messages.values(), key=lambda item: (item["created"], item["id"]))
     contract_marker = f"FLEET_RESULT:{run_id}:<STATUS>"
     matching_users = [
         (index, message)
@@ -492,21 +576,26 @@ def opencode_turn_evidence(
         ):
             candidates.append((completed, created, message["id"], message))
     if not candidates:
-        raise FrontierError("OpenCode turn evidence has no completed assistant response")
+        raise FrontierError(
+            "OpenCode turn evidence has no completed assistant response"
+        )
     _, _, _, assistant = max(candidates)
     assistant_data = assistant["data"]
     provider = assistant_data.get("providerID")
     model = assistant_data.get("modelID")
     variant = assistant_data.get("variant")
-    if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+    if (
+        not isinstance(provider, str)
+        or not provider
+        or not isinstance(model, str)
+        or not model
+    ):
         raise FrontierError("OpenCode turn evidence lacks provider/model identity")
     if variant is not None and not isinstance(variant, str):
         raise FrontierError("OpenCode turn evidence has invalid variant identity")
     response = "\n".join(
         part[2]
-        for part in sorted(
-            assistant["parts"], key=lambda part: (part[0], part[1])
-        )
+        for part in sorted(assistant["parts"], key=lambda part: (part[0], part[1]))
     )
     return response, provider, model, variant
 
@@ -517,7 +606,7 @@ def _transcript_rows(session_id: str, hook_source: str) -> list[dict[str, Any]]:
     if not isinstance(transcript_path, str) or not transcript_path:
         raise FrontierError(f"{hook_source} session lacks transcript path")
     try:
-        lines = Path(transcript_path).expanduser().read_text(encoding="utf-8").splitlines()
+        lines = Path(transcript_path).expanduser().read_bytes().splitlines()
     except OSError as exc:
         raise FrontierError(f"cannot read {hook_source} transcript: {exc}") from exc
     rows: list[dict[str, Any]] = []
@@ -525,9 +614,11 @@ def _transcript_rows(session_id: str, hook_source: str) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         try:
-            row = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise FrontierError(f"{hook_source} transcript contains invalid JSON") from exc
+            row = fleet_json.loads(line)
+        except fleet_json.FleetJSONError as exc:
+            raise FrontierError(
+                f"{hook_source} transcript contains invalid JSON"
+            ) from exc
         if not isinstance(row, dict):
             raise FrontierError(f"{hook_source} transcript row is not an object")
         rows.append(row)
@@ -566,8 +657,7 @@ def _claude_human_prompt(row: dict[str, Any]) -> bool:
     if not isinstance(content, list):
         return False
     return bool(content) and not any(
-        isinstance(part, dict) and part.get("type") == "tool_result"
-        for part in content
+        isinstance(part, dict) and part.get("type") == "tool_result" for part in content
     )
 
 
@@ -603,7 +693,8 @@ def codex_turn_evidence(
             and isinstance(payload, dict)
             and payload.get("type") == "message"
             and payload.get("role") == "user"
-            and marker in _message_text(payload.get("content"), text_types={"input_text"})
+            and marker
+            in _message_text(payload.get("content"), text_types={"input_text"})
         ):
             matching_users.append(index)
     if len(matching_users) != 1:
@@ -680,10 +771,7 @@ def claude_turn_evidence(
     for index in range(user_index + 1, len(rows)):
         row = rows[index]
         message = row.get("message")
-        if (
-            _claude_human_prompt(row)
-            and row.get("sessionId") == raw_session_id
-        ):
+        if _claude_human_prompt(row) and row.get("sessionId") == raw_session_id:
             next_user_index = index
             break
 
@@ -775,25 +863,45 @@ def prepare_run(
     variant: str = "",
     run_id: str = "",
 ) -> dict[str, Any]:
+    # Validate every durable/path-bearing identifier before consulting or
+    # mutating the ledger.  In particular, feature must never reach
+    # ``ledger_path`` or the lease store with traversal components.
+    feature = _safe_component(feature, "feature", feature=True)
+    instance = _safe_component(instance, "instance")
+    role = _safe_component(role, "role")
+    phase = _safe_component(phase, "phase")
+    workspace_uuid = _canonical_uuid(workspace_uuid, "workspace_uuid")
+    surface_uuid = _canonical_uuid(surface_uuid, "surface_uuid")
+    if not isinstance(task, str) or not task:
+        raise FrontierError("frontier task must be a non-empty string")
     if not provider or not model or not hook_source:
-        raise FrontierError("frontier runs require provider, model, and hook source identity")
+        raise FrontierError(
+            "frontier runs require provider, model, and hook source identity"
+        )
+    _safe_component(hook_source, "hook_source")
     if hook_source not in HOOK_SESSION_FILES:
         raise FrontierError(f"unsupported frontier hook source: {hook_source}")
     if variant and hook_source != "opencode":
         raise FrontierError("frontier variant identity is supported only for OpenCode")
+    if not isinstance(variant, str):
+        raise FrontierError("frontier variant identity must be a string")
     if any(character in variant for character in ("\n", "\r", "\x00", "\x1f")):
-        raise FrontierError("frontier variant identity contains a forbidden control character")
+        raise FrontierError(
+            "frontier variant identity contains a forbidden control character"
+        )
     try:
         configured_provider = fleet_providers.identity(
             provider, model, variant or None, hook_source
         )
         adapter = fleet_providers.adapter_for(configured_provider)
     except fleet_providers.ProviderError as exc:
-        raise FrontierError(f"frontier provider adapter rejected identity: {exc}") from exc
+        raise FrontierError(
+            f"frontier provider adapter rejected identity: {exc}"
+        ) from exc
     if run_id:
         try:
             canonical_run_id = str(uuid.UUID(run_id))
-        except ValueError as exc:
+        except (AttributeError, TypeError, ValueError) as exc:
             raise FrontierError("frontier run_id must be a canonical UUID") from exc
         if canonical_run_id != run_id:
             raise FrontierError("frontier run_id must be a canonical UUID")
@@ -802,7 +910,7 @@ def prepare_run(
         run_id = str(uuid.uuid4())
     task_sha256 = hashlib.sha256(task.encode("utf-8")).hexdigest()
     ledger = ledger_path(runs_dir, feature)
-    if events_for_run(ledger, run_id=run_id):
+    if events_for_run(ledger, run_id=run_id, runs_dir=runs_dir):
         raise FrontierError(f"frontier run_id is already durable: {run_id}")
     preparing_at = utc_now()
     preparing = {
@@ -815,8 +923,8 @@ def prepare_run(
         "runner": "interactive",
         "status": "preparing",
         "task_sha256": task_sha256,
-        "workspace_uuid": workspace_uuid.upper(),
-        "surface_uuid": surface_uuid.upper(),
+        "workspace_uuid": workspace_uuid,
+        "surface_uuid": surface_uuid,
         "provider": provider,
         "model": model,
         "hook_source": hook_source,
@@ -825,7 +933,7 @@ def prepare_run(
     }
     if variant:
         preparing["variant"] = variant
-    if not append_event(ledger, preparing):
+    if not append_event(ledger, preparing, runs_dir=runs_dir):
         raise FrontierError(f"frontier run unexpectedly already terminal: {run_id}")
     lease: Path | None = None
     try:
@@ -840,13 +948,22 @@ def prepare_run(
             workspace_uuid=workspace_uuid,
             surface_uuid=surface_uuid,
         )
-        prompt_file = runs_dir / "prompts" / feature / f"{run_id}.txt"
-        submission = adapter.prepare_submission(
-            configured_provider, task, run_id, prompt_file
-        )
-        prompt = submission["prompt"]
-        prompt_file.parent.mkdir(parents=True, exist_ok=True)
-        prompt_file.write_text(prompt, encoding="utf-8")
+        prompt_relative = _prompt_relative(feature, run_id)
+        prompt_file = runs_dir / prompt_relative
+        try:
+            with fleet_safe_paths.RootedFS(runs_dir) as rooted:
+                submission = adapter.prepare_submission(
+                    configured_provider, task, run_id, prompt_file
+                )
+                prompt = submission["prompt"]
+                rooted.atomic_write(
+                    prompt_relative,
+                    prompt.encode("utf-8"),
+                    directory_modes=(0o755, 0o700),
+                )
+                rooted.assert_root_binding()
+        except fleet_safe_paths.SafePathError as exc:
+            raise FrontierError(f"unsafe frontier prompt path: {exc}") from exc
         ack = event_ack()
         resume = ack["resume"]
         dispatched_at = utc_now()
@@ -860,8 +977,8 @@ def prepare_run(
             "runner": "interactive",
             "status": "dispatched",
             "task_sha256": task_sha256,
-            "workspace_uuid": workspace_uuid.upper(),
-            "surface_uuid": surface_uuid.upper(),
+            "workspace_uuid": workspace_uuid,
+            "surface_uuid": surface_uuid,
             "provider": provider,
             "model": model,
             "hook_source": hook_source,
@@ -874,7 +991,7 @@ def prepare_run(
         }
         if variant:
             event["variant"] = variant
-        if not append_event(ledger, event):
+        if not append_event(ledger, event, runs_dir=runs_dir):
             raise FrontierError(f"frontier run unexpectedly already terminal: {run_id}")
         return {
             **event,
@@ -895,6 +1012,7 @@ def prepare_run(
                 "exit_code": STATUS_CODES["abandoned"],
                 "reason": "frontier_prepare_failed",
             },
+            runs_dir=runs_dir,
         )
         if lease is not None:
             release(runs_dir, run_id, [lease])
@@ -957,6 +1075,7 @@ def terminalize(
         ledger,
         run_id=str(state["run_id"]),
         instance=str(state["instance"]),
+        runs_dir=runs_dir,
     )
     if existing and existing.get("status") in TERMINAL_STATUSES:
         if existing.get("hook_source") == "opencode" and existing.get("surface_uuid"):
@@ -966,11 +1085,16 @@ def terminalize(
                 pass
         return existing
     if status == "succeeded" and result_file is None:
-        raise FrontierError("succeeded frontier terminal requires a durable result file")
-    if status == "succeeded" and (
-        result_file.is_symlink() or not result_file.is_file()
-    ):
-        raise FrontierError("succeeded frontier result file is not a regular file")
+        raise FrontierError(
+            "succeeded frontier terminal requires a durable result file"
+        )
+    if status == "succeeded":
+        read_frontier_result(
+            runs_dir,
+            feature=str(state["feature"]),
+            run_id=str(state["run_id"]),
+            recorded_path=result_file,
+        )
     terminal = {
         **_common_event(state),
         "timestamp": utc_now(),
@@ -993,14 +1117,18 @@ def terminalize(
         terminal["lease_retained"] = True
     if result_file is not None:
         terminal["result_file"] = str(result_file)
-    appended = append_event(ledger, terminal)
+    appended = append_event(ledger, terminal, runs_dir=runs_dir)
     if appended and release_lease:
         _release_frontier_lease(runs_dir, state)
-    result = latest_event(
-        ledger,
-        run_id=str(state["run_id"]),
-        instance=str(state["instance"]),
-    ) or terminal
+    result = (
+        latest_event(
+            ledger,
+            run_id=str(state["run_id"]),
+            instance=str(state["instance"]),
+            runs_dir=runs_dir,
+        )
+        or terminal
+    )
     if result.get("hook_source") == "opencode" and result.get("surface_uuid"):
         try:
             cleanup_opencode_data_home(str(result["surface_uuid"]))
@@ -1046,7 +1174,9 @@ def _event_after_dispatch(
     if occurred_at and dispatched_at and occurred_at < dispatched_at:
         return False
     if event.get("boot_id") == state.get("event_boot_id"):
-        return isinstance(event.get("seq"), int) and event["seq"] > int(state["after_seq"])
+        return isinstance(event.get("seq"), int) and event["seq"] > int(
+            state["after_seq"]
+        )
     return allow_cross_boot
 
 
@@ -1077,9 +1207,10 @@ def process_event(
         state, event, allow_cross_boot=allow_cross_boot
     ):
         return None
-    if str(event.get("workspace_id") or "").upper() != str(
-        state.get("workspace_uuid") or ""
-    ).upper():
+    if (
+        str(event.get("workspace_id") or "").upper()
+        != str(state.get("workspace_uuid") or "").upper()
+    ):
         return None
     payload = event.get("payload") or {}
     expected_source = str(state.get("hook_source") or "")
@@ -1112,7 +1243,6 @@ def process_event(
         )
     observation = adapter.observe(event, state)
 
-    name = event.get("name")
     ledger = ledger_path(runs_dir, str(state["feature"]))
     if observation == "bind":
         if state.get("tracking_protocol") == "control-v1":
@@ -1155,7 +1285,7 @@ def process_event(
             "binding_event_id": event.get("id"),
             "submitted_at": event.get("occurred_at"),
         }
-        append_event(ledger, binding)
+        append_event(ledger, binding, runs_dir=runs_dir)
         state.update(binding)
         return None
 
@@ -1193,22 +1323,28 @@ def process_event(
     response = ""
     try:
         readers = {
-            "codex": lambda current_session, current_run, stopped: transcript_turn_evidence(
-                codex_turn_evidence, current_session, current_run, stopped
+            "codex": lambda current_session, current_run, stopped: (
+                transcript_turn_evidence(
+                    codex_turn_evidence, current_session, current_run, stopped
+                )
             ),
-            "claude": lambda current_session, current_run, stopped: transcript_turn_evidence(
-                claude_turn_evidence, current_session, current_run, stopped
+            "claude": lambda current_session, current_run, stopped: (
+                transcript_turn_evidence(
+                    claude_turn_evidence, current_session, current_run, stopped
+                )
             ),
-            "opencode": lambda current_session, current_run, stopped: transcript_turn_evidence(
-                lambda session, run, occurred_at: opencode_turn_evidence(
-                    session,
-                    run,
-                    occurred_at,
-                    str(state["surface_uuid"]),
-                ),
-                current_session,
-                current_run,
-                stopped,
+            "opencode": lambda current_session, current_run, stopped: (
+                transcript_turn_evidence(
+                    lambda session, run, occurred_at: opencode_turn_evidence(
+                        session,
+                        run,
+                        occurred_at,
+                        str(state["surface_uuid"]),
+                    ),
+                    current_session,
+                    current_run,
+                    stopped,
+                )
             ),
         }
         evidence = adapter.extract_final_response(
@@ -1223,7 +1359,9 @@ def process_event(
         try:
             adapter.verify_identity(expected_identity, evidence)
         except fleet_providers.ProviderIdentityError as exc:
-            suffix = "variant_mismatch" if exc.field == "variant" else "identity_mismatch"
+            suffix = (
+                "variant_mismatch" if exc.field == "variant" else "identity_mismatch"
+            )
             status, reason = "indeterminate", f"frontier_{expected_source}_{suffix}"
     except (FrontierError, fleet_providers.ProviderError):
         status, reason = (
@@ -1264,7 +1402,10 @@ def confirm_prompt_submission(
             payload = event.get("payload") or {}
             if payload.get("phase") != "received":
                 continue
-            if event.get("source") != hook_source or payload.get("_source") != hook_source:
+            if (
+                event.get("source") != hook_source
+                or payload.get("_source") != hook_source
+            ):
                 continue
             if str(event.get("workspace_id") or "").upper() != workspace_uuid.upper():
                 continue
@@ -1293,7 +1434,12 @@ def authorize_prompt_submission(
 ) -> dict[str, Any]:
     """Bind exactly one physical submit to a CONTROL-prepared tracked run."""
     ledger = ledger_path(runs_dir, feature)
-    state = frontier_state(ledger, run_id=run_id, instance=instance)
+    state = frontier_state(
+        ledger,
+        run_id=run_id,
+        instance=instance,
+        runs_dir=runs_dir,
+    )
     if not state or state.get("runner") != "interactive":
         raise FrontierError(f"unknown frontier run: {instance}={run_id}")
     if state.get("tracking_protocol") != "control-v1":
@@ -1311,7 +1457,8 @@ def authorize_prompt_submission(
                 and payload.get("phase") == "received"
                 and event.get("source") == hook_source
                 and payload.get("_source") == hook_source
-                and str(event.get("workspace_id") or "").upper() == workspace_uuid.upper()
+                and str(event.get("workspace_id") or "").upper()
+                == workspace_uuid.upper()
                 and str(event.get("occurred_at") or "") >= since
                 and _event_after_dispatch(state, event, allow_cross_boot=True)
                 and session_id
@@ -1336,11 +1483,15 @@ def authorize_prompt_submission(
                 "submission_session_id": session_id,
                 "submission_authorized_at": utc_now(),
             }
-            if not append_event(ledger, authorized):
-                raise FrontierError("frontier run became terminal before submission authorization")
+            if not append_event(ledger, authorized, runs_dir=runs_dir):
+                raise FrontierError(
+                    "frontier run became terminal before submission authorization"
+                )
             return authorized
         if len(matches) > 1:
-            raise FrontierError("multiple UserPromptSubmit events make transfer authorization ambiguous")
+            raise FrontierError(
+                "multiple UserPromptSubmit events make transfer authorization ambiguous"
+            )
         if time.monotonic() >= deadline:
             raise FrontierError(
                 "no UserPromptSubmit observed after dispatch; prompt transfer unconfirmed"
@@ -1350,22 +1501,28 @@ def authorize_prompt_submission(
 
 def audit_events() -> list[dict[str, Any]]:
     configured = os.environ.get("CMUX_EVENTS_LOG")
-    current = Path(configured).expanduser() if configured else Path.home() / ".cmuxterm/events.jsonl"
+    current = (
+        Path(configured).expanduser()
+        if configured
+        else Path.home() / ".cmuxterm/events.jsonl"
+    )
     paths = [Path(f"{current}.1"), current]
     events: list[dict[str, Any]] = []
     seen: set[str] = set()
     for path in paths:
         try:
-            lines = path.read_text(encoding="utf-8").splitlines()
+            lines = path.read_bytes().splitlines()
         except OSError:
             continue
         for raw in lines:
             if not raw.strip():
                 continue
             try:
-                event = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise FrontierError(f"cmux audit contains invalid JSON: {path}") from exc
+                event = fleet_json.loads(raw)
+            except fleet_json.FleetJSONError as exc:
+                raise FrontierError(
+                    f"cmux audit contains invalid JSON: {path}"
+                ) from exc
             if not isinstance(event, dict) or not isinstance(event.get("id"), str):
                 raise FrontierError(f"cmux audit contains an invalid event: {path}")
             event_id = str(event.get("id") or "")
@@ -1385,7 +1542,10 @@ def _continuous_audit_suffix(
     anchor = -1
     if baseline_seq > 0:
         for index, event in enumerate(events):
-            if event.get("boot_id") == baseline_boot and event.get("seq") == baseline_seq:
+            if (
+                event.get("boot_id") == baseline_boot
+                and event.get("seq") == baseline_seq
+            ):
                 anchor = index
                 break
         if anchor < 0:
@@ -1466,6 +1626,7 @@ def recover_from_audit(
             ledger_path(runs_dir, str(state["feature"])),
             run_id=str(state["run_id"]),
             instance=str(state["instance"]),
+            runs_dir=runs_dir,
         )
         if refreshed:
             current = refreshed
@@ -1489,7 +1650,10 @@ def abandon_run(
     reason: str,
 ) -> dict[str, Any]:
     state = frontier_state(
-        ledger_path(runs_dir, feature), run_id=run_id, instance=instance
+        ledger_path(runs_dir, feature),
+        run_id=run_id,
+        instance=instance,
+        runs_dir=runs_dir,
     )
     if not state or state.get("runner") != "interactive":
         raise FrontierError(f"unknown frontier run: {instance}={run_id}")
@@ -1514,7 +1678,10 @@ def mark_indeterminate(
     reason: str,
 ) -> dict[str, Any]:
     state = frontier_state(
-        ledger_path(runs_dir, feature), run_id=run_id, instance=instance
+        ledger_path(runs_dir, feature),
+        run_id=run_id,
+        instance=instance,
+        runs_dir=runs_dir,
     )
     if not state or state.get("runner") != "interactive":
         raise FrontierError(f"unknown frontier run: {instance}={run_id}")
@@ -1535,7 +1702,13 @@ def _parser() -> argparse.ArgumentParser:
     prepare = sub.add_parser("prepare")
     prepare.add_argument("runs_dir")
     for name in (
-        "feature", "instance", "role", "phase", "task", "workspace-uuid", "surface-uuid"
+        "feature",
+        "instance",
+        "role",
+        "phase",
+        "task",
+        "workspace-uuid",
+        "surface-uuid",
     ):
         prepare.add_argument(f"--{name}", required=True)
     for name in ("provider", "model", "hook-source", "variant"):
@@ -1590,7 +1763,9 @@ def main() -> int:
         elif args.command == "confirm-submit":
             supplied = [args.feature, args.instance, args.run_id]
             if any(supplied) and not all(supplied):
-                raise FrontierError("--feature, --instance, and --run-id must be supplied together")
+                raise FrontierError(
+                    "--feature, --instance, and --run-id must be supplied together"
+                )
             if all(supplied):
                 result = authorize_prompt_submission(
                     runs_dir,

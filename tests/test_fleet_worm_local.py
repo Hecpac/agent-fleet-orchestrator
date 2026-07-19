@@ -126,6 +126,31 @@ class FleetWormLocalTests(unittest.TestCase):
         with self.assertRaisesRegex(local_worm.LocalWormError, "private regular file"):
             local_worm._load_state(state_dir)
 
+    def test_state_loader_rejects_ambiguous_strict_json(self) -> None:
+        state_dir = self.root / "strict-state"
+        state_dir.mkdir(mode=0o700)
+        state_file = state_dir / local_worm.STATE_FILE
+        invalid = (
+            b'{"schema_version":1,"schema_version":1}',
+            b'{"value":1e999}',
+            b"\xef\xbb\xbf{}",
+            b'{"value":"\xff"}',
+            rb'{"value":"\ud800"}',
+            b"{}{}",
+        )
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                state_file.write_bytes(payload)
+                state_file.chmod(0o600)
+                with self.assertRaisesRegex(
+                    local_worm.LocalWormError, "missing or invalid"
+                ):
+                    local_worm._load_state(state_dir)
+
+    def test_regulated_negative_is_a_compile_time_effect_gate(self) -> None:
+        error = local_worm._regulated_compile_negative()
+        self.assertIn("not enforceable", error)
+
     def test_failed_cleanup_retains_the_only_ownership_state(self) -> None:
         state_dir = self.root / "retained-state"
         with (

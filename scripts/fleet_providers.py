@@ -10,6 +10,8 @@ import re
 import sys
 from typing import Any, Callable, Protocol, runtime_checkable
 
+import fleet_json
+
 
 # Provider modules import this contract by its stable module name. Preserve the
 # same class identities when this file is invoked directly as a CLI.
@@ -332,13 +334,13 @@ def main(argv: list[str] | None = None) -> int:
             adapter = DEFAULT_REGISTRY.resolve(
                 hook_source=configured.hook_source, provider=configured.provider
             )
-            command = json.loads(args.command_json)
+            command = fleet_json.loads(args.command_json)
             value = adapter.validate_configuration(
                 configured, command=command or None, runner=args.runner
             )
         print(json.dumps(value, sort_keys=True))
         return 0
-    except (ProviderError, json.JSONDecodeError) as exc:
+    except (ProviderError, fleet_json.FleetJSONError) as exc:
         print(f"fleet-providers: {exc}", file=sys.stderr)
         return 2
 

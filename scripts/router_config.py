@@ -24,11 +24,18 @@ from typing import Any, Iterable
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
-import fleet_providers
+import fleet_providers  # noqa: E402
+import fleet_compiled  # noqa: E402
+import fleet_json  # noqa: E402
+import fleet_manifest  # noqa: E402
+import fleet_mission  # noqa: E402
+import fleet_mission_state  # noqa: E402
+import fleet_safe_paths  # noqa: E402
 
 DEFAULT_ROUTER = ROOT / "orchestration" / "router.yaml"
 IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 ENV_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 RESERVED_INSTANCE_IDS = {"workspace", "lead", "monitor"}
 RUNNERS = {"interactive", "local"}
 AUTHORITIES = {"control", "write", "advisory", "verification"}
@@ -42,15 +49,6 @@ OPENCODE_AGENT_IDENTITY_RE = re.compile(r"^(model|variant):[ \t]*(\S(?:.*\S)?)[ 
 
 class RouterError(ValueError):
     """Configuration or planning error that must fail before cmux effects."""
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise RouterError(f"duplicate key: {key}")
-        result[key] = value
-    return result
 
 
 def _opencode_agent_name(command: list[str], where: str) -> str | None:
@@ -96,14 +94,90 @@ def _opencode_agent_identity(
 def load_router(path: str | os.PathLike[str] | None = None) -> dict[str, Any]:
     router_path = Path(path or os.environ.get("FLEET_ROUTER_PATH", DEFAULT_ROUTER))
     try:
-        with router_path.open(encoding="utf-8") as handle:
-            config = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
+        config = fleet_json.loads(router_path.read_bytes())
     except RouterError:
         raise
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, fleet_json.FleetJSONError) as exc:
         raise RouterError(f"cannot load router {router_path}: {exc}") from exc
     validate_router(config)
     return config
+
+
+def _compiled_runtime_config(
+    args: argparse.Namespace,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    cli_path = getattr(args, "compiled_workflow", None)
+    env_path = os.environ.get("FLEET_COMPILED_WORKFLOW")
+    env_digest = os.environ.get("FLEET_COMPILED_DIGEST")
+    if env_path and not env_digest and not cli_path:
+        raise RouterError(
+            "inherited compiled authority requires FLEET_COMPILED_DIGEST"
+        )
+    if env_digest and not env_path:
+        raise RouterError(
+            "FLEET_COMPILED_DIGEST cannot be used without FLEET_COMPILED_WORKFLOW"
+        )
+    if env_digest and not SHA256_RE.fullmatch(env_digest):
+        raise RouterError(
+            "FLEET_COMPILED_DIGEST must be a lowercase SHA-256 digest"
+        )
+    if cli_path and env_path:
+        if (
+            Path(cli_path).expanduser().resolve()
+            != Path(env_path).expanduser().resolve()
+        ):
+            raise RouterError(
+                "--compiled-workflow conflicts with FLEET_COMPILED_WORKFLOW"
+            )
+    compiled_path = cli_path or env_path
+    mission_id = os.environ.get("FLEET_MISSION_ID")
+    if not compiled_path:
+        if mission_id:
+            raise RouterError(
+                "Mission-bound router access requires compiled workflow authority"
+            )
+        return load_router(args.router), None
+    if args.router:
+        raise RouterError("--router cannot be combined with compiled router authority")
+    try:
+        if mission_id:
+            normalized_mission_id = fleet_mission_state.normalize_uuid(
+                mission_id, "mission_id"
+            )
+            runs_dir = Path(
+                os.environ.get(
+                    "FLEET_RUNS_DIR", ROOT / "orchestration" / "runs"
+                )
+            )
+            runs_root = fleet_safe_paths.canonical_root(runs_dir)
+            expected_path = (
+                runs_root
+                / "missions"
+                / normalized_mission_id
+                / "compiled-workflow.json"
+            )
+            supplied_path = Path(compiled_path).expanduser()
+            if not supplied_path.is_absolute() or supplied_path != expected_path:
+                raise RouterError(
+                    "Mission-bound compiled workflow path is not canonical"
+                )
+            compiled, _ = fleet_mission.load_mission_compiled(
+                runs_root, normalized_mission_id, mode="effect"
+            )
+        else:
+            compiled = fleet_compiled.load(compiled_path, mode="effect")
+    except (
+        fleet_compiled.CompiledError,
+        fleet_mission.MissionError,
+        fleet_mission_state.MissionStateError,
+        fleet_safe_paths.SafePathError,
+    ) as exc:
+        raise RouterError(
+            f"compiled workflow binding failed before planning effects: {exc}"
+        ) from exc
+    if env_digest and compiled["compiled_digest"] != env_digest:
+        raise RouterError("compiled workflow differs from inherited boot authority")
+    return copy.deepcopy(compiled["router_snapshot"]), compiled
 
 
 def _expect_mapping(value: Any, where: str) -> dict[str, Any]:
@@ -322,7 +396,19 @@ def validate_router(config: dict[str, Any]) -> None:
             if not ENV_RE.fullmatch(env_name):
                 raise RouterError(f"router.roles.{role_type}.requires_env has invalid name: {env_name}")
         _expect_string_list(role["capabilities"], f"router.roles.{role_type}.capabilities", nonempty=True)
-        _expect_string_list(role["tool_access"], f"router.roles.{role_type}.tool_access", nonempty=True)
+        role_tools = _expect_string_list(
+            role["tool_access"],
+            f"router.roles.{role_type}.tool_access",
+            nonempty=True,
+        )
+        if role["runner"] == "interactive" and "fleet_control" not in role_tools:
+            raise RouterError(
+                f"router.roles.{role_type} interactive role requires fleet_control"
+            )
+        if role["runner"] != "interactive" and "fleet_control" in role_tools:
+            raise RouterError(
+                f"router.roles.{role_type} non-interactive role cannot claim fleet_control"
+            )
         if role["authority"] not in AUTHORITIES - {"control"}:
             raise RouterError(
                 f"router.roles.{role_type}.authority must be one of {sorted(AUTHORITIES - {'control'})}"
@@ -338,7 +424,10 @@ def validate_router(config: dict[str, Any]) -> None:
         if role["phase"] in {"RECON", "CHALLENGE", "VERIFY"}:
             forbidden = [
                 tool for tool in role["tool_access"]
-                if tool not in {"prompt_only", "filesystem_read", "shell_read", "git_read"}
+                if tool not in {
+                    "prompt_only", "filesystem_read", "shell_read", "git_read",
+                    "fleet_control",
+                }
             ]
             if forbidden:
                 raise RouterError(
@@ -638,8 +727,22 @@ def _validate_instances(config: dict[str, Any], instances: list[dict[str, Any]],
         if "tool_access" in instance:
             _expect_string_list(instance["tool_access"], f"{where}[{index}].tool_access", nonempty=True)
         effective_tools = instance.get("tool_access", role["tool_access"])
+        if role["runner"] == "interactive" and "fleet_control" not in effective_tools:
+            raise RouterError(
+                f"{where}[{index}] interactive instance requires fleet_control"
+            )
+        if role["runner"] != "interactive" and "fleet_control" in effective_tools:
+            raise RouterError(
+                f"{where}[{index}] non-interactive instance cannot claim fleet_control"
+            )
         if phase in {"RECON", "CHALLENGE", "VERIFY"}:
-            forbidden = [tool for tool in effective_tools if tool not in {"prompt_only", "filesystem_read", "shell_read", "git_read"}]
+            forbidden = [
+                tool for tool in effective_tools
+                if tool not in {
+                    "prompt_only", "filesystem_read", "shell_read", "git_read",
+                    "fleet_control",
+                }
+            ]
             if forbidden:
                 raise RouterError(f"{where}[{index}] phase {phase} has write-capable tools: {forbidden}")
     if writers > 1:
@@ -698,6 +801,8 @@ def select_lead(
         if requested not in candidates:
             raise RouterError(f"requested lead is not a configured candidate: {requested}")
         candidates = [requested] + ([item for item in candidates if item != requested] if allow_fallback else [])
+    elif not allow_fallback:
+        candidates = candidates[:1]
     failures: list[str] = []
     for role_type in candidates:
         role = config["roles"][role_type]
@@ -828,10 +933,22 @@ def build_plan(
     }
 
 
-def _records(plan: dict[str, Any]) -> str:
+def _records(plan: dict[str, Any], binding: dict[str, str] | None = None) -> str:
     lines = [
         US.join(["META", str(plan["schema_version"]), plan["preset"], plan["mode"]])
     ]
+    if binding is not None:
+        lines.append(
+            US.join(
+                [
+                    "BINDING",
+                    binding["compiled_digest"],
+                    binding["router_digest"],
+                    binding["roster_digest"],
+                    binding["launch_digest"],
+                ]
+            )
+        )
     if plan["lead"]:
         lead = plan["lead"]
         lines.append(
@@ -902,7 +1019,10 @@ def verify_layout(expected: list[str], tree: dict[str, Any]) -> list[str]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--router", help="router path (default: FLEET_ROUTER_PATH or repository router)")
+    parser.add_argument(
+        "--router",
+        help="router path for compilation/legacy operation; ignored authority is forbidden",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("validate", help="validate the router")
@@ -926,6 +1046,7 @@ def _parser() -> argparse.ArgumentParser:
     plan.add_argument("--no-lead", action="store_true")
     plan.add_argument("--skip-healthcheck", action="store_true")
     plan.add_argument("--format", choices=("json", "records"), default="json")
+    plan.add_argument("--compiled-workflow")
     plan.add_argument("instances", nargs="*")
 
     layout = subparsers.add_parser("verify-layout", help="verify cmux tree JSON from stdin")
@@ -937,7 +1058,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _parser()
     args = parser.parse_args(argv)
     try:
-        config = load_router(args.router)
+        config, compiled = _compiled_runtime_config(args)
         if args.command == "validate":
             print(f"router schema {config['schema_version']} valid")
         elif args.command == "presets":
@@ -976,6 +1097,11 @@ def main(argv: list[str] | None = None) -> int:
                 print(value)
         elif args.command == "limits-field":
             if args.field not in config["limits"]:
+                if args.field == "local_token_budget_per_feature":
+                    # This limit is optional by schema. Empty stdout is the
+                    # unambiguous representation of "not configured"; other
+                    # unknown fields remain errors.
+                    return 0
                 raise RouterError(f"limits has no field: {args.field}")
             value = config["limits"][args.field]
             if isinstance(value, (list, dict)):
@@ -983,6 +1109,23 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 print(value)
         elif args.command == "plan":
+            if compiled is not None:
+                static_plan = build_plan(
+                    config,
+                    preset_name=args.preset,
+                    instance_specs=args.instances,
+                    lead_provider=args.lead_provider,
+                    allow_fallback=args.allow_fallback,
+                    no_lead=args.no_lead,
+                    run_healthcheck=False,
+                    check_runtime_availability=False,
+                )
+                try:
+                    fleet_manifest.bind_plan(config, static_plan, compiled)
+                except fleet_manifest.ManifestError as exc:
+                    raise RouterError(
+                        f"compiled workflow binding failed before planning effects: {exc}"
+                    ) from exc
             resolved = build_plan(
                 config,
                 preset_name=args.preset,
@@ -992,20 +1135,27 @@ def main(argv: list[str] | None = None) -> int:
                 no_lead=args.no_lead,
                 run_healthcheck=not args.skip_healthcheck,
             )
+            binding = None
+            if compiled is not None:
+                try:
+                    binding = fleet_manifest.bind_plan(config, resolved, compiled)
+                except fleet_manifest.ManifestError as exc:
+                    raise RouterError(f"compiled workflow binding failed: {exc}") from exc
             if args.format == "records":
-                print(_records(resolved))
+                print(_records(resolved, binding))
             else:
                 print(json.dumps(resolved, indent=2, sort_keys=True))
         elif args.command == "verify-layout":
             expected = [item for item in args.expected.split(",") if item]
-            actual = verify_layout(expected, json.load(sys.stdin))
+            try:
+                layout = fleet_json.loads(sys.stdin.buffer.read())
+            except fleet_json.FleetJSONError as exc:
+                raise RouterError(f"invalid cmux tree JSON: {exc}") from exc
+            actual = verify_layout(expected, layout)
             print("layout valid: " + ",".join(actual))
         return 0
     except RouterError as exc:
         print(f"router error: {exc}", file=sys.stderr)
-        return 2
-    except json.JSONDecodeError as exc:
-        print(f"router error: invalid cmux tree JSON: {exc}", file=sys.stderr)
         return 2
 
 

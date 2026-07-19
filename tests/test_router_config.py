@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import copy
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
+
+from tests.mission_control_test_support import legacy_v1_compiled, write_compiled
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,10 +21,17 @@ assert SPEC and SPEC.loader
 router_config = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(router_config)
 
+import workflow_config  # noqa: E402
+
 
 class RouterConfigTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = router_config.load_router()
+        self.which_patch = mock.patch.object(
+            router_config.shutil, "which", return_value="/usr/bin/fleet-ci-provider"
+        )
+        self.which_patch.start()
+        self.addCleanup(self.which_patch.stop)
 
     def write_config(self, config: dict) -> str:
         handle = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
@@ -43,13 +56,178 @@ class RouterConfigTests(unittest.TestCase):
                 "research",
             },
         )
+
+    def test_plan_rejects_historical_compiled_before_provider_healthchecks(
+        self,
+    ) -> None:
+        compiled = workflow_config.compile_path(
+            ROOT / "workflows" / "implementation.yaml"
+        )
+        handle = tempfile.NamedTemporaryFile(delete=False)
+        handle.close()
+        compiled_path = Path(handle.name)
+        self.addCleanup(compiled_path.unlink, missing_ok=True)
+        write_compiled(compiled_path, legacy_v1_compiled(compiled))
+        with mock.patch.object(router_config, "build_plan") as effect:
+            result = router_config.main(
+                [
+                    "plan",
+                    "--preset",
+                    compiled["resolved"]["preset"],
+                    "--compiled-workflow",
+                    str(compiled_path),
+                ]
+            )
+        self.assertEqual(result, 2)
+        effect.assert_not_called()
+
+    def test_plan_uses_snapshot_when_live_router_drifts_after_compile(self) -> None:
+        compiled = workflow_config.compile_path(
+            ROOT / "workflows" / "implementation.yaml"
+        )
+        compiled_handle = tempfile.NamedTemporaryFile(delete=False)
+        compiled_handle.close()
+        compiled_path = Path(compiled_handle.name)
+        self.addCleanup(compiled_path.unlink, missing_ok=True)
+        write_compiled(compiled_path, compiled)
+        drifted = copy.deepcopy(self.config)
+        drifted["roles"]["codex"]["command"].append("--live-router-drift")
+        output = io.StringIO()
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"FLEET_ROUTER_PATH": self.write_config(drifted)},
+            ),
+            mock.patch.object(router_config.subprocess, "run") as effect,
+            redirect_stdout(output),
+        ):
+            result = router_config.main(
+                [
+                    "plan",
+                    "--preset",
+                    compiled["resolved"]["preset"],
+                    "--compiled-workflow",
+                    str(compiled_path),
+                    "--skip-healthcheck",
+                ]
+            )
+        self.assertEqual(result, 0)
+        effect.assert_not_called()
+        self.assertNotIn("--live-router-drift", output.getvalue())
+
+    def test_snapshot_tamper_fails_before_provider_healthchecks(self) -> None:
+        compiled = workflow_config.compile_path(
+            ROOT / "workflows" / "implementation.yaml"
+        )
+        compiled["router_snapshot"]["roles"]["codex"]["command"].append(
+            "--tampered"
+        )
+        compiled["router_digest"] = workflow_config.sha256(
+            compiled["router_snapshot"]
+        )
+        compiled["compiled_digest"] = workflow_config.sha256(
+            {
+                key: value
+                for key, value in compiled.items()
+                if key != "compiled_digest"
+            }
+        )
+        handle = tempfile.NamedTemporaryFile(delete=False)
+        handle.close()
+        compiled_path = Path(handle.name)
+        self.addCleanup(compiled_path.unlink, missing_ok=True)
+        write_compiled(compiled_path, compiled)
+        with mock.patch.object(router_config.subprocess, "run") as effect:
+            result = router_config.main(
+                [
+                    "plan",
+                    "--preset",
+                    "dan",
+                    "--compiled-workflow",
+                    str(compiled_path),
+                ]
+            )
+        self.assertEqual(result, 2)
+        effect.assert_not_called()
+
+    def test_inherited_compiled_authority_requires_exact_digest_pair(self) -> None:
+        compiled = workflow_config.compile_path(
+            ROOT / "workflows" / "implementation.yaml"
+        )
+        handle = tempfile.NamedTemporaryFile(delete=False)
+        handle.close()
+        compiled_path = Path(handle.name)
+        self.addCleanup(compiled_path.unlink, missing_ok=True)
+        write_compiled(compiled_path, compiled)
+
+        with mock.patch.dict(
+            os.environ,
+            {"FLEET_COMPILED_WORKFLOW": str(compiled_path)},
+            clear=True,
+        ):
+            self.assertEqual(router_config.main(["validate"]), 2)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FLEET_COMPILED_WORKFLOW": str(compiled_path),
+                "FLEET_COMPILED_DIGEST": compiled["compiled_digest"],
+            },
+            clear=True,
+        ):
+            self.assertEqual(router_config.main(["validate"]), 0)
+
+    def test_compiled_optional_local_budget_can_be_absent(self) -> None:
+        router = copy.deepcopy(self.config)
+        router["limits"].pop("local_token_budget_per_feature", None)
+        workflow = workflow_config.load_workflow(
+            ROOT / "workflows" / "implementation.yaml"
+        )
+        compiled = workflow_config.compile_workflow(workflow, router=router)
+        handle = tempfile.NamedTemporaryFile(delete=False)
+        handle.close()
+        compiled_path = Path(handle.name)
+        self.addCleanup(compiled_path.unlink, missing_ok=True)
+        write_compiled(compiled_path, compiled)
+        output = io.StringIO()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FLEET_COMPILED_WORKFLOW": str(compiled_path),
+                "FLEET_COMPILED_DIGEST": compiled["compiled_digest"],
+            },
+            clear=True,
+        ), redirect_stdout(output):
+            result = router_config.main(
+                ["limits-field", "local_token_budget_per_feature"]
+            )
+        self.assertEqual(result, 0)
+        self.assertEqual(output.getvalue(), "")
+
     def test_duplicate_json_key_is_rejected(self) -> None:
         handle = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False)
         with handle:
             handle.write('{"schema_version": 2, "schema_version": 2}')
         self.addCleanup(Path(handle.name).unlink, missing_ok=True)
-        with self.assertRaisesRegex(router_config.RouterError, "duplicate key"):
+        with self.assertRaisesRegex(router_config.RouterError, "duplicate.*key"):
             router_config.load_router(handle.name)
+
+    def test_router_json_rejects_overflow_unicode_bom_and_trailing_data(self) -> None:
+        invalid = (
+            b'{"schema_version":1e999}',
+            b"\xef\xbb\xbf{}",
+            b'{"model":"\xff"}',
+            rb'{"model":"\ud800"}',
+            b"{}{}",
+        )
+        for payload in invalid:
+            handle = tempfile.NamedTemporaryFile("wb", suffix=".yaml", delete=False)
+            with handle:
+                handle.write(payload)
+            self.addCleanup(Path(handle.name).unlink, missing_ok=True)
+            with self.subTest(payload=payload), self.assertRaises(
+                router_config.RouterError
+            ):
+                router_config.load_router(handle.name)
 
     def test_unknown_field_is_rejected(self) -> None:
         config = copy.deepcopy(self.config)
@@ -63,6 +241,24 @@ class RouterConfigTests(unittest.TestCase):
         self.assertIn("danger-full-access", lead["command"])
         claude = router_config.select_lead(self.config, "claude", run_healthcheck=False)
         self.assertEqual(claude["role_type"], "claude")
+
+    def test_default_lead_fallback_is_opt_in_but_explicit_claude_is_allowed(
+        self,
+    ) -> None:
+        def available(executable: str) -> str | None:
+            return None if executable == "codex" else f"/usr/bin/{executable}"
+
+        with mock.patch.object(router_config.shutil, "which", side_effect=available):
+            with self.assertRaisesRegex(router_config.RouterError, "codex.*missing"):
+                router_config.select_lead(self.config, run_healthcheck=False)
+            fallback = router_config.select_lead(
+                self.config, allow_fallback=True, run_healthcheck=False
+            )
+            explicit = router_config.select_lead(
+                self.config, "claude", run_healthcheck=False
+            )
+        self.assertEqual(fallback["role_type"], "claude")
+        self.assertEqual(explicit["role_type"], "claude")
 
     def test_preset_order_is_capability_first(self) -> None:
         expected = {
@@ -93,7 +289,11 @@ class RouterConfigTests(unittest.TestCase):
         custom = router_config.build_plan(
             self.config, instance_specs=["triage"], run_healthcheck=False
         )
+        research = router_config.build_plan(
+            self.config, preset_name="research", run_healthcheck=False
+        )
         self.assertEqual(dan["mode"], "autonomous")
+        self.assertEqual(research["mode"], "autonomous")
         self.assertEqual(assured["mode"], "assured")
         self.assertEqual(custom["mode"], "guided")
         self.assertEqual(
@@ -210,13 +410,35 @@ class RouterConfigTests(unittest.TestCase):
             ["opencode", "-m", "zai/glm-5.2", "--agent", "glm-challenger"],
         )
 
-    def test_opencode_roles_declare_only_filesystem_read_access(self) -> None:
+    def test_opencode_roles_declare_read_and_authenticated_control_access(self) -> None:
         for role_name in ("glm", "minimax", "minimax_candidate", "minimax_checker"):
             with self.subTest(role=role_name):
                 self.assertEqual(
                     self.config["roles"][role_name]["tool_access"],
-                    ["filesystem_read"],
+                    ["filesystem_read", "fleet_control"],
                 )
+
+    def test_fleet_control_access_is_exactly_interactive(self) -> None:
+        for role_name, role in self.config["roles"].items():
+            with self.subTest(role=role_name):
+                self.assertEqual(
+                    "fleet_control" in role["tool_access"],
+                    role["runner"] == "interactive",
+                )
+
+        missing = copy.deepcopy(self.config)
+        missing["roles"]["glm"]["tool_access"].remove("fleet_control")
+        with self.assertRaisesRegex(
+            router_config.RouterError, "interactive role requires fleet_control"
+        ):
+            router_config.load_router(self.write_config(missing))
+
+        amplified = copy.deepcopy(self.config)
+        amplified["roles"]["triage"]["tool_access"].append("fleet_control")
+        with self.assertRaisesRegex(
+            router_config.RouterError, "non-interactive role cannot claim fleet_control"
+        ):
+            router_config.load_router(self.write_config(amplified))
 
     def test_opencode_variant_must_be_durable_and_agent_pinned(self) -> None:
         config = copy.deepcopy(self.config)

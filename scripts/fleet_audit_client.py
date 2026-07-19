@@ -23,8 +23,11 @@ from typing import Any
 import uuid
 
 import fleet_audit_control as audit
+import fleet_compiled  # noqa: F401 - historical/offline inspection API
+import fleet_json
 import fleet_mission
 import fleet_mission_state as mission_state
+import fleet_safe_paths
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,47 +37,186 @@ AUDIT_RECEIPT_FIELDS = {
     "worm", "backend", "trust_scope", "public_key_sha256", "verified_at",
     "anchor_receipts_sha256", "ed25519_signature",
 }
+AUDIT_LIFECYCLE_FIELDS = {
+    "schema_version", "mission_id", "mode", "trust_scope", "pid", "socket",
+    "ledger_root", "anchor_receipts", "public_key", "started_at", "stopped_at",
+}
+MAX_AUDIT_JSON_BYTES = 4 * 1024 * 1024
+MAX_AUDIT_LEDGER_BYTES = 64 * 1024 * 1024
+MAX_AUDIT_PUBLIC_KEY_BYTES = 1024 * 1024
 
 
 class AuditClientError(RuntimeError):
     """Audit lifecycle or evidence failed closed."""
 
 
-def _load_json(path: Path) -> dict[str, Any]:
+def _relative_under(
+    rooted: fleet_safe_paths.RootedFS, path: Path, *, where: str
+) -> Path:
+    candidate = path.expanduser()
+    if not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise AuditClientError(f"cannot load audit lifecycle file: {path.name}") from exc
-    if not isinstance(value, dict):
-        raise AuditClientError("audit lifecycle file must contain an object")
+        return candidate.relative_to(rooted.root)
+    except ValueError as exc:
+        raise AuditClientError(f"{where} is outside its trusted root") from exc
+
+
+def _read_regular(
+    path: Path,
+    *,
+    where: str,
+    max_bytes: int,
+    file_modes: tuple[int, ...] = (0o600,),
+    rooted: fleet_safe_paths.RootedFS | None = None,
+    directory_mode: int | None = 0o700,
+) -> bytes:
+    try:
+        if rooted is not None:
+            relative = _relative_under(rooted, path, where=where)
+            modes = (directory_mode,) * (len(relative.parts) - 1)
+            last_error: fleet_safe_paths.SafePathError | None = None
+            for file_mode in file_modes:
+                try:
+                    return rooted.read_regular(
+                        relative,
+                        directory_modes=modes,
+                        file_mode=file_mode,
+                        max_bytes=max_bytes,
+                        require_single_link=True,
+                    )
+                except fleet_safe_paths.SafePathError as exc:
+                    last_error = exc
+            assert last_error is not None
+            raise last_error
+
+        selected = path.expanduser()
+        parent = selected.parent.resolve(strict=True)
+        with fleet_safe_paths.RootedFS(parent) as selected_root:
+            last_error = None
+            for file_mode in file_modes:
+                try:
+                    return selected_root.read_regular(
+                        selected.name,
+                        directory_modes=(),
+                        file_mode=file_mode,
+                        max_bytes=max_bytes,
+                        require_single_link=True,
+                    )
+                except fleet_safe_paths.SafePathError as exc:
+                    last_error = exc
+            assert last_error is not None
+            raise last_error
+    except (OSError, RuntimeError, fleet_safe_paths.SafePathError) as exc:
+        raise AuditClientError(f"unsafe {where}") from exc
+
+
+def _strict_json_object(raw: bytes, *, where: str) -> dict[str, Any]:
+    try:
+        value = fleet_json.loads(raw)
+        canonical = fleet_json.canonical_bytes(value) + b"\n"
+    except fleet_json.FleetJSONError as exc:
+        raise AuditClientError(f"{where} is invalid strict JSON") from exc
+    if type(value) is not dict:
+        raise AuditClientError(f"{where} must contain a JSON object")
+    if raw != canonical:
+        raise AuditClientError(f"{where} is not canonical LF-terminated JSON")
     return value
 
 
+def _load_json_bytes(
+    path: Path,
+    *,
+    where: str = "audit JSON file",
+    rooted: fleet_safe_paths.RootedFS | None = None,
+    directory_mode: int | None = 0o700,
+) -> tuple[dict[str, Any], bytes]:
+    raw = _read_regular(
+        path,
+        where=where,
+        max_bytes=MAX_AUDIT_JSON_BYTES,
+        rooted=rooted,
+        directory_mode=directory_mode,
+    )
+    return _strict_json_object(raw, where=where), raw
+
+
+def _load_json(
+    path: Path,
+    *,
+    where: str = "audit JSON file",
+    rooted: fleet_safe_paths.RootedFS | None = None,
+    directory_mode: int | None = 0o700,
+) -> dict[str, Any]:
+    return _load_json_bytes(
+        path,
+        where=where,
+        rooted=rooted,
+        directory_mode=directory_mode,
+    )[0]
+
+
 def _anchor_envelope(
-    events: list[dict[str, Any]], anchor_receipts: Path, *, exact: bool = True
+    events: list[dict[str, Any]],
+    anchor_receipts: Path,
+    *,
+    exact: bool = True,
+    rooted: fleet_safe_paths.RootedFS | None = None,
+    directory_mode: int | None = 0o700,
 ) -> tuple[list[dict[str, Any]], str]:
-    try:
-        root_info = anchor_receipts.lstat()
-    except OSError as exc:
-        raise AuditClientError("audit anchor receipt directory is missing") from exc
-    if not stat.S_ISDIR(root_info.st_mode) or stat.S_ISLNK(root_info.st_mode):
-        raise AuditClientError("audit anchor receipt directory is unsafe")
-    expected_names = {f"{event['event_id']}.json" for event in events}
-    if exact:
-        actual_names = {path.name for path in anchor_receipts.iterdir()}
-        if actual_names != expected_names:
-            raise AuditClientError("audit anchor receipt set differs from ledger")
-    envelope: list[dict[str, Any]] = []
+    expected_names: set[str] = set()
     for event in events:
-        path = anchor_receipts / f"{event['event_id']}.json"
+        event_id = str(event.get("event_id", ""))
         try:
-            info = path.lstat()
-        except OSError as exc:
-            raise AuditClientError("audit anchor receipt is missing") from exc
-        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
-            raise AuditClientError("audit anchor receipt is not a regular file")
-        envelope.append({"event_id": event["event_id"], "receipt": _load_json(path)})
-    return envelope, mission_state.sha256(envelope)
+            if str(uuid.UUID(event_id)) != event_id:
+                raise ValueError
+        except ValueError as exc:
+            raise AuditClientError("audit event_id is not a canonical UUID") from exc
+        expected_names.add(f"{event_id}.json")
+
+    selected_root: fleet_safe_paths.RootedFS | None = None
+    try:
+        if rooted is None:
+            selected_root = fleet_safe_paths.RootedFS(
+                anchor_receipts, root_mode=0o700
+            )
+            rooted = selected_root
+            receipt_root = Path()
+            directory_modes: tuple[int, ...] = ()
+        else:
+            receipt_root = _relative_under(
+                rooted, anchor_receipts, where="audit anchor receipt directory"
+            )
+            directory_modes = (directory_mode,) * len(receipt_root.parts)
+        actual_names = set(
+            rooted.list_directory(
+                receipt_root,
+                directory_modes=directory_modes,
+            )
+        )
+        if (exact and actual_names != expected_names) or (
+            not exact and not expected_names.issubset(actual_names)
+        ):
+            raise AuditClientError("audit anchor receipt set differs from ledger")
+        envelope: list[dict[str, Any]] = []
+        for event in events:
+            relative = receipt_root / f"{event['event_id']}.json"
+            raw = rooted.read_regular(
+                relative,
+                directory_modes=directory_modes,
+                file_mode=0o600,
+                max_bytes=MAX_AUDIT_JSON_BYTES,
+                require_single_link=True,
+            )
+            receipt = _strict_json_object(raw, where="audit anchor receipt")
+            envelope.append({"event_id": event["event_id"], "receipt": receipt})
+        rooted.assert_root_binding()
+        return envelope, mission_state.sha256(envelope)
+    except fleet_safe_paths.SafePathError as exc:
+        raise AuditClientError("audit anchor receipt directory is unsafe") from exc
+    finally:
+        if selected_root is not None:
+            selected_root.close()
 
 
 def _run(command: list[str], *, input_bytes: bytes | None = None) -> subprocess.CompletedProcess[bytes]:
@@ -126,21 +268,30 @@ def _generate_keys(root: Path) -> tuple[Path, Path, Path]:
     return hmac_key, private_key, public_key
 
 
-def _chain_without_secret(path: Path) -> list[dict[str, Any]]:
+def _chain_source(
+    path: Path,
+    *,
+    rooted: fleet_safe_paths.RootedFS | None = None,
+    directory_mode: int | None = 0o700,
+) -> tuple[list[dict[str, Any]], bytes]:
     events: list[dict[str, Any]] = []
     previous = audit.GENESIS_SHA256
     try:
-        rows = path.read_bytes().splitlines(keepends=True)
-    except OSError as exc:
-        raise AuditClientError("signed audit ledger is missing") from exc
-    for number, raw in enumerate(rows, 1):
-        if not raw.endswith(b"\n"):
-            raise AuditClientError(f"partial signed audit record at line {number}")
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise AuditClientError(f"invalid signed audit JSON at line {number}") from exc
-        if not isinstance(event, dict) or not event.get("control_signature"):
+        raw = _read_regular(
+            path,
+            where="signed audit ledger",
+            max_bytes=MAX_AUDIT_LEDGER_BYTES,
+            rooted=rooted,
+            directory_mode=directory_mode,
+        )
+        records = fleet_json.load_jsonl(raw, require_nonempty=True)
+        canonical = fleet_json.canonical_jsonl(records)
+    except fleet_json.FleetJSONError as exc:
+        raise AuditClientError("signed audit ledger is invalid strict JSONL") from exc
+    if raw != canonical:
+        raise AuditClientError("signed audit ledger is not canonical JSONL")
+    for number, event in enumerate(records, 1):
+        if type(event) is not dict or not event.get("control_signature"):
             raise AuditClientError(f"signed audit record lacks signature at line {number}")
         unsigned_signature = {key: value for key, value in event.items() if key != "control_signature"}
         stored = str(unsigned_signature.get("event_sha256", ""))
@@ -155,7 +306,18 @@ def _chain_without_secret(path: Path) -> list[dict[str, Any]]:
         events.append(event)
     if not events:
         raise AuditClientError("signed audit ledger is empty")
-    return events
+    return events, raw
+
+
+def _chain_without_secret(
+    path: Path,
+    *,
+    rooted: fleet_safe_paths.RootedFS | None = None,
+    directory_mode: int | None = 0o700,
+) -> list[dict[str, Any]]:
+    return _chain_source(
+        path, rooted=rooted, directory_mode=directory_mode
+    )[0]
 
 
 def read_verified_public_chain(path: Path) -> list[dict[str, Any]]:
@@ -182,14 +344,19 @@ def _sign_receipt(private_key: Path, receipt: dict[str, Any]) -> str:
         input_path.unlink(missing_ok=True)
 
 
-def _verify_signature(public_key: Path, receipt: dict[str, Any]) -> None:
+def _verify_signature_bytes(
+    public_key_bytes: bytes, receipt: dict[str, Any]
+) -> None:
     try:
         signature = base64.b64decode(receipt["ed25519_signature"], validate=True)
     except (KeyError, ValueError) as exc:
         raise AuditClientError("audit receipt signature is invalid") from exc
-    signature_path = public_key.parent / ".audit-signature.verify.tmp"
-    input_path = public_key.parent / ".audit-receipt.verify.tmp"
-    try:
+    with tempfile.TemporaryDirectory(prefix="fleet-audit-verify-") as temporary:
+        root = Path(temporary)
+        public_key = root / "audit-signing-public.pem"
+        signature_path = root / "signature.bin"
+        input_path = root / "receipt.json"
+        mission_state.atomic_write(public_key, public_key_bytes, mode=0o600)
         mission_state.atomic_write(signature_path, signature, mode=0o600)
         mission_state.atomic_write(input_path, _receipt_unsigned(receipt), mode=0o600)
         _run(
@@ -199,9 +366,6 @@ def _verify_signature(public_key: Path, receipt: dict[str, Any]) -> None:
                 "-in", str(input_path),
             ]
         )
-    finally:
-        signature_path.unlink(missing_ok=True)
-        input_path.unlink(missing_ok=True)
 
 
 def verify_offline(
@@ -212,9 +376,28 @@ def verify_offline(
     *,
     require_worm: bool,
     required_trust_scope: str | None = None,
+    _rooted: fleet_safe_paths.RootedFS | None = None,
+    _directory_mode: int | None = 0o700,
 ) -> dict[str, Any]:
-    events = _chain_without_secret(ledger_path)
-    receipt = _load_json(receipt_path)
+    events, ledger_bytes = _chain_source(
+        ledger_path,
+        rooted=_rooted,
+        directory_mode=_directory_mode,
+    )
+    receipt, _ = _load_json_bytes(
+        receipt_path,
+        where="audit verification receipt",
+        rooted=_rooted,
+        directory_mode=_directory_mode,
+    )
+    public_key_bytes = _read_regular(
+        public_key,
+        where="audit verification public key",
+        max_bytes=MAX_AUDIT_PUBLIC_KEY_BYTES,
+        file_modes=(0o600, 0o644),
+        rooted=_rooted,
+        directory_mode=_directory_mode,
+    )
     if set(receipt) != AUDIT_RECEIPT_FIELDS or receipt["schema_version"] != 1:
         raise AuditClientError("audit verification receipt fields are invalid")
     if receipt["records"] != len(events) or receipt["head_sha256"] != events[-1]["event_sha256"]:
@@ -222,14 +405,19 @@ def verify_offline(
     run_ids = {event.get("run_id") for event in events}
     if len(run_ids) != 1 or receipt["mission_id"] not in run_ids:
         raise AuditClientError("audit verification receipt mission differs from ledger")
-    if receipt["ledger_sha256"] != audit.file_sha256(ledger_path):
+    if receipt["ledger_sha256"] != hashlib.sha256(ledger_bytes).hexdigest():
         raise AuditClientError("audit verification receipt ledger hash mismatch")
-    if receipt["public_key_sha256"] != audit.file_sha256(public_key):
+    if receipt["public_key_sha256"] != hashlib.sha256(public_key_bytes).hexdigest():
         raise AuditClientError("audit verification public key hash mismatch")
-    _verify_signature(public_key, receipt)
-    envelope, envelope_sha256 = _anchor_envelope(events, anchor_receipts)
+    envelope, envelope_sha256 = _anchor_envelope(
+        events,
+        anchor_receipts,
+        rooted=_rooted,
+        directory_mode=_directory_mode,
+    )
     if receipt["anchor_receipts_sha256"] != envelope_sha256:
         raise AuditClientError("audit verification anchor envelope hash mismatch")
+    _verify_signature_bytes(public_key_bytes, receipt)
     compliance = all(event.get("worm_compliance_mode") is True for event in events)
     if any(event.get("worm_compliance_mode") is not compliance for event in events):
         raise AuditClientError("audit ledger mixes WORM compliance modes")
@@ -324,9 +512,9 @@ def verify_offline(
 def _validate_prior_receipt(
     prior: dict[str, Any],
     events: list[dict[str, Any]],
-    ledger_path: Path,
-    public_key: Path,
-    anchor_receipts: Path,
+    ledger_bytes: bytes,
+    public_key_bytes: bytes,
+    envelope: list[dict[str, Any]],
     *,
     mission_id: str,
     compliance: bool,
@@ -335,7 +523,6 @@ def _validate_prior_receipt(
 ) -> int:
     if set(prior) != AUDIT_RECEIPT_FIELDS or prior.get("schema_version") != 1:
         raise AuditClientError("prior audit verification receipt fields are invalid")
-    _verify_signature(public_key, prior)
     records = prior.get("records")
     if isinstance(records, bool) or not isinstance(records, int) or not 1 <= records <= len(events):
         raise AuditClientError("prior audit verification receipt length is invalid")
@@ -347,20 +534,24 @@ def _validate_prior_receipt(
             prior.get("worm") is not compliance,
             prior.get("backend") != backend,
             prior.get("trust_scope") != trust_scope,
-            prior.get("public_key_sha256") != audit.file_sha256(public_key),
+            prior.get("public_key_sha256")
+            != hashlib.sha256(public_key_bytes).hexdigest(),
         )
     ):
         raise AuditClientError("prior audit verification receipt identity conflicts")
     try:
-        ledger_rows = ledger_path.read_bytes().splitlines(keepends=True)
-    except OSError as exc:
-        raise AuditClientError("signed audit ledger is missing") from exc
-    prefix_sha256 = hashlib.sha256(b"".join(ledger_rows[:records])).hexdigest()
+        prefix_bytes = fleet_json.canonical_jsonl(events[:records])
+    except fleet_json.FleetJSONError as exc:
+        raise AuditClientError("signed audit ledger prefix is not canonical") from exc
+    if not ledger_bytes.startswith(prefix_bytes):
+        raise AuditClientError("prior audit verification receipt is not a ledger prefix")
+    prefix_sha256 = hashlib.sha256(prefix_bytes).hexdigest()
     if prior.get("ledger_sha256") != prefix_sha256:
         raise AuditClientError("prior audit verification receipt is not a ledger prefix")
-    _, anchors_sha256 = _anchor_envelope(prefix, anchor_receipts, exact=False)
+    anchors_sha256 = mission_state.sha256(envelope[:records])
     if prior.get("anchor_receipts_sha256") != anchors_sha256:
         raise AuditClientError("prior audit receipt anchor prefix conflicts")
+    _verify_signature_bytes(public_key_bytes, prior)
     return records
 
 
@@ -369,6 +560,7 @@ class AuditLifecycle:
         self.runs_dir = runs_dir.resolve()
         self.mission_id = mission_state.normalize_uuid(mission_id, "mission_id")
         self.mission_root = mission_state.mission_root(self.runs_dir, self.mission_id)
+        self._compiled_value = self._load_compiled()
         self.root = self.mission_root / "audit"
         self.lifecycle_path = self.root / "lifecycle.json"
         socket_name = hashlib.sha256(
@@ -384,13 +576,19 @@ class AuditLifecycle:
         self.public_key = self.root / "audit-signing-public.pem"
         self._process: subprocess.Popen[bytes] | None = None
 
-    def _compiled(self) -> dict[str, Any]:
+    def _load_compiled(self) -> dict[str, Any]:
         try:
-            return fleet_mission.validate_compiled(
-                json.loads((self.mission_root / "compiled-workflow.json").read_text(encoding="utf-8"))
+            compiled, _ = fleet_mission.load_mission_compiled(
+                self.runs_dir, self.mission_id, mode="effect"
             )
-        except (OSError, json.JSONDecodeError) as exc:
-            raise AuditClientError("cannot load compiled audit policy") from exc
+        except (fleet_mission.MissionError, mission_state.MissionStateError) as exc:
+            raise AuditClientError(
+                f"cannot load effect-authorized compiled audit policy: {exc}"
+            ) from exc
+        return compiled
+
+    def _compiled(self) -> dict[str, Any]:
+        return self._compiled_value
 
     def _mode(self) -> str:
         mode = str(self._compiled()["workflow"]["audit"]["mode"])
@@ -405,7 +603,44 @@ class AuditLifecycle:
         return trust_scope
 
     def _lifecycle(self) -> dict[str, Any]:
-        return _load_json(self.lifecycle_path)
+        try:
+            with fleet_safe_paths.RootedFS(self.runs_dir) as rooted:
+                value = _load_json(
+                    self.lifecycle_path,
+                    where="audit lifecycle",
+                    rooted=rooted,
+                )
+                rooted.assert_root_binding()
+        except fleet_safe_paths.SafePathError as exc:
+            raise AuditClientError("audit lifecycle path is unsafe") from exc
+        if (
+            set(value) != AUDIT_LIFECYCLE_FIELDS
+            or value.get("schema_version") != 1
+            or value.get("mission_id") != self.mission_id
+            or value.get("mode") not in {"signed", "worm"}
+            or value.get("trust_scope") not in audit.TRUST_SCOPES
+            or isinstance(value.get("pid"), bool)
+            or not isinstance(value.get("pid"), int)
+            or value["pid"] <= 0
+            or value.get("socket") != str(self.socket_path)
+            or value.get("ledger_root") != str(self.ledger_root)
+            or value.get("anchor_receipts") != str(self.anchor_receipts)
+            or value.get("public_key") != str(self.public_key)
+        ):
+            raise AuditClientError("audit lifecycle fields are invalid")
+        for field in ("started_at", "stopped_at"):
+            timestamp = value[field]
+            if field == "stopped_at" and timestamp is None:
+                continue
+            if not isinstance(timestamp, str):
+                raise AuditClientError("audit lifecycle timestamp is invalid")
+            try:
+                parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise AuditClientError("audit lifecycle timestamp is invalid") from exc
+            if parsed.tzinfo is None:
+                raise AuditClientError("audit lifecycle timestamp lacks timezone")
+        return value
 
     def health(self) -> dict[str, Any]:
         try:
@@ -619,6 +854,46 @@ class AuditLifecycle:
 
     def verify(self) -> dict[str, Any]:
         lifecycle = self._lifecycle()
+        ledger_path = self.ledger_root / self.mission_id / "a2a_ledger.jsonl"
+        prior: dict[str, Any] | None = None
+        prior_bytes: bytes | None = None
+        try:
+            with fleet_safe_paths.RootedFS(self.runs_dir) as rooted:
+                public_events, ledger_bytes = _chain_source(
+                    ledger_path, rooted=rooted
+                )
+                envelope, anchor_receipts_sha256 = _anchor_envelope(
+                    public_events,
+                    self.anchor_receipts,
+                    rooted=rooted,
+                )
+                public_key_bytes = _read_regular(
+                    self.public_key,
+                    where="audit verification public key",
+                    max_bytes=MAX_AUDIT_PUBLIC_KEY_BYTES,
+                    file_modes=(0o644,),
+                    rooted=rooted,
+                )
+                receipt_relative = _relative_under(
+                    rooted,
+                    self.receipt_path,
+                    where="audit verification receipt",
+                )
+                prior_bytes = rooted.read_regular_optional(
+                    receipt_relative,
+                    directory_modes=(0o700,) * (len(receipt_relative.parts) - 1),
+                    file_mode=0o600,
+                    max_bytes=MAX_AUDIT_JSON_BYTES,
+                    require_single_link=True,
+                )
+                if prior_bytes is not None:
+                    prior = _strict_json_object(
+                        prior_bytes, where="prior audit verification receipt"
+                    )
+                rooted.assert_root_binding()
+        except fleet_safe_paths.SafePathError as exc:
+            raise AuditClientError("live audit evidence path is unsafe") from exc
+
         try:
             key = audit.load_control_key(self.hmac_key)
             ledger = audit.AuditLedger(
@@ -627,6 +902,8 @@ class AuditLifecycle:
             events = ledger.read_verified(self.mission_id)
         except (OSError, RuntimeError, json.JSONDecodeError) as exc:
             raise AuditClientError(f"signed audit live verification failed: {exc}") from exc
+        if events != public_events:
+            raise AuditClientError("signed audit ledger changed during verification")
         if not events:
             raise AuditClientError("assured audit chain is empty")
         compliance = all(event.get("worm_compliance_mode") is True for event in events)
@@ -641,27 +918,26 @@ class AuditLifecycle:
             raise AuditClientError("workflow requires WORM but audit chain is non-compliant")
         if not require_worm and compliance:
             raise AuditClientError("signed profile unexpectedly claims WORM")
-        ledger_path = self.ledger_root / self.mission_id / "a2a_ledger.jsonl"
-        _, anchor_receipts_sha256 = _anchor_envelope(events, self.anchor_receipts)
         receipt: dict[str, Any] = {
             "schema_version": 1,
             "mission_id": self.mission_id,
             "records": len(events),
             "head_sha256": events[-1]["event_sha256"],
-            "ledger_sha256": audit.file_sha256(ledger_path),
+            "ledger_sha256": hashlib.sha256(ledger_bytes).hexdigest(),
             "worm": compliance,
             "backend": events[-1]["worm_backend"],
             "trust_scope": events[-1]["worm_trust_scope"],
-            "public_key_sha256": audit.file_sha256(self.public_key),
+            "public_key_sha256": hashlib.sha256(public_key_bytes).hexdigest(),
             "anchor_receipts_sha256": anchor_receipts_sha256,
             "verified_at": datetime.now(timezone.utc).isoformat(),
         }
-        receipt["ed25519_signature"] = _sign_receipt(self.private_key, receipt)
-        content = mission_state.canonical_bytes(receipt) + b"\n"
-        if self.receipt_path.exists():
-            prior = _load_json(self.receipt_path)
+        if prior is not None:
             prior_records = _validate_prior_receipt(
-                prior, events, ledger_path, self.public_key, self.anchor_receipts,
+                prior,
+                events,
+                ledger_bytes,
+                public_key_bytes,
+                envelope,
                 mission_id=self.mission_id, compliance=compliance,
                 backend=str(events[-1]["worm_backend"]),
                 trust_scope=str(events[-1]["worm_trust_scope"]),
@@ -676,8 +952,14 @@ class AuditLifecycle:
             ):
                 receipt = prior
             else:
+                receipt["ed25519_signature"] = _sign_receipt(
+                    self.private_key, receipt
+                )
+                content = fleet_json.canonical_bytes(receipt) + b"\n"
                 mission_state.atomic_write(self.receipt_path, content)
         else:
+            receipt["ed25519_signature"] = _sign_receipt(self.private_key, receipt)
+            content = fleet_json.canonical_bytes(receipt) + b"\n"
             mission_state.atomic_write(self.receipt_path, content)
         return verify_offline(
             ledger_path, self.receipt_path, self.public_key, self.anchor_receipts,
@@ -774,13 +1056,20 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if not args.runs_dir or not args.mission_id:
             raise AuditClientError("live audit commands require --runs-dir and --mission-id")
+        metadata: dict[str, Any] | None = None
+        if args.command == "record":
+            try:
+                parsed_metadata = fleet_json.loads(args.metadata_json)
+            except fleet_json.FleetJSONError as exc:
+                raise AuditClientError("--metadata-json is invalid strict JSON") from exc
+            if type(parsed_metadata) is not dict:
+                raise AuditClientError("--metadata-json must be an object")
+            metadata = parsed_metadata
         lifecycle = AuditLifecycle(Path(args.runs_dir), args.mission_id)
         if args.command == "start":
             value = lifecycle.start(Path(args.manifest))
         elif args.command == "record":
-            metadata = json.loads(args.metadata_json)
-            if not isinstance(metadata, dict):
-                raise AuditClientError("--metadata-json must be an object")
+            assert metadata is not None
             value = lifecycle.record_control_event(
                 event_type=args.event_type,
                 subject_id=args.subject_id,

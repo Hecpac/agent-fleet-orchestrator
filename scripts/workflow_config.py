@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,8 +11,12 @@ import re
 import sys
 from typing import Any, Iterable
 
-import router_config
+import fleet_compiled
+import fleet_json
+import fleet_manifest
 import fleet_providers
+import fleet_usage
+import router_config
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,36 +53,24 @@ class WorkflowError(ValueError):
 
 
 def canonical_bytes(value: Any) -> bytes:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        sort_keys=True,
-    ).encode("utf-8")
+    try:
+        return fleet_json.canonical_bytes(value)
+    except fleet_json.FleetJSONError as exc:
+        raise WorkflowError(f"value is not canonical JSON: {exc}") from exc
 
 
 def sha256(value: Any) -> str:
-    payload = value if isinstance(value, bytes) else canonical_bytes(value)
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise WorkflowError(f"duplicate key: {key}")
-        result[key] = value
-    return result
+    try:
+        return fleet_json.sha256(value)
+    except fleet_json.FleetJSONError as exc:
+        raise WorkflowError(f"value is not canonical JSON: {exc}") from exc
 
 
 def load_workflow(path: str | os.PathLike[str]) -> dict[str, Any]:
     workflow_path = Path(path)
     try:
-        with workflow_path.open(encoding="utf-8") as handle:
-            value = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
-    except WorkflowError:
-        raise
-    except (OSError, json.JSONDecodeError) as exc:
+        value = fleet_json.load(workflow_path)
+    except fleet_json.FleetJSONError as exc:
         raise WorkflowError(f"cannot load workflow {workflow_path}: {exc}") from exc
     validate_workflow(value)
     return value
@@ -132,7 +123,9 @@ def _boolean(value: Any, where: str) -> bool:
     return value
 
 
-def _integer(value: Any, where: str, *, minimum: int, maximum: int | None = None) -> int:
+def _integer(
+    value: Any, where: str, *, minimum: int, maximum: int | None = None
+) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
         raise WorkflowError(f"{where} must be an integer >= {minimum}")
     if maximum is not None and value > maximum:
@@ -161,7 +154,7 @@ def _enum(value: Any, choices: set[str], where: str) -> str:
 def validate_workflow(value: Any) -> None:
     workflow = _object(value, "workflow")
     _keys(workflow, ROOT_FIELDS, "workflow")
-    if workflow["schema_version"] != 1:
+    if type(workflow["schema_version"]) is not int or workflow["schema_version"] != 1:
         raise WorkflowError("workflow.schema_version must be 1")
     _identifier(workflow["name"], "workflow.name")
     _string(workflow["description"], "workflow.description")
@@ -184,10 +177,16 @@ def validate_workflow(value: Any) -> None:
         maximum=8,
     )
     if not autonomy["allow_subdelegation"] and depth != 0:
-        raise WorkflowError("max_delegation_depth must be 0 when subdelegation is disabled")
+        raise WorkflowError(
+            "max_delegation_depth must be 0 when subdelegation is disabled"
+        )
 
     capabilities = _object(workflow["capabilities"], "workflow.capabilities")
-    _keys(capabilities, {"available", "required_outcomes", "writer"}, "workflow.capabilities")
+    _keys(
+        capabilities,
+        {"available", "required_outcomes", "writer"},
+        "workflow.capabilities",
+    )
     _names(capabilities["available"], "workflow.capabilities.available")
     _names(capabilities["required_outcomes"], "workflow.capabilities.required_outcomes")
     _identifier(capabilities["writer"], "workflow.capabilities.writer", allow_none=True)
@@ -201,15 +200,23 @@ def validate_workflow(value: Any) -> None:
     assurance = _object(workflow["assurance"], "workflow.assurance")
     _keys(assurance, {"profile", "preset", "minimum_gates"}, "workflow.assurance")
     profile = _enum(
-        assurance["profile"], {"none", "proportional", "assured"}, "workflow.assurance.profile"
+        assurance["profile"],
+        {"none", "proportional", "assured"},
+        "workflow.assurance.profile",
     )
     _identifier(assurance["preset"], "workflow.assurance.preset")
-    gates = _names(assurance["minimum_gates"], "workflow.assurance.minimum_gates", allow_empty=True)
+    gates = _names(
+        assurance["minimum_gates"], "workflow.assurance.minimum_gates", allow_empty=True
+    )
     unknown_gates = sorted(set(gates) - GATES)
     if unknown_gates:
-        raise WorkflowError(f"workflow.assurance.minimum_gates unknown values: {', '.join(unknown_gates)}")
+        raise WorkflowError(
+            f"workflow.assurance.minimum_gates unknown values: {', '.join(unknown_gates)}"
+        )
     if profile == "assured" and set(gates) != GATES:
-        raise WorkflowError("assured workflows require fdp2, human_build_exit, and fdp3")
+        raise WorkflowError(
+            "assured workflows require fdp2, human_build_exit, and fdp3"
+        )
     if profile == "none" and gates:
         raise WorkflowError("assurance profile none cannot declare gates")
 
@@ -221,10 +228,14 @@ def validate_workflow(value: Any) -> None:
         {"local-development", "external-compliance"},
         "workflow.audit.trust_scope",
     )
-    worm_for = _names(audit["worm_required_for"], "workflow.audit.worm_required_for", allow_empty=True)
+    worm_for = _names(
+        audit["worm_required_for"], "workflow.audit.worm_required_for", allow_empty=True
+    )
     unknown_categories = sorted(set(worm_for) - WORM_CATEGORIES)
     if unknown_categories:
-        raise WorkflowError(f"workflow.audit.worm_required_for unknown values: {', '.join(unknown_categories)}")
+        raise WorkflowError(
+            f"workflow.audit.worm_required_for unknown values: {', '.join(unknown_categories)}"
+        )
     if audit_mode == "signed" and trust_scope != "local-development":
         raise WorkflowError("signed audit cannot claim external-compliance trust")
     if workflow["name"] == "regulated" and (
@@ -233,7 +244,11 @@ def validate_workflow(value: Any) -> None:
         raise WorkflowError(
             "regulated workflow requires worm mode and external-compliance trust"
         )
-    if "regulated" in worm_for and audit_mode == "worm" and trust_scope != "external-compliance":
+    if (
+        "regulated" in worm_for
+        and audit_mode == "worm"
+        and trust_scope != "external-compliance"
+    ):
         raise WorkflowError(
             "regulated WORM requirements need external-compliance trust"
         )
@@ -246,15 +261,46 @@ def validate_workflow(value: Any) -> None:
     )
     if archive["mode"] != "incremental":
         raise WorkflowError("workflow.archive.mode must be incremental")
-    _enum(archive["content_policy"], {"full", "redacted", "hash-only"}, "workflow.archive.content_policy")
+    _enum(
+        archive["content_policy"],
+        {"full", "redacted", "hash-only"},
+        "workflow.archive.content_policy",
+    )
     _boolean(archive["include_final_tree"], "workflow.archive.include_final_tree")
     _boolean(archive["include_git_delta"], "workflow.archive.include_git_delta")
 
     limits = _object(workflow["limits"], "workflow.limits")
-    _keys(limits, {"deadline_seconds", "token_budget", "budget_mode"}, "workflow.limits")
-    _integer(limits["deadline_seconds"], "workflow.limits.deadline_seconds", minimum=60, maximum=604800)
+    _keys(
+        limits,
+        {
+            "deadline_seconds",
+            "token_budget",
+            "budget_mode",
+            "delegation_credits",
+            "max_active_delegations",
+        },
+        "workflow.limits",
+    )
+    _integer(
+        limits["deadline_seconds"],
+        "workflow.limits.deadline_seconds",
+        minimum=60,
+        maximum=604800,
+    )
     _integer(limits["token_budget"], "workflow.limits.token_budget", minimum=0)
     _enum(limits["budget_mode"], {"soft", "hard"}, "workflow.limits.budget_mode")
+    _integer(
+        limits["delegation_credits"],
+        "workflow.limits.delegation_credits",
+        minimum=1,
+        maximum=10000,
+    )
+    _integer(
+        limits["max_active_delegations"],
+        "workflow.limits.max_active_delegations",
+        minimum=1,
+        maximum=256,
+    )
 
 
 def _abstract_capabilities(plan: dict[str, Any]) -> set[str]:
@@ -274,87 +320,158 @@ def _abstract_capabilities(plan: dict[str, Any]) -> set[str]:
     return result
 
 
+def _public_member(member: dict[str, Any]) -> dict[str, Any]:
+    """Freeze the execution identity and authority used by a runtime roster."""
+    hook_source = str(member.get("hook_source", ""))
+    provider_adapter = fleet_providers.DEFAULT_REGISTRY.resolve(
+        hook_source=hook_source, provider=str(member["provider"])
+    ).name
+    return {
+        "instance_id": member["instance_id"],
+        "role_type": member["role_type"],
+        "runner": member["runner"],
+        "phase": member["phase"],
+        "authority": member["authority"],
+        "provider": member["provider"],
+        "provider_adapter": provider_adapter,
+        "hook_source": hook_source,
+        "model": member["model"],
+        "variant": member.get("variant"),
+        "capabilities": sorted(member.get("capabilities", [])),
+    }
+
+
 def compile_workflow(
     workflow: dict[str, Any],
     *,
     router: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    validate_workflow(workflow)
-    router_value = router or router_config.load_router(DEFAULT_ROUTER)
     try:
+        normalized = fleet_json.loads(fleet_json.canonical_bytes(workflow))
+    except fleet_json.FleetJSONError as exc:
+        raise WorkflowError(f"workflow is not canonical JSON: {exc}") from exc
+    validate_workflow(normalized)
+
+    try:
+        router_source = (
+            router if router is not None else router_config.load_router(DEFAULT_ROUTER)
+        )
+        # Freeze canonical bytes once. Each resolver gets a fresh detached view,
+        # so neither the caller nor one resolver can mutate the other plan.
+        router_snapshot = fleet_json.canonical_bytes(router_source)
+        router_value = fleet_json.loads(router_snapshot)
         plan = router_config.build_plan(
-            router_value,
-            preset_name=workflow["preset"],
+            fleet_json.loads(router_snapshot),
+            preset_name=normalized["preset"],
             run_healthcheck=False,
             check_runtime_availability=False,
         )
         assurance_plan = router_config.build_plan(
-            router_value,
-            preset_name=workflow["assurance"]["preset"],
+            fleet_json.loads(router_snapshot),
+            preset_name=normalized["assurance"]["preset"],
             run_healthcheck=False,
             check_runtime_availability=False,
         )
     except router_config.RouterError as exc:
         raise WorkflowError(f"router resolution failed: {exc}") from exc
+    except fleet_json.FleetJSONError as exc:
+        raise WorkflowError(f"router is not canonical JSON: {exc}") from exc
 
     resolved_capabilities = _abstract_capabilities(plan)
-    missing = sorted(set(workflow["capabilities"]["available"]) - resolved_capabilities)
+    missing = sorted(
+        set(normalized["capabilities"]["available"]) - resolved_capabilities
+    )
     if missing:
         raise WorkflowError(
             "workflow capabilities are not provided by preset "
-            f"{workflow['preset']}: {', '.join(missing)}"
+            f"{normalized['preset']}: {', '.join(missing)}"
         )
     writers = [
         member["instance_id"]
         for member in plan["instances"]
         if member.get("authority") == "write"
     ]
-    writer_contract = workflow["capabilities"]["writer"]
+    writer_contract = normalized["capabilities"]["writer"]
     if writer_contract == "none" and writers:
-        raise WorkflowError("workflow declares writer=none but preset contains a writer")
+        raise WorkflowError(
+            "workflow declares writer=none but preset contains a writer"
+        )
     if writer_contract != "none" and len(writers) != 1:
         raise WorkflowError("workflow requires exactly one resolved writer")
-    if workflow["assurance"]["profile"] != "none" and assurance_plan["mode"] != "assured":
+    if (
+        normalized["assurance"]["profile"] != "none"
+        and assurance_plan["mode"] != "assured"
+    ):
         raise WorkflowError("assurance preset must resolve to mode=assured")
 
-    def public_member(member: dict[str, Any]) -> dict[str, Any]:
-        hook_source = str(member.get("hook_source", ""))
-        provider_adapter = fleet_providers.DEFAULT_REGISTRY.resolve(
-            hook_source=hook_source, provider=str(member["provider"])
-        ).name
-        return {
-            "instance_id": member["instance_id"],
-            "role_type": member["role_type"],
-            "phase": member["phase"],
-            "authority": member["authority"],
-            "provider": member["provider"],
-            "provider_adapter": provider_adapter,
-            "hook_source": hook_source,
-            "model": member["model"],
-            "variant": member.get("variant"),
-            "capabilities": sorted(member.get("capabilities", [])),
+    # A token ceiling is only a real policy when every provider that this
+    # workflow may launch can account for/enforce it.  Validate the complete
+    # main + assurance provider set while the resolved plans are still local;
+    # accepting a hard policy here and discovering an incapable provider after
+    # boot would turn the compiled contract into a false guarantee.
+    usage_providers = sorted(
+        {
+            fleet_providers.DEFAULT_REGISTRY.resolve(
+                hook_source=str(member.get("hook_source") or ""),
+                provider=str(member["provider"]),
+            ).name
+            for selected_plan in (plan, assurance_plan)
+            for member in (
+                ([selected_plan["lead"]] if selected_plan.get("lead") else [])
+                + list(selected_plan["instances"])
+            )
         }
+    )
+    try:
+        fleet_usage.validate_policy(
+            {
+                "budget_mode": normalized["limits"]["budget_mode"],
+                "token_budget": normalized["limits"]["token_budget"],
+            },
+            providers=usage_providers,
+        )
+    except fleet_usage.UsageError as exc:
+        raise WorkflowError(f"workflow token budget is not enforceable: {exc}") from exc
 
-    normalized = json.loads(canonical_bytes(workflow))
     result = {
-        "schema_version": 1,
+        "schema_version": 2,
         "workflow": normalized,
         "workflow_digest": sha256(normalized),
         "router_digest": sha256(router_value),
+        "router_snapshot": router_value,
         "resolved": {
             "preset": plan["preset"],
             "mode": plan["mode"],
+            "launch_digest": fleet_manifest.launch_digest(plan),
             "identity_groups": plan["identity_groups"],
-            "lead": public_member(plan["lead"]) if plan.get("lead") else None,
-            "instances": [public_member(item) for item in plan["instances"]],
+            "lead": _public_member(plan["lead"]) if plan.get("lead") else None,
+            "instances": [_public_member(item) for item in plan["instances"]],
             "available_capabilities": sorted(resolved_capabilities),
             "writer_instance": writers[0] if writers else None,
             "assurance_preset": assurance_plan["preset"],
+            "assurance_mode": assurance_plan["mode"],
+            "assurance_launch_digest": fleet_manifest.launch_digest(assurance_plan),
             "assurance_identity_groups": assurance_plan["identity_groups"],
+            "assurance_lead": (
+                _public_member(assurance_plan["lead"])
+                if assurance_plan.get("lead")
+                else None
+            ),
+            "assurance_instances": [
+                _public_member(item) for item in assurance_plan["instances"]
+            ],
         },
     }
     result["compiled_digest"] = sha256(result)
-    return result
+    # Compilation already resolved both plans from isolated copies and admitted
+    # the provider-aware budget. A read-mode pass still closes the emitted
+    # schema and checksum envelope without resolving those plans a second time;
+    # effect consumers perform the strict snapshot-to-plan proof at their trust
+    # boundary.
+    try:
+        return fleet_compiled.validate(result, mode="read")
+    except fleet_compiled.CompiledError as exc:
+        raise WorkflowError(f"compiled workflow contract failed: {exc}") from exc
 
 
 def compile_path(
@@ -378,7 +495,9 @@ def _parser() -> argparse.ArgumentParser:
     validate.add_argument("paths", nargs="+")
     show = commands.add_parser("show", help="show normalized workflow JSON")
     show.add_argument("path")
-    compile_command = commands.add_parser("compile", help="compile canonical policy JSON")
+    compile_command = commands.add_parser(
+        "compile", help="compile canonical policy JSON"
+    )
     compile_command.add_argument("path")
     return parser
 
@@ -388,7 +507,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "validate":
             for path in args.paths:
-                compile_path(path, router_path=args.router)
+                # Schema validation is intentionally portable and static. It
+                # does not require the machine's router/provider availability;
+                # `compile` is the effect-admission command.
+                load_workflow(path)
                 print(f"workflow valid: {path}")
         elif args.command == "show":
             workflow = load_workflow(args.path)

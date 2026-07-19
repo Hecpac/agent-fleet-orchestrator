@@ -37,7 +37,7 @@
     "provider": {"type": "string", "minLength": 1},
     "model": {"type": "string", "minLength": 1},
     "variant": {"type": ["string", "null"]},
-    "depth": {"type": "integer", "minimum": 1, "maximum": 8},
+    "depth": {"type": "integer", "minimum": 0, "maximum": 8},
     "token_id": {"type": ["string", "null"], "format": "uuid"}
   },
   "$defs": {

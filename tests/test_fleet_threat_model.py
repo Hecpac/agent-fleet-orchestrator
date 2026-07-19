@@ -62,7 +62,10 @@ class FleetThreatModelTests(unittest.TestCase):
         self.assertFalse(settings["sandbox"]["allowUnsandboxedCommands"])
         self.assertEqual(
             settings["permissions"]["allow"],
-            ["Read(/__FLEET_REPO_ROOT__/orchestration/runs/prompts/**)"],
+            [
+                "Read(/__FLEET_REPO_ROOT__/orchestration/runs/prompts/**)",
+                "mcp__fleet_control__*",
+            ],
         )
         self.assertFalse(
             any("cmux" in permission.lower() for permission in settings["permissions"]["allow"])
@@ -79,7 +82,10 @@ class FleetThreatModelTests(unittest.TestCase):
             self.assertNotIn("\n  bash:", policy)
             self.assertNotRegex(policy, r'(?m)^\s+"cmux(?:\s|\*)')
         for role_name in ("glm", "minimax", "minimax_candidate", "minimax_checker"):
-            self.assertEqual(self.router["roles"][role_name]["tool_access"], ["filesystem_read"])
+            self.assertEqual(
+                self.router["roles"][role_name]["tool_access"],
+                ["filesystem_read", "fleet_control"],
+            )
         self.assertIn("P1-OC1", self.doc)
         self.assertNotIn("P1 OPEN — does not yet satisfy boundary A", self.doc)
 

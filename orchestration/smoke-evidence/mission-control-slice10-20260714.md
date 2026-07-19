@@ -1,5 +1,10 @@
 # Mission Control Slice 10 — end-to-end smoke evidence
 
+> **HISTORICAL / SUPERSEDED.** This evidence belongs to the dated tree and
+> predates compiled-v2, current admission, and current locking/handoff. It is
+> not acceptance of the final working tree; see
+> `s0-single-mac-operational-truth-20260717.md`.
+
 Date: 2026-07-14
 
 ## Scope

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -14,6 +15,8 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "fleet-run.py"
+if str(SCRIPT.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT.parent))
 SPEC = importlib.util.spec_from_file_location("fleet_run", SCRIPT)
 assert SPEC and SPEC.loader
 fleet_run = importlib.util.module_from_spec(SPEC)
@@ -25,6 +28,20 @@ class FleetRunTests(unittest.TestCase):
         value = fleet_run.last_json_object('{\n  "run_id": "run-1"\n}\n', source="test")
 
         self.assertEqual(value, {"run_id": "run-1"})
+
+    def test_last_json_object_rejects_ambiguous_or_prefixed_output(self) -> None:
+        invalid = (
+            '{"run_id":"one","run_id":"two"}',
+            '{"usage":1e999}',
+            '\ufeff{}',
+            r'{"value":"\ud800"}',
+            'log line\n{"run_id":"run-1"}\n',
+            '{}{}',
+            '[]',
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(fleet_run.MissionError):
+                fleet_run.last_json_object(value, source="test")
 
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
