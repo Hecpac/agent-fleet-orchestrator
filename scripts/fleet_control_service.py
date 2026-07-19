@@ -2381,7 +2381,11 @@ class ControlLifecycle:
             # lifecycle receipt was durably marked stopped.  A live/reused PID
             # remains a hard failure because its identity can no longer be
             # proven through the bound socket.
-            crash_deadline = time.monotonic() + 1.0
+            # A self-stopping server removes its endpoints before the
+            # interpreter finishes exiting; slow hosts need more than one
+            # second to cross that window, so the bounded grace matches the
+            # quiescence deadline instead of racing interpreter teardown.
+            crash_deadline = time.monotonic() + 5.0
             while (
                 self._expected_process_running(lifecycle)
                 and time.monotonic() < crash_deadline
