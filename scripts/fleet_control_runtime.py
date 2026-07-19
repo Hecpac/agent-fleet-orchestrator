@@ -453,10 +453,10 @@ def process_observation(pid: int) -> tuple[dict[str, Any] | None, bool]:
         )
         return identity, value.pbi_status == 5
     if sys.platform.startswith("linux"):
-        stat_path = Path("/proc") / str(pid) / "stat"
+        proc_root = Path("/proc") / str(pid)
         try:
-            info = stat_path.stat()
-            raw = stat_path.read_text(encoding="ascii")
+            raw = (proc_root / "stat").read_text(encoding="ascii")
+            status = (proc_root / "status").read_text(encoding="ascii")
             boot_id = (
                 Path("/proc/sys/kernel/random/boot_id")
                 .read_text(encoding="ascii")
@@ -468,6 +468,20 @@ def process_observation(pid: int) -> tuple[dict[str, Any] | None, bool]:
             raise RuntimeIdentityError(
                 "cannot read exact Linux process identity"
             ) from exc
+        # The /proc inode owner flips to root for the duration of execve
+        # (the kernel clears dumpable until the new credentials are
+        # computed), so observing a just-spawned child through the inode
+        # owner misreports uid 0. The status Uid credential line is stable
+        # across that window and is the only honest owner source here.
+        euid: int | None = None
+        for line in status.splitlines():
+            if line.startswith("Uid:"):
+                parts = line.split()
+                if len(parts) >= 3 and parts[2].isdigit():
+                    euid = int(parts[2])
+                break
+        if euid is None:
+            raise RuntimeIdentityError("invalid Linux process status record")
         close = raw.rfind(")")
         fields = raw[close + 2 :].split() if close >= 0 else []
         if len(fields) < 20:
@@ -475,7 +489,7 @@ def process_observation(pid: int) -> tuple[dict[str, Any] | None, bool]:
         identity = validate_process_identity(
             {
                 "kind": "linux-proc-stat-v1",
-                "uid": int(info.st_uid),
+                "uid": euid,
                 "boot_id": boot_id,
                 "start_ticks": int(fields[19]),
             }

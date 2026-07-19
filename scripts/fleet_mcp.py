@@ -1956,6 +1956,12 @@ def _create_socket_server(
                 raise FleetControlError(
                     "inherited control descriptor is not a listening Unix stream socket"
                 )
+            # Linux pins SO_PEERCRED at listen(2), so the staging parent's
+            # credentials would answer every client peer-PID check forever.
+            # Re-listen from this exact server process so the kernel attests
+            # the authenticated PID; macOS LOCAL_PEERPID reports the live
+            # peer already and an extra listen only restates the backlog.
+            inherited.listen()
         except BaseException:
             server.server_close()
             raise

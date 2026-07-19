@@ -238,13 +238,17 @@ class FleetLedgerBootstrapTests(unittest.TestCase):
     def test_stale_handoff_after_completed_teardown_can_start_fresh(self) -> None:
         fleet_ledger_bootstrap.ensure(self.runs, self.feature)
         fleet_ledger_bootstrap.handoff(self.runs, self.feature)
-        old_inode = self.ledger.stat().st_ino
+        old_descriptor = os.open(self.ledger, os.O_RDONLY)
+        self.addCleanup(os.close, old_descriptor)
         self.ledger.unlink()
 
         fleet_ledger_bootstrap.ensure(self.runs, self.feature)
         self.assertTrue(self.intent.exists())
         self.assertTrue(self.ledger.exists())
-        self.assertNotEqual(self.ledger.stat().st_ino, old_inode)
+        # ext4 reuses freed inode numbers immediately, so st_ino inequality
+        # cannot prove freshness; the old object holding zero links while the
+        # path exists again is the platform-neutral proof of a new ledger.
+        self.assertEqual(os.fstat(old_descriptor).st_nlink, 0)
 
 
 if __name__ == "__main__":
