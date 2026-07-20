@@ -3,10 +3,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from unittest import mock
@@ -15,6 +18,7 @@ from tests.mission_control_test_support import create_running_mission
 
 import fleet_agent_mcp
 import fleet_control
+import fleet_control_service
 import fleet_decisions
 import fleet_ledger
 import fleet_mcp
@@ -252,7 +256,7 @@ class FleetDecisionTests(unittest.TestCase):
             )
         self.assertEqual(dispatched["recipient_instance"], "builder")
 
-    def test_best_effort_notification_is_secret_free_once_and_never_authoritative(
+    def test_durable_notification_is_secret_free_targeted_and_never_authoritative(
         self,
     ) -> None:
         recommendation, challenge = self.seed_evidence()
@@ -280,11 +284,17 @@ class FleetDecisionTests(unittest.TestCase):
 
         self.assertTrue(requested["notification"]["attempted"])
         self.assertTrue(requested["notification"]["accepted"])
+        self.assertEqual(requested["notification"]["outcome"], "accepted")
+        self.assertEqual(
+            requested["notification"]["guarantee"], "cmux_acceptance"
+        )
         self.assertEqual(requested["notification"]["authority"], "wake_up_only")
+        self.assertEqual(requested["decision"]["delivery"]["status"], "accepted")
         self.assertFalse(repeated["appended"])
         self.assertFalse(repeated["notification"]["attempted"])
         notify.assert_called_once()
         rendered_command = " ".join(notify.call_args.args[0])
+        self.assertIn("--surface 00000000-0000-0000-0000-000000000001", rendered_command)
         self.assertIn(self.mission_id, rendered_command)
         self.assertIn(requested["decision"]["decision_id"], rendered_command)
         self.assertNotIn(brief["title"], rendered_command)
@@ -302,9 +312,449 @@ class FleetDecisionTests(unittest.TestCase):
                 idempotency_key="decision:notify-failure",
             )
         self.assertTrue(failed_notice["appended"])
-        self.assertTrue(failed_notice["notification"]["attempted"])
+        self.assertFalse(failed_notice["notification"]["attempted"])
         self.assertFalse(failed_notice["notification"]["accepted"])
-        self.assertEqual(len(notifying.events()), before + 1)
+        self.assertEqual(failed_notice["notification"]["outcome"], "rejected")
+        self.assertEqual(
+            failed_notice["notification"]["reason"], "command_unavailable"
+        )
+        self.assertEqual(
+            failed_notice["decision"]["delivery"]["status"], "rejected"
+        )
+        self.assertEqual(len(notifying.events()), before + 4)
+
+    def test_decision_request_and_outbox_enqueue_publish_atomically(self) -> None:
+        recommendation, challenge = self.seed_evidence()
+        before = self.control.events()
+
+        def fail_before_publish(point: str) -> None:
+            if point == "before_publish":
+                raise RuntimeError("simulated crash before atomic publication")
+
+        with (
+            mock.patch.object(
+                mission_state,
+                "_mission_transaction_checkpoint",
+                side_effect=fail_before_publish,
+            ),
+            self.assertRaisesRegex(RuntimeError, "simulated crash"),
+        ):
+            self.control.request_decision(
+                brief=self.brief(recommendation, challenge),
+                idempotency_key="decision:atomic-outbox",
+            )
+        self.assertEqual(self.control.events(), before)
+
+        requested = self.control.request_decision(
+            brief=self.brief(recommendation, challenge),
+            idempotency_key="decision:atomic-outbox",
+        )
+        self.assertEqual(
+            [event["kind"] for event in self.control.events()[-2:]],
+            ["human_decision_requested", "decision_notification_enqueued"],
+        )
+        self.assertEqual(requested["decision"]["delivery"]["status"], "pending")
+
+    def test_rejection_retries_after_backoff_and_rebinds_current_mission_lead(
+        self,
+    ) -> None:
+        recommendation, challenge = self.seed_evidence()
+        targets: list[dict[str, object]] = []
+
+        def notifier(current, decision, target):
+            del current, decision
+            targets.append(dict(target))
+            if len(targets) == 1:
+                return fleet_control._notification_result(
+                    attempted=True,
+                    outcome="rejected",
+                    reason="cmux_rejected",
+                    returncode=2,
+                    delivery_status="rejected",
+                )
+            return fleet_control._notification_result(
+                attempted=True,
+                outcome="accepted",
+                reason="cmux_accepted",
+                returncode=0,
+                delivery_status="accepted",
+            )
+
+        control = fleet_control.FleetControl(
+            self.runs, self.mission_id, decision_notifier=notifier
+        )
+        requested = control.request_decision(
+            brief=self.brief(recommendation, challenge),
+            idempotency_key="decision:retry-and-rebind",
+        )
+        decision_id = requested["decision"]["decision_id"]
+        rejected = requested["decision"]["delivery"]
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertEqual(rejected["attempts"], 1)
+        first_outcome_at = mission_state.parse_timestamp(
+            rejected["last_outcome"]["outcome_at"], "first outcome"
+        )
+        retry_at = mission_state.parse_timestamp(
+            rejected["next_attempt_at"], "retry at"
+        )
+        self.assertIn(int((retry_at - first_outcome_at).total_seconds()), {4, 5, 6})
+
+        not_due = control.deliver_due_decision_notification(decision_id=decision_id)
+        self.assertFalse(not_due["processed"])
+        self.assertEqual(len(targets), 1)
+
+        manifest_path = self.runs / "fleet-decision-control.manifest"
+        manifest = manifest_path.read_text(encoding="utf-8")
+        manifest_path.write_text(
+            manifest.replace(
+                "lead.uuid=00000000-0000-0000-0000-000000000001",
+                "lead.uuid=00000000-0000-0000-0000-000000000009",
+            ),
+            encoding="utf-8",
+        )
+        claim_at = retry_at.isoformat(timespec="microseconds").replace(
+            "+00:00", "Z"
+        )
+        outcome_at = (retry_at + timedelta(microseconds=1)).isoformat(
+            timespec="microseconds"
+        ).replace("+00:00", "Z")
+        clock = mock.Mock()
+        clock.now.return_value = retry_at
+        with (
+            mock.patch.object(fleet_control, "datetime", clock),
+            mock.patch.object(
+                mission_state,
+                "_next_timestamp",
+                side_effect=[claim_at, outcome_at],
+            ),
+        ):
+            retried = control.deliver_due_decision_notification(
+                decision_id=decision_id
+            )
+        self.assertTrue(retried["processed"])
+        self.assertEqual(retried["notification"]["outcome"], "accepted")
+        self.assertEqual(targets[0]["surface_uuid"], "00000000-0000-0000-0000-000000000001")
+        self.assertEqual(targets[1]["surface_uuid"], "00000000-0000-0000-0000-000000000009")
+        delivery = control.state()["decisions"][decision_id]["delivery"]
+        self.assertEqual(delivery["status"], "accepted")
+        self.assertEqual(delivery["attempts"], 2)
+
+    def test_retry_cadence_is_deterministic_jittered_and_capped(self) -> None:
+        decision_id = "c8c1da00-d3b8-5620-87ed-b3d4b850f4fa"
+        bases = [5, 30, 120, 600, 600, 600]
+        observed = [
+            mission_state.decision_notification_retry_seconds(decision_id, attempt)
+            for attempt in range(1, len(bases) + 1)
+        ]
+        self.assertEqual(
+            observed,
+            [
+                mission_state.decision_notification_retry_seconds(
+                    decision_id, attempt
+                )
+                for attempt in range(1, len(bases) + 1)
+            ],
+        )
+        for seconds, base in zip(observed, bases, strict=True):
+            span = max(1, base // 5)
+            self.assertGreaterEqual(seconds, base - span)
+            self.assertLessEqual(seconds, base + span)
+
+    def test_ambiguous_or_legacy_delivery_never_retries(self) -> None:
+        recommendation, challenge = self.seed_evidence()
+        calls = 0
+
+        def timeout_notifier(current, decision, target):
+            nonlocal calls
+            del target
+            calls += 1
+            self.assertEqual(decision["delivery"]["status"], "in_flight")
+            self.assertEqual(current["decisions"][decision["decision_id"]]["delivery"]["status"], "in_flight")
+            return fleet_control._notification_result(
+                attempted=True,
+                outcome="indeterminate",
+                reason="timeout",
+                returncode=None,
+                delivery_status="indeterminate",
+            )
+
+        control = fleet_control.FleetControl(
+            self.runs, self.mission_id, decision_notifier=timeout_notifier
+        )
+        requested = control.request_decision(
+            brief=self.brief(recommendation, challenge),
+            idempotency_key="decision:ambiguous-no-retry",
+        )
+        decision_id = requested["decision"]["decision_id"]
+        self.assertEqual(requested["decision"]["delivery"]["status"], "indeterminate")
+        self.assertIsNone(requested["decision"]["delivery"]["next_attempt_at"])
+        self.assertFalse(
+            control.deliver_due_decision_notification(
+                decision_id=decision_id
+            )["processed"]
+        )
+        self.assertEqual(calls, 1)
+
+        legacy = self.control.request_decision(
+            brief=self.brief(recommendation, challenge),
+            idempotency_key="decision:legacy-ambiguous",
+        )
+        legacy_id = legacy["decision"]["decision_id"]
+        events = self.control.events()
+        self.assertEqual(events[-1]["kind"], "decision_notification_enqueued")
+        ledger = mission_state.ledger_path(self.runs, self.mission_id)
+        ledger.write_bytes(
+            b"".join(
+                mission_state.canonical_bytes(event) + b"\n"
+                for event in events[:-1]
+            )
+        )
+        legacy_calls = mock.Mock()
+        legacy_control = fleet_control.FleetControl(
+            self.runs, self.mission_id, decision_notifier=legacy_calls
+        )
+        legacy_delivery = legacy_control.state()["decisions"][legacy_id]["delivery"]
+        self.assertEqual(legacy_delivery["status"], "legacy_indeterminate")
+        self.assertFalse(
+            legacy_control.deliver_due_decision_notification(
+                decision_id=legacy_id
+            )["processed"]
+        )
+        legacy_calls.assert_not_called()
+
+    def test_resolved_decision_closes_rejected_delivery(self) -> None:
+        recommendation, challenge = self.seed_evidence()
+        calls = 0
+
+        def reject(current, decision, target):
+            nonlocal calls
+            del current, decision, target
+            calls += 1
+            return fleet_control._notification_result(
+                attempted=True,
+                outcome="rejected",
+                reason="cmux_rejected",
+                returncode=2,
+                delivery_status="rejected",
+            )
+
+        control = fleet_control.FleetControl(
+            self.runs, self.mission_id, decision_notifier=reject
+        )
+        requested = control.request_decision(
+            brief=self.brief(recommendation, challenge),
+            idempotency_key="decision:close-delivery",
+        )
+        decision_id = requested["decision"]["decision_id"]
+        fleet_decisions.resolve_human(
+            self.runs,
+            self.mission_id,
+            decision_id=decision_id,
+            option_id="additive",
+            reason="operator closed the decision",
+            idempotency_key="human:decision:close-delivery",
+        )
+        delivery = control.state()["decisions"][decision_id]["delivery"]
+        self.assertEqual(delivery["status"], "closed")
+        self.assertIsNone(delivery["next_attempt_at"])
+        self.assertFalse(
+            control.deliver_due_decision_notification(
+                decision_id=decision_id
+            )["processed"]
+        )
+        self.assertEqual(calls, 1)
+
+    def test_parallel_drainers_claim_only_one_physical_attempt(self) -> None:
+        recommendation, challenge = self.seed_evidence()
+        entered = threading.Event()
+        release = threading.Event()
+        calls = 0
+
+        def blocked_notifier(current, decision, target):
+            nonlocal calls
+            del current, decision, target
+            calls += 1
+            entered.set()
+            self.assertTrue(release.wait(timeout=5))
+            return fleet_control._notification_result(
+                attempted=True,
+                outcome="accepted",
+                reason="cmux_accepted",
+                returncode=0,
+                delivery_status="accepted",
+            )
+
+        control = fleet_control.FleetControl(
+            self.runs, self.mission_id, decision_notifier=blocked_notifier
+        )
+        key = "decision:single-physical-attempt"
+        decision_id = str(uuid.uuid5(uuid.UUID(self.mission_id), f"decision:{key}"))
+        outcome: dict[str, object] = {}
+
+        def request() -> None:
+            outcome["value"] = control.request_decision(
+                brief=self.brief(recommendation, challenge),
+                idempotency_key=key,
+            )
+
+        thread = threading.Thread(target=request)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            raced = control.deliver_due_decision_notification(
+                decision_id=decision_id
+            )
+            self.assertFalse(raced["processed"])
+            self.assertEqual(
+                control.state()["decisions"][decision_id]["delivery"]["status"],
+                "in_flight",
+            )
+        finally:
+            release.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertIn("value", outcome)
+        self.assertEqual(calls, 1)
+        self.assertEqual(
+            control.state()["decisions"][decision_id]["delivery"]["status"],
+            "accepted",
+        )
+
+    def test_two_decisions_never_overlap_physical_notification(self) -> None:
+        recommendation, challenge = self.seed_evidence()
+        first = self.control.request_decision(
+            brief=self.brief(recommendation, challenge),
+            idempotency_key="decision:serialized:first",
+        )["decision"]["decision_id"]
+        second = self.control.request_decision(
+            brief=self.brief(recommendation, challenge),
+            idempotency_key="decision:serialized:second",
+        )["decision"]["decision_id"]
+        entered = threading.Event()
+        release = threading.Event()
+        guard = threading.Lock()
+        active = 0
+        maximum_active = 0
+        calls: list[str] = []
+
+        def blocked_notifier(current, decision, target):
+            nonlocal active, maximum_active
+            del current, target
+            with guard:
+                active += 1
+                maximum_active = max(maximum_active, active)
+                calls.append(decision["decision_id"])
+            try:
+                if decision["decision_id"] == first:
+                    entered.set()
+                    self.assertTrue(release.wait(timeout=5))
+                return fleet_control._notification_result(
+                    attempted=True,
+                    outcome="accepted",
+                    reason="cmux_accepted",
+                    returncode=0,
+                    delivery_status="accepted",
+                )
+            finally:
+                with guard:
+                    active -= 1
+
+        first_control = fleet_control.FleetControl(
+            self.runs, self.mission_id, decision_notifier=blocked_notifier
+        )
+        second_control = fleet_control.FleetControl(
+            self.runs, self.mission_id, decision_notifier=blocked_notifier
+        )
+        outcome: dict[str, object] = {}
+
+        def deliver_first() -> None:
+            outcome["first"] = first_control.deliver_due_decision_notification(
+                decision_id=first
+            )
+
+        thread = threading.Thread(target=deliver_first)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(timeout=5))
+            raced = second_control.deliver_due_decision_notification(
+                decision_id=second
+            )
+            self.assertFalse(raced["processed"])
+            pending = second_control.state()["decisions"][second]["delivery"]
+            self.assertEqual(pending["status"], "pending")
+            self.assertEqual(pending["attempts"], 0)
+        finally:
+            release.set()
+            thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertIn("first", outcome)
+
+        delivered = second_control.deliver_due_decision_notification(
+            decision_id=second
+        )
+        self.assertTrue(delivered["processed"])
+        self.assertEqual(maximum_active, 1)
+        self.assertEqual(calls, [first, second])
+
+    def test_running_control_service_drains_enqueued_notification(self) -> None:
+        recommendation, challenge = self.seed_evidence()
+        fake_bin = self.tmp / "fake-bin"
+        fake_bin.mkdir(mode=0o700)
+        notify_log = self.tmp / "cmux-notify.log"
+        cmux = fake_bin / "cmux"
+        cmux.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$FLEET_TEST_NOTIFY_LOG\"\n",
+            encoding="utf-8",
+        )
+        cmux.chmod(0o700)
+        configured_short_root = os.environ.get("FLEET_TEST_SHORT_TMPDIR")
+        candidate_short_root = Path(
+            configured_short_root or os.environ.get("TMPDIR", "/tmp")
+        )
+        socket_parent = (
+            candidate_short_root
+            if configured_short_root is not None
+            or len(os.fsencode(candidate_short_root)) <= 32
+            else Path("/tmp")
+        )
+        socket_temp = tempfile.TemporaryDirectory(prefix="f2b-", dir=socket_parent)
+        self.addCleanup(socket_temp.cleanup)
+        socket_root = Path(socket_temp.name)
+        environment = {
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+            "FLEET_CONTROL_SOCKET_DIR": str(socket_root),
+            "FLEET_TEST_NOTIFY_LOG": str(notify_log),
+        }
+        with mock.patch.dict(os.environ, environment):
+            lifecycle = fleet_control_service.ControlLifecycle(
+                self.runs, self.mission_id
+            )
+            lifecycle.start()
+            try:
+                requested = self.control.request_decision(
+                    brief=self.brief(recommendation, challenge),
+                    idempotency_key="decision:service-drain",
+                )
+                decision_id = requested["decision"]["decision_id"]
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline:
+                    delivery = self.control.state()["decisions"][decision_id][
+                        "delivery"
+                    ]
+                    if delivery["status"] == "accepted":
+                        break
+                    time.sleep(0.02)
+                else:
+                    self.fail("running Fleet Control did not drain the outbox")
+            finally:
+                lifecycle.stop()
+        rendered = notify_log.read_text(encoding="utf-8")
+        self.assertIn("--surface 00000000-0000-0000-0000-000000000001", rendered)
+        self.assertIn(decision_id, rendered)
+
+    def test_notification_worker_telemetry_never_controls_liveness(self) -> None:
+        with mock.patch("builtins.print", side_effect=OSError("stderr unavailable")):
+            fleet_mcp._notification_worker_log("diagnostic only")
 
     def test_report_counts_durable_decisions_and_human_wait(self) -> None:
         recommendation, challenge = self.seed_evidence()
@@ -380,13 +830,15 @@ class FleetDecisionTests(unittest.TestCase):
         self.assertEqual(row["decision_id"], requested["decision"]["decision_id"])
         self.assertEqual(row["status"], "DEFAULT_ELIGIBLE")
         self.assertTrue(row["default_eligible"])
+        self.assertEqual(row["delivery_status"], "pending")
+        self.assertEqual(row["delivery_attempts"], 0)
         self.assertEqual(ledger.read_bytes(), before)
         serialized = json.dumps(inventory, sort_keys=True)
         self.assertNotIn(brief["question"], serialized)
         self.assertNotIn(brief["dissent"], serialized)
         self.assertNotIn(brief["title"], serialized)
 
-    def test_production_cli_and_mcp_enable_the_best_effort_notifier(self) -> None:
+    def test_production_cli_and_mcp_enable_the_durable_notifier(self) -> None:
         cli_control = mock.Mock()
         cli_control.state.return_value = {"status": "running"}
         with (

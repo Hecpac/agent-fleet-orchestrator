@@ -1701,13 +1701,16 @@ class RootedFS:
         file_mode: int = 0o600,
         require_single_link: bool = True,
         create_directories: bool = True,
-    ) -> Iterator[None]:
+        blocking: bool = True,
+    ) -> Iterator[bool]:
         """Acquire an owner-bound flock beneath the pinned root descriptor."""
 
         if not isinstance(require_single_link, bool):
             raise SafePathError("require_single_link must be bool")
         if not isinstance(create_directories, bool):
             raise SafePathError("create_directories must be bool")
+        if not isinstance(blocking, bool):
+            raise SafePathError("blocking must be bool")
         self.assert_root_binding()
         mode = _validate_mode(file_mode, "lock file")
         assert mode is not None
@@ -1762,7 +1765,12 @@ class RootedFS:
                     where=logical,
                     require_single_link=require_single_link,
                 )
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                operation = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(fd, operation)
+                except BlockingIOError:
+                    yield False
+                    return
                 try:
                     _validate_leaf_binding(
                         parent_fd,
@@ -1774,7 +1782,7 @@ class RootedFS:
                         require_single_link=require_single_link,
                     )
                     self.assert_root_binding()
-                    yield
+                    yield True
                     _validate_leaf_binding(
                         parent_fd,
                         leaf,

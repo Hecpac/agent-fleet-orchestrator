@@ -259,6 +259,11 @@ def _print_decisions(
             print(
                 f"    mission={decision['mission_id']} decision={decision['decision_id']}"
             )
+            print(
+                f"    delivery={decision['delivery_status']} "
+                f"attempts={decision['delivery_attempts']} "
+                f"next={decision['delivery_next_attempt_at'] or '-'}"
+            )
     if invalid_missions:
         if decisions:
             print()

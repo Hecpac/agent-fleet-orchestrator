@@ -282,8 +282,8 @@ boundary rather than out-of-band proof of human presence.
 - `tests/test_fleet_status.py::FleetStatusTests::test_decision_inventory_is_read_only_and_keeps_invalid_missions_visible`
 - `tests/test_fleet_status.py::FleetStatusTests::test_inventory_aggregates_pending_decisions_across_projects_in_one_root`
 - `tests/test_fleet_decisions.py::FleetDecisionTests::test_global_inventory_redacts_brief_and_marks_default_without_mutation`
-- `tests/test_fleet_decisions.py::FleetDecisionTests::test_best_effort_notification_is_secret_free_once_and_never_authoritative`
-- `tests/test_fleet_decisions.py::FleetDecisionTests::test_production_cli_and_mcp_enable_the_best_effort_notifier`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_durable_notification_is_secret_free_targeted_and_never_authoritative`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_production_cli_and_mcp_enable_the_durable_notifier`
 - `tests/test_fleet_decisions.py::FleetDecisionTests::test_report_counts_durable_decisions_and_human_wait`
 
 `why:` One operator radar scans the canonical Mission directories under exactly
@@ -295,10 +295,41 @@ linked canonical Mission ledger is reported as `INVALID/UNREADABLE`; healthy
 missions remain visible and the command exits non-zero instead of silently
 omitting the failure. JSON and human output exclude question, title, options,
 tradeoffs, dissent, evidence content, and full repository paths. CMUX receives
-at most one secret-free best-effort wake-up for a newly appended request; a
-missing or failed notification cannot roll back, resolve, or contradict the
-durable decision. Per-Mission reports derive decision counts and human wait from
-the same ledger and remain non-authoritative.
+only secret-free, mission-scoped wake-ups; a missing, rejected, or ambiguous
+notification cannot roll back, resolve, or contradict the durable decision.
+Per-Mission reports derive decision counts and human wait from the same ledger
+and remain non-authoritative.
+
+## Decision delivery is durable, mission-scoped, and ambiguity-safe
+
+`rule: decision_notification_outbox_never_converts_cmux_ambiguity_into_delivery`
+
+`enforced_by:`
+
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_decision_request_and_outbox_enqueue_publish_atomically`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_durable_notification_is_secret_free_targeted_and_never_authoritative`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_rejection_retries_after_backoff_and_rebinds_current_mission_lead`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_retry_cadence_is_deterministic_jittered_and_capped`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_ambiguous_or_legacy_delivery_never_retries`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_resolved_decision_closes_rejected_delivery`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_parallel_drainers_claim_only_one_physical_attempt`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_two_decisions_never_overlap_physical_notification`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_running_control_service_drains_enqueued_notification`
+- `tests/test_fleet_decisions.py::FleetDecisionTests::test_notification_worker_telemetry_never_controls_liveness`
+- `tests/test_fleet_safe_paths.py::FleetSafePathsTests::test_nonblocking_exclusive_lock_reports_contention`
+
+`why:` A Decision Brief and its enqueue publish in one Mission transaction. Each
+external attempt is claimed in the same hash-chained ledger before `cmux notify`
+runs. A descriptor-anchored, nonblocking Mission lock spans claim, physical
+send, and receipt, so different briefs and different Fleet Control callers can
+never overlap their CMUX effects. Only a synchronous exit-zero outcome becomes `accepted`. Explicit
+rejections retain a single retry schedule while the decision is pending; every
+attempt re-reads the exact mission-bound Lead UUID, so a restarted Lead can take
+over without a global or cross-project fallback. An attempt without a durable
+outcome, a timeout, or a legacy request without an enqueue is ambiguous and has
+no automatic retry. This deliberately prevents duplicates but means the
+contract is not strict at-least-once under ambiguity. Notification state stays
+observational and can never resolve or otherwise mutate Decision Brief truth.
 
 ## Risk-proportional execution modes
 

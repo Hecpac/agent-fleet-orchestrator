@@ -40,6 +40,8 @@ MAX_ACTIVE_SOCKET_HANDLERS = 16
 MAX_ACTIVE_MANAGEMENT_HANDLERS = 4
 MAX_OPERATION_OUTPUT_BYTES = 2_000_000
 SPECIALIST_DENIAL_MESSAGE = "specialist control request failed closed"
+DECISION_NOTIFICATION_WORKER_MAX_WAIT_SECONDS = 0.5
+DECISION_NOTIFICATION_WORKER_ERROR_WAIT_SECONDS = 1.0
 
 DISPATCH_PROPERTIES: dict[str, Any] = {
     "recipient_instance": {"type": "string"},
@@ -2090,6 +2092,55 @@ def _write_stopped_receipt(
         raise FleetControlError("cannot publish exact control stopped receipt") from exc
 
 
+def _notification_worker_log(message: str) -> None:
+    """Emit best-effort private worker telemetry without affecting service liveness."""
+
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+
+
+def _decision_notification_loop(
+    control: FleetControl, stopping: threading.Event
+) -> None:
+    """Drain due Decision Brief wake-ups without making them authoritative."""
+
+    last_error: str | None = None
+    while not stopping.is_set():
+        try:
+            result = control.deliver_due_decision_notification()
+            delay = result.get("next_wake_seconds")
+            if result.get("processed") and delay == 0:
+                continue
+            wait_seconds = (
+                DECISION_NOTIFICATION_WORKER_MAX_WAIT_SECONDS
+                if delay is None
+                else min(
+                    DECISION_NOTIFICATION_WORKER_MAX_WAIT_SECONDS,
+                    max(0.01, float(delay)),
+                )
+            )
+            if last_error is not None:
+                _notification_worker_log(
+                    "fleet-mcp: decision notification worker recovered"
+                )
+                last_error = None
+        except Exception as exc:
+            # A broken wake-up path cannot terminate Mission Control or mutate
+            # the durable Decision Brief. The next bounded pass retries only
+            # delivery states that are still explicitly retryable.
+            error = f"{type(exc).__name__}: {exc}"
+            if error != last_error:
+                _notification_worker_log(
+                    "fleet-mcp: decision notification worker retry failed: "
+                    + error
+                )
+                last_error = error
+            wait_seconds = DECISION_NOTIFICATION_WORKER_ERROR_WAIT_SECONDS
+        stopping.wait(wait_seconds)
+
+
 def serve_sockets(
     control: FleetControl,
     base_path: Path,
@@ -2216,16 +2267,29 @@ def serve_sockets(
         threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1})
         for server in servers
     ]
+    notification_thread = threading.Thread(
+        target=_decision_notification_loop,
+        args=(control, stopping),
+        name="fleet-decision-notifications",
+        daemon=True,
+    )
     started = 0
+    notification_started = False
     original_run_process = fleet_control_module.run_process
     fleet_control_module.run_process = operation_supervisor.run
     try:
         for thread in threads:
             thread.start()
             started += 1
+        notification_thread.start()
+        notification_started = True
         while not stopping.wait(0.1):
             if any(not thread.is_alive() for thread in threads):
                 raise FleetControlError("control socket endpoint stopped unexpectedly")
+            if not notification_thread.is_alive():
+                raise FleetControlError(
+                    "decision notification worker stopped unexpectedly"
+                )
     finally:
         requested_shutdown = stopping.is_set()
         admission.begin_shutdown()
@@ -2236,6 +2300,13 @@ def serve_sockets(
             server.shutdown()
         for thread in threads[:started]:
             thread.join(timeout=2)
+        if notification_started:
+            notification_thread.join(
+                timeout=(
+                    fleet_control_module.DECISION_NOTIFICATION_COMMAND_TIMEOUT_SECONDS
+                    + 1
+                )
+            )
         # Close the accept race between the first cancellation snapshot and
         # serve_forever() observing shutdown.
         for server in servers:
@@ -2243,6 +2314,7 @@ def serve_sockets(
         for server in servers:
             server.server_close()
         operation_supervisor.assert_quiescent()
+        notification_stuck = notification_started and notification_thread.is_alive()
         fleet_control_module.run_process = original_run_process
         try:
             with control_runtime.open_socket_root(
@@ -2255,6 +2327,10 @@ def serve_sockets(
             raise FleetControlError(
                 "cannot remove exact control socket endpoints"
             ) from exc
+        if notification_stuck:
+            raise FleetControlError(
+                "decision notification worker did not stop within its deadline"
+            )
         if requested_shutdown:
             _write_stopped_receipt(control, health_result=health_result)
 

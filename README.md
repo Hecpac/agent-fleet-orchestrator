@@ -421,11 +421,24 @@ a default, and CONTROL can durably apply only that exact default after two
 hours. Specialists cannot discover or call `request_decision`; the management
 socket and Lead CLI share the same Fleet Control core.
 
-After a new request is durably appended, the production Lead CLI/MCP attempts
-one secret-free `cmux notify`. It is best-effort only: failure does not roll back
-the request, normal idempotent replay does not notify twice, and the ledger/radar
-remain the recovery path. Periodic reminders and multi-root discovery are not
-part of the S0 contract.
+The request and its notification enqueue are one crash-atomic Mission-ledger
+publication. Before touching CMUX, CONTROL durably claims one attempt against the
+current mission-bound Lead surface. A descriptor-anchored per-Mission lock spans
+claim, send, and receipt, so separate briefs and separate Fleet Control callers
+cannot overlap physical notifications. Exit zero is recorded as CMUX acceptance;
+it does not prove that the human read the brief. Explicit rejection retries only
+while the decision remains pending, using `5s -> 30s -> 2m -> 10m` capped
+backoff with deterministic jitter and a fresh read of the same Mission manifest.
+A replacement Lead surface therefore receives the next attempt, but there is no
+cross-project/global fallback.
+
+Timeouts, crashes after the durable claim, and receipt-write failures remain
+ambiguous and are not retried, preventing duplicate wake-ups at the accepted
+cost of a possible missed delivery. Pre-outbox pending briefs are likewise
+labelled `legacy_indeterminate`, never silently resent. Consequently this is not
+strict `at-least-once` delivery under ambiguity. The ledger/radar remain the
+recovery path and the only authority; CMUX events and human-read receipts are
+not part of this contract.
 
 Coordination is event-driven, not polled: both `fleet-dispatch` and `fleet-send`
 return a durable `run_id`; pass every one back as `--run instance=run_id` to

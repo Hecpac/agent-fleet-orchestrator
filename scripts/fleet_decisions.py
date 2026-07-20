@@ -92,6 +92,7 @@ def decision_inventory(
         project, project_id = _project_identity(current["target_repo"])
         for decision_id, decision in sorted(current["pending_decisions"].items()):
             request = decision["request"]
+            delivery = decision["delivery"]
             requested_at = mission_state.parse_timestamp(
                 decision["requested_at"], "decision requested_at"
             )
@@ -129,6 +130,9 @@ def decision_inventory(
                         max(0.0, (observed_at - requested_at).total_seconds()), 6
                     ),
                     "default_eligible": default_eligible,
+                    "delivery_status": delivery["status"],
+                    "delivery_attempts": delivery["attempts"],
+                    "delivery_next_attempt_at": delivery["next_attempt_at"],
                 }
             )
 
@@ -345,6 +349,9 @@ def format_brief(current: dict[str, Any], decision: dict[str, Any]) -> str:
             f"{challenge_identity['artifact_id']}",
             f"Disenso: {request['dissent']}",
             f"Plazo: {decision['deadline_at']}",
+            "Entrega CMUX: "
+            f"{decision['delivery']['status']} "
+            f"(intentos={decision['delivery']['attempts']})",
             "Default tras 2h: "
             + (request["default_option_id"] or "ninguno; requiere decisión humana"),
             "Resolver: python3 scripts/fleet-decision.py --mission-id "

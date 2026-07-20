@@ -414,6 +414,11 @@ class FleetStatusTests(unittest.TestCase):
                     decision_ids[index]: {
                         "requested_at": "2026-07-19T00:00:00.000000Z",
                         "deadline_at": "2026-07-19T02:00:00.000000Z",
+                        "delivery": {
+                            "status": "pending",
+                            "attempts": 0,
+                            "next_attempt_at": "2026-07-19T00:00:00.000001Z",
+                        },
                         "request": {
                             "impact": "checkpoint",
                             "risk": "low" if index == 0 else "medium",

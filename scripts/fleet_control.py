@@ -40,27 +40,56 @@ class FleetControlError(RuntimeError):
     """A Fleet Control request violates mission or runtime evidence."""
 
 
-DecisionNotifier = Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]
+DecisionNotifier = Callable[
+    [dict[str, Any], dict[str, Any], dict[str, Any]], dict[str, Any]
+]
+DECISION_NOTIFICATION_COMMAND_TIMEOUT_SECONDS = 2
+DECISION_NOTIFICATION_SERIALIZATION_RETRY_SECONDS = 0.1
 
 
-def _notification_result(*, attempted: bool, accepted: bool) -> dict[str, Any]:
+def _notification_result(
+    *,
+    attempted: bool,
+    outcome: str | None,
+    reason: str | None,
+    returncode: int | None,
+    delivery_status: str,
+) -> dict[str, Any]:
     return {
         "attempted": attempted,
-        "accepted": accepted,
-        "guarantee": "best_effort",
+        "accepted": outcome == "accepted",
+        "outcome": outcome,
+        "reason": reason,
+        "returncode": returncode,
+        "delivery_status": delivery_status,
+        "guarantee": "cmux_acceptance",
         "authority": "wake_up_only",
     }
 
 
 def cmux_decision_notifier(
-    current: dict[str, Any], decision: dict[str, Any]
+    current: dict[str, Any],
+    decision: dict[str, Any],
+    target: dict[str, Any],
 ) -> dict[str, Any]:
-    """Send one secret-free CMUX wake-up without affecting Mission truth."""
+    """Request one targeted, secret-free CMUX wake-up."""
+
+    surface_uuid = target.get("surface_uuid")
+    if not isinstance(surface_uuid, str):
+        return _notification_result(
+            attempted=False,
+            outcome="rejected",
+            reason="target_unavailable",
+            returncode=None,
+            delivery_status="rejected",
+        )
 
     request = decision["request"]
     command = [
         "cmux",
         "notify",
+        "--surface",
+        surface_uuid,
         "--title",
         f"fleet decision: {current['feature']}",
         "--body",
@@ -77,14 +106,39 @@ def cmux_decision_notifier(
             env={**os.environ, "CMUX_QUIET": "1"},
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            timeout=10,
+            timeout=DECISION_NOTIFICATION_COMMAND_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired):
-        return _notification_result(attempted=True, accepted=False)
+    except subprocess.TimeoutExpired:
+        return _notification_result(
+            attempted=True,
+            outcome="indeterminate",
+            reason="timeout",
+            returncode=None,
+            delivery_status="indeterminate",
+        )
+    except OSError:
+        return _notification_result(
+            attempted=False,
+            outcome="rejected",
+            reason="command_unavailable",
+            returncode=None,
+            delivery_status="rejected",
+        )
+    if completed.returncode == 0:
+        return _notification_result(
+            attempted=True,
+            outcome="accepted",
+            reason="cmux_accepted",
+            returncode=0,
+            delivery_status="accepted",
+        )
     return _notification_result(
         attempted=True,
-        accepted=completed.returncode == 0,
+        outcome="rejected",
+        reason="cmux_rejected",
+        returncode=completed.returncode,
+        delivery_status="rejected",
     )
 
 
@@ -1482,6 +1536,318 @@ class FleetControl:
             "variant": result.get("variant"),
         }
 
+    def _decision_notification_target(self) -> dict[str, Any]:
+        lead, _ = self._selected_roster()
+        instance = (
+            str(lead.get("instance_id"))
+            if isinstance(lead, dict) and lead.get("instance_id")
+            else "lead"
+        )
+        try:
+            manifest = self.manifest()
+            surface_uuid = str(uuid.UUID(manifest[f"{instance}.uuid"]))
+            workspace_uuid = str(uuid.UUID(manifest["workspace_uuid"]))
+        except (FleetControlError, KeyError, TypeError, ValueError, AttributeError):
+            surface_uuid = None
+            workspace_uuid = None
+        return {
+            "instance": instance,
+            "surface_uuid": surface_uuid,
+            "workspace_uuid": workspace_uuid,
+        }
+
+    @staticmethod
+    def _notification_view(
+        decision: dict[str, Any], *, attempted: bool = False
+    ) -> dict[str, Any]:
+        delivery = decision["delivery"]
+        last_outcome = delivery.get("last_outcome")
+        if isinstance(last_outcome, dict):
+            outcome = last_outcome["outcome"]
+            reason = last_outcome["reason"]
+            returncode = last_outcome["returncode"]
+        else:
+            outcome = None
+            reason = None
+            returncode = None
+        return _notification_result(
+            attempted=attempted,
+            outcome=outcome,
+            reason=reason,
+            returncode=returncode,
+            delivery_status=delivery["status"],
+        )
+
+    @staticmethod
+    def _normalize_notification_result(value: Any) -> dict[str, Any]:
+        expected = {
+            "attempted",
+            "accepted",
+            "outcome",
+            "reason",
+            "returncode",
+            "delivery_status",
+            "guarantee",
+            "authority",
+        }
+        if not isinstance(value, dict) or set(value) != expected:
+            return _notification_result(
+                attempted=True,
+                outcome="indeterminate",
+                reason="invalid_notifier_result",
+                returncode=None,
+                delivery_status="indeterminate",
+            )
+        outcome = value.get("outcome")
+        reason = value.get("reason")
+        returncode = value.get("returncode")
+        if (
+            not isinstance(value.get("attempted"), bool)
+            or not isinstance(value.get("accepted"), bool)
+            or value.get("accepted") != (outcome == "accepted")
+            or outcome not in mission_state.DECISION_NOTIFICATION_OUTCOMES
+            or reason not in mission_state.DECISION_NOTIFICATION_REASONS[outcome]
+            or value.get("delivery_status") != outcome
+            or value.get("guarantee") != "cmux_acceptance"
+            or value.get("authority") != "wake_up_only"
+            or (
+                returncode is not None
+                and (isinstance(returncode, bool) or not isinstance(returncode, int))
+            )
+            or (outcome == "accepted" and returncode != 0)
+            or (
+                reason == "cmux_rejected"
+                and (returncode is None or returncode == 0)
+            )
+            or (
+                reason != "cmux_rejected"
+                and outcome != "accepted"
+                and returncode is not None
+            )
+        ):
+            return _notification_result(
+                attempted=True,
+                outcome="indeterminate",
+                reason="invalid_notifier_result",
+                returncode=None,
+                delivery_status="indeterminate",
+            )
+        return value
+
+    @staticmethod
+    def _notification_wait_seconds(
+        current: dict[str, Any], *, now: datetime | None = None
+    ) -> float | None:
+        observed_at = now or datetime.now(timezone.utc)
+        waits: list[float] = []
+        for decision in current.get("pending_decisions", {}).values():
+            if not isinstance(decision, dict):
+                continue
+            delivery = decision.get("delivery")
+            if (
+                not isinstance(delivery, dict)
+                or not delivery.get("managed")
+                or delivery.get("status") not in {"pending", "rejected"}
+                or not isinstance(delivery.get("next_attempt_at"), str)
+            ):
+                continue
+            due = mission_state.parse_timestamp(
+                delivery["next_attempt_at"], "notification next attempt"
+            )
+            waits.append(max(0.0, (due - observed_at).total_seconds()))
+        return min(waits) if waits else None
+
+    def _claim_due_decision_notification(
+        self, decision_id: str | None = None
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        if decision_id is not None:
+            decision_id = mission_state.normalize_uuid(decision_id, "decision_id")
+        target = self._decision_notification_target()
+        with mission_state.MissionTransaction(
+            self.runs_dir, self.mission_id
+        ) as transaction:
+            current = transaction.current_state
+            if current is None:
+                raise FleetControlError("mission does not exist")
+            candidates = current.get("pending_decisions", {})
+            selected: dict[str, Any] | None = None
+            selected_id: str | None = None
+            now = datetime.now(timezone.utc)
+            for candidate_id in sorted(candidates):
+                if decision_id is not None and candidate_id != decision_id:
+                    continue
+                candidate = candidates[candidate_id]
+                delivery = candidate.get("delivery")
+                if (
+                    not isinstance(delivery, dict)
+                    or not delivery.get("managed")
+                    or delivery.get("status") not in {"pending", "rejected"}
+                    or not isinstance(delivery.get("next_attempt_at"), str)
+                ):
+                    continue
+                due = mission_state.parse_timestamp(
+                    delivery["next_attempt_at"], "notification next attempt"
+                )
+                if due <= now:
+                    selected = candidate
+                    selected_id = candidate_id
+                    break
+            if selected is None or selected_id is None:
+                return None
+            delivery = selected["delivery"]
+            attempt_number = delivery["attempts"] + 1
+            attempt_event, appended = transaction.append_event(
+                kind="decision_notification_attempted",
+                actor="CONTROL",
+                idempotency_key=(
+                    f"decision:notification:attempt:{selected_id}:{attempt_number}"
+                ),
+                payload={
+                    "decision_id": selected_id,
+                    "enqueue_event_sha256": delivery["enqueue_event_sha256"],
+                    "attempt_number": attempt_number,
+                    "target_instance": target["instance"],
+                    "target_surface_uuid": target["surface_uuid"],
+                    "target_workspace_uuid": target["workspace_uuid"],
+                },
+            )
+            if not appended:
+                raise FleetControlError(
+                    "decision notification attempt was already claimed"
+                )
+        return attempt_event, target
+
+    def _notification_not_processed(
+        self,
+        decision_id: str | None,
+        *,
+        current: dict[str, Any] | None = None,
+        serialization_busy: bool = False,
+    ) -> dict[str, Any]:
+        observed = self.state() if current is None else current
+        next_wake_seconds = self._notification_wait_seconds(observed)
+        if serialization_busy and (
+            next_wake_seconds is None or next_wake_seconds <= 0
+        ):
+            next_wake_seconds = DECISION_NOTIFICATION_SERIALIZATION_RETRY_SECONDS
+        decision = (
+            observed.get("decisions", {}).get(decision_id)
+            if decision_id is not None
+            else None
+        )
+        return {
+            "processed": False,
+            "decision_id": decision_id,
+            "notification": (
+                self._notification_view(decision)
+                if isinstance(decision, dict)
+                else None
+            ),
+            "next_wake_seconds": next_wake_seconds,
+        }
+
+    def deliver_due_decision_notification(
+        self, *, decision_id: str | None = None
+    ) -> dict[str, Any]:
+        """Serialize, claim, and settle at most one due notification."""
+
+        relative_lock = (
+            Path("missions") / self.mission_id / ".decision-notification.lock"
+        )
+        try:
+            with fleet_safe_paths.RootedFS(self.runs_dir) as rooted:
+                with rooted.exclusive_lock(
+                    relative_lock,
+                    directory_modes=(0o700, 0o700),
+                    file_mode=0o600,
+                    create_directories=False,
+                    blocking=False,
+                ) as acquired:
+                    if not acquired:
+                        return self._notification_not_processed(
+                            decision_id, serialization_busy=True
+                        )
+                    return self._deliver_due_decision_notification_serialized(
+                        decision_id=decision_id
+                    )
+        except fleet_safe_paths.SafePathError as exc:
+            raise FleetControlError(
+                "cannot acquire decision notification serialization lock"
+            ) from exc
+
+    def _deliver_due_decision_notification_serialized(
+        self, *, decision_id: str | None = None
+    ) -> dict[str, Any]:
+        """Claim, send, and settle while the Mission send lock is held."""
+
+        current = self.state()
+        next_wake_seconds = self._notification_wait_seconds(current)
+        if (
+            self._decision_notifier is None
+            or next_wake_seconds is None
+            or next_wake_seconds > 0
+        ):
+            return self._notification_not_processed(decision_id, current=current)
+        claimed = self._claim_due_decision_notification(decision_id)
+        if claimed is None:
+            return self._notification_not_processed(decision_id)
+
+        attempt_event, target = claimed
+        claimed_id = attempt_event["payload"]["decision_id"]
+        claimed_state = self.state()
+        claimed_decision = claimed_state["decisions"][claimed_id]
+        try:
+            raw_result = self._decision_notifier(
+                claimed_state, claimed_decision, target
+            )
+        except Exception:
+            raw_result = _notification_result(
+                attempted=True,
+                outcome="indeterminate",
+                reason="notifier_error",
+                returncode=None,
+                delivery_status="indeterminate",
+            )
+        result = self._normalize_notification_result(raw_result)
+        outcome_payload = {
+            "decision_id": claimed_id,
+            "enqueue_event_sha256": claimed_decision["delivery"][
+                "enqueue_event_sha256"
+            ],
+            "attempt_event_sha256": attempt_event["event_sha256"],
+            "outcome": result["outcome"],
+            "reason": result["reason"],
+            "returncode": result["returncode"],
+        }
+        try:
+            mission_state.append_event(
+                self.runs_dir,
+                self.mission_id,
+                kind="decision_notification_outcome",
+                actor="CONTROL",
+                idempotency_key=(
+                    f"decision:notification:outcome:{attempt_event['event_id']}"
+                ),
+                payload=outcome_payload,
+            )
+        except mission_state.MissionStateError:
+            result = _notification_result(
+                attempted=result["attempted"],
+                outcome="indeterminate",
+                reason="receipt_unavailable",
+                returncode=None,
+                delivery_status="in_flight",
+            )
+        refreshed = self.state()
+        refreshed_decision = refreshed["decisions"][claimed_id]
+        result["delivery_status"] = refreshed_decision["delivery"]["status"]
+        return {
+            "processed": True,
+            "decision_id": claimed_id,
+            "notification": result,
+            "next_wake_seconds": self._notification_wait_seconds(refreshed),
+        }
+
     def request_decision(
         self,
         *,
@@ -1607,28 +1973,56 @@ class FleetControl:
         }
         try:
             mission_state.validate_decision_request_payload(payload)
-            event, appended = mission_state.append_event(
-                self.runs_dir,
-                self.mission_id,
-                kind="human_decision_requested",
-                actor="lead",
-                idempotency_key=idempotency_key,
-                payload=payload,
-            )
+            with mission_state.MissionTransaction(
+                self.runs_dir, self.mission_id
+            ) as transaction:
+                request_exists = any(
+                    item["idempotency_key"] == idempotency_key
+                    for item in transaction.events
+                )
+                requests = [
+                    {
+                        "kind": "human_decision_requested",
+                        "actor": "lead",
+                        "idempotency_key": idempotency_key,
+                        "payload": payload,
+                    }
+                ]
+                if not request_exists:
+                    requests.append(
+                        {
+                            "kind": "decision_notification_enqueued",
+                            "actor": "CONTROL",
+                            "idempotency_key": (
+                                f"decision:notification:enqueue:{decision_id}"
+                            ),
+                            "payload": {"decision_id": decision_id},
+                        }
+                    )
+                results = transaction.append_events(requests)
+                event, appended = results[0]
         except mission_state.MissionStateError as exc:
             raise FleetControlError(str(exc)) from exc
+        refreshed = self.state()
+        decision = refreshed["decisions"][decision_id]
+        notification = self._notification_view(decision)
+        if appended and self._decision_notifier is not None:
+            try:
+                delivered = self.deliver_due_decision_notification(
+                    decision_id=decision_id
+                )
+                if isinstance(delivered.get("notification"), dict):
+                    notification = delivered["notification"]
+            except Exception:
+                # The request and enqueue are already one durable publication.
+                # Delivery remains non-authoritative and the service can drain it.
+                notification = self._notification_view(self.state()["decisions"][decision_id])
         refreshed = self.state()
         decision = refreshed["decisions"][decision_id]
         try:
             formatted = fleet_decisions.format_brief(refreshed, decision)
         except fleet_decisions.DecisionError as exc:
             raise FleetControlError(str(exc)) from exc
-        notification = _notification_result(attempted=False, accepted=False)
-        if appended and self._decision_notifier is not None:
-            try:
-                notification = self._decision_notifier(refreshed, decision)
-            except Exception:
-                notification = _notification_result(attempted=True, accepted=False)
         return {
             "event": event,
             "appended": appended,

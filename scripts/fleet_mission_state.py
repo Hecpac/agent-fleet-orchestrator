@@ -25,6 +25,24 @@ DECISION_TIMEOUT_SECONDS = 2 * 60 * 60
 DECISION_IMPACTS = frozenset({"blocking", "checkpoint"})
 DECISION_RISKS = frozenset({"low", "medium", "high", "unknown"})
 DECISION_RESOLUTION_KINDS = frozenset({"human", "automatic"})
+DECISION_NOTIFICATION_OUTCOMES = frozenset(
+    {"accepted", "rejected", "indeterminate"}
+)
+DECISION_NOTIFICATION_REASONS = {
+    "accepted": frozenset({"cmux_accepted"}),
+    "rejected": frozenset(
+        {"cmux_rejected", "command_unavailable", "target_unavailable"}
+    ),
+    "indeterminate": frozenset(
+        {
+            "timeout",
+            "notifier_error",
+            "invalid_notifier_result",
+            "receipt_unavailable",
+        }
+    ),
+}
+DECISION_NOTIFICATION_BACKOFF_SECONDS = (5, 30, 2 * 60, 10 * 60)
 EVENT_FIELDS = {
     "schema_version",
     "event_id",
@@ -293,6 +311,38 @@ def decision_deadline(requested_at: str) -> str:
     return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def decision_notification_retry_seconds(
+    decision_id: str, attempt_number: int
+) -> int:
+    """Return one deterministic capped backoff with bounded 20% jitter."""
+
+    normalized = _require_uuid(decision_id, "notification decision_id")
+    if (
+        isinstance(attempt_number, bool)
+        or not isinstance(attempt_number, int)
+        or attempt_number < 1
+    ):
+        raise MissionStateError("notification attempt_number must be positive")
+    base = DECISION_NOTIFICATION_BACKOFF_SECONDS[
+        min(attempt_number - 1, len(DECISION_NOTIFICATION_BACKOFF_SECONDS) - 1)
+    ]
+    span = max(1, base // 5)
+    digest = hashlib.sha256(
+        f"{normalized}:{attempt_number}".encode("utf-8")
+    ).digest()
+    offset = int.from_bytes(digest[:4], "big") % (2 * span + 1) - span
+    return base + offset
+
+
+def decision_notification_retry_at(
+    outcome_at: str, decision_id: str, attempt_number: int
+) -> str:
+    value = parse_timestamp(outcome_at, "notification outcome timestamp") + timedelta(
+        seconds=decision_notification_retry_seconds(decision_id, attempt_number)
+    )
+    return value.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
 def _validate_decision_evidence(value: Any, where: str, *, recommendation: bool) -> None:
     fields = {"artifact_id", "delegation_id", "instance"}
     fields |= {"option_id", "rationale"} if recommendation else {"summary"}
@@ -431,6 +481,83 @@ def validate_decision_resolution_payload(payload: dict[str, Any]) -> None:
     _require_nonempty(payload["reason"], "decision resolution reason")
     if payload["resolution_kind"] not in DECISION_RESOLUTION_KINDS:
         raise MissionStateError("decision resolution kind is invalid")
+
+
+def validate_decision_notification_enqueued_payload(payload: dict[str, Any]) -> None:
+    kind = "decision_notification_enqueued"
+    _require_fields(kind, payload, {"decision_id"})
+    _require_uuid(payload["decision_id"], "notification decision_id")
+
+
+def validate_decision_notification_attempt_payload(payload: dict[str, Any]) -> None:
+    kind = "decision_notification_attempted"
+    _require_fields(
+        kind,
+        payload,
+        {
+            "decision_id",
+            "enqueue_event_sha256",
+            "attempt_number",
+            "target_instance",
+            "target_surface_uuid",
+            "target_workspace_uuid",
+        },
+    )
+    _require_uuid(payload["decision_id"], "notification decision_id")
+    _require_sha(payload["enqueue_event_sha256"], "notification enqueue event")
+    if _require_uint(payload["attempt_number"], "notification attempt_number") < 1:
+        raise MissionStateError("notification attempt_number must be positive")
+    target_instance = _require_nonempty(
+        payload["target_instance"], "notification target_instance"
+    )
+    if not SAFE_FEATURE.fullmatch(target_instance):
+        raise MissionStateError("notification target_instance is invalid")
+    target_values = (
+        payload["target_surface_uuid"],
+        payload["target_workspace_uuid"],
+    )
+    if all(value is None for value in target_values):
+        return
+    if any(value is None for value in target_values):
+        raise MissionStateError("notification target UUIDs must be paired")
+    _require_uuid(target_values[0], "notification target surface UUID")
+    _require_uuid(target_values[1], "notification target workspace UUID")
+
+
+def validate_decision_notification_outcome_payload(payload: dict[str, Any]) -> None:
+    kind = "decision_notification_outcome"
+    _require_fields(
+        kind,
+        payload,
+        {
+            "decision_id",
+            "enqueue_event_sha256",
+            "attempt_event_sha256",
+            "outcome",
+            "reason",
+            "returncode",
+        },
+    )
+    _require_uuid(payload["decision_id"], "notification decision_id")
+    _require_sha(payload["enqueue_event_sha256"], "notification enqueue event")
+    _require_sha(payload["attempt_event_sha256"], "notification attempt event")
+    outcome = payload["outcome"]
+    reason = payload["reason"]
+    if outcome not in DECISION_NOTIFICATION_OUTCOMES:
+        raise MissionStateError("decision notification outcome is invalid")
+    if reason not in DECISION_NOTIFICATION_REASONS[outcome]:
+        raise MissionStateError("decision notification reason mismatches outcome")
+    returncode = payload["returncode"]
+    if returncode is not None and (
+        isinstance(returncode, bool) or not isinstance(returncode, int)
+    ):
+        raise MissionStateError("decision notification returncode is invalid")
+    if outcome == "accepted" and returncode != 0:
+        raise MissionStateError("accepted notification requires returncode zero")
+    if reason == "cmux_rejected" and (returncode is None or returncode == 0):
+        raise MissionStateError("CMUX rejection requires a nonzero returncode")
+    if reason != "cmux_rejected" and outcome != "accepted" and returncode is not None:
+        raise MissionStateError("notification failure reason cannot carry returncode")
 
 
 def _validate_assured_action(kind: str, payload: dict[str, Any]) -> None:
@@ -879,6 +1006,12 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         validate_decision_request_payload(payload)
     elif kind == "human_decision_resolved":
         validate_decision_resolution_payload(payload)
+    elif kind == "decision_notification_enqueued":
+        validate_decision_notification_enqueued_payload(payload)
+    elif kind == "decision_notification_attempted":
+        validate_decision_notification_attempt_payload(payload)
+    elif kind == "decision_notification_outcome":
+        validate_decision_notification_outcome_payload(payload)
     elif kind == "run_cancel_requested":
         _require_fields(kind, payload, {"run_id", "reason"})
         _require_uuid(payload["run_id"], "cancel run_id")
@@ -2208,9 +2341,126 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                 "requested_at": event["timestamp"],
                 "deadline_at": decision_deadline(event["timestamp"]),
                 "resolution": None,
+                "delivery": {
+                    "managed": False,
+                    "status": "legacy_indeterminate",
+                    "attempts": 0,
+                    "enqueue_event_sha256": None,
+                    "next_attempt_at": None,
+                    "active_attempt_event_sha256": None,
+                    "last_attempt": None,
+                    "last_outcome": None,
+                },
             }
             result["decisions"][decision_id] = decision
             result["pending_decisions"][decision_id] = decision
+        elif kind == "decision_notification_enqueued":
+            if event["actor"] != "CONTROL":
+                raise MissionStateError(
+                    "decision notification enqueue requires CONTROL actor"
+                )
+            decision_id = payload["decision_id"]
+            decision = result["pending_decisions"].get(decision_id)
+            if not isinstance(decision, dict):
+                raise MissionConflict(
+                    "decision notification enqueue requires a pending decision"
+                )
+            delivery = decision["delivery"]
+            if delivery["managed"]:
+                raise MissionConflict("decision notification enqueue is immutable")
+            decision["delivery"] = {
+                "managed": True,
+                "status": "pending",
+                "attempts": 0,
+                "enqueue_event_sha256": event["event_sha256"],
+                "next_attempt_at": event["timestamp"],
+                "active_attempt_event_sha256": None,
+                "last_attempt": None,
+                "last_outcome": None,
+            }
+        elif kind == "decision_notification_attempted":
+            if event["actor"] != "CONTROL":
+                raise MissionStateError(
+                    "decision notification attempt requires CONTROL actor"
+                )
+            decision_id = payload["decision_id"]
+            decision = result["pending_decisions"].get(decision_id)
+            if not isinstance(decision, dict):
+                raise MissionConflict(
+                    "decision notification attempt requires a pending decision"
+                )
+            delivery = decision["delivery"]
+            if not delivery["managed"] or delivery["status"] not in {
+                "pending",
+                "rejected",
+            }:
+                raise MissionConflict("decision notification is not retryable")
+            if (
+                payload["enqueue_event_sha256"]
+                != delivery["enqueue_event_sha256"]
+            ):
+                raise MissionConflict("decision notification enqueue binding mismatch")
+            expected_attempt = delivery["attempts"] + 1
+            if payload["attempt_number"] != expected_attempt:
+                raise MissionConflict("decision notification attempt sequence mismatch")
+            next_attempt_at = delivery["next_attempt_at"]
+            if next_attempt_at is None or parse_timestamp(
+                event["timestamp"], "notification attempt timestamp"
+            ) < parse_timestamp(next_attempt_at, "notification next attempt"):
+                raise MissionConflict("decision notification retry is not due")
+            delivery["status"] = "in_flight"
+            delivery["attempts"] = expected_attempt
+            delivery["next_attempt_at"] = None
+            delivery["active_attempt_event_sha256"] = event["event_sha256"]
+            delivery["last_attempt"] = {
+                "attempt_number": expected_attempt,
+                "attempted_at": event["timestamp"],
+                "event_sha256": event["event_sha256"],
+                "target_instance": payload["target_instance"],
+                "target_surface_uuid": payload["target_surface_uuid"],
+                "target_workspace_uuid": payload["target_workspace_uuid"],
+            }
+        elif kind == "decision_notification_outcome":
+            if event["actor"] != "CONTROL":
+                raise MissionStateError(
+                    "decision notification outcome requires CONTROL actor"
+                )
+            decision_id = payload["decision_id"]
+            decision = result["decisions"].get(decision_id)
+            if not isinstance(decision, dict):
+                raise MissionConflict("decision notification references unknown decision")
+            delivery = decision["delivery"]
+            if not delivery["managed"]:
+                raise MissionConflict("legacy decision notification has no outbox")
+            if (
+                payload["enqueue_event_sha256"]
+                != delivery["enqueue_event_sha256"]
+                or payload["attempt_event_sha256"]
+                != delivery["active_attempt_event_sha256"]
+            ):
+                raise MissionConflict("decision notification outcome binding mismatch")
+            delivery["active_attempt_event_sha256"] = None
+            delivery["last_outcome"] = {
+                "outcome": payload["outcome"],
+                "reason": payload["reason"],
+                "returncode": payload["returncode"],
+                "outcome_at": event["timestamp"],
+                "event_sha256": event["event_sha256"],
+            }
+            if payload["outcome"] == "accepted":
+                delivery["status"] = "accepted"
+                delivery["next_attempt_at"] = None
+            elif payload["outcome"] == "indeterminate":
+                delivery["status"] = "indeterminate"
+                delivery["next_attempt_at"] = None
+            elif decision["status"] == "pending":
+                delivery["status"] = "rejected"
+                delivery["next_attempt_at"] = decision_notification_retry_at(
+                    event["timestamp"], decision_id, delivery["attempts"]
+                )
+            else:
+                delivery["status"] = "closed"
+                delivery["next_attempt_at"] = None
         elif kind == "human_decision_resolved":
             decision_id = payload["decision_id"]
             decision = result["pending_decisions"].get(decision_id)
@@ -2255,6 +2505,10 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
             }
             decision["status"] = "resolved"
             decision["resolution"] = resolution
+            delivery = decision["delivery"]
+            if delivery["status"] in {"pending", "rejected"}:
+                delivery["status"] = "closed"
+                delivery["next_attempt_at"] = None
             del result["pending_decisions"][decision_id]
         elif kind == "risk_escalated":
             if payload["from"] != result["risk"]:

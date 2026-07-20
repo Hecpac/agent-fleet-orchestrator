@@ -119,6 +119,33 @@ class FleetSafePathsTests(unittest.TestCase):
                     directory_modes=(0o700, 0o700, 0o700),
                 )
 
+    def test_nonblocking_exclusive_lock_reports_contention(self) -> None:
+        root = self.private_directory("nonblocking-lock")
+        lock_path = "missions/mission/.notification.lock"
+        with (
+            fleet_safe_paths.RootedFS(root, root_mode=0o700) as first,
+            fleet_safe_paths.RootedFS(root, root_mode=0o700) as second,
+        ):
+            with first.exclusive_lock(
+                lock_path,
+                directory_modes=(0o700, 0o700),
+            ) as first_acquired:
+                self.assertTrue(first_acquired)
+                with second.exclusive_lock(
+                    lock_path,
+                    directory_modes=(0o700, 0o700),
+                    create_directories=False,
+                    blocking=False,
+                ) as second_acquired:
+                    self.assertFalse(second_acquired)
+            with second.exclusive_lock(
+                lock_path,
+                directory_modes=(0o700, 0o700),
+                create_directories=False,
+                blocking=False,
+            ) as acquired_after_release:
+                self.assertTrue(acquired_after_release)
+
     def test_open_root_descriptor_survives_pathname_substitution_without_escape(self) -> None:
         root = self.private_directory("runs")
         secure = root / "secure"
