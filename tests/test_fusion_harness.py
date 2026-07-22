@@ -205,6 +205,146 @@ class FusionOpinionTests(unittest.TestCase):
         )
 
 
+class FusionCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tempdir.cleanup)
+        self.tmp = Path(self.tempdir.name)
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        self.out = self.tmp / "fusion-out"
+        self._executable(
+            "claude",
+            """
+            #!/bin/sh
+            # A rendered prompt is itself multi-line, so counting invocations
+            # via `wc -l` on an appended-argv file would count newlines-in-
+            # content instead of calls. Track ordinal + per-call capture in
+            # dedicated files so call N can be recovered exactly regardless
+            # of how many lines its own argv happens to contain.
+            n=$(( $(cat "$FLEET_TEST_DIR/claude.count" 2>/dev/null || echo 0) + 1 ))
+            printf '%s' "$n" > "$FLEET_TEST_DIR/claude.count"
+            printf '%s' "$*" > "$FLEET_TEST_DIR/claude.call.$n"
+            if [ "${FLEET_TEST_CLAUDE_FAIL_ON:-0}" = "$n" ]; then
+              printf 'claude call %s exploded\\n' "$n" >&2
+              exit 7
+            fi
+            printf 'claude call %s output\\n' "$n"
+            """,
+        )
+        self._executable(
+            "codex",
+            """
+            #!/bin/sh
+            printf '%s\\n' "$*" >> "$FLEET_TEST_DIR/codex.argv"
+            if [ "${FLEET_TEST_CODEX_FAIL:-0}" = 1 ]; then exit 9; fi
+            printf 'builder output\\n'
+            """,
+        )
+
+    _executable = FusionOpinionTests._executable
+
+    def _run(self, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["python3", str(HARNESS), "fusion", *args],
+            env={
+                **os.environ,
+                "PATH": f"{self.bin}:{os.environ['PATH']}",
+                "FLEET_FUSION_OUTPUT_DIR": str(self.out),
+                "FLEET_TEST_DIR": str(self.tmp),
+                **env,
+            },
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+    def _summary(self) -> dict:
+        runs = [item for item in self.out.iterdir() if item.is_dir()]
+        self.assertEqual(len(runs), 1)
+        return fleet_json.load(runs[0] / "fusion" / "summary.json")
+
+    def test_happy_path_produces_fused_answer_and_complete_summary(self) -> None:
+        result = self._run("pick a queue library")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["command"], "fusion")
+        self.assertEqual(summary["status"], "complete")
+        self.assertEqual(summary["input_mode"], "inline")
+        self.assertEqual(
+            [item["role"] for item in summary["agents"]],
+            ["architect", "builder", "fusion"],
+        )
+        self.assertEqual(summary["fusion_prompt_hash"], __import__("hashlib").sha256(FUSION_TEMPLATE.read_bytes()).hexdigest())
+        self.assertEqual(len(summary["rendered_prompt_hash"]), 64)
+        run_dir = self.out / summary["run_id"] / "fusion"
+        for name in ("architect.md", "builder.md", "fused.md"):
+            self.assertTrue((run_dir / name).is_file(), name)
+        fusion_argv = (self.tmp / "claude.call.2").read_text(encoding="utf-8")
+        self.assertIn("UNTRUSTED DATA", fusion_argv)
+        self.assertIn("builder output", fusion_argv)
+
+    def test_worker_failure_is_fail_closed_without_fusion(self) -> None:
+        result = self._run("q", FLEET_TEST_CODEX_FAIL="1")
+
+        self.assertEqual(result.returncode, 4, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["status"], "incomplete")
+        self.assertTrue((self.tmp / "claude.call.1").is_file())
+        self.assertFalse(
+            (self.tmp / "claude.call.2").exists(), "FUSION must not be spawned"
+        )
+        run_dir = self.out / summary["run_id"] / "fusion"
+        self.assertTrue((run_dir / "architect.md").is_file())
+        self.assertFalse((run_dir / "fused.md").exists())
+
+    def test_fusion_agent_failure_returns_5_and_incomplete(self) -> None:
+        result = self._run("q", FLEET_TEST_CLAUDE_FAIL_ON="2")
+
+        self.assertEqual(result.returncode, 5, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["status"], "incomplete")
+        by_role = {item["role"]: item for item in summary["agents"]}
+        self.assertEqual(by_role["fusion"]["status"], "failed")
+
+    def test_oversized_worker_output_switches_both_inputs_to_path_mode(self) -> None:
+        self._executable(
+            "codex",
+            """
+            #!/bin/sh
+            printf '%s\\n' "$*" >> "$FLEET_TEST_DIR/codex.argv"
+            head -c 61000 /dev/zero | tr '\\0' 'b'
+            printf '\\n'
+            """,
+        )
+        result = self._run("q")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["input_mode"], "path")
+        run_dir = self.out / summary["run_id"] / "fusion"
+        fusion_argv = (self.tmp / "claude.call.2").read_text(encoding="utf-8")
+        self.assertIn(f"READ THIS FILE COMPLETELY: {run_dir / 'architect.md'}", fusion_argv)
+        self.assertIn(f"READ THIS FILE COMPLETELY: {run_dir / 'builder.md'}", fusion_argv)
+        self.assertNotIn("bbbbbbbbbb", fusion_argv)
+
+    def test_empty_worker_output_is_fail_closed(self) -> None:
+        self._executable(
+            "codex",
+            """
+            #!/bin/sh
+            printf '%s\\n' "$*" >> "$FLEET_TEST_DIR/codex.argv"
+            exit 0
+            """,
+        )
+        result = self._run("q")
+
+        self.assertEqual(result.returncode, 4, result.stderr)
+        self.assertEqual(self._summary()["status"], "incomplete")
+
+
 FUSION_TEMPLATE = ROOT / "scripts" / "fusion" / "prompts" / "fusion.md"
 
 

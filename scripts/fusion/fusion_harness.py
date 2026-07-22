@@ -247,6 +247,22 @@ def run_agent(
     return outcome
 
 
+def _agent_summary(
+    worker: dict[str, Any], outcome: dict[str, Any], artifact: Path
+) -> dict[str, Any]:
+    return {
+        "role": worker["role"],
+        "cli": worker["cli"],
+        "model": worker["model"],
+        "status": outcome["status"],
+        "exit_code": outcome["exit_code"],
+        "latency_seconds": outcome["latency_seconds"],
+        "output_path": str(artifact),
+        "output_chars": len(outcome["output"]),
+        "stderr_tail": outcome["stderr_tail"],
+    }
+
+
 def opinion(args: argparse.Namespace) -> int:
     question = args.question.strip()
     if not question:
@@ -308,19 +324,7 @@ def opinion(args: argparse.Namespace) -> int:
         outcome = outcomes[agent["role"]]
         artifact = run_dir / f"{agent['role']}.md"
         artifact.write_text(outcome["output"], encoding="utf-8")
-        summary_agents.append(
-            {
-                "role": agent["role"],
-                "cli": agent["cli"],
-                "model": agent["model"],
-                "status": outcome["status"],
-                "exit_code": outcome["exit_code"],
-                "latency_seconds": outcome["latency_seconds"],
-                "output_path": str(artifact),
-                "output_chars": len(outcome["output"]),
-                "stderr_tail": outcome["stderr_tail"],
-            }
-        )
+        summary_agents.append(_agent_summary(agent, outcome, artifact))
 
     summary = {
         "schema_version": 1,
@@ -354,6 +358,144 @@ def opinion(args: argparse.Namespace) -> int:
     return 0
 
 
+def fusion(args: argparse.Namespace) -> int:
+    question = args.question.strip()
+    if not question:
+        raise FusionError("fusion requires a non-empty question")
+    tier = args.tier or os.environ.get("FLEET_FUSION_TIER", "workhorse")
+    if tier not in TIERS:
+        raise FusionError(f"unknown tier: {tier}; available: {sorted(TIERS)}")
+    timeout_seconds = float(os.environ.get("FLEET_FUSION_TIMEOUT", "300"))
+    budget = int(
+        os.environ.get("FLEET_FUSION_PROMPT_BUDGET", str(DEFAULT_PROMPT_BUDGET))
+    )
+    instruction = args.instruction or ""
+
+    workers = []
+    for role in ("architect", "builder"):
+        spec = TIERS[tier][role]
+        prompt = render_prompt(question, role)
+        workers.append(
+            {
+                "role": role,
+                "cli": spec["cli"],
+                "model": spec["model"],
+                "argv": [
+                    part.replace("{prompt}", prompt).replace("{model}", spec["model"])
+                    for part in spec["argv"]
+                ],
+            }
+        )
+
+    run_id = str(uuid.uuid4())[:8]
+    run_dir = output_root() / run_id / "fusion"
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = {
+            pool.submit(run_agent, w["role"], w["argv"], timeout_seconds): w
+            for w in workers
+        }
+        outcomes = {
+            futures[f]["role"]: f.result()
+            for f in concurrent.futures.as_completed(futures)
+        }
+
+    summary_agents = []
+    for worker in workers:
+        outcome = outcomes[worker["role"]]
+        artifact = run_dir / f"{worker['role']}.md"
+        artifact.write_text(outcome["output"], encoding="utf-8")
+        summary_agents.append(_agent_summary(worker, outcome, artifact))
+
+    rendered_hash = ""
+    input_mode = "inline"
+
+    def finish(status: str, exit_code: int) -> int:
+        summary = {
+            "schema_version": 1,
+            "command": "fusion",
+            "run_id": run_id,
+            "tier": tier,
+            "question_sha256": hashlib.sha256(question.encode()).hexdigest(),
+            "fusion_prompt_hash": fusion_template_hash(),
+            "rendered_prompt_hash": rendered_hash,
+            "input_mode": input_mode,
+            "status": status,
+            "agents": summary_agents,
+        }
+        summary_path = run_dir / "summary.json"
+        summary_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        with (output_root() / "ledger.jsonl").open("ab") as ledger:
+            ledger.write(fleet_json.canonical_bytes(summary) + b"\n")
+        print(f"fusion run {run_id} (tier={tier}) status={status}")
+        for item in summary_agents:
+            print(
+                f"  {item['role']:<10} {item['model']:<18} {item['status']:<8} "
+                f"{item['latency_seconds']:>7.1f}s {item['output_chars']:>7} chars"
+            )
+        print(f"  summary: {summary_path}")
+        return exit_code
+
+    # Fail closed (spec R3): FUSION only runs over two healthy, non-empty
+    # perspectives — a synthesis of a missing input is a false synthesis.
+    if any(
+        outcomes[w["role"]]["status"] != "ok"
+        or not outcomes[w["role"]]["output"].strip()
+        for w in workers
+    ):
+        return finish("incomplete", 4)
+
+    architect_text = outcomes["architect"]["output"]
+    builder_text = outcomes["builder"]["output"]
+    template = FUSION_TEMPLATE.read_text(encoding="utf-8")
+    # Question and operator instruction count toward the fixed overhead:
+    # a huge question must not push an "inline" decision over budget.
+    fixed_overhead = len(template) + len(question) + len(instruction)
+    input_mode = choose_input_mode(
+        architect_text,
+        builder_text,
+        template_chars=fixed_overhead,
+        budget=budget,
+    )
+    if input_mode == "inline":
+        architect_content, builder_content = architect_text, builder_text
+    else:
+        architect_content = f"READ THIS FILE COMPLETELY: {run_dir / 'architect.md'}"
+        builder_content = f"READ THIS FILE COMPLETELY: {run_dir / 'builder.md'}"
+
+    spec = TIERS[tier]["architect"]
+    rendered = render_fusion_prompt(
+        question=question,
+        instruction=instruction,
+        architect_model=spec["model"],
+        builder_model=TIERS[tier]["builder"]["model"],
+        architect_content=architect_content,
+        builder_content=builder_content,
+    )
+    rendered_hash = rendered_prompt_hash(rendered)
+    fusion_argv = [
+        part.replace("{prompt}", rendered).replace("{model}", spec["model"])
+        for part in spec["argv"]
+    ]
+    outcome = run_agent("fusion", fusion_argv, timeout_seconds)
+    fused = run_dir / "fused.md"
+    fused.write_text(outcome["output"], encoding="utf-8")
+    summary_agents.append(
+        _agent_summary(
+            {"role": "fusion", "cli": spec["cli"], "model": spec["model"]},
+            outcome,
+            fused,
+        )
+    )
+    if outcome["status"] != "ok" or not outcome["output"].strip():
+        return finish("incomplete", 5)
+    return finish("complete", 0)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -368,6 +510,12 @@ def _parser() -> argparse.ArgumentParser:
     opinion_parser.add_argument(
         "--panel-role", default="triage", help="local router role for the panel"
     )
+    fusion_parser = sub.add_parser(
+        "fusion", help="two perspectives plus an adjudicated synthesis"
+    )
+    fusion_parser.add_argument("question")
+    fusion_parser.add_argument("instruction", nargs="?", default="")
+    fusion_parser.add_argument("--tier", choices=sorted(TIERS))
     return parser
 
 
@@ -376,6 +524,8 @@ def main() -> int:
     try:
         if args.command == "opinion":
             return opinion(args)
+        if args.command == "fusion":
+            return fusion(args)
         raise FusionError(f"unknown command: {args.command}")
     except FusionError as error:
         print(f"fusion: {error}", file=sys.stderr)
