@@ -15,7 +15,7 @@ import fleet_json  # noqa: E402
 import fleet_usage  # noqa: E402
 
 
-PROVIDERS = ("codex", "claude", "opencode", "ollama")
+PROVIDERS = ("codex", "claude", "kimi", "opencode", "ollama")
 
 
 class FleetUsagePolicyTests(unittest.TestCase):
@@ -23,6 +23,7 @@ class FleetUsagePolicyTests(unittest.TestCase):
         expected = {
             "codex": "none",
             "claude": "none",
+            "kimi": "none",
             "opencode": "none",
             "ollama": "hard_output_only",
         }
@@ -71,7 +72,7 @@ class FleetUsagePolicyTests(unittest.TestCase):
             fleet_usage.validate_policy({"budget_mode": "hard", "token_budget": 1})
         with self.assertRaisesRegex(
             fleet_usage.UsageError,
-            "unsupported providers: claude, codex, ollama, opencode",
+            "unsupported providers: claude, codex, kimi, ollama, opencode",
         ):
             fleet_usage.validate_policy(
                 {"budget_mode": "hard", "token_budget": 1},
@@ -138,7 +139,7 @@ class FleetUsageReceiptTests(unittest.TestCase):
         self.assertEqual(fleet_json.loads(fleet_usage.canonical_bytes(value)), value)
 
     def test_none_capability_cannot_claim_observed_totals(self) -> None:
-        for provider in ("codex", "claude", "opencode"):
+        for provider in ("codex", "claude", "kimi", "opencode"):
             with (
                 self.subTest(provider=provider),
                 self.assertRaisesRegex(fleet_usage.UsageError, "cannot claim observed"),

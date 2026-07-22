@@ -50,6 +50,7 @@ class RouterConfigTests(unittest.TestCase):
                 "small",
                 "audit",
                 "frontier_verification",
+                "kimi_audit",
                 "kimi_review",
                 "fleet_dialogue",
                 "implementation_review",
@@ -341,13 +342,24 @@ class RouterConfigTests(unittest.TestCase):
         )
         kimi = plan["instances"][1]
         self.assertEqual(kimi["provider"], "moonshot-ai")
-        self.assertEqual(kimi["model"], "moonshot-ai/kimi-k3")
+        self.assertEqual(kimi["model"], "kimi-code/kimi-for-coding")
         self.assertEqual(kimi["hook_source"], "kimi")
         self.assertEqual(kimi["authority"], "verification")
         self.assertEqual(kimi["tool_access"], ["filesystem_read", "fleet_control"])
         self.assertIn("--thinking", kimi["command"])
         self.assertNotIn("--yolo", kimi["command"])
         self.assertNotIn("--print", kimi["command"])
+
+    def test_kimi_audit_is_autonomous_and_read_only(self) -> None:
+        plan = router_config.build_plan(
+            self.config, preset_name="kimi_audit", run_healthcheck=False
+        )
+        self.assertEqual(plan["mode"], "autonomous")
+        self.assertEqual(
+            [(item["instance_id"], item["role_type"]) for item in plan["instances"]],
+            [("verify", "kimi")],
+        )
+        self.assertEqual(plan["instances"][0]["authority"], "verification")
 
     def test_kimi_role_rejects_unsafe_or_unpinned_commands(self) -> None:
         for mutation, error in (

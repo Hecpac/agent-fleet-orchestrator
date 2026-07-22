@@ -836,7 +836,7 @@ if [[ "$role_type" == "kimi" && "$provider_basename" == "kimi" \
     --hook-dir "${CMUX_HOOK_DIR:-$controller_home/.cmuxterm}" \
     --events-file "$kimi_events_file" \
     --provider moonshot-ai \
-    --model moonshot-ai/kimi-k3 \
+    --model kimi-code/kimi-for-coding \
     >/dev/null 2>&1 &
   kimi_bridge_pid=$!
   sleep 0.1

@@ -1145,6 +1145,66 @@ os.chmod(path, stat.S_IMODE(path.lstat().st_mode) & ~0o222)
 ' "$worktrees_root" "$clone_path"
 }
 
+reader_clone_root_fingerprint() {
+  local clone_path="$1"
+  python3 -c '
+import hashlib, json, os, stat, sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve(strict=True)
+path = Path(sys.argv[2])
+info = path.lstat()
+if (
+    not stat.S_ISDIR(info.st_mode)
+    or stat.S_ISLNK(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or path.parent.resolve(strict=True) != root
+):
+    raise SystemExit("unsafe isolated reader clone")
+records = []
+for entry in sorted(os.scandir(path), key=lambda item: os.fsencode(item.name)):
+    item = entry.stat(follow_symlinks=False)
+    records.append([
+        entry.name,
+        item.st_mode,
+        item.st_uid,
+        item.st_gid,
+        item.st_dev,
+        item.st_ino,
+        item.st_nlink,
+        item.st_size,
+        item.st_mtime_ns,
+    ])
+payload = json.dumps(records, ensure_ascii=False, separators=(",", ":")).encode()
+print(hashlib.sha256(payload).hexdigest())
+' "$worktrees_root" "$clone_path"
+}
+
+make_kimi_reader_root_cli_writable() {
+  local clone_path="$1" fingerprint
+  python3 "$clone_guard" verify-device --clone-path "$clone_path" >/dev/null || return 1
+  fingerprint="$(reader_clone_root_fingerprint "$clone_path")" || return 1
+  python3 -c '
+import os, stat, sys
+from pathlib import Path
+
+root = Path(sys.argv[1]).resolve(strict=True)
+path = Path(sys.argv[2])
+info = path.lstat()
+mode = stat.S_IMODE(info.st_mode)
+if (
+    not stat.S_ISDIR(info.st_mode)
+    or stat.S_ISLNK(info.st_mode)
+    or info.st_uid != os.geteuid()
+    or path.parent.resolve(strict=True) != root
+    or mode & 0o222
+):
+    raise SystemExit("unsafe Kimi reader launch transition")
+os.chmod(path, mode | stat.S_IWUSR)
+' "$worktrees_root" "$clone_path" || return 1
+  printf '%s\n' "$fingerprint"
+}
+
 isolated_git() {
   sanitized_git "$@"
 }
@@ -1628,6 +1688,7 @@ for ((i=${#instance_ids[@]}-1; i>=0; i--)); do
   if [[ "${runners[$i]}" == "interactive" ]]; then
     agent_command="${commands[$i]}"
     instance_endpoint="${instance_control_sockets[$i]:-}"
+    kimi_reader_fingerprint=""
     if [[ -n "$mission_id" && "${providers[$i]}" == "openai" \
       && "${authorities[$i]}" != "control" ]]; then
       expected_sandbox="read-only"
@@ -1670,11 +1731,47 @@ for ((i=${#instance_ids[@]}-1; i>=0; i--)); do
       fi
       launch_cwd="${worktrees[$i]}"
     fi
+    # Kimi CLI 1.11 validates an explicit --work-dir as writable before its
+    # reduced read-only agent is loaded.  Permit only the clone root during
+    # provider startup; descendants remain physically read-only, no task has
+    # been submitted, and the exact root entry set is sealed.  Restore and
+    # revalidate the complete reader snapshot before publishing the manifest.
+    if [[ -n "$mission_id" && "${hook_sources[$i]}" == "kimi" \
+      && "${authorities[$i]}" != "write" ]]; then
+      kimi_reader_fingerprint="$(make_kimi_reader_root_cli_writable "$launch_cwd")" || {
+        echo "Could not prepare the read-only Kimi workspace for CLI startup." >&2
+        exit 1
+      }
+    fi
+    launch_rc=0
     launch_interactive_surface \
       "$surface" "${instance_ids[$i]}/${role_types[$i]}" "$launch_cwd" \
       "${role_types[$i]}" "${authorities[$i]}" "${required_envs[$i]}" \
       "$instance_endpoint" "$agent_command" "${ready_patterns[$i]}" \
-      "${executables[$i]}" || exit 1
+      "${executables[$i]}" || launch_rc=$?
+    if [[ -n "$kimi_reader_fingerprint" ]]; then
+      if ! make_reader_clone_read_only "$launch_cwd"; then
+        echo "Could not restore the Kimi reader snapshot to read-only mode." >&2
+        exit 1
+      fi
+      restored_fingerprint="$(reader_clone_root_fingerprint "$launch_cwd")" || {
+        echo "Could not verify the restored Kimi reader snapshot." >&2
+        exit 1
+      }
+      if [[ "$restored_fingerprint" != "$kimi_reader_fingerprint" ]]; then
+        echo "Kimi CLI startup changed the sealed reader root." >&2
+        exit 1
+      fi
+      set +e
+      reader_head="$(failed_reader_head "$launch_cwd" "$target_head")"
+      reader_rc=$?
+      set -e
+      if (( reader_rc != 0 )) || [[ "$reader_head" != "$target_head" ]]; then
+        echo "Kimi reader snapshot drifted during CLI startup (check=$reader_rc)." >&2
+        exit 1
+      fi
+    fi
+    (( launch_rc == 0 )) || exit "$launch_rc"
   else
     idle_command="clear; echo '== worker: ${instance_ids[$i]} (${role_types[$i]}) — idle =='; echo 'dispatch with: ./scripts/fleet-dispatch.sh $feature ${instance_ids[$i]} \"<task>\"'"
     if [[ -n "${worktrees[$i]:-}" ]]; then

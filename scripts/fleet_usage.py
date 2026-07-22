@@ -21,6 +21,7 @@ PROVIDER_CAPABILITIES: Mapping[str, str] = MappingProxyType(
     {
         "claude": "none",
         "codex": "none",
+        "kimi": "none",
         "ollama": "hard_output_only",
         "opencode": "none",
     }

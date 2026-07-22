@@ -35,8 +35,9 @@ class KimiReviewerTests(unittest.TestCase):
             self.assertNotIn('"kimi_cli.tools.file:Grep"', spec)
             for forbidden in ("Shell", "WriteFile", "StrReplaceFile"):
                 self.assertNotIn(forbidden, spec)
-        self.assertIn("kimi_cli.tools.multiagent:Task", main)
+        self.assertNotIn("kimi_cli.tools.multiagent:Task", main)
         self.assertNotIn("kimi_cli.tools.multiagent:Task", sub)
+        self.assertNotIn("\n  subagents:", main)
 
     def test_runner_pins_model_target_and_read_only_agent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

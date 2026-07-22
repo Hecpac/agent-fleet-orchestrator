@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +9,8 @@ from fleet_providers import BaseAdapter, ProviderError, ProviderIdentity
 
 
 AGENT_FILE = ".kimi/agents/fleet-reviewer/agent.yaml"
+NEWLINE_TOKEN = "<<<FDP_NEWLINE_7F4C2A91>>>"
+BACKSLASH_TOKEN = "<<<FDP_BACKSLASH_7F4C2A91>>>"
 UNSAFE_FLAGS = {
     "--yolo",
     "--yes",
@@ -77,8 +78,12 @@ class KimiAdapter(BaseAdapter):
         del prompt_path
         self._validate_source(identity)
         logical = self.logical_prompt(task, run_id)
+        if NEWLINE_TOKEN in logical or BACKSLASH_TOKEN in logical:
+            raise ProviderError("Kimi prompt collides with the inline transport tokens")
+        encoded = logical.replace("\\", BACKSLASH_TOKEN).replace("\n", NEWLINE_TOKEN)
         payload = (
-            "Decode the JSON string after FDP_PROMPT= as your exact prompt and follow it. "
-            f"FDP_PROMPT={json.dumps(logical, ensure_ascii=False)}"
+            f"Reconstruct your exact prompt by replacing every literal {NEWLINE_TOKEN} "
+            f"with a newline and every literal {BACKSLASH_TOKEN} with one backslash. "
+            f"Then follow it. FDP_PROMPT={encoded}"
         )
-        return {"prompt": logical, "payload": payload, "transport": "inline-json"}
+        return {"prompt": logical, "payload": payload, "transport": "inline-tokenized"}

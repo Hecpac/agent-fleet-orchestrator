@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "name": "kimi-audit",
+  "description": "Autonomous read-only Kimi K3 repository audit",
+  "preset": "kimi_audit",
+  "autonomy": {
+    "owner": "lead",
+    "allow_parallel": false,
+    "allow_subdelegation": false,
+    "max_delegation_depth": 0
+  },
+  "capabilities": {
+    "available": ["verify"],
+    "required_outcomes": ["lead_result"],
+    "writer": "none"
+  },
+  "risk": {
+    "minimum": "low",
+    "allow_lead_escalation": true,
+    "high_action": "confirm_assured"
+  },
+  "assurance": {
+    "profile": "proportional",
+    "preset": "fleet_dialogue",
+    "minimum_gates": ["fdp2", "human_build_exit", "fdp3"]
+  },
+  "audit": {
+    "mode": "signed",
+    "trust_scope": "local-development",
+    "worm_required_for": ["regulated"]
+  },
+  "archive": {
+    "mode": "incremental",
+    "content_policy": "full",
+    "include_final_tree": true,
+    "include_git_delta": true
+  },
+  "limits": {
+    "deadline_seconds": 3600,
+    "token_budget": 0,
+    "budget_mode": "soft",
+    "delegation_credits": 4,
+    "max_active_delegations": 1
+  }
+}

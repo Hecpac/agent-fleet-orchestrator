@@ -240,11 +240,11 @@
       "phase": "VERIFY",
       "runner": "interactive",
       "provider": "moonshot-ai",
-      "model": "moonshot-ai/kimi-k3",
+      "model": "kimi-code/kimi-for-coding",
       "hook_source": "kimi",
-      "command": ["kimi", "--model", "moonshot-ai/kimi-k3", "--thinking", "--agent-file", ".kimi/agents/fleet-reviewer/agent.yaml"],
+      "command": ["kimi", "--model", "kimi-code/kimi-for-coding", "--thinking", "--agent-file", ".kimi/agents/fleet-reviewer/agent.yaml"],
       "healthcheck": ["kimi", "info", "--json"],
-      "ready_pattern": "Welcome to Kimi Code CLI|💫[[:space:]]*$",
+      "ready_pattern": "Welcome to Kimi Code CLI|💫[[:space:]]*$|ctrl-x: toggle mode[[:space:]]+context:",
       "enabled": true,
       "requires_env": [],
       "capabilities": ["independent_code_review", "long_context_review", "architecture_challenge"],
@@ -326,6 +326,14 @@
       "identity_groups": [["build", "verify"]],
       "instances": [
         {"instance_id": "build", "role_type": "codex"},
+        {"instance_id": "verify", "role_type": "kimi"}
+      ]
+    },
+    "kimi_audit": {
+      "description": "Autonomous read-only Kimi K3 audit lane with a CONTROL lead.",
+      "mode": "autonomous",
+      "include_lead": true,
+      "instances": [
         {"instance_id": "verify", "role_type": "kimi"}
       ]
     },

@@ -93,24 +93,35 @@ trap cleanup_untransferred EXIT
 prompt_path="$(jq -er '.prompt_path // empty' <<< "$prepared")" || exit 75
 [[ -n "$prompt_path" && -n "$prompt" && -n "$payload" ]] || exit 75
 send_attempted=1
-since="$(date -u +%Y-%m-%dT%H:%M:%S)"
+since="$(jq -er '.dispatched_at // empty' <<< "$prepared")" || exit 75
 cmux send --surface "$surface" --workspace "$workspace" "$payload" >/dev/null
 [[ "${FLEET_SEND_KEY_DELAY:-0.2}" == "0" ]] || sleep "${FLEET_SEND_KEY_DELAY:-0.2}"
 cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
-# Some TUIs (codex) intermittently swallow the first Enter, leaving the
-# payload queued in the composer. Re-press Enter only while zero submissions
-# have been observed, so a slow-but-submitted turn is never double-entered.
 confirmed=0
-for _attempt in 1 2 3; do
+# Kimi records its submit through the local Wire bridge, which can lag the
+# physical keypress while its session binding is published. A second Enter is
+# unsafe there: Kimi may treat the remaining composer text as another prompt.
+if [[ "$hook_source" == "kimi" ]]; then
   if python3 "$frontier" confirm-submit "$runs_dir" \
     --feature "$feature" --instance "$instance_id" --run-id "$run_id" \
     --workspace-uuid "$workspace_uuid" --hook-source "$hook_source" \
-    --since "$since" --timeout "${FLEET_CONFIRM_SUBMIT_TIMEOUT:-6}" >/dev/null 2>&1; then
+    --since "$since" --timeout "${FLEET_KIMI_CONFIRM_SUBMIT_TIMEOUT:-30}" >/dev/null 2>&1; then
     confirmed=1
-    break
   fi
-  cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
-done
+else
+  # Codex-like TUIs can intermittently swallow Enter while leaving the full
+  # payload queued. Retry only while no physical submission is observable.
+  for _attempt in 1 2 3; do
+    if python3 "$frontier" confirm-submit "$runs_dir" \
+      --feature "$feature" --instance "$instance_id" --run-id "$run_id" \
+      --workspace-uuid "$workspace_uuid" --hook-source "$hook_source" \
+      --since "$since" --timeout "${FLEET_CONFIRM_SUBMIT_TIMEOUT:-6}" >/dev/null 2>&1; then
+      confirmed=1
+      break
+    fi
+    cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
+  done
+fi
 if (( confirmed == 0 )); then
   python3 "$frontier" confirm-submit "$runs_dir" \
     --feature "$feature" --instance "$instance_id" --run-id "$run_id" \
@@ -120,7 +131,7 @@ fi
 entered=1
 if [[ "$output_mode" == "--json" ]]; then
   cmux read-screen --surface "$surface" --workspace "$workspace" --lines 8 >/dev/null || true
-  jq -n --arg run_id "$run_id" --arg feature "$feature" \
+  jq -nc --arg run_id "$run_id" --arg feature "$feature" \
     --arg instance "$instance_id" --arg role "$role" --arg surface "$surface" \
     '{run_id:$run_id,feature:$feature,instance:$instance,role:$role,surface:$surface,runner:"interactive"}'
 else

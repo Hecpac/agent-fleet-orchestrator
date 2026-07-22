@@ -49,7 +49,7 @@ class FleetProviderTests(unittest.TestCase):
         cases = (
             ("openai", "gpt-test", "codex", "pointer"),
             ("anthropic", "claude-test", "claude", "pointer"),
-            ("moonshot-ai", "kimi-test", "kimi", "inline-json"),
+            ("moonshot-ai", "kimi-test", "kimi", "inline-tokenized"),
             ("minimax", "MiniMax-M3", "opencode", "inline-json"),
         )
         for provider, model, source, transport in cases:
@@ -64,10 +64,17 @@ class FleetProviderTests(unittest.TestCase):
                     fleet_frontier.prompt_with_contract(task, run_id, hook_source=source),
                 )
                 self.assertIn(f"FLEET_RESULT:{run_id}:<STATUS>", submission["prompt"])
-                if source in {"kimi", "opencode"}:
+                if source == "opencode":
                     self.assertNotIn("\n", submission["payload"])
                     logical = json.loads(submission["payload"].rsplit("FDP_PROMPT=", 1)[1])
                     self.assertTrue(logical.startswith(task))
+                elif source == "kimi":
+                    self.assertNotIn("\n", submission["payload"])
+                    encoded = submission["payload"].rsplit("FDP_PROMPT=", 1)[1]
+                    logical = encoded.replace(
+                        "<<<FDP_NEWLINE_7F4C2A91>>>", "\n"
+                    ).replace("<<<FDP_BACKSLASH_7F4C2A91>>>", "\\")
+                    self.assertEqual(logical, submission["prompt"])
                 else:
                     self.assertTrue(submission["payload"].startswith(f"FLEET_RUN {run_id}:"))
 

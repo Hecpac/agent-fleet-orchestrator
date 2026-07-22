@@ -26,7 +26,7 @@ class WorkflowConfigTests(unittest.TestCase):
         self.router = workflow_config.router_config.load_router()
 
     def test_repository_workflows_compile_against_router(self) -> None:
-        expected = {"hotfix", "implementation", "local-worm", "research"}
+        expected = {"hotfix", "implementation", "kimi-audit", "local-worm", "research"}
         paths = sorted((ROOT / "workflows").glob("*.yaml"))
         compiled = [
             workflow_config.compile_path(path)
@@ -46,6 +46,15 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertEqual(
             implementation["resolved"]["assurance_identity_groups"],
             [["maker", "checker", "challenge", "verify"]],
+        )
+        kimi_audit = next(
+            item for item in compiled if item["workflow"]["name"] == "kimi-audit"
+        )
+        self.assertEqual(kimi_audit["resolved"]["mode"], "autonomous")
+        self.assertIsNone(kimi_audit["resolved"]["writer_instance"])
+        self.assertEqual(
+            [item["instance_id"] for item in kimi_audit["resolved"]["instances"]],
+            ["verify"],
         )
         local_worm = next(
             item for item in compiled if item["workflow"]["name"] == "local-worm"
