@@ -35,11 +35,11 @@ class OpenCodeAdapter(BaseAdapter):
         del prompt_path
         self._validate_source(identity)
         logical = self.logical_prompt(task, run_id)
-        prompt = (
+        payload = (
             "Decode the JSON string after FDP_PROMPT= as your exact prompt and follow it. "
             f"FDP_PROMPT={json.dumps(logical, ensure_ascii=False)}"
         )
-        return {"prompt": prompt, "payload": prompt, "transport": "inline-json"}
+        return {"prompt": logical, "payload": payload, "transport": "inline-json"}
 
     def observe(self, event: dict[str, Any], state: dict[str, Any]) -> str:
         value = super().observe(event, state)

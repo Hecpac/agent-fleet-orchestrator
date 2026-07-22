@@ -76,7 +76,7 @@ class FleetSendTests(unittest.TestCase):
         path.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
-    def _manifest(self, hook_source: str) -> None:
+    def _manifest(self, hook_source: str, *extra_lines: str) -> None:
         (self.runs / "fleet-test.manifest").write_text(
             "\n".join(
                 (
@@ -91,6 +91,7 @@ class FleetSendTests(unittest.TestCase):
                     "agent.model=kimi-k3",
                     f"agent.hook_source={hook_source}",
                     "agent.variant=",
+                    *extra_lines,
                 )
             )
             + "\n",
@@ -130,6 +131,62 @@ class FleetSendTests(unittest.TestCase):
         self.assertIn(
             "--since 2026-07-20T18:30:16.333420+00:00", frontier_calls
         )
+
+    def _send_env(self) -> dict[str, str]:
+        return {
+            **os.environ,
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "FLEET_RUNS_DIR": str(self.runs),
+            "FLEET_SEND_KEY_DELAY": "0",
+            "FLEET_CONFIRM_SUBMIT_TIMEOUT": "0",
+            "FLEET_TEST_CONFIRM_FIRST_FAIL": "1",
+            "FLEET_TEST_CMUX_LOG": str(self.cmux_log),
+            "FLEET_TEST_FRONTIER_LOG": str(self.frontier_log),
+            "FLEET_TEST_CONFIRM_COUNT": str(self.confirm_count),
+        }
+
+    def _enter_calls(self) -> list[str]:
+        cmux_calls = self.cmux_log.read_text(encoding="utf-8").splitlines()
+        return [call for call in cmux_calls if call.startswith("send-key ")]
+
+    def test_manifest_submit_semantics_govern_the_enter_loop_not_the_name(
+        self,
+    ) -> None:
+        self._manifest(
+            "codex",
+            "provider.codex.submit.repress_safe=false",
+            "provider.codex.submit.confirm_timeout_seconds=1",
+            "provider.codex.submit.event_source=cmux",
+        )
+        result = subprocess.run(
+            ["bash", str(FLEET_SEND), "test", "agent", "audit the target", "--json"],
+            cwd=ROOT,
+            env=self._send_env(),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self._enter_calls()), 1, self._enter_calls())
+
+    def test_legacy_manifest_without_submit_semantics_keeps_repress_fallback(
+        self,
+    ) -> None:
+        self._manifest("codex")
+        result = subprocess.run(
+            ["bash", str(FLEET_SEND), "test", "agent", "audit the target", "--json"],
+            cwd=ROOT,
+            env=self._send_env(),
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self._enter_calls()), 2, self._enter_calls())
 
 
 if __name__ == "__main__":

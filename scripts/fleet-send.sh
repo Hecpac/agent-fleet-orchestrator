@@ -98,30 +98,41 @@ cmux send --surface "$surface" --workspace "$workspace" "$payload" >/dev/null
 [[ "${FLEET_SEND_KEY_DELAY:-0.2}" == "0" ]] || sleep "${FLEET_SEND_KEY_DELAY:-0.2}"
 cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
 confirmed=0
-# Kimi records its submit through the local Wire bridge, which can lag the
-# physical keypress while its session binding is published. A second Enter is
-# unsafe there: Kimi may treat the remaining composer text as another prompt.
-if [[ "$hook_source" == "kimi" ]]; then
+# The submit semantics are declared per CLI in router.providers and copied
+# into the manifest at boot. repress_safe=true marks TUIs that can swallow
+# the first Enter while keeping the payload queued (safe to re-press while
+# zero submissions were observed). repress_safe=false marks TUIs whose
+# submission evidence can lag the keypress (a second Enter could submit the
+# remaining composer text as another prompt), so exactly one Enter is sent.
+repress_safe="$(manifest_value "provider.$hook_source.submit.repress_safe")"
+confirm_timeout="$(manifest_value "provider.$hook_source.submit.confirm_timeout_seconds")"
+if [[ -z "$repress_safe" || -z "$confirm_timeout" ]]; then
+  # Manifests written before the declarative providers section: preserve the
+  # exact semantics that were hardcoded when those fleets were booted.
+  if [[ "$hook_source" == "kimi" ]]; then
+    repress_safe="false"
+    confirm_timeout=30
+  else
+    repress_safe="true"
+    confirm_timeout=6
+  fi
+fi
+confirm_timeout="${FLEET_CONFIRM_SUBMIT_TIMEOUT:-$confirm_timeout}"
+[[ "$hook_source" != "kimi" ]] || \
+  confirm_timeout="${FLEET_KIMI_CONFIRM_SUBMIT_TIMEOUT:-$confirm_timeout}"
+attempts=1
+[[ "$repress_safe" != "true" ]] || attempts=3
+for ((_attempt=1; _attempt<=attempts; _attempt++)); do
   if python3 "$frontier" confirm-submit "$runs_dir" \
     --feature "$feature" --instance "$instance_id" --run-id "$run_id" \
     --workspace-uuid "$workspace_uuid" --hook-source "$hook_source" \
-    --since "$since" --timeout "${FLEET_KIMI_CONFIRM_SUBMIT_TIMEOUT:-30}" >/dev/null 2>&1; then
+    --since "$since" --timeout "$confirm_timeout" >/dev/null 2>&1; then
     confirmed=1
+    break
   fi
-else
-  # Codex-like TUIs can intermittently swallow Enter while leaving the full
-  # payload queued. Retry only while no physical submission is observable.
-  for _attempt in 1 2 3; do
-    if python3 "$frontier" confirm-submit "$runs_dir" \
-      --feature "$feature" --instance "$instance_id" --run-id "$run_id" \
-      --workspace-uuid "$workspace_uuid" --hook-source "$hook_source" \
-      --since "$since" --timeout "${FLEET_CONFIRM_SUBMIT_TIMEOUT:-6}" >/dev/null 2>&1; then
-      confirmed=1
-      break
-    fi
+  [[ "$repress_safe" != "true" ]] || \
     cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
-  done
-fi
+done
 if (( confirmed == 0 )); then
   python3 "$frontier" confirm-submit "$runs_dir" \
     --feature "$feature" --instance "$instance_id" --run-id "$run_id" \

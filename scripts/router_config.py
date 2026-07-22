@@ -41,6 +41,9 @@ RUNNERS = {"interactive", "local"}
 AUTHORITIES = {"control", "write", "advisory", "verification"}
 RESOURCE_CLASSES = {"remote", "local_light", "local_heavy"}
 PHASES = {"CONTROL", "RECON", "BUILD", "CHALLENGE", "VERIFY"}
+INTERACTIVE_HOOK_SOURCES = {"codex", "claude", "kimi", "opencode"}
+TRANSPORTS = {"pointer", "inline-json", "inline-tokenized"}
+SUBMIT_EVENT_SOURCES = {"cmux", "wire-bridge"}
 EXECUTION_MODES = {"autonomous", "guided", "assured"}
 US = "\x1f"
 OPENCODE_AGENTS_DIR = ROOT / ".opencode" / "agents"
@@ -319,7 +322,15 @@ def validate_router(config: dict[str, Any]) -> None:
     config = _expect_mapping(config, "router")
     _expect_keys(
         config,
-        required={"schema_version", "defaults", "limits", "lead", "roles", "presets"},
+        required={
+            "schema_version",
+            "defaults",
+            "providers",
+            "limits",
+            "lead",
+            "roles",
+            "presets",
+        },
         where="router",
     )
     if config["schema_version"] != 3:
@@ -329,6 +340,33 @@ def validate_router(config: dict[str, Any]) -> None:
     _expect_keys(defaults, required={"preset", "race_roles"}, where="router.defaults")
     _expect_identifier(defaults["preset"], "router.defaults.preset", allow_reserved=True)
     race_roles = _expect_string_list(defaults["race_roles"], "router.defaults.race_roles", nonempty=True)
+
+    providers = _expect_mapping(config["providers"], "router.providers")
+    if not providers:
+        raise RouterError("router.providers must not be empty")
+    for provider_hook, raw_entry in providers.items():
+        provider_where = f"router.providers.{provider_hook}"
+        if provider_hook not in INTERACTIVE_HOOK_SOURCES:
+            raise RouterError(f"{provider_where} is not a supported interactive hook_source")
+        entry = _expect_mapping(raw_entry, provider_where)
+        _expect_keys(entry, required={"submit"}, where=provider_where)
+        submit = _expect_mapping(entry["submit"], f"{provider_where}.submit")
+        _expect_keys(
+            submit,
+            required={"repress_safe", "confirm_timeout_seconds", "event_source"},
+            where=f"{provider_where}.submit",
+        )
+        if not isinstance(submit["repress_safe"], bool):
+            raise RouterError(f"{provider_where}.submit.repress_safe must be boolean")
+        timeout = submit["confirm_timeout_seconds"]
+        if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
+            raise RouterError(
+                f"{provider_where}.submit.confirm_timeout_seconds must be a positive integer"
+            )
+        if submit["event_source"] not in SUBMIT_EVENT_SOURCES:
+            raise RouterError(
+                f"{provider_where}.submit.event_source must be one of {sorted(SUBMIT_EVENT_SOURCES)}"
+            )
 
     limits = _expect_mapping(config["limits"], "router.limits")
     _expect_keys(
@@ -372,7 +410,10 @@ def validate_router(config: dict[str, Any]) -> None:
         "variant",
         "instructions",
         "hook_source",
+        "transport",
+        "num_predict",
     }
+    used_hook_sources: set[str] = set()
     for role_type, raw_role in roles.items():
         _expect_identifier(role_type, f"router.roles.{role_type}", allow_reserved=True)
         role = _expect_mapping(raw_role, f"router.roles.{role_type}")
@@ -440,6 +481,20 @@ def validate_router(config: dict[str, Any]) -> None:
         _expect_rank(role["display_rank"], f"router.roles.{role_type}.display_rank")
         if isinstance(role["concurrency"], bool) or not isinstance(role["concurrency"], int) or role["concurrency"] < 1:
             raise RouterError(f"router.roles.{role_type}.concurrency must be a positive integer")
+        if role["runner"] != "interactive" and "transport" in role:
+            raise RouterError(
+                f"router.roles.{role_type}.transport is supported only for interactive roles"
+            )
+        if "num_predict" in role:
+            if role["runner"] != "local":
+                raise RouterError(
+                    f"router.roles.{role_type}.num_predict is supported only for local workers"
+                )
+            num_predict = role["num_predict"]
+            if isinstance(num_predict, bool) or not isinstance(num_predict, int) or num_predict < 1:
+                raise RouterError(
+                    f"router.roles.{role_type}.num_predict must be a positive integer"
+                )
 
         if role["runner"] == "interactive":
             _expect_command(role.get("command"), f"router.roles.{role_type}.command")
@@ -464,10 +519,19 @@ def validate_router(config: dict[str, Any]) -> None:
                 f"router.roles.{role_type}.hook_source",
                 allow_reserved=True,
             )
-            if hook_source not in {"codex", "claude", "kimi", "opencode"}:
+            if hook_source not in INTERACTIVE_HOOK_SOURCES:
                 raise RouterError(
                     f"router.roles.{role_type}.hook_source is not supported: {hook_source}"
                 )
+            if role.get("transport") not in TRANSPORTS:
+                raise RouterError(
+                    f"router.roles.{role_type}.transport must be one of {sorted(TRANSPORTS)}"
+                )
+            if hook_source not in providers:
+                raise RouterError(
+                    f"router.roles.{role_type}.hook_source has no router.providers entry: {hook_source}"
+                )
+            used_hook_sources.add(hook_source)
             if hook_source != "opencode" and "variant" in role:
                 raise RouterError(
                     f"router.roles.{role_type}.variant is supported only for OpenCode"
@@ -619,6 +683,13 @@ def validate_router(config: dict[str, Any]) -> None:
             )
         except fleet_providers.ProviderError as exc:
             raise RouterError(f"router.roles.{role_type} provider adapter: {exc}") from exc
+
+    unused_providers = sorted(set(providers) - used_hook_sources)
+    if unused_providers:
+        raise RouterError(
+            "router.providers has entries with no interactive role: "
+            + ", ".join(unused_providers)
+        )
 
     for role_type in race_roles:
         if role_type not in roles:
@@ -942,6 +1013,7 @@ def build_plan(
         "lead": lead,
         "instances": resolved,
         "identity_groups": identity_groups,
+        "providers": copy.deepcopy(config["providers"]),
         "limits": copy.deepcopy(config["limits"]),
         "warnings": warnings,
     }
@@ -1009,6 +1081,19 @@ def _records(plan: dict[str, Any], binding: dict[str, str] | None = None) -> str
                     instance["provider"],
                     instance.get("hook_source", ""),
                     instance.get("variant", ""),
+                ]
+            )
+        )
+    for hook_source in sorted(plan.get("providers", {})):
+        submit = plan["providers"][hook_source]["submit"]
+        lines.append(
+            US.join(
+                [
+                    "PROVIDER",
+                    hook_source,
+                    "true" if submit["repress_safe"] else "false",
+                    str(submit["confirm_timeout_seconds"]),
+                    submit["event_source"],
                 ]
             )
         )

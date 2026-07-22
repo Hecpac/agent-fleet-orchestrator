@@ -288,6 +288,10 @@ providers=()
 hook_sources=()
 variants=()
 identity_groups=()
+provider_hooks=()
+provider_repress=()
+provider_timeouts=()
+provider_events=()
 warnings=()
 
 while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n o p; do
@@ -333,6 +337,12 @@ while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n o p; do
       providers+=("$n")
       hook_sources+=("$o")
       variants+=("$p")
+      ;;
+    PROVIDER)
+      provider_hooks+=("$a")
+      provider_repress+=("$b")
+      provider_timeouts+=("$c")
+      provider_events+=("$d")
       ;;
     IDENTITY_GROUP)
       identity_groups+=("$b")
@@ -1830,6 +1840,11 @@ manifest_tmp="$(mktemp "$runs_dir/.fleet-$feature.manifest.XXXXXX")"
   echo "identity_group.count=${#identity_groups[@]}"
   for ((i=0; i<${#identity_groups[@]}; i++)); do
     echo "identity_group.$((i + 1))=${identity_groups[$i]}"
+  done
+  for ((i=0; i<${#provider_hooks[@]}; i++)); do
+    echo "provider.${provider_hooks[$i]}.submit.repress_safe=${provider_repress[$i]}"
+    echo "provider.${provider_hooks[$i]}.submit.confirm_timeout_seconds=${provider_timeouts[$i]}"
+    echo "provider.${provider_hooks[$i]}.submit.event_source=${provider_events[$i]}"
   done
   [[ -z "$mission_id" ]] || echo "mission_id=$mission_id"
   [[ -z "$control_socket" ]] || echo "control_socket=$control_socket"

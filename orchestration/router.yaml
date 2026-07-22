@@ -4,6 +4,20 @@
     "preset": "small",
     "race_roles": ["codex_candidate", "minimax_candidate"]
   },
+  "providers": {
+    "claude": {
+      "submit": {"repress_safe": true, "confirm_timeout_seconds": 6, "event_source": "cmux"}
+    },
+    "codex": {
+      "submit": {"repress_safe": true, "confirm_timeout_seconds": 6, "event_source": "cmux"}
+    },
+    "kimi": {
+      "submit": {"repress_safe": false, "confirm_timeout_seconds": 30, "event_source": "wire-bridge"}
+    },
+    "opencode": {
+      "submit": {"repress_safe": true, "confirm_timeout_seconds": 6, "event_source": "cmux"}
+    }
+  },
   "limits": {
     "max_local_heavy_in_flight": 1,
     "max_parallel_local_workers": 3,
@@ -83,6 +97,7 @@
       "provider": "openai",
       "model": "gpt-5.6-sol",
       "hook_source": "codex",
+      "transport": "pointer",
       "command": ["codex", "--model", "gpt-5.6-sol"],
       "healthcheck": ["codex", "login", "status"],
       "ready_pattern": "^[[:space:]]*›[[:space:]].+",
@@ -101,6 +116,7 @@
       "provider": "openai",
       "model": "gpt-5.6-sol",
       "hook_source": "codex",
+      "transport": "pointer",
       "command": ["codex", "--model", "gpt-5.6-sol"],
       "healthcheck": ["codex", "login", "status"],
       "ready_pattern": "^[[:space:]]*›[[:space:]].+",
@@ -119,6 +135,7 @@
       "provider": "anthropic",
       "model": "claude-fable-5",
       "hook_source": "claude",
+      "transport": "pointer",
       "command": ["claude", "--model", "claude-fable-5", "--no-chrome"],
       "healthcheck": ["claude", "auth", "status"],
       "ready_pattern": "^[[:space:]]*❯[[:space:]]*$|new task\\?",
@@ -152,6 +169,7 @@
       "provider": "zai",
       "model": "glm-5.2",
       "hook_source": "opencode",
+      "transport": "inline-json",
       "command": ["opencode", "-m", "zai/glm-5.2", "--agent", "glm-challenger"],
       "healthcheck": ["opencode", "--version"],
       "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
@@ -171,6 +189,7 @@
       "model": "MiniMax-M3",
       "variant": "none",
       "hook_source": "opencode",
+      "transport": "inline-json",
       "command": ["opencode", "--agent", "fleet-reviewer"],
       "healthcheck": ["opencode", "--version"],
       "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
@@ -190,6 +209,7 @@
       "model": "MiniMax-M3",
       "variant": "none",
       "hook_source": "opencode",
+      "transport": "inline-json",
       "command": ["opencode", "--agent", "fleet-reviewer"],
       "healthcheck": ["opencode", "--version"],
       "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
@@ -209,6 +229,7 @@
       "model": "MiniMax-M3",
       "variant": "none",
       "hook_source": "opencode",
+      "transport": "inline-json",
       "command": ["opencode", "--agent", "minimax-checker"],
       "healthcheck": ["opencode", "--version"],
       "ready_pattern": "ctrl\\+p commands|\\.opencode/agents/|[0-9]+\\.[0-9]+\\.[0-9]+[[:space:]]*$",
@@ -234,6 +255,7 @@
       "resource_class": "local_heavy",
       "display_rank": 50,
       "concurrency": 1,
+      "num_predict": 2048,
       "instructions": "You review supplied diffs and evidence for security, architecture, regressions, and missing tests."
     },
     "kimi": {
@@ -242,6 +264,7 @@
       "provider": "moonshot-ai",
       "model": "kimi-code/kimi-for-coding",
       "hook_source": "kimi",
+      "transport": "inline-tokenized",
       "command": ["kimi", "--model", "kimi-code/kimi-for-coding", "--thinking", "--agent-file", ".kimi/agents/fleet-reviewer/agent.yaml"],
       "healthcheck": ["kimi", "info", "--json"],
       "ready_pattern": "Welcome to Kimi Code CLI|💫[[:space:]]*$|ctrl-x: toggle mode[[:space:]]+context:",
@@ -260,6 +283,7 @@
       "provider": "anthropic",
       "model": "claude-fable-5",
       "hook_source": "claude",
+      "transport": "pointer",
       "command": ["claude", "--model", "claude-fable-5", "--effort", "xhigh", "--permission-mode", "plan", "--no-chrome", "--append-system-prompt", "HARD OUTPUT CONTRACT - NON-NEGOTIABLE: when the prompt requests JSON, your entire visible reply is exactly one JSON object, then the fleet sentinel on its own final line. Nothing else, ever. The first visible character of your final answer must be {. FORBIDDEN before, between, or after the JSON and the sentinel: prose, preambles, tool-availability notes, conclusions, headings, bullet lists, tables, Markdown fences, or status narration. One stray visible word outside the JSON invalidates the run. All analysis stays internal; anything worth reporting goes inside the JSON fields the prompt defines."],
       "healthcheck": ["claude", "auth", "status"],
       "ready_pattern": "^[[:space:]]*❯[[:space:]]*$|new task\\?",

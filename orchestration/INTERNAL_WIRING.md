@@ -1273,3 +1273,34 @@ the remaining staged leaves by durable identity. The locking test pins exit
 code 137 and a short socket root so the injected crash really executes on
 every platform; without the sweep, every mid-publish crash leaves stale
 staged sockets behind and the stop's emptiness contract is false.
+
+## Provider transport and submit semantics are declarative and conformance-locked
+
+`rule: provider_dialects_conform_to_one_declared_contract`
+
+`enforced_by:`
+
+- `tests/test_provider_conformance.py::TransportConformanceTests::test_every_adapter_returns_the_exact_submission_shape`
+- `tests/test_provider_conformance.py::TransportConformanceTests::test_prompt_is_always_the_logical_prompt_never_a_wrapper`
+- `tests/test_provider_conformance.py::TransportConformanceTests::test_inline_payloads_are_single_line_and_pointer_references_disk`
+- `tests/test_provider_conformance.py::TransportConformanceTests::test_declared_role_transport_matches_adapter_output`
+- `tests/test_provider_conformance.py::SubmitSemanticsConformanceTests::test_providers_section_covers_exactly_the_interactive_hook_sources`
+- `tests/test_provider_conformance.py::SubmitSemanticsConformanceTests::test_plan_records_publish_provider_submit_semantics`
+- `tests/test_provider_conformance.py::StrictSchemaConformanceTests::test_every_mcp_enum_declares_an_explicit_type`
+- `tests/test_fleet_send.py::FleetSendTests::test_manifest_submit_semantics_govern_the_enter_loop_not_the_name`
+- `tests/test_fleet_send.py::FleetSendTests::test_legacy_manifest_without_submit_semantics_keeps_repress_fallback`
+
+`why:` Each provider CLI is a dialect (transport wrapper, submit confirmation,
+schema strictness), and chasing quirks with per-provider shims turned every CLI
+release into a production surprise. The contract is therefore declared once:
+`router.providers` binds submit semantics (`repress_safe`,
+`confirm_timeout_seconds`, `event_source`) to each interactive hook_source and
+every interactive role declares its `transport`; `fleet-up.sh` copies the
+semantics into the manifest and `fleet-send.sh` obeys the manifest, never a
+hardcoded provider name. Every adapter returns `{prompt, payload, transport}`
+where `prompt` is the durable logical evidence — never a wire wrapper — inline
+payloads stay single-line for TUI composers, and MCP enums carry explicit
+types because strict consumers (Kimi CLI) reject inferred ones. A provider
+that breaks protocol now turns this suite red instead of failing inside a
+live fleet; pre-contract manifests keep their exact frozen semantics through
+the legacy fallback.
