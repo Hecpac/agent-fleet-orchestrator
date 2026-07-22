@@ -186,6 +186,14 @@ def choose_input_mode(
     return "inline"
 
 
+def fusion_template_hash() -> str:
+    return hashlib.sha256(FUSION_TEMPLATE.read_bytes()).hexdigest()
+
+
+def rendered_prompt_hash(rendered: str) -> str:
+    return hashlib.sha256(rendered.encode()).hexdigest()
+
+
 def _signal_group(process: subprocess.Popen[str], signum: int) -> None:
     try:
         os.killpg(os.getpgid(process.pid), signum)

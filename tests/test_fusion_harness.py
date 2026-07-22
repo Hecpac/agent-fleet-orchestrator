@@ -303,6 +303,18 @@ class FusionRenderTests(unittest.TestCase):
         self.assertEqual(choose("a", "b" * 60_001, template_chars=5000, budget=160_000), "path")
         self.assertEqual(choose("a" * 50_000, "b" * 50_000, template_chars=70_000, budget=160_000), "path")
 
+    def test_template_hash_is_byte_exact_and_input_independent(self) -> None:
+        import hashlib
+
+        expected = hashlib.sha256(FUSION_TEMPLATE.read_bytes()).hexdigest()
+        self.assertEqual(self.harness.fusion_template_hash(), expected)
+
+    def test_rendered_hash_is_reproducible_and_sensitive(self) -> None:
+        first = self.harness.rendered_prompt_hash(self._render())
+        self.assertEqual(first, self.harness.rendered_prompt_hash(self._render()))
+        other = self.harness.rendered_prompt_hash(self._render(architect="different"))
+        self.assertNotEqual(first, other)
+
 
 if __name__ == "__main__":
     unittest.main()
