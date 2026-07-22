@@ -206,6 +206,8 @@ class FusionTemplateTests(unittest.TestCase):
 
     def test_template_declares_every_variable_and_contract_section(self) -> None:
         text = FUSION_TEMPLATE.read_text(encoding="utf-8")
+        import re
+
         for variable in (
             "{{QUESTION}}",
             "{{FUSION_INSTRUCTION}}",
@@ -216,12 +218,12 @@ class FusionTemplateTests(unittest.TestCase):
             "{{BUILDER_CONTENT}}",
         ):
             self.assertIn(variable, text)
+        for heading in ("# Fused Answer", "# Consensus & Divergence", "# Discarded"):
+            self.assertRegex(text, rf"(?m)^{re.escape(heading)}$")
         for section in (
-            "# Fused Answer",
             "## Supported consensus",
             "## Genuine divergence",
             "## Uncertainty",
-            "# Discarded",
             "popularity-trap",
             "UNTRUSTED DATA",
         ):
