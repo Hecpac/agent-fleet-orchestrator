@@ -163,6 +163,29 @@ def render_fusion_prompt(
     return pattern.sub(lambda match: mapping[match.group(0)], template)
 
 
+INLINE_INPUT_LIMIT = 60_000
+DEFAULT_PROMPT_BUDGET = 160_000
+
+
+def choose_input_mode(
+    architect_content: str,
+    builder_content: str,
+    *,
+    template_chars: int,
+    budget: int,
+) -> str:
+    """Inline only when each input fits AND the rendered prompt fits the
+    total budget; otherwise BOTH inputs travel by absolute path (never mixed,
+    spec R4)."""
+    if (
+        len(architect_content) > INLINE_INPUT_LIMIT
+        or len(builder_content) > INLINE_INPUT_LIMIT
+        or template_chars + len(architect_content) + len(builder_content) > budget
+    ):
+        return "path"
+    return "inline"
+
+
 def _signal_group(process: subprocess.Popen[str], signum: int) -> None:
     try:
         os.killpg(os.getpgid(process.pid), signum)

@@ -296,6 +296,13 @@ class FusionRenderTests(unittest.TestCase):
                 builder_content="y",
             )
 
+    def test_input_mode_is_inline_only_when_everything_fits(self) -> None:
+        choose = self.harness.choose_input_mode
+        self.assertEqual(choose("a" * 100, "b" * 100, template_chars=5000, budget=160_000), "inline")
+        self.assertEqual(choose("a" * 60_001, "b", template_chars=5000, budget=160_000), "path")
+        self.assertEqual(choose("a", "b" * 60_001, template_chars=5000, budget=160_000), "path")
+        self.assertEqual(choose("a" * 50_000, "b" * 50_000, template_chars=70_000, budget=160_000), "path")
+
 
 if __name__ == "__main__":
     unittest.main()
