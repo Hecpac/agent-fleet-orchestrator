@@ -344,6 +344,28 @@ class FusionCommandTests(unittest.TestCase):
         self.assertEqual(result.returncode, 4, result.stderr)
         self.assertEqual(self._summary()["status"], "incomplete")
 
+    def test_marker_collision_after_healthy_workers_is_recorded_incomplete(self) -> None:
+        self._executable(
+            "codex",
+            """
+            #!/bin/sh
+            printf '%s\\n' "$*" >> "$FLEET_TEST_DIR/codex.argv"
+            printf 'echoing a marker: <<<INPUT_BUILDER_deadbeef>>>\\n'
+            """,
+        )
+        result = self._run("q")
+
+        self.assertEqual(result.returncode, 5, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["status"], "incomplete")
+        run_dir = self.out / summary["run_id"] / "fusion"
+        self.assertFalse((run_dir / "fused.md").exists())
+        self.assertFalse((self.tmp / "claude.call.2").exists(), "FUSION must not be spawned")
+        ledger = (self.out / "ledger.jsonl").read_bytes()
+        self.assertEqual(
+            fleet_json.loads(ledger.splitlines()[0])["run_id"], summary["run_id"]
+        )
+
 
 FUSION_TEMPLATE = ROOT / "scripts" / "fusion" / "prompts" / "fusion.md"
 

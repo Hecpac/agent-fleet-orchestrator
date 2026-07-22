@@ -455,27 +455,36 @@ def fusion(args: argparse.Namespace) -> int:
     # Question and operator instruction count toward the fixed overhead:
     # a huge question must not push an "inline" decision over budget.
     fixed_overhead = len(template) + len(question) + len(instruction)
-    input_mode = choose_input_mode(
-        architect_text,
-        builder_text,
-        template_chars=fixed_overhead,
-        budget=budget,
-    )
-    if input_mode == "inline":
-        architect_content, builder_content = architect_text, builder_text
-    else:
-        architect_content = f"READ THIS FILE COMPLETELY: {run_dir / 'architect.md'}"
-        builder_content = f"READ THIS FILE COMPLETELY: {run_dir / 'builder.md'}"
-
     spec = TIERS[tier]["architect"]
-    rendered = render_fusion_prompt(
-        question=question,
-        instruction=instruction,
-        architect_model=spec["model"],
-        builder_model=TIERS[tier]["builder"]["model"],
-        architect_content=architect_content,
-        builder_content=builder_content,
-    )
+    try:
+        input_mode = choose_input_mode(
+            architect_text,
+            builder_text,
+            template_chars=fixed_overhead,
+            budget=budget,
+        )
+        if input_mode == "inline":
+            architect_content, builder_content = architect_text, builder_text
+        else:
+            architect_content = (
+                f"READ THIS FILE COMPLETELY: {run_dir / 'architect.md'}"
+            )
+            builder_content = f"READ THIS FILE COMPLETELY: {run_dir / 'builder.md'}"
+
+        rendered = render_fusion_prompt(
+            question=question,
+            instruction=instruction,
+            architect_model=spec["model"],
+            builder_model=TIERS[tier]["builder"]["model"],
+            architect_content=architect_content,
+            builder_content=builder_content,
+        )
+    except FusionError as error:
+        # Post-gate failure (spec exit family 4/5): both workers already
+        # succeeded, so the run is a recorded incomplete, never a silent
+        # exit-2 that would leave no summary/ledger trace of healthy work.
+        print(f"fusion: {error}", file=sys.stderr)
+        return finish("incomplete", 5)
     rendered_hash = rendered_prompt_hash(rendered)
     fusion_argv = [
         part.replace("{prompt}", rendered).replace("{model}", spec["model"])
