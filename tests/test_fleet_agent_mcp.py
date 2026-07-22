@@ -131,6 +131,9 @@ class FleetAgentMCPProtocolTests(unittest.TestCase):
             self.assertTrue(
                 {"_caller_run_id", "_caller_token_id"} <= set(schema["required"])
             )
+            for property_schema in schema["properties"].values():
+                if "enum" in property_schema:
+                    self.assertEqual(property_schema.get("type"), "string")
             self.assertEqual(schema["properties"]["_caller_run_id"]["format"], "uuid")
             self.assertEqual(schema["properties"]["_caller_token_id"]["format"], "uuid")
         serialized = json.dumps(tools, sort_keys=True)

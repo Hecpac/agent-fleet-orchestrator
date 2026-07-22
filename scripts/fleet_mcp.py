@@ -101,8 +101,11 @@ DECISION_BRIEF_SCHEMA = {
             "items": {"type": "string"},
             "minItems": 1,
         },
-        "impact": {"enum": ["blocking", "checkpoint"]},
-        "risk": {"enum": ["low", "medium", "high", "unknown"]},
+        "impact": {"type": "string", "enum": ["blocking", "checkpoint"]},
+        "risk": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "unknown"],
+        },
         "reversible": {"type": "boolean"},
         "options": {
             "type": "array",
@@ -224,7 +227,7 @@ TOOLS = [
             "additionalProperties": False,
             "required": ["risk", "categories", "reason", "idempotency_key"],
             "properties": {
-                "risk": {"enum": ["high", "unknown"]},
+                "risk": {"type": "string", "enum": ["high", "unknown"]},
                 "categories": {"type": "array", "items": {"type": "string"}},
                 "reason": {"type": "string"},
                 "idempotency_key": {"type": "string"},

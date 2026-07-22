@@ -155,7 +155,7 @@ TOOLS: list[dict[str, Any]] = [
         "inputSchema": _schema(
             ["risk", "categories", "reason", "idempotency_key"],
             {
-                "risk": {"enum": ["high", "unknown"]},
+                "risk": {"type": "string", "enum": ["high", "unknown"]},
                 "categories": {"type": "array", "items": {"type": "string"}},
                 "reason": {"type": "string"},
                 "idempotency_key": {"type": "string"},
