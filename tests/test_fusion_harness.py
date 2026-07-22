@@ -189,5 +189,44 @@ class FusionOpinionTests(unittest.TestCase):
         self.assertFalse(self.out.exists())
 
 
+FUSION_TEMPLATE = ROOT / "scripts" / "fusion" / "prompts" / "fusion.md"
+
+
+class FusionTemplateTests(unittest.TestCase):
+    def test_guardrails_and_self_audit_map_one_to_one(self) -> None:
+        text = FUSION_TEMPLATE.read_text(encoding="utf-8")
+        import re
+
+        guardrails = re.findall(r"^G(\d)\.", text, flags=re.MULTILINE)
+        audits = re.findall(r"^A(\d) \(G(\d)\)", text, flags=re.MULTILINE)
+        self.assertEqual(guardrails, [str(i) for i in range(1, 10)])
+        self.assertEqual([a for a, _ in audits], [str(i) for i in range(1, 10)])
+        for audit_index, guardrail_index in audits:
+            self.assertEqual(audit_index, guardrail_index)
+
+    def test_template_declares_every_variable_and_contract_section(self) -> None:
+        text = FUSION_TEMPLATE.read_text(encoding="utf-8")
+        for variable in (
+            "{{QUESTION}}",
+            "{{FUSION_INSTRUCTION}}",
+            "{{ARCHITECT_MODEL}}",
+            "{{BUILDER_MODEL}}",
+            "{{BOUNDARY}}",
+            "{{ARCHITECT_CONTENT}}",
+            "{{BUILDER_CONTENT}}",
+        ):
+            self.assertIn(variable, text)
+        for section in (
+            "# Fused Answer",
+            "## Supported consensus",
+            "## Genuine divergence",
+            "## Uncertainty",
+            "# Discarded",
+            "popularity-trap",
+            "UNTRUSTED DATA",
+        ):
+            self.assertIn(section, text)
+
+
 if __name__ == "__main__":
     unittest.main()
