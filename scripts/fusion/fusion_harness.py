@@ -126,6 +126,13 @@ def run_agent(
     """
     started = time.monotonic()
     outcome: dict[str, Any] = {"role": role, "status": "ok", "exit_code": 0}
+    # A leaked ANTHROPIC_API_KEY diverts headless claude from subscription
+    # OAuth to whatever account the key names (smoke F0, corrida 20a44f2c).
+    agent_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key != "ANTHROPIC_API_KEY"
+    }
     process = subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
@@ -133,6 +140,7 @@ def run_agent(
         text=True,
         cwd=REPO_ROOT,
         start_new_session=True,
+        env=agent_env,
     )
     try:
         stdout, stderr = process.communicate(timeout=timeout_seconds)

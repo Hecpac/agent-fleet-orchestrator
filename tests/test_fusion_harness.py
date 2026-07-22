@@ -188,6 +188,22 @@ class FusionOpinionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertFalse(self.out.exists())
 
+    def test_spawned_agents_never_see_anthropic_api_key(self) -> None:
+        self._executable(
+            "claude",
+            """
+            #!/bin/sh
+            printf '%s' "${ANTHROPIC_API_KEY:-ABSENT}" > "$FLEET_TEST_DIR/keycheck"
+            printf 'ok\\n'
+            """,
+        )
+        result = self._run("q", ANTHROPIC_API_KEY="leaked-key")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.tmp / "keycheck").read_text(encoding="utf-8"), "ABSENT"
+        )
+
 
 FUSION_TEMPLATE = ROOT / "scripts" / "fusion" / "prompts" / "fusion.md"
 
