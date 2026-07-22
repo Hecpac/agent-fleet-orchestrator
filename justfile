@@ -103,6 +103,11 @@ dan feature task *flags:
 opinion question *flags:
     python3 scripts/fusion/fusion_harness.py opinion "{{question}}" {{flags}}
 
+# Fusion harness F1: two perspectives plus an adjudicated synthesis.
+# Ex: just fusion "should the ledger move to sqlite?" "focus on migration cost"
+fusion question *flags:
+    python3 scripts/fusion/fusion_harness.py fusion "{{question}}" {{flags}}
+
 # Preview the exact autonomous lead mission without touching CMUX.
 dan-dry feature task *flags:
     python3 scripts/fleet-run.py {{feature}} "{{task}}" --dry-run {{flags}}
