@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -106,6 +107,60 @@ def render_prompt(question: str, role: str) -> str:
     if "{{" in rendered:
         raise FusionError("opinion prompt template has unresolved variables")
     return rendered
+
+
+FUSION_TEMPLATE = Path(__file__).resolve().parent / "prompts" / "fusion.md"
+BOUNDARY_JOIN = "\x1f"
+DEFAULT_INSTRUCTION = "(none — follow the output contract as written)"
+MARKER_PREFIXES = (
+    "<<<INPUT_ARCHITECT_",
+    "<<<END_INPUT_ARCHITECT_",
+    "<<<INPUT_BUILDER_",
+    "<<<END_INPUT_BUILDER_",
+)
+
+
+def fusion_boundary(architect_content: str, builder_content: str) -> str:
+    digest = hashlib.sha256(
+        (architect_content + BOUNDARY_JOIN + builder_content).encode()
+    ).hexdigest()
+    return digest[:12]
+
+
+def render_fusion_prompt(
+    *,
+    question: str,
+    instruction: str,
+    architect_model: str,
+    builder_model: str,
+    architect_content: str,
+    builder_content: str,
+) -> str:
+    template = FUSION_TEMPLATE.read_text(encoding="utf-8")
+    # Any marker-shaped sequence inside input data is a collision: fail
+    # closed before FUSION could mistake data for a boundary (G1).
+    for content in (architect_content, builder_content):
+        if any(prefix in content for prefix in MARKER_PREFIXES):
+            raise FusionError("fusion input collides with the boundary markers")
+    boundary = fusion_boundary(architect_content, builder_content)
+    mapping = {
+        "{{QUESTION}}": question,
+        "{{FUSION_INSTRUCTION}}": instruction or DEFAULT_INSTRUCTION,
+        "{{ARCHITECT_MODEL}}": architect_model,
+        "{{BUILDER_MODEL}}": builder_model,
+        "{{BOUNDARY}}": boundary,
+        "{{ARCHITECT_CONTENT}}": architect_content,
+        "{{BUILDER_CONTENT}}": builder_content,
+    }
+    unknown = set(re.findall(r"\{\{[A-Z_]+\}\}", template)) - set(mapping)
+    if unknown:
+        raise FusionError(
+            f"fusion template has unresolved variables: {sorted(unknown)}"
+        )
+    # Single pass: substituted content is never rescanned, so template
+    # placeholders inside the untrusted inputs stay literal data (G1).
+    pattern = re.compile("|".join(re.escape(key) for key in mapping))
+    return pattern.sub(lambda match: mapping[match.group(0)], template)
 
 
 def _signal_group(process: subprocess.Popen[str], signum: int) -> None:
