@@ -240,7 +240,8 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             "'HOME','USER','LOGNAME','FLEET_HUMAN_UID','SSH_AUTH_SOCK',"
             "'AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','GIT_AUTHOR_NAME',"
             "'GIT_AUTHOR_EMAIL','GIT_COMMITTER_NAME','GIT_COMMITTER_EMAIL',"
-            "'CMUX_HOOK_DIR','CMUX_EVENTS_LOG')}",
+            "'CMUX_HOOK_DIR','CMUX_EVENTS_LOG','FLEET_CONTROLLER_HOOK_DIR',"
+            "'FLEET_CONTROLLER_EVENTS_LOG')}",
         )
         values = self.parse(result)
         isolated_home = Path(str(values["HOME"]))
@@ -262,6 +263,10 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
         self.assertEqual(
             values["CMUX_EVENTS_LOG"],
             str(Path.home() / ".cmuxterm" / "events.jsonl"),
+        )
+        self.assertEqual(values["FLEET_CONTROLLER_HOOK_DIR"], values["CMUX_HOOK_DIR"])
+        self.assertEqual(
+            values["FLEET_CONTROLLER_EVENTS_LOG"], values["CMUX_EVENTS_LOG"]
         )
         self.assertFalse(isolated_home.exists(), "ephemeral HOME must be removed")
 

@@ -513,6 +513,24 @@ class FleetFrontierTests(unittest.TestCase):
             fleet_frontier.session_record(f"codex-{shared}", hook_source="codex")
         )
 
+    def test_hook_session_uses_controller_path_when_provider_home_is_ephemeral(
+        self,
+    ) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FLEET_CONTROLLER_HOOK_DIR": str(self.hooks),
+                "HOME": str(self.tmp / "ephemeral-home"),
+            },
+            clear=True,
+        ):
+            record = fleet_frontier.session_record(
+                CODEX_SESSION_ID, hook_source="codex"
+            )
+
+        self.assertIsNotNone(record)
+        self.assertEqual(record["surfaceId"], SURFACE_UUID)
+
     def test_hook_session_optional_json_rejects_ambiguity_without_effects(self) -> None:
         session_file = self.hooks / "codex-hook-sessions.json"
         valid = session_file.read_bytes()
@@ -2211,6 +2229,23 @@ class FleetFrontierTests(unittest.TestCase):
         )
 
         self.assertEqual(fleet_frontier.audit_events(), [event])
+
+    def test_cmux_audit_uses_controller_path_when_provider_home_is_ephemeral(
+        self,
+    ) -> None:
+        event = self.hook_event("agent.hook.UserPromptSubmit", 101)
+        self.events_log.write_text(json.dumps(event) + "\n", encoding="utf-8")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FLEET_CONTROLLER_EVENTS_LOG": str(self.events_log),
+                "HOME": str(self.tmp / "ephemeral-home"),
+            },
+            clear=True,
+        ):
+            events = fleet_frontier.audit_events()
+
+        self.assertEqual(events, [event])
 
     def test_cross_boot_audit_recovers_binding_stop_and_status(self) -> None:
         run_id = "run-replay"

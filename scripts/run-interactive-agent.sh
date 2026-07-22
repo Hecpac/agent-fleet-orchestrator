@@ -323,6 +323,11 @@ keep+=(
   "FLEET_HOME=$isolated_home"
   "FLEET_EXECUTION_PROFILE=$execution_profile"
   "FLEET_HUMAN_UID=sha256:$controller_user_sha256"
+  # The cmux CLI shim may intentionally consume CMUX_* variables before the
+  # provider starts. Preserve controller evidence locations under the Fleet
+  # namespace so nested CONTROL wrappers never fall back to ephemeral HOME.
+  "FLEET_CONTROLLER_HOOK_DIR=${CMUX_HOOK_DIR:-$controller_home/.cmuxterm}"
+  "FLEET_CONTROLLER_EVENTS_LOG=${CMUX_EVENTS_LOG:-$controller_home/.cmuxterm/events.jsonl}"
   "CMUX_HOOK_DIR=${CMUX_HOOK_DIR:-$controller_home/.cmuxterm}"
   "CMUX_EVENTS_LOG=${CMUX_EVENTS_LOG:-$controller_home/.cmuxterm/events.jsonl}"
   "GIT_AUTHOR_NAME=FleetMaker"

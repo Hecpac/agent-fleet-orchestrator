@@ -277,7 +277,11 @@ def validate_event_ack(frame: Any) -> None:
 
 
 def session_record(session_id: str, *, hook_source: str = "") -> dict[str, Any] | None:
-    hook_dir = os.environ.get("CMUX_HOOK_DIR", os.path.expanduser("~/.cmuxterm"))
+    hook_dir = (
+        os.environ.get("CMUX_HOOK_DIR")
+        or os.environ.get("FLEET_CONTROLLER_HOOK_DIR")
+        or os.path.expanduser("~/.cmuxterm")
+    )
     filename = HOOK_SESSION_FILES.get(hook_source)
     prefix = f"{hook_source}-"
     if filename is None or not session_id.startswith(prefix):
@@ -1720,7 +1724,9 @@ def reconcile_kimi_events(
 
 
 def audit_events() -> list[dict[str, Any]]:
-    configured = os.environ.get("CMUX_EVENTS_LOG")
+    configured = os.environ.get("CMUX_EVENTS_LOG") or os.environ.get(
+        "FLEET_CONTROLLER_EVENTS_LOG"
+    )
     current = (
         Path(configured).expanduser()
         if configured
