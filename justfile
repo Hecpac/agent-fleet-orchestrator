@@ -98,6 +98,11 @@ manifest-migrate manifest *flags:
 dan feature task *flags:
     python3 scripts/fleet-run.py {{feature}} "{{task}}" {{flags}}
 
+# Fusion harness F0: independent model perspectives on one question.
+# Ex: just opinion "top 3 sqlite persistence strategies for the ledger" --panel
+opinion question *flags:
+    python3 scripts/fusion/fusion_harness.py opinion "{{question}}" {{flags}}
+
 # Preview the exact autonomous lead mission without touching CMUX.
 dan-dry feature task *flags:
     python3 scripts/fleet-run.py {{feature}} "{{task}}" --dry-run {{flags}}
