@@ -69,8 +69,8 @@ class AutoValidateBase(unittest.TestCase):
             #!/bin/sh
             n=$(cat "$FLEET_TEST_DIR/claude.count" 2>/dev/null || echo 0)
             n=$((n+1)); echo $n > "$FLEET_TEST_DIR/claude.count"
-            printf '%s' "$2" > "$FLEET_TEST_DIR/claude.call.$n"
-            case "$2" in
+            printf '%s' "$*" > "$FLEET_TEST_DIR/claude.call.$n"
+            case "$*" in
               *"# VALIDATOR"*)
                 cp "$FLEET_TEST_DIR/gate-fixture.py" gate.py
                 [ "${FLEET_TEST_VALIDATOR_EXTRA:-0}" = 1 ] && printf 'x' > extra.txt
@@ -169,6 +169,8 @@ class AutoValidateTemplateTests(unittest.TestCase):
         validator = (PROMPTS / "validator.md").read_text(encoding="utf-8")
         self.assertIn("EXACTLY ONE file named gate.py", validator)
         self.assertIn("FAIL on an empty workspace", validator)
+        self.assertIn("Do not write any other file", validator)
+        self.assertIn('"FAIL: expected <X>, found <Y>, at <path>', validator)
         builder = (PROMPTS / "builder_round.md").read_text(encoding="utf-8")
         self.assertIn("IMMUTABLE", builder)
         triage = (PROMPTS / "triage.md").read_text(encoding="utf-8")
