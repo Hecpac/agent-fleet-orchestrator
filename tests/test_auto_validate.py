@@ -611,5 +611,51 @@ class AutoValidateCommandTests(AutoValidateBase):
         self.assertTrue(summary["rounds"][0]["harness_errors"])
 
 
+class GateRepairTests(AutoValidateBase):
+    def test_gate_defect_single_free_repair(self) -> None:
+        wrong_gate = TOY_GATE.replace("hello.txt", "wrong.txt")
+        (self.tmp / "gate-fixture.py").write_text(wrong_gate, encoding="utf-8")
+        (self.tmp / "gate-fixture-fixed.py").write_text(TOY_GATE, encoding="utf-8")
+        (self.tmp / "triage-fixture.txt").write_text(
+            "gate checks wrong.txt but the task says hello.txt\n"
+            "TRIAGE_VERDICT: GATE_DEFECT — gate checks wrong.txt, task asks hello.txt\n",
+            encoding="utf-8",
+        )
+        self._executable(
+            "claude",
+            """
+            #!/bin/sh
+            n=$(cat "$FLEET_TEST_DIR/claude.count" 2>/dev/null || echo 0)
+            n=$((n+1)); echo $n > "$FLEET_TEST_DIR/claude.count"
+            printf '%s' "$2" > "$FLEET_TEST_DIR/claude.call.$n"
+            case "$2" in
+              *"corrected gate"*)
+                cp "$FLEET_TEST_DIR/gate-fixture-fixed.py" gate.py
+                printf 'repaired\\n' ;;
+              *"# VALIDATOR"*)
+                cp "$FLEET_TEST_DIR/gate-fixture.py" gate.py
+                printf 'gate written\\n' ;;
+              *"# TRIAGE"*)
+                cat "$FLEET_TEST_DIR/triage-fixture.txt" ;;
+            esac
+            """,
+        )
+        result = self._run("make hello.txt", FLEET_TEST_SUCCEED_ON="1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["status"], "green")
+        self.assertEqual(summary["gate_repairs"], 1)
+        self.assertEqual(len(summary["rounds"]), 3)
+        self.assertEqual(summary["rounds"][2]["triage_verdict"], "GATE_DEFECT")
+        self.assertEqual(summary["rounds"][2]["gate_verdict"], "pass")
+        run_dir = self.out / summary["run_id"] / "autovalidate"
+        self.assertTrue((run_dir / "gate.py.r3").is_file())
+        codex_calls = int(
+            (self.tmp / "codex.count").read_text(encoding="utf-8").strip()
+        )
+        self.assertEqual(codex_calls, 3, "free re-run: no builder between repair and gate")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -108,6 +108,11 @@ opinion question *flags:
 fusion question *flags:
     python3 scripts/fusion/fusion_harness.py fusion "{{question}}" {{flags}}
 
+# Fusion harness F2: gate-first build loop in an isolated workspace.
+# Ex: just auto-validate "create hello.py that prints the first 10 primes"
+auto-validate task *flags:
+    python3 scripts/fusion/fusion_harness.py auto-validate "{{task}}" {{flags}}
+
 # Preview the exact autonomous lead mission without touching CMUX.
 dan-dry feature task *flags:
     python3 scripts/fleet-run.py {{feature}} "{{task}}" --dry-run {{flags}}
