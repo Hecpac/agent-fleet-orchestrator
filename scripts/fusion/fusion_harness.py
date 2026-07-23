@@ -202,7 +202,7 @@ def _signal_group(process: subprocess.Popen[str], signum: int) -> None:
 
 
 def run_agent(
-    role: str, argv: list[str], timeout_seconds: float
+    role: str, argv: list[str], timeout_seconds: float, cwd: Path | None = None
 ) -> dict[str, Any]:
     """Run one worker CLI; SIGTERM then SIGKILL on timeout, never a hang.
 
@@ -224,7 +224,7 @@ def run_agent(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=REPO_ROOT,
+        cwd=cwd or REPO_ROOT,
         start_new_session=True,
         env=agent_env,
     )

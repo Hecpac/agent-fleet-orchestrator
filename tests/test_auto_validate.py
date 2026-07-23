@@ -178,5 +178,96 @@ class AutoValidateTemplateTests(unittest.TestCase):
         self.assertIn("TRIAGE_VERDICT: GATE_DEFECT", triage)
 
 
+class GatePrimitiveTests(AutoValidateBase):
+    def setUp(self) -> None:
+        super().setUp()
+        import auto_validate
+
+        self.av = auto_validate
+        self.av_dir = self.tmp / "avdir"
+        self.av_dir.mkdir()
+        self.workspace = self.av_dir / "workspace"
+        self.workspace.mkdir()
+
+    def test_render_av_template_is_single_pass_and_checks_unknowns(self) -> None:
+        rendered = self.av.render_av_template(
+            "triage.md",
+            {
+                "{{ROUND}}": "3",
+                "{{TASK}}": "make {{GATE_SOURCE}} appear literally",
+                "{{GATE_SOURCE}}": "print('gate')",
+                "{{GATE_OUTPUT}}": "FAIL: x",
+                "{{WORKSPACE}}": "/tmp/ws",
+            },
+        )
+        self.assertIn("make {{GATE_SOURCE}} appear literally", rendered)
+        self.assertEqual(rendered.count("print('gate')"), 1)
+
+    def test_seal_and_run_gate_red_and_green(self) -> None:
+        (self.av_dir / "gate.py").write_text(TOY_GATE, encoding="utf-8")
+        digest = self.av.seal_gate(self.av_dir)
+        self.assertEqual(len(digest), 64)
+        result = self.av.run_gate(self.av_dir, self.workspace, timeout_seconds=60)
+        self.assertEqual(result["verdict"], "fail")
+        self.assertEqual(len(result["fail_lines"]), 1)
+        self.assertFalse(result["tampered"])
+        (self.workspace / "hello.txt").write_text("hello", encoding="utf-8")
+        result = self.av.run_gate(self.av_dir, self.workspace, timeout_seconds=60)
+        self.assertEqual(result["verdict"], "pass")
+
+    def test_run_gate_restores_sealed_copy_and_records_tampering(self) -> None:
+        (self.av_dir / "gate.py").write_text(TOY_GATE, encoding="utf-8")
+        self.av.seal_gate(self.av_dir)
+        (self.av_dir / "gate.py").write_text(ALWAYS_GREEN_GATE, encoding="utf-8")
+        result = self.av.run_gate(self.av_dir, self.workspace, timeout_seconds=60)
+        self.assertTrue(result["tampered"])
+        self.assertEqual(result["verdict"], "fail")  # sealed toy gate ran, not the green one
+        self.assertEqual(
+            (self.av_dir / "gate.py").read_text(encoding="utf-8"), TOY_GATE
+        )
+
+    def test_run_gate_harness_errors_are_typed(self) -> None:
+        (self.av_dir / "gate.py").write_text(TOY_GATE, encoding="utf-8")
+        self.av.seal_gate(self.av_dir)
+        slow = self.av_dir / "gate.py"
+        slow.write_text(
+            TOY_GATE.replace(
+                "import sys", "import sys, time\ntime.sleep(30)"
+            ),
+            encoding="utf-8",
+        )
+        self.av.seal_gate(self.av_dir)  # reseal the slow gate deliberately
+        result = self.av.run_gate(self.av_dir, self.workspace, timeout_seconds=1)
+        self.assertEqual(result["verdict"], "harness-error")
+        self.assertIn("timeout", result["harness_error"])
+
+    def test_run_agent_accepts_cwd_override(self) -> None:
+        import fusion_harness
+
+        self._executable(
+            "claude",
+            """
+            #!/bin/sh
+            pwd > "$FLEET_TEST_DIR/agent.cwd"
+            printf 'ok\\n'
+            """,
+        )
+        env_patch = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FLEET_TEST_DIR": str(self.tmp)}
+        old = {k: os.environ.get(k) for k in env_patch}
+        os.environ.update(env_patch)
+        try:
+            fusion_harness.run_agent("probe", ["claude", "-p", "x"], 30, cwd=self.av_dir)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.assertEqual(
+            Path((self.tmp / "agent.cwd").read_text(encoding="utf-8").strip()).resolve(),
+            self.av_dir.resolve(),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
