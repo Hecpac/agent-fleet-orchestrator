@@ -415,7 +415,7 @@ class AgentLegTests(AutoValidateBase):
 
     def test_triage_leg_takes_last_verdict_and_tolerates_indent(self) -> None:
         (self.tmp / "triage-fixture.txt").write_text(
-            "draft: TRIAGE_VERDICT: GATE_DEFECT — early draft\n"
+            "TRIAGE_VERDICT: GATE_DEFECT — early draft\n"
             "reasoning...\n"
             "  TRIAGE_VERDICT: BUILDER_DEFECT — final call\n",
             encoding="utf-8",
