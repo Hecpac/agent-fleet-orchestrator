@@ -426,6 +426,18 @@ def auto_validate(args: Any) -> int:
                 gate_result = run_gate(
                     av_dir, workspace, timeout_seconds=gate_timeout
                 )
+                if gate_result["verdict"] == "harness-error":
+                    # Same never-charged rule as the main loop: this repair
+                    # re-run is not a legitimate gate result, so it must not
+                    # consume a round. Repeat the round (builder runs again).
+                    harness_strikes += 1
+                    record["gate_verdict"] = "harness-error"
+                    record["harness_errors"].append(gate_result["harness_error"])
+                    rounds.append(record)
+                    if harness_strikes >= 2:
+                        return finish("harness-error", 2)
+                    continue
+                harness_strikes = 0
                 record["gate_verdict"] = gate_result["verdict"]
                 record["fail_lines"] = gate_result["fail_lines"]
                 if gate_result["verdict"] == "pass":

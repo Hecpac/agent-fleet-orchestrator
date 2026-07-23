@@ -535,6 +535,53 @@ class AutoValidateCommandTests(AutoValidateBase):
             ["first", "stateless-fallback"],
         )
 
+    def test_empty_task_exits_2_cleanly_without_traceback(self) -> None:
+        result = self._run("   ")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.out.exists())
+
+    def test_repair_rerun_harness_error_is_never_charged(self) -> None:
+        wrong_gate = TOY_GATE.replace("hello.txt", "wrong.txt")
+        (self.tmp / "gate-fixture.py").write_text(wrong_gate, encoding="utf-8")
+        (self.tmp / "gate-fixture-fixed.py").write_text(TOY_GATE, encoding="utf-8")
+        (self.tmp / "triage-fixture.txt").write_text(
+            "gate checks wrong.txt\nTRIAGE_VERDICT: GATE_DEFECT — checks wrong.txt\n",
+            encoding="utf-8",
+        )
+        self._executable(
+            "claude",
+            """
+            #!/bin/sh
+            case "$*" in
+              *"corrected gate"*) cp "$FLEET_TEST_DIR/gate-fixture-fixed.py" gate.py; printf 'repaired\\n' ;;
+              *"# VALIDATOR"*) cp "$FLEET_TEST_DIR/gate-fixture.py" gate.py; printf 'gate written\\n' ;;
+              *"# TRIAGE"*) cat "$FLEET_TEST_DIR/triage-fixture.txt" ;;
+            esac
+            """,
+        )
+        real_uv = subprocess.run(["which", "uv"], capture_output=True, text=True).stdout.strip()
+        self._executable(
+            "uv",
+            f"""
+            #!/bin/sh
+            n=$(cat "$FLEET_TEST_DIR/uv.count" 2>/dev/null || echo 0)
+            n=$((n+1)); echo $n > "$FLEET_TEST_DIR/uv.count"
+            if [ "$n" = 5 ]; then exit 127; fi
+            exec {real_uv} "$@"
+            """,
+        )
+        result = self._run("make hello.txt", FLEET_TEST_SUCCEED_ON="1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["status"], "green")
+        self.assertEqual(summary["gate_repairs"], 1)
+        harness_rounds = [r for r in summary["rounds"] if r["gate_verdict"] == "harness-error"]
+        self.assertEqual(len(harness_rounds), 1)
+        self.assertTrue(harness_rounds[0]["harness_errors"])
+
 
 if __name__ == "__main__":
     unittest.main()

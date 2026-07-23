@@ -534,6 +534,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # When executed as a script, register this module under its canonical
+    # name so auto_validate's `from fusion_harness import FusionError`
+    # resolves to THIS module's classes, not a duplicate second import
+    # (running as __main__ leaves "fusion_harness" unregistered otherwise,
+    # so the nested import below would load a second, distinct module
+    # object whose FusionError this except clause could never catch).
+    sys.modules.setdefault("fusion_harness", sys.modules[__name__])
     args = _parser().parse_args()
     try:
         if args.command == "opinion":
