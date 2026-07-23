@@ -246,6 +246,15 @@ def triage_leg(
     return outcome, match.group(1), match.group(2).strip()
 
 
+def _record_harness_error(
+    rounds: list[dict[str, Any]], record: dict[str, Any], message: str
+) -> None:
+    """Log a harness-error round without charging it (spec: never a round)."""
+    record["gate_verdict"] = "harness-error"
+    record["harness_errors"].append(message)
+    rounds.append(record)
+
+
 def auto_validate(args: Any) -> int:
     task = args.task.strip()
     if not task:
@@ -360,20 +369,6 @@ def auto_validate(args: Any) -> int:
             )
         )
         gate_result = run_gate(av_dir, workspace, timeout_seconds=gate_timeout)
-        if gate_result["verdict"] == "harness-error":
-            harness_strikes += 1
-            rounds.append(
-                {
-                    "n": round_no, "memory": memory, "gate_verdict": "harness-error",
-                    "fail_lines": [], "triage_verdict": None,
-                    "gate_tampered": gate_result["tampered"],
-                    "harness_errors": [gate_result["harness_error"]],
-                }
-            )
-            if harness_strikes >= 2:
-                return finish("harness-error", 2)
-            continue  # repeat the same round number: never charged
-        harness_strikes = 0
         record = {
             "n": round_no, "memory": memory,
             "gate_verdict": gate_result["verdict"],
@@ -382,6 +377,13 @@ def auto_validate(args: Any) -> int:
             "gate_tampered": gate_result["tampered"],
             "harness_errors": [],
         }
+        if gate_result["verdict"] == "harness-error":
+            _record_harness_error(rounds, record, gate_result["harness_error"])
+            harness_strikes += 1
+            if harness_strikes >= 2:
+                return finish("harness-error", 2)
+            continue  # repeat the same round number: never charged
+        harness_strikes = 0
         if gate_result["verdict"] == "pass":
             rounds.append(record)
             return finish("green", 0)
@@ -430,10 +432,8 @@ def auto_validate(args: Any) -> int:
                     # Same never-charged rule as the main loop: this repair
                     # re-run is not a legitimate gate result, so it must not
                     # consume a round. Repeat the round (builder runs again).
+                    _record_harness_error(rounds, record, gate_result["harness_error"])
                     harness_strikes += 1
-                    record["gate_verdict"] = "harness-error"
-                    record["harness_errors"].append(gate_result["harness_error"])
-                    rounds.append(record)
                     if harness_strikes >= 2:
                         return finish("harness-error", 2)
                     continue

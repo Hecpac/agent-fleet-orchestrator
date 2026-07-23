@@ -581,6 +581,34 @@ class AutoValidateCommandTests(AutoValidateBase):
         harness_rounds = [r for r in summary["rounds"] if r["gate_verdict"] == "harness-error"]
         self.assertEqual(len(harness_rounds), 1)
         self.assertTrue(harness_rounds[0]["harness_errors"])
+        he = harness_rounds[0]
+        passing = [r for r in summary["rounds"] if r["gate_verdict"] == "pass"]
+        self.assertEqual(he["n"], passing[-1]["n"], "repeat must not charge the round")
+
+    def test_mid_round_harness_error_repeats_the_same_round(self) -> None:
+        real_uv = subprocess.run(["which", "uv"], capture_output=True, text=True).stdout.strip()
+        self._executable(
+            "uv",
+            f"""
+            #!/bin/sh
+            n=$(cat "$FLEET_TEST_DIR/uv.count" 2>/dev/null || echo 0)
+            n=$((n+1)); echo $n > "$FLEET_TEST_DIR/uv.count"
+            if [ "$n" = 2 ]; then exit 127; fi
+            exec {real_uv} "$@"
+            """,
+        )
+        result = self._run("make hello.txt", FLEET_TEST_SUCCEED_ON="1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["status"], "green")
+        self.assertEqual(len(summary["rounds"]), 2)
+        self.assertEqual([r["n"] for r in summary["rounds"]], [1, 1])
+        self.assertEqual(
+            [r["gate_verdict"] for r in summary["rounds"]],
+            ["harness-error", "pass"],
+        )
+        self.assertTrue(summary["rounds"][0]["harness_errors"])
 
 
 if __name__ == "__main__":
