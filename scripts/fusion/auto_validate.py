@@ -117,3 +117,107 @@ def run_gate(
 def extract_session_id(text: str) -> str:
     matches = SESSION_ID_RE.findall(text)
     return matches[-1] if matches else ""
+
+
+def validator_leg(
+    tier: str, task: str, av_dir: Path, timeout_seconds: float
+) -> dict[str, Any]:
+    spec = TIERS[tier]["architect"]
+    prompt = render_av_template("validator.md", {"{{TASK}}": task})
+    before = {entry.name for entry in av_dir.iterdir()}
+    argv = _fill(VALIDATOR_ARGV, model=spec["model"], prompt=prompt)
+    outcome = run_agent("validator", argv, timeout_seconds, cwd=av_dir)
+    created = {entry.name for entry in av_dir.iterdir()} - before
+    if outcome["status"] != "ok":
+        raise FusionError(f"validator failed: {outcome['stderr_tail'][-200:]}")
+    if created != {GATE_NAME}:
+        raise FusionError(
+            f"validator must create exactly gate.py; created: {sorted(created)}"
+        )
+    return outcome
+
+
+def builder_leg(
+    tier: str,
+    round_no: int,
+    task: str,
+    gate_source: str,
+    feedback: str,
+    workspace: Path,
+    session_id: str,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], str, str]:
+    spec = TIERS[tier]["builder"]
+    if round_no == 1:
+        memory = "first"
+        task_block = f"Task:\n\n{task}"
+    elif session_id:
+        memory = "resume"
+        task_block = "Continue the same task from your previous rounds."
+    else:
+        memory = "stateless-fallback"
+        task_block = f"Task:\n\n{task}"
+    prompt = render_av_template(
+        "builder_round.md",
+        {
+            "{{ROUND}}": str(round_no),
+            "{{MAX_ROUNDS}}": str(MAX_ROUNDS),
+            "{{TASK_BLOCK}}": task_block,
+            "{{GATE_SOURCE}}": gate_source,
+            "{{ROUND_FEEDBACK}}": feedback,
+        },
+    )
+    if memory == "resume":
+        argv = _fill(
+            BUILDER_RESUME_ARGV,
+            session_id=session_id,
+            workspace=str(workspace),
+            model=spec["model"],
+            prompt=prompt,
+        )
+    else:
+        argv = _fill(
+            BUILDER_FIRST_ARGV,
+            workspace=str(workspace),
+            model=spec["model"],
+            prompt=prompt,
+        )
+    outcome = run_agent("builder", argv, timeout_seconds)
+    new_session = extract_session_id(outcome["output"]) or extract_session_id(
+        outcome["stderr_tail"]
+    )
+    return outcome, new_session, memory
+
+
+TRIAGE_VERDICT_RE = re.compile(
+    r"^TRIAGE_VERDICT:\s*(BUILDER_DEFECT|GATE_DEFECT)\s*[—-]?\s*(.*)$",
+    re.MULTILINE,
+)
+
+
+def triage_leg(
+    tier: str,
+    round_no: int,
+    task: str,
+    gate_source: str,
+    gate_output: str,
+    workspace: Path,
+    timeout_seconds: float,
+) -> tuple[dict[str, Any], str | None, str]:
+    spec = TIERS[tier]["architect"]
+    prompt = render_av_template(
+        "triage.md",
+        {
+            "{{ROUND}}": str(round_no),
+            "{{TASK}}": task,
+            "{{GATE_SOURCE}}": gate_source,
+            "{{GATE_OUTPUT}}": gate_output,
+            "{{WORKSPACE}}": str(workspace),
+        },
+    )
+    argv = _fill(TRIAGE_ARGV, model=spec["model"], prompt=prompt)
+    outcome = run_agent("triage", argv, timeout_seconds)
+    match = TRIAGE_VERDICT_RE.search(outcome["output"])
+    if not match:
+        return outcome, None, ""
+    return outcome, match.group(1), match.group(2).strip()

@@ -288,5 +288,100 @@ class GatePrimitiveTests(AutoValidateBase):
         self.assertEqual(self.av.extract_session_id("no ids here"), "")
 
 
+class AgentLegTests(AutoValidateBase):
+    def setUp(self) -> None:
+        super().setUp()
+        import auto_validate
+
+        self.av = auto_validate
+        self.av_dir = self.tmp / "avdir"
+        self.av_dir.mkdir()
+        self.workspace = self.av_dir / "workspace"
+        self.workspace.mkdir()
+        self._patch_env = {
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "FLEET_TEST_DIR": str(self.tmp),
+        }
+
+    def _with_env(self, fn, *args, **kwargs):
+        old = {k: os.environ.get(k) for k in self._patch_env}
+        os.environ.update(self._patch_env)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_validator_leg_accepts_exactly_gate_py(self) -> None:
+        outcome = self._with_env(
+            self.av.validator_leg, "workhorse", "make hello.txt", self.av_dir, 60
+        )
+        self.assertEqual(outcome["status"], "ok")
+        self.assertTrue((self.av_dir / "gate.py").is_file())
+
+    def test_validator_leg_rejects_extra_files(self) -> None:
+        os.environ["FLEET_TEST_VALIDATOR_EXTRA"] = "1"
+        self.addCleanup(os.environ.pop, "FLEET_TEST_VALIDATOR_EXTRA", None)
+        with self.assertRaisesRegex(self.av.FusionError, "exactly gate.py"):
+            self._with_env(
+                self.av.validator_leg, "workhorse", "make hello.txt", self.av_dir, 60
+            )
+
+    def test_builder_leg_first_round_then_resume_then_fallback(self) -> None:
+        outcome, session, memory = self._with_env(
+            self.av.builder_leg,
+            "workhorse", 1, "make hello.txt", "gate src", "", self.workspace, "", 60,
+        )
+        self.assertEqual(memory, "first")
+        self.assertEqual(session, "test-sess-1")
+        outcome, session, memory = self._with_env(
+            self.av.builder_leg,
+            "workhorse", 2, "make hello.txt", "gate src", "FAIL: x", self.workspace, session, 60,
+        )
+        self.assertEqual(memory, "resume")
+        argv2 = (self.tmp / "codex.call.2").read_text(encoding="utf-8")
+        self.assertIn("resume test-sess-1", argv2)
+        os.environ["FLEET_TEST_NO_SESSION"] = "1"
+        self.addCleanup(os.environ.pop, "FLEET_TEST_NO_SESSION", None)
+        outcome, session, memory = self._with_env(
+            self.av.builder_leg,
+            "workhorse", 3, "make hello.txt", "gate src", "FAIL: x", self.workspace, "", 60,
+        )
+        self.assertEqual(memory, "stateless-fallback")
+        self.assertEqual(session, "")
+        argv3 = (self.tmp / "codex.call.3").read_text(encoding="utf-8")
+        self.assertIn("make hello.txt", argv3)
+
+    def test_triage_leg_parses_verdicts(self) -> None:
+        outcome, verdict, guidance = self._with_env(
+            self.av.triage_leg,
+            "workhorse", 3, "task", "gate src", "FAIL: x", self.workspace, 60,
+        )
+        self.assertEqual(verdict, "BUILDER_DEFECT")
+        self.assertIn("write the file", guidance)
+        (self.tmp / "triage-fixture.txt").write_text(
+            "bad gate\nTRIAGE_VERDICT: GATE_DEFECT — checks wrong path\n",
+            encoding="utf-8",
+        )
+        outcome, verdict, guidance = self._with_env(
+            self.av.triage_leg,
+            "workhorse", 4, "task", "gate src", "FAIL: x", self.workspace, 60,
+        )
+        self.assertEqual(verdict, "GATE_DEFECT")
+
+    def test_triage_leg_malformed_verdict_is_none(self) -> None:
+        (self.tmp / "triage-fixture.txt").write_text(
+            "rambling with no verdict line\n", encoding="utf-8"
+        )
+        outcome, verdict, guidance = self._with_env(
+            self.av.triage_leg,
+            "workhorse", 3, "task", "gate src", "FAIL: x", self.workspace, 60,
+        )
+        self.assertIsNone(verdict)
+
+
 if __name__ == "__main__":
     unittest.main()
