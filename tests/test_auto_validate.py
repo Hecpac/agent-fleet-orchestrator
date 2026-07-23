@@ -268,6 +268,25 @@ class GatePrimitiveTests(AutoValidateBase):
             self.av_dir.resolve(),
         )
 
+    def test_render_av_template_unknown_variable_fails_closed(self) -> None:
+        with self.assertRaisesRegex(self.av.FusionError, "unresolved variables"):
+            self.av.render_av_template("triage.md", {"{{ROUND}}": "1"})
+
+    def test_run_gate_missing_uv_is_typed_harness_error(self) -> None:
+        (self.av_dir / "gate.py").write_text(TOY_GATE, encoding="utf-8")
+        self.av.seal_gate(self.av_dir)
+        import unittest.mock as mock
+
+        with mock.patch.object(self.av.subprocess, "run", side_effect=FileNotFoundError):
+            result = self.av.run_gate(self.av_dir, self.workspace, timeout_seconds=5)
+        self.assertEqual(result["verdict"], "harness-error")
+        self.assertIn("uv is not available", result["harness_error"])
+
+    def test_extract_session_id_takes_the_last_match(self) -> None:
+        text = "I created session id: fake-prose\nwork...\nsession id: real-final\n"
+        self.assertEqual(self.av.extract_session_id(text), "real-final")
+        self.assertEqual(self.av.extract_session_id("no ids here"), "")
+
 
 if __name__ == "__main__":
     unittest.main()

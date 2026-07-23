@@ -115,5 +115,5 @@ def run_gate(
 
 
 def extract_session_id(text: str) -> str:
-    match = SESSION_ID_RE.search(text)
-    return match.group(1) if match else ""
+    matches = SESSION_ID_RE.findall(text)
+    return matches[-1] if matches else ""
