@@ -119,15 +119,28 @@ def extract_session_id(text: str) -> str:
     return matches[-1] if matches else ""
 
 
+VALIDATOR_IGNORED_DROPPINGS = {".claude.json", ".claude"}
+
+
+def _tree(root: Path) -> set[str]:
+    paths: set[str] = set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = Path(dirpath).relative_to(root)
+        for name in dirnames + filenames:
+            paths.add(str(rel / name))
+    return paths
+
+
 def validator_leg(
     tier: str, task: str, av_dir: Path, timeout_seconds: float
 ) -> dict[str, Any]:
     spec = TIERS[tier]["architect"]
     prompt = render_av_template("validator.md", {"{{TASK}}": task})
-    before = {entry.name for entry in av_dir.iterdir()}
+    before = _tree(av_dir)
     argv = _fill(VALIDATOR_ARGV, model=spec["model"], prompt=prompt)
     outcome = run_agent("validator", argv, timeout_seconds, cwd=av_dir)
-    created = {entry.name for entry in av_dir.iterdir()} - before
+    created = _tree(av_dir) - before
+    created -= {p for p in created if Path(p).parts[0] in VALIDATOR_IGNORED_DROPPINGS}
     if outcome["status"] != "ok":
         raise FusionError(f"validator failed: {outcome['stderr_tail'][-200:]}")
     if created != {GATE_NAME}:
@@ -190,7 +203,7 @@ def builder_leg(
 
 
 TRIAGE_VERDICT_RE = re.compile(
-    r"^TRIAGE_VERDICT:\s*(BUILDER_DEFECT|GATE_DEFECT)\s*[—-]?\s*(.*)$",
+    r"^\s*TRIAGE_VERDICT:\s*(BUILDER_DEFECT|GATE_DEFECT)\s*[—-]?\s*(.*)$",
     re.MULTILINE,
 )
 
@@ -217,7 +230,8 @@ def triage_leg(
     )
     argv = _fill(TRIAGE_ARGV, model=spec["model"], prompt=prompt)
     outcome = run_agent("triage", argv, timeout_seconds)
-    match = TRIAGE_VERDICT_RE.search(outcome["output"])
-    if not match:
+    matches = list(TRIAGE_VERDICT_RE.finditer(outcome["output"]))
+    if not matches:
         return outcome, None, ""
+    match = matches[-1]
     return outcome, match.group(1), match.group(2).strip()

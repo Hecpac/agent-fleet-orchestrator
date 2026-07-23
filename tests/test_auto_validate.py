@@ -330,6 +330,37 @@ class AgentLegTests(AutoValidateBase):
                 self.av.validator_leg, "workhorse", "make hello.txt", self.av_dir, 60
             )
 
+    def test_validator_leg_rejects_writes_into_workspace_subdir(self) -> None:
+        self._executable(
+            "claude",
+            """
+            #!/bin/sh
+            cp "$FLEET_TEST_DIR/gate-fixture.py" gate.py
+            printf 'seed' > workspace/seed.py
+            printf 'gate written\\n'
+            """,
+        )
+        (self.av_dir / "workspace").mkdir(exist_ok=True)
+        with self.assertRaisesRegex(self.av.FusionError, "exactly gate.py"):
+            self._with_env(
+                self.av.validator_leg, "workhorse", "make hello.txt", self.av_dir, 60
+            )
+
+    def test_validator_leg_ignores_known_cli_droppings(self) -> None:
+        self._executable(
+            "claude",
+            """
+            #!/bin/sh
+            cp "$FLEET_TEST_DIR/gate-fixture.py" gate.py
+            printf '{}' > .claude.json
+            printf 'gate written\\n'
+            """,
+        )
+        outcome = self._with_env(
+            self.av.validator_leg, "workhorse", "make hello.txt", self.av_dir, 60
+        )
+        self.assertEqual(outcome["status"], "ok")
+
     def test_builder_leg_first_round_then_resume_then_fallback(self) -> None:
         outcome, session, memory = self._with_env(
             self.av.builder_leg,
@@ -381,6 +412,20 @@ class AgentLegTests(AutoValidateBase):
             "workhorse", 3, "task", "gate src", "FAIL: x", self.workspace, 60,
         )
         self.assertIsNone(verdict)
+
+    def test_triage_leg_takes_last_verdict_and_tolerates_indent(self) -> None:
+        (self.tmp / "triage-fixture.txt").write_text(
+            "draft: TRIAGE_VERDICT: GATE_DEFECT — early draft\n"
+            "reasoning...\n"
+            "  TRIAGE_VERDICT: BUILDER_DEFECT — final call\n",
+            encoding="utf-8",
+        )
+        outcome, verdict, guidance = self._with_env(
+            self.av.triage_leg,
+            "workhorse", 3, "task", "gate src", "FAIL: x", self.workspace, 60,
+        )
+        self.assertEqual(verdict, "BUILDER_DEFECT")
+        self.assertIn("final call", guidance)
 
 
 if __name__ == "__main__":
