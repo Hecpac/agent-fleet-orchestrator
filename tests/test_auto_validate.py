@@ -428,5 +428,113 @@ class AgentLegTests(AutoValidateBase):
         self.assertIn("final call", guidance)
 
 
+class AutoValidateCommandTests(AutoValidateBase):
+    def test_green_round_one(self) -> None:
+        result = self._run("make hello.txt", FLEET_TEST_SUCCEED_ON="1")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["command"], "auto-validate")
+        self.assertEqual(summary["status"], "green")
+        self.assertEqual(len(summary["rounds"]), 1)
+        self.assertEqual(summary["rounds"][0]["gate_verdict"], "pass")
+        self.assertEqual(summary["gate_repairs"], 0)
+
+    def test_green_round_three_feeds_fail_lines_forward(self) -> None:
+        result = self._run("make hello.txt", FLEET_TEST_SUCCEED_ON="3")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = self._summary()
+        self.assertEqual(len(summary["rounds"]), 3)
+        self.assertEqual(
+            [item["gate_verdict"] for item in summary["rounds"]],
+            ["fail", "fail", "pass"],
+        )
+        argv2 = (self.tmp / "codex.call.2").read_text(encoding="utf-8")
+        self.assertIn("FAIL: expected hello.txt", argv2)
+
+    def test_baseline_not_red_exits_6(self) -> None:
+        (self.tmp / "gate-fixture.py").write_text(
+            ALWAYS_GREEN_GATE, encoding="utf-8"
+        )
+        result = self._run("make hello.txt")
+
+        self.assertEqual(result.returncode, 6, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["status"], "baseline-not-red")
+        self.assertEqual(summary["rounds"], [])
+        self.assertFalse((self.tmp / "codex.count").exists(), "no builder round")
+
+    def test_halt_after_five_rounds_exits_7(self) -> None:
+        result = self._run("make hello.txt", FLEET_TEST_SUCCEED_ON="99")
+
+        self.assertEqual(result.returncode, 7, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["status"], "halted")
+        self.assertEqual(len(summary["rounds"]), 5)
+        ledger = (self.out / "ledger.jsonl").read_bytes()
+        self.assertEqual(
+            fleet_json.loads(ledger.splitlines()[0])["run_id"], summary["run_id"]
+        )
+
+    def test_validator_extra_file_exits_5(self) -> None:
+        result = self._run(
+            "make hello.txt", FLEET_TEST_VALIDATOR_EXTRA="1"
+        )
+
+        self.assertEqual(result.returncode, 5, result.stderr)
+        self.assertEqual(self._summary()["status"], "invalid-validator")
+
+    def test_gate_tampering_is_recorded_and_sealed_copy_runs(self) -> None:
+        self._executable(
+            "codex",
+            """
+            #!/bin/sh
+            n=$(cat "$FLEET_TEST_DIR/codex.count" 2>/dev/null || echo 0)
+            n=$((n+1)); echo $n > "$FLEET_TEST_DIR/codex.count"
+            printf '%s' "$*" > "$FLEET_TEST_DIR/codex.call.$n"
+            ws=""; prev=""
+            for arg in "$@"; do [ "$prev" = "-C" ] && ws="$arg"; prev="$arg"; done
+            printf 'print("PASS: forged")\\nraise SystemExit(0)\\n' > "$ws/../gate.py"
+            printf 'session id: s-%s\\n' "$n"
+            """,
+        )
+        result = self._run("make hello.txt")
+
+        self.assertEqual(result.returncode, 7, result.stderr)
+        summary = self._summary()
+        self.assertTrue(all(item["gate_tampered"] for item in summary["rounds"]))
+        self.assertTrue(
+            all(item["gate_verdict"] == "fail" for item in summary["rounds"])
+        )
+
+    def test_harness_error_round_is_not_charged(self) -> None:
+        # Break uv for the FIRST gate run after baseline by shadowing it with
+        # a one-shot failing shim, then restore. Simplest deterministic proxy:
+        # break uv entirely -> baseline itself is a harness error, retried
+        # once, then exit 2 with status harness-error and zero rounds charged.
+        self._executable("uv", "#!/bin/sh\nexit 127\n")
+        result = self._run("make hello.txt")
+
+        self.assertEqual(result.returncode, 2, result.stderr)
+        summary = self._summary()
+        self.assertEqual(summary["status"], "harness-error")
+        self.assertEqual(summary["rounds"], [])
+
+    def test_memory_fallback_is_recorded(self) -> None:
+        result = self._run(
+            "make hello.txt",
+            FLEET_TEST_SUCCEED_ON="2",
+            FLEET_TEST_NO_SESSION="1",
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = self._summary()
+        self.assertEqual(
+            [item["memory"] for item in summary["rounds"]],
+            ["first", "stateless-fallback"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

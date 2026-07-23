@@ -525,6 +525,11 @@ def _parser() -> argparse.ArgumentParser:
     fusion_parser.add_argument("question")
     fusion_parser.add_argument("instruction", nargs="?", default="")
     fusion_parser.add_argument("--tier", choices=sorted(TIERS))
+    autovalidate_parser = sub.add_parser(
+        "auto-validate", help="gate-first build loop: validator, builder, triage"
+    )
+    autovalidate_parser.add_argument("task")
+    autovalidate_parser.add_argument("--tier", choices=sorted(TIERS))
     return parser
 
 
@@ -535,6 +540,10 @@ def main() -> int:
             return opinion(args)
         if args.command == "fusion":
             return fusion(args)
+        if args.command == "auto-validate":
+            import auto_validate as auto_validate_module
+
+            return auto_validate_module.auto_validate(args)
         raise FusionError(f"unknown command: {args.command}")
     except FusionError as error:
         print(f"fusion: {error}", file=sys.stderr)
