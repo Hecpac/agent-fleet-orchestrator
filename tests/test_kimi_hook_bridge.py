@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -47,9 +48,23 @@ class KimiHookBridgeTests(unittest.TestCase):
         self.surface_state = self.state_root / SURFACE_UUID
         self.surface_state.mkdir(parents=True)
         self.events = self.surface_state / "events.jsonl"
+        # kimi-code layout: the CLI mints the session under the isolated
+        # home; the test plays the CLI's role and creates it first.
+        work_hash = hashlib.sha256(
+            str(self.work.resolve()).encode("utf-8")
+        ).hexdigest()[:12]
+        self.session_root = self.share / "sessions" / f"wd_cwd_{work_hash}"
+        cli_session = (
+            self.session_root
+            / "session_11111111-1111-4111-8111-111111111111"
+            / "agents"
+            / "main"
+        )
+        cli_session.mkdir(parents=True)
         self.transcript = kimi_hook_bridge.wire_path(
             self.share, self.work, SESSION_ID
         )
+        self.assertEqual(self.transcript, cli_session / "wire.jsonl")
 
     def bridge_command(self) -> list[str]:
         return [
@@ -114,9 +129,9 @@ class KimiHookBridgeTests(unittest.TestCase):
         self.wait_for(session_file.exists)
         prompt = "private task\nFLEET_RESULT:run-1:<STATUS>"
         response = "review complete\nFLEET_RESULT:run-1:DONE"
-        self.transcript.parent.mkdir(parents=True)
+        self.transcript.parent.mkdir(parents=True, exist_ok=True)
         rows = [
-            {"type": "metadata", "protocol_version": "1.3"},
+            {"type": "metadata", "protocol_version": "1.10"},
             wire_record(100.0, "TurnBegin", {"user_input": prompt}),
             wire_record(101.0, "ContentPart", {"type": "text", "text": response}),
             wire_record(102.0, "TurnEnd", {}),
@@ -167,7 +182,7 @@ class KimiHookBridgeTests(unittest.TestCase):
         prompt = f"inspect\nFLEET_RESULT:{run_id}:<STATUS>"
         response = f"evidence\nFLEET_RESULT:{run_id}:DONE"
         stopped_at = 1784419234.4319842
-        self.transcript.parent.mkdir(parents=True)
+        self.transcript.parent.mkdir(parents=True, exist_ok=True)
         self.transcript.write_text(
             "".join(
                 json.dumps(row) + "\n"
@@ -262,7 +277,7 @@ class KimiHookBridgeTests(unittest.TestCase):
                 ),
                 wire_record(now + 2, "TurnEnd", {}),
             ]
-            self.transcript.parent.mkdir(parents=True)
+            self.transcript.parent.mkdir(parents=True, exist_ok=True)
             self.transcript.write_text(
                 "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
             )
@@ -322,6 +337,58 @@ class KimiHookBridgeTests(unittest.TestCase):
             run_events, required_protocol="control-v1"
         )
         self.assertEqual(verified["status"], "succeeded")
+
+    def test_wire_path_fails_closed_on_ambiguous_sessions(self) -> None:
+        second = (
+            self.session_root
+            / "session_22222222-2222-4222-8222-222222222222"
+            / "agents"
+            / "main"
+        )
+        second.mkdir(parents=True)
+        with self.assertRaisesRegex(
+            kimi_hook_bridge.KimiBridgeError, "ambiguous"
+        ):
+            kimi_hook_bridge.wire_path(self.share, self.work, SESSION_ID)
+
+    def test_wire_path_rejects_legacy_kimi_cli_layout(self) -> None:
+        import shutil
+
+        shutil.rmtree(self.session_root)
+        legacy_hash = hashlib.md5(
+            str(self.work.resolve()).encode("utf-8")
+        ).hexdigest()
+        (self.share / "sessions" / legacy_hash).mkdir(parents=True)
+        with self.assertRaisesRegex(
+            kimi_hook_bridge.KimiBridgeError, "legacy kimi-cli"
+        ):
+            kimi_hook_bridge.wire_path(self.share, self.work, SESSION_ID)
+
+    def test_resolve_wire_path_waits_for_session_minting(self) -> None:
+        import shutil
+        import threading
+
+        shutil.rmtree(self.session_root)
+        minted = (
+            self.session_root
+            / "session_33333333-3333-4333-8333-333333333333"
+            / "agents"
+            / "main"
+        )
+
+        def mint() -> None:
+            time.sleep(0.4)
+            minted.mkdir(parents=True)
+
+        thread = threading.Thread(target=mint)
+        thread.start()
+        try:
+            resolved = kimi_hook_bridge.resolve_wire_path(
+                self.share, self.work, SESSION_ID, timeout_seconds=5
+            )
+        finally:
+            thread.join()
+        self.assertEqual(resolved, minted / "wire.jsonl")
 
 
 if __name__ == "__main__":

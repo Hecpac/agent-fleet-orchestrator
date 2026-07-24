@@ -3,7 +3,7 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target_repo="${1:-}"
-agent_file="$repo_root/.kimi/agents/fleet-reviewer/agent.yaml"
+agents_source="$repo_root/orchestration/prompts/kimi_reviewer_agents.md"
 
 if [[ -z "$target_repo" ]]; then
   echo "Usage: $0 <absolute-target-repo>" >&2
@@ -13,8 +13,8 @@ if [[ "$target_repo" != /* || ! -d "$target_repo" || -L "$target_repo" ]]; then
   echo "Kimi reviewer target must be an absolute, non-symlink directory" >&2
   exit 2
 fi
-if [[ ! -f "$agent_file" || -L "$agent_file" ]]; then
-  echo "Kimi read-only fleet agent is unavailable" >&2
+if [[ ! -f "$agents_source" || -L "$agents_source" ]]; then
+  echo "Kimi read-only reviewer contract is unavailable" >&2
   exit 2
 fi
 kimi_executable="$(command -v kimi || true)"
@@ -23,8 +23,9 @@ if [[ -z "$kimi_executable" ]]; then
   exit 2
 fi
 
-PYTHONPATH="$repo_root/scripts${PYTHONPATH:+:$PYTHONPATH}" exec "$kimi_executable" \
-  --work-dir "$target_repo" \
-  --model moonshot-ai/kimi-k3 \
-  --thinking \
-  --agent-file "$agent_file"
+# kimi-code reads the role contract from AGENTS.md; KIMI_AGENTS_MD points at
+# the repo-owned contract without writing into the target checkout.
+cd "$target_repo"
+KIMI_AGENTS_MD="$agents_source" exec "$kimi_executable" \
+  --model kimi-code/k3 \
+  --plan

@@ -24,7 +24,7 @@ from typing import Any
 import fleet_json
 
 
-SUPPORTED_WIRE_PROTOCOLS = {"1.2", "1.3"}
+SUPPORTED_WIRE_PROTOCOLS = {"1.2", "1.3", "1.10"}
 
 
 class KimiBridgeError(RuntimeError):
@@ -56,9 +56,62 @@ def _safe_directory(path: Path, field: str, *, create: bool = False) -> Path:
 
 
 def wire_path(share_dir: Path, work_dir: Path, session_id: str) -> Path:
+    """Resolve the surface's wire.jsonl under an ISOLATED kimi-code home.
+
+    kimi-code (>= 0.28) mints its own session id and lays sessions out as
+    ``sessions/wd_cwd_<sha256(work_dir)[:12]>/session_<id>/agents/main/``.
+    The fleet cannot choose the id (the legacy ``--session`` flag now only
+    resumes), so the bridge discovers it — safely, because ``share_dir`` is
+    a per-surface ``KIMI_CODE_HOME``: more than one session directory means
+    the isolation broke, and the bridge fails closed instead of guessing.
+    The caller-supplied ``session_id`` (surface-derived) remains the stable
+    identity used in emitted event ids; it never names the path.
+    """
+    del session_id
     canonical_work_dir = work_dir.resolve(strict=True)
-    work_hash = hashlib.md5(str(canonical_work_dir).encode("utf-8")).hexdigest()
-    return share_dir / "sessions" / work_hash / session_id / "wire.jsonl"
+    legacy_hash = hashlib.md5(str(canonical_work_dir).encode("utf-8")).hexdigest()
+    legacy_root = share_dir / "sessions" / legacy_hash
+    work_hash = hashlib.sha256(str(canonical_work_dir).encode("utf-8")).hexdigest()[:12]
+    session_root = share_dir / "sessions" / f"wd_cwd_{work_hash}"
+    if not session_root.is_dir():
+        if legacy_root.is_dir():
+            raise KimiBridgeError(
+                "legacy kimi-cli session layout found; the fleet requires kimi-code"
+            )
+        raise KimiBridgeError("Kimi session root has not been created yet")
+    candidates = sorted(
+        entry
+        for entry in session_root.iterdir()
+        if entry.is_dir() and entry.name.startswith("session_")
+    )
+    if not candidates:
+        raise KimiBridgeError("Kimi session root has not been created yet")
+    if len(candidates) > 1:
+        raise KimiBridgeError(
+            "multiple Kimi sessions in one isolated home make evidence ambiguous"
+        )
+    return candidates[0] / "agents" / "main" / "wire.jsonl"
+
+
+def resolve_wire_path(
+    share_dir: Path,
+    work_dir: Path,
+    session_id: str,
+    *,
+    timeout_seconds: float = 120.0,
+    poll_seconds: float = 0.25,
+) -> Path:
+    """Wait for the TUI to mint its session before binding the transcript."""
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            return wire_path(share_dir, work_dir, session_id)
+        except KimiBridgeError as error:
+            if "not been created yet" not in str(error):
+                raise
+            if time.monotonic() >= deadline:
+                raise
+        time.sleep(poll_seconds)
 
 
 def _read_object(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -262,7 +315,7 @@ def watch(args: argparse.Namespace) -> int:
     events_file = state_dir / Path(args.events_file).name
     if events_file.is_symlink() or (events_file.exists() and not events_file.is_file()):
         raise KimiBridgeError("events_file must be a regular non-symlink file")
-    transcript = wire_path(share_dir, Path(args.work_dir), session_id)
+    transcript = resolve_wire_path(share_dir, Path(args.work_dir), session_id)
     record_session(
         hook_dir,
         session_id=session_id,

@@ -2182,9 +2182,10 @@ class FleetFrontierTests(unittest.TestCase):
             )
         self.assertFalse((self.runs / "fleet-frontier.ledger.jsonl").exists())
 
-    def test_opencode_prompt_transport_is_one_submission_with_exact_logical_prompt(
-        self,
-    ) -> None:
+    def test_opencode_prompt_contract_is_the_exact_logical_prompt(self) -> None:
+        # Since the R1 conformance contract, `prompt` is ALWAYS the logical
+        # prompt (the durable evidence); the single-line FDP_PROMPT wrapper is
+        # the submission payload, locked in tests/test_fleet_providers.py.
         task = "first line\nsecond line with ñ"
         run_id = "run-opencode-single-submit"
 
@@ -2192,13 +2193,10 @@ class FleetFrontierTests(unittest.TestCase):
             task, run_id, hook_source="opencode"
         )
 
-        self.assertNotIn("\n", prompt)
-        marker = "FDP_PROMPT="
-        logical_prompt = json.loads(prompt.rsplit(marker, 1)[1])
         self.assertTrue(
-            logical_prompt.startswith(f"{task}\n\nFleet completion protocol:")
+            prompt.startswith(f"{task}\n\nFleet completion protocol:")
         )
-        self.assertIn(f"FLEET_RESULT:{run_id}:<STATUS>", logical_prompt)
+        self.assertIn(f"FLEET_RESULT:{run_id}:<STATUS>", prompt)
 
     def test_non_opencode_prompt_transport_keeps_multiline_contract(self) -> None:
         prompt = fleet_frontier.prompt_with_contract(

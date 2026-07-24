@@ -342,12 +342,14 @@ class RouterConfigTests(unittest.TestCase):
         )
         kimi = plan["instances"][1]
         self.assertEqual(kimi["provider"], "moonshot-ai")
-        self.assertEqual(kimi["model"], "kimi-code/kimi-for-coding")
+        self.assertEqual(kimi["model"], "kimi-code/k3")
         self.assertEqual(kimi["hook_source"], "kimi")
         self.assertEqual(kimi["authority"], "verification")
         self.assertEqual(kimi["tool_access"], ["filesystem_read", "fleet_control"])
-        self.assertIn("--thinking", kimi["command"])
+        self.assertIn("--plan", kimi["command"])
+        self.assertNotIn("--agent-file", kimi["command"])
         self.assertNotIn("--yolo", kimi["command"])
+        self.assertNotIn("--auto", kimi["command"])
         self.assertNotIn("--print", kimi["command"])
 
     def test_kimi_audit_is_autonomous_and_read_only(self) -> None:
@@ -364,8 +366,11 @@ class RouterConfigTests(unittest.TestCase):
     def test_kimi_role_rejects_unsafe_or_unpinned_commands(self) -> None:
         for mutation, error in (
             (("append", "--print"), "unsafe/non-interactive"),
-            (("remove", "--thinking"), "enable thinking"),
-            (("replace_agent", "other.yaml"), "canonical reviewer"),
+            (("append", "--auto"), "unsafe/non-interactive"),
+            (("append", "-S"), "unsafe/non-interactive"),
+            (("append", "--continue"), "unsafe/non-interactive"),
+            (("remove", "--plan"), "plan mode exactly once"),
+            (("insert_subcommand", "acp"), "not a subcommand"),
         ):
             with self.subTest(mutation=mutation):
                 config = copy.deepcopy(self.config)
@@ -376,7 +381,7 @@ class RouterConfigTests(unittest.TestCase):
                 elif action == "remove":
                     command.remove(value)
                 else:
-                    command[command.index("--agent-file") + 1] = value
+                    command.insert(1, value)
                 with self.assertRaisesRegex(router_config.RouterError, error):
                     router_config.load_router(self.write_config(config))
 

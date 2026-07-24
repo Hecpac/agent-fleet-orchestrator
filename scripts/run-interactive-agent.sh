@@ -545,54 +545,41 @@ case "$role_type" in
       echo "Kimi share state is unsafe" >&2
       exit 2
     fi
+    # kimi-code (>= 0.28) resolves config, credentials, mcp.json, and the
+    # session store from one KIMI_CODE_HOME root. The fleet provisions an
+    # isolated home per surface: the legacy --config-file/--work-dir/
+    # --session flags and KIMI_SHARE_DIR are gone from the CLI.
     mkdir -p "$kimi_share_dir"
     chmod 700 "$kimi_share_dir"
-    kimi_config_file="$isolated_home/kimi-config.toml"
-    cp "$controller_kimi_config" "$kimi_config_file"
-    chmod 600 "$kimi_config_file"
+    cp "$controller_kimi_config" "$kimi_share_dir/config.toml"
+    chmod 600 "$kimi_share_dir/config.toml"
+    controller_kimi_credentials="$controller_home/.kimi/credentials/kimi-code.json"
+    if [[ -f "$controller_kimi_credentials" && ! -L "$controller_kimi_credentials" ]]; then
+      mkdir -p "$kimi_share_dir/credentials"
+      chmod 700 "$kimi_share_dir/credentials"
+      cp "$controller_kimi_credentials" "$kimi_share_dir/credentials/kimi-code.json"
+      chmod 600 "$kimi_share_dir/credentials/kimi-code.json"
+    fi
     keep+=(
-      "KIMI_SHARE_DIR=$kimi_share_dir"
+      "KIMI_CODE_HOME=$kimi_share_dir"
+      "KIMI_CODE_NO_AUTO_UPDATE=1"
       "KIMI_CLI_NO_AUTO_UPDATE=1"
-      "PYTHONPATH=$repo_root/scripts"
     )
     if [[ "$(basename "$1")" == "kimi" && "${FLEET_HEALTHCHECK:-0}" != "1" ]]; then
       if (( fleet_agent_mcp_enabled != 1 )); then
         echo "Kimi Fleet role requires an authenticated Fleet Control endpoint" >&2
         exit 2
       fi
-      kimi_agent_file="$repo_root/.kimi/agents/fleet-reviewer/agent.yaml"
-      if [[ ! -f "$kimi_agent_file" || -L "$kimi_agent_file" ]]; then
-        echo "Canonical Kimi Fleet agent is unavailable" >&2
-        exit 2
-      fi
-      kimi_command=()
-      skip_next=0
-      for argument in "$@"; do
-        if (( skip_next == 1 )); then
-          skip_next=0
-          continue
-        fi
-        if [[ "$argument" == "--agent-file" ]]; then
-          kimi_command+=("--agent-file" "$kimi_agent_file")
-          skip_next=1
-        else
-          kimi_command+=("$argument")
-        fi
-      done
-      kimi_mcp_config="$(python3 -c '
+      python3 -c '
 import json
 import sys
-print(json.dumps({"mcpServers": {"fleet_control": {
-    "command": sys.argv[1], "args": [sys.argv[2]]
-}}}, separators=(",", ":")))
-' "$fleet_agent_mcp_python" "$fleet_agent_mcp_proxy")"
-      kimi_command+=(
-        "--config-file" "$kimi_config_file"
-        "--work-dir" "$kimi_work_dir"
-        "--session" "$kimi_session_id"
-        "--mcp-config" "$kimi_mcp_config"
-      )
-      set -- "${kimi_command[@]}"
+path, command, proxy = sys.argv[1:4]
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump({"mcpServers": {"fleet_control": {
+        "command": command, "args": [proxy]
+    }}}, handle, separators=(",", ":"))
+' "$kimi_share_dir/mcp.json" "$fleet_agent_mcp_python" "$fleet_agent_mcp_proxy"
+      chmod 600 "$kimi_share_dir/mcp.json"
       kimi_bridge_python="$(command -v python3)"
     fi
     ;;
@@ -831,7 +818,7 @@ fi
 
 if [[ "$role_type" == "kimi" && "$provider_basename" == "kimi" \
   && "${FLEET_HEALTHCHECK:-0}" != "1" ]]; then
-  /usr/bin/env -i "${keep[@]}" "$kimi_bridge_python" \
+  /usr/bin/env -i "${keep[@]}" "PYTHONPATH=$repo_root/scripts" "$kimi_bridge_python" \
     "$repo_root/scripts/kimi_hook_bridge.py" \
     --share-dir "$kimi_share_dir" \
     --work-dir "$kimi_work_dir" \
@@ -841,7 +828,7 @@ if [[ "$role_type" == "kimi" && "$provider_basename" == "kimi" \
     --hook-dir "${CMUX_HOOK_DIR:-$controller_home/.cmuxterm}" \
     --events-file "$kimi_events_file" \
     --provider moonshot-ai \
-    --model kimi-code/kimi-for-coding \
+    --model kimi-code/k3 \
     >/dev/null 2>&1 &
   kimi_bridge_pid=$!
   sleep 0.1

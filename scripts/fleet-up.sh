@@ -1641,10 +1641,21 @@ if [[ -n "$target_repo" ]]; then
       fi
       fleet_boot_checkpoint after_clone_creation_binding
       fleet_boot_checkpoint after_clone_creation_intent
+      # Kimi readers carry their role contract as AGENTS.md inside the sealed
+      # snapshot: written after checkout, before the read-only seal, so the
+      # root fingerprint covers it (frozen decision D4 of the kimi-code
+      # migration). The target repo is untrusted, so drop any checked-out
+      # AGENTS.md (rm -rf, no trailing slash) before copying: a tracked
+      # symlink would otherwise make cp write the contract through the link,
+      # outside the reader clone; a tracked directory would misplace it.
+      kimi_agents_source="$repo_root/orchestration/prompts/kimi_reviewer_agents.md"
       if ! sanitized_git clone -q --no-hardlinks --no-checkout "$target_repo" "$wt" \
           || [[ "${FLEET_TEST_FAIL_CLONE_INSTANCE:-}" == "${instance_ids[$i]}" ]] \
           || ! sanitized_git -C "$wt" remote remove origin \
           || ! sanitized_git -C "$wt" switch -q --detach "$base_sha" \
+          || { [[ "${hook_sources[$i]}" == "kimi" ]] \
+               && { rm -rf "$wt/AGENTS.md"; \
+                    ! cp "$kimi_agents_source" "$wt/AGENTS.md"; }; } \
           || ! make_reader_clone_read_only "$wt"; then
         if [[ -e "$wt" || -L "$wt" ]]; then
           failed_boot_stage_clone partial "${instance_ids[$i]}" "$base_sha" \
