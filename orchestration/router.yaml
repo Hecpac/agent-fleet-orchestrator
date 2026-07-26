@@ -267,7 +267,7 @@
       "transport": "inline-tokenized",
       "command": ["kimi", "--model", "kimi-code/k3", "--plan"],
       "healthcheck": ["kimi", "doctor"],
-      "ready_pattern": "Welcome to Kimi|kimi-code|ctrl-x|context left|/help",
+      "ready_pattern": "Welcome to Kimi|kimi-code|ctrl-x|context left|/help|plan[[:space:]]+K3[[:space:]]+thinking",
       "enabled": true,
       "requires_env": [],
       "capabilities": ["independent_code_review", "long_context_review", "architecture_challenge"],

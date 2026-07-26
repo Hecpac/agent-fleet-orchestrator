@@ -69,6 +69,13 @@ class FleetStatusTests(unittest.TestCase):
         self.write_file(path, fleet_json.canonical_bytes(value), mode)
         return path
 
+    def test_hook_timestamps_accept_seconds_and_normalize_milliseconds(self) -> None:
+        self.assertEqual(fleet_status._updated_at(1_784_566_763.217), 1_784_566_763.217)
+        self.assertEqual(fleet_status._updated_at(1_784_566_763_217), 1_784_566_763.217)
+        for invalid in (10_000_000_000, 10_000_000_000_000, True, -1):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                fleet_status._updated_at(invalid)
+
     def test_live_schema_maps_one_strict_session_without_mixing_indexes(self) -> None:
         self.write_manifest("alpha")
         self.write_hooks(

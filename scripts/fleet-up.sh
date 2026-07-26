@@ -93,8 +93,9 @@ Usage:
   fleet-up.sh --list-presets
 
 --target-repo <path>: git repository the fleet works on. Every instance with
-write authority gets a dedicated fleet/<feature>/<instance> branch and worktree
-there, so committed output remains reachable after teardown.
+write authority gets a dedicated fleet/<feature>/<instance> branch in an
+isolated clone. The target ref changes only during controlled teardown after
+the output is verified and committed.
 --execution-profile <name>: native (default), sandboxed, or regulated. Profiles
 change the process perimeter; router-declared tool capabilities remain intact.
 --compiled-workflow <path>: bind the pre-effect router plan and published
@@ -293,6 +294,8 @@ provider_repress=()
 provider_timeouts=()
 provider_events=()
 warnings=()
+interactive_launch_ids=()
+last_launch_id=""
 
 while IFS=$'\x1f' read -r record a b c d e f g h i j k l m n o p; do
   case "$record" in
@@ -563,6 +566,7 @@ launch_interactive_surface() {
   local ready_pattern="$9" executable="${10}"
   local agent_command descriptor launch_id spec_sha256 launcher_runs launcher_command
   local -a compiled_environment=()
+  last_launch_id=""
   agent_command="$(interactive_agent_command \
     "$role_type" "$authority" "$required_csv" "$command_shell")"
   if [[ -n "$compiled_workflow" ]]; then
@@ -585,6 +589,7 @@ launch_interactive_surface() {
     echo "Interactive agent '$label' returned an invalid launch descriptor." >&2
     return 1
   fi
+  last_launch_id="$launch_id"
   launcher_runs="$(cd "$runs_dir" && pwd -P)" || return 1
   if [[ "$launcher_runs" == "$repo_root/"* ]]; then
     launcher_runs="${launcher_runs#"$repo_root/"}"
@@ -1655,7 +1660,8 @@ if [[ -n "$target_repo" ]]; then
           || ! sanitized_git -C "$wt" switch -q --detach "$base_sha" \
           || { [[ "${hook_sources[$i]}" == "kimi" ]] \
                && { rm -rf "$wt/AGENTS.md"; \
-                    ! cp "$kimi_agents_source" "$wt/AGENTS.md"; }; } \
+                    { ! cp "$kimi_agents_source" "$wt/AGENTS.md" \
+                      || ! printf '/AGENTS.md\n' > "$wt/.git/info/exclude"; }; }; } \
           || ! make_reader_clone_read_only "$wt"; then
         if [[ -e "$wt" || -L "$wt" ]]; then
           failed_boot_stage_clone partial "${instance_ids[$i]}" "$base_sha" \
@@ -1700,6 +1706,9 @@ cmux rename-tab --surface "$lead_surface" --workspace "$ws_ref" "$lead_title" >/
 # cmux inserts every right split next to the still-focused lead. Creating the
 # sorted plan in reverse therefore renders the requested rank order naturally.
 surfaces=()
+for ((i=0; i<${#instance_ids[@]}; i++)); do
+  interactive_launch_ids[$i]=""
+done
 for ((i=${#instance_ids[@]}-1; i>=0; i--)); do
   pane_output="$(cmux new-pane --direction right --workspace "$ws_ref" --focus false)"
   surface="$(grep -o 'surface:[0-9]*' <<< "$pane_output" | head -1)"
@@ -1770,6 +1779,7 @@ for ((i=${#instance_ids[@]}-1; i>=0; i--)); do
       "${role_types[$i]}" "${authorities[$i]}" "${required_envs[$i]}" \
       "$instance_endpoint" "$agent_command" "${ready_patterns[$i]}" \
       "${executables[$i]}" || launch_rc=$?
+    interactive_launch_ids[$i]="$last_launch_id"
     if [[ -n "$kimi_reader_fingerprint" ]]; then
       if ! make_reader_clone_read_only "$launch_cwd"; then
         echo "Could not restore the Kimi reader snapshot to read-only mode." >&2
@@ -1903,6 +1913,13 @@ manifest_tmp="$(mktemp "$runs_dir/.fleet-$feature.manifest.XXXXXX")"
     echo "${instance_ids[$i]}.provider=${providers[$i]}"
     echo "${instance_ids[$i]}.model=${models[$i]}"
     echo "${instance_ids[$i]}.hook_source=${hook_sources[$i]}"
+    if [[ "${runners[$i]}" == "interactive" ]]; then
+      [[ "${interactive_launch_ids[$i]:-}" =~ ^[0-9a-f-]{36}$ ]] || {
+        echo "Missing launch generation for ${instance_ids[$i]}" >&2
+        exit 1
+      }
+      echo "${instance_ids[$i]}.launch_id=${interactive_launch_ids[$i]}"
+    fi
     [[ -z "${instance_control_sockets[$i]:-}" ]] || \
       echo "${instance_ids[$i]}.control_socket=${instance_control_sockets[$i]}"
     [[ -z "${variants[$i]}" ]] || echo "${instance_ids[$i]}.variant=${variants[$i]}"

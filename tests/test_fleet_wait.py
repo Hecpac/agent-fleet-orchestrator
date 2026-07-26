@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -300,9 +301,15 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
         surface_state.mkdir(parents=True)
         events_file = surface_state / "events.jsonl"
         work = self.tmp / "work"
-        share = self.tmp / "share"
+        share = surface_state / "share"
         work.mkdir()
         share.mkdir()
+        hooks.chmod(0o700)
+        state_root.chmod(0o700)
+        surface_state.chmod(0o700)
+        share.chmod(0o700)
+        mission_id = "00000000-0000-4000-8000-000000000201"
+        generation_id = "00000000-0000-4000-8000-000000000301"
         run_id = "00000000-0000-4000-8000-000000000777"
         session_id = UUID_2
         ack = {
@@ -338,16 +345,31 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
                 workspace_uuid=WORKSPACE_UUID,
                 surface_uuid=UUID_2,
                 provider="moonshot-ai",
-                model="moonshot-ai/kimi-k3",
+                model="kimi-code/k3",
                 hook_source="kimi",
+                mission_id=mission_id,
+                generation_id=generation_id,
                 run_id=run_id,
             )
             timestamp = time.time() + 1
             response = f"verified\nFLEET_RESULT:{run_id}:DONE"
+            work_hash = hashlib.sha256(
+                str(work.resolve()).encode("utf-8")
+            ).hexdigest()[:12]
+            session_root = (
+                share
+                / "sessions"
+                / f"wd_cwd_{work_hash}"
+                / "session_provider_generated"
+                / "agents"
+                / "main"
+            )
+            session_root.mkdir(parents=True)
+            for directory, _, _ in os.walk(share):
+                Path(directory).chmod(0o700)
             transcript = kimi_hook_bridge.wire_path(share, work, session_id)
-            transcript.parent.mkdir(parents=True)
             rows = (
-                {"type": "metadata", "protocol_version": "1.3"},
+                {"type": "metadata", "protocol_version": "1.10"},
                 {
                     "timestamp": timestamp,
                     "message": {
@@ -371,14 +393,18 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
                 "".join(json.dumps(row) + "\n" for row in rows),
                 encoding="utf-8",
             )
+            transcript.chmod(0o600)
             kimi_hook_bridge.record_session(
                 hooks,
+                share_dir=share,
                 session_id=session_id,
                 workspace_id=WORKSPACE_UUID,
                 surface_id=UUID_2,
+                mission_id=mission_id,
+                generation_id=generation_id,
                 transcript_path=transcript,
                 provider="moonshot-ai",
-                model="moonshot-ai/kimi-k3",
+                model="kimi-code/k3",
             )
             for record_index, row in ((2, rows[1]), (4, rows[3])):
                 event = kimi_hook_bridge.hook_event(

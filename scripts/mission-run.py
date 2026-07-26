@@ -546,19 +546,20 @@ def exact_legacy_run(
     run_id: str,
     *,
     prompt_sha256: str | None = None,
+    instance: str = "lead",
 ) -> dict[str, Any]:
     matches = [
         event
         for event in legacy_events(runs_dir, feature)
-        if event.get("instance") == "lead" and event.get("run_id") == run_id
+        if event.get("instance") == instance and event.get("run_id") == run_id
     ]
     if not matches:
-        raise MissionRunError(f"missing legacy evidence for lead run {run_id}")
+        raise MissionRunError(f"missing legacy evidence for {instance} run {run_id}")
     if prompt_sha256 is not None and any(
         event.get("task_sha256") != prompt_sha256 for event in matches
     ):
         raise MissionRunError(
-            "Lead task_sha256 differs from its dispatch prompt_sha256"
+            f"{instance} task_sha256 differs from its dispatch prompt_sha256"
         )
     manifest = parse_manifest(runs_dir / f"fleet-{feature}.manifest")
     try:
@@ -567,7 +568,9 @@ def exact_legacy_run(
             required_protocol=manifest.get("tracking_protocol", "legacy-cmux"),
         )
     except fleet_tracking.TrackingError as exc:
-        raise MissionRunError(f"lead tracked result provenance invalid: {exc}") from exc
+        raise MissionRunError(
+            f"{instance} tracked result provenance invalid: {exc}"
+        ) from exc
 
 
 def terminal_evidence(
@@ -674,17 +677,55 @@ def _finalize_lead(
     mission_id: str,
     *,
     reason: str,
-    terminal_evidence: dict[str, Any],
+    lead_terminal_evidence: dict[str, Any],
 ) -> None:
     current = fleet_mission.load_state(runs_dir, mission_id)
     admission_id = current.get("lead_admission_id")
     if not isinstance(admission_id, str):
         raise MissionRunError("Lead terminal evidence lacks admission ownership")
+    # A specialist can reach a durable frontier terminal before its accepted
+    # wrapper effect is reconciled into delegation_registered (for example, an
+    # unconfirmed Kimi Wire submit).  Admission ownership already exists at
+    # that point.  Reconcile every exact terminal child before retiring the
+    # parent so a pre-registration failure cannot strand the Mission running.
+    for child in sorted(
+        (
+            item
+            for item in current["admissions"].values()
+            if item.get("active") and item.get("parent_admission_id") == admission_id
+        ),
+        key=lambda item: item["admission_id"],
+    ):
+        child_terminal = exact_legacy_run(
+            runs_dir,
+            current["feature"],
+            child["run_id"],
+            prompt_sha256=child["task_sha256"],
+            instance=child["recipient_instance"],
+        )
+        child_status = str(child_terminal.get("status", ""))
+        if child_status not in mission_state.TERMINAL_STATUSES:
+            raise MissionRunError(
+                "Lead admission has an active child without durable terminal evidence"
+            )
+        _finalize_run_admission(
+            runs_dir,
+            mission_id,
+            run_id=child["run_id"],
+            idempotency_key=f"admission:child:{child['admission_id']}:finalize",
+            terminal_evidence=terminal_evidence(
+                child_terminal,
+                run_id=child["run_id"],
+                task_sha256=child["task_sha256"],
+                status=child_status,
+            ),
+        )
+    current = fleet_mission.load_state(runs_dir, mission_id)
     durable = current["admissions"].get(admission_id)
     if durable is None:
         raise MissionRunError("Lead admission disappeared before finalization")
     if durable["phase"] == "finalized":
-        if durable["terminal"].get("terminal_evidence") != terminal_evidence:
+        if durable["terminal"].get("terminal_evidence") != lead_terminal_evidence:
             raise MissionRunError("Lead terminal admission is immutable")
         return
     try:
@@ -694,7 +735,7 @@ def _finalize_lead(
             admission_id=admission_id,
             recipient_instance=durable["recipient_instance"],
             writer=bool(durable["writer"]),
-            terminal_evidence=terminal_evidence,
+            terminal_evidence=lead_terminal_evidence,
             reason=reason,
             idempotency_key="admission:lead:finalize",
         )
@@ -1110,7 +1151,7 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                         runs_dir,
                         mission_id,
                         reason="principal Lead retired for assured handoff",
-                        terminal_evidence=terminal_evidence(
+                        lead_terminal_evidence=terminal_evidence(
                             lead_terminal,
                             run_id=lead_admission["run_id"],
                             task_sha256=lead_prompt_sha256,
@@ -1630,7 +1671,7 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                         runs_dir,
                         mission_id,
                         reason=f"durable Lead terminal status: {terminal}",
-                        terminal_evidence=terminal_evidence(
+                        lead_terminal_evidence=terminal_evidence(
                             legacy_terminal,
                             run_id=current["lead_run_id"],
                             task_sha256=prompt_sha,
@@ -1708,7 +1749,7 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                     runs_dir,
                     mission_id,
                     reason="Lead result attested",
-                    terminal_evidence=terminal_evidence(
+                    lead_terminal_evidence=terminal_evidence(
                         legacy,
                         run_id=current["lead_run_id"],
                         task_sha256=prompt_sha,
@@ -1884,7 +1925,7 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                             reason=(
                                 "prior Lead terminal reconciled after assured synthesis"
                             ),
-                            terminal_evidence=terminal_evidence(
+                            lead_terminal_evidence=terminal_evidence(
                                 prior_terminal,
                                 run_id=prior_lead["run_id"],
                                 task_sha256=prior_lead["task_sha256"],

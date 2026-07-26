@@ -56,7 +56,7 @@ class KimiRouterRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             temp = Path(directory)
             controller_home = temp / "home"
-            controller_kimi = controller_home / ".kimi"
+            controller_kimi = controller_home / ".kimi-code"
             controller_kimi.mkdir(parents=True)
             (controller_kimi / "config.toml").write_text(
                 'default_model = "kimi-code/k3"\n'
@@ -152,6 +152,7 @@ class KimiRouterRuntimeTests(unittest.TestCase):
                     "CMUX_HOOK_DIR": str(hook_dir),
                     "CMUX_WORKSPACE_ID": WORKSPACE_UUID,
                     "CMUX_SURFACE_ID": SURFACE_UUID,
+                    "FLEET_LAUNCH_ID": "00000000-0000-4000-8000-000000000301",
                 },
                 text=True,
                 capture_output=True,

@@ -38,6 +38,7 @@ archive_client="$repo_root/scripts/fleet_archive.py"
 control_client="$repo_root/scripts/fleet_control_service.py"
 manifest_guard="$repo_root/scripts/fleet_manifest_guard.py"
 clone_guard="$repo_root/scripts/fleet_clone_guard.py"
+kimi_frontier="$repo_root/scripts/fleet_frontier.py"
 assurance_handoff="$repo_root/scripts/fleet_assurance_handoff.py"
 export CMUX_QUIET=1
 
@@ -1628,6 +1629,32 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
     done
     set_manifest_value "workspace.quiesced" "1"
     set_manifest_value "workspace.handoff_state" "quiesced"
+    # CMUX absence has now been observed and made durable. Retire only exact
+    # Kimi launch generations whose frontier runs are all durably releasable.
+    # Any indeterminate/retained/nonterminal run, live bridge lock, or binding
+    # mismatch fails closed and leaves the active state intact for recovery.
+    kimi_hook_records="$(manifest_entries_with_suffix ".hook_source")" || exit 75
+    while IFS= read -r entry; do
+      [[ -n "$entry" ]] || continue
+      [[ "${entry#*=}" == "kimi" ]] || continue
+      instance="${entry%%.*}"
+      generation_id="$(manifest_value "$instance.launch_id")"
+      surface_uuid="$(manifest_value "$instance.uuid")"
+      if [[ -z "$generation_id" ]]; then
+        # Legacy manifests predate generation-bound Kimi state. Preserve their
+        # trees rather than guessing ownership during teardown.
+        continue
+      fi
+      kimi_hook_dir="${CMUX_HOOK_DIR:-${FLEET_CONTROLLER_HOOK_DIR:-$HOME/.cmuxterm}}"
+      if ! python3 "$kimi_frontier" retire-kimi "$runs_dir" \
+          --feature "$feature" --instance "$instance" \
+          --workspace-uuid "$workspace_uuid" --surface-uuid "$surface_uuid" \
+          --mission-id "$mission_id" --generation-id "$generation_id" \
+          --hook-dir "$kimi_hook_dir" --workspace-quiesced >/dev/null; then
+        echo "Refusing teardown: Kimi state for '$instance' could not be retired exactly." >&2
+        exit 75
+      fi
+    done <<< "$kimi_hook_records"
     if (( workspace_already_absent == 1 )) && [[ "$preset" == "fleet_dialogue" ]]; then
       if ! python3 "$dialogue_controller" verify "$runs_dir" --feature "$feature" \
           --require-terminal --write-receipt "$verification_receipt" >/dev/null; then

@@ -60,15 +60,18 @@ Event stream (prefer listening over polling when waiting on many agents):
    definition; that fallback asks for Bash or external-directory permissions
    and can leave the pane waiting. Launch through `fleet-up.sh` or
    `scripts/run-interactive-agent.sh`, then verify the resolved role/policy.
-   The supported wrapper copies the dedicated agent into isolated config and
-   fails closed unless `external_directory` is denied.
-8. **Launch Kimi review panes with the repo-owned read-only agent file.** Use
-   model alias `moonshot-ai/kimi-k3`, `--thinking`, the exact target
-   `--work-dir`, and
-   `.kimi/agents/fleet-reviewer/agent.yaml`. Never use `--yolo`, `--afk`, or
-   `--print` for a review: those modes auto-approve shell commands and file
-   mutations. A permission granted in one interactive session is not the
-   launch contract for a new session; the reduced tool set is.
+   The supported wrapper installs the repo-owned agent into fresh isolated
+   config without importing the controller's OpenCode config, plugins,
+   database, history, or state, and fails closed unless `external_directory`
+   is denied.
+8. **Launch authoritative Kimi review panes only through a Mission-bound
+   supported wrapper.** The router pins `kimi-code/k3` with the `plan` thinking
+   mode, injects the exact read-only contract through `AGENTS.md`, and runs
+   against a sealed read-only clone. Standalone guided Kimi does not yet provide
+   that boundary. Current kimi-code no longer supports the legacy `--thinking`,
+   `--work-dir`, or repo agent-file flags. Never use `--yolo`, `--afk`, or
+   `--print` for a review: those modes can auto-approve shell commands and file
+   mutations.
 
 ## This repo's fleet pattern
 
@@ -113,9 +116,11 @@ exact tracked result. Routine work needs no phase advance or human approval.
 Use `fleet_dialogue` when production, money, secrets, destructive actions, or a
 known high-risk boundary requires the assured FDP-2/FDP-3 path.
 
-For lower-level/manual operation, boot a team from the capability router. The default `small` preset creates a
-Codex lead; Claude is an enabled fallback candidate (`first_available` walks
-`lead.candidates` in order). Panes render by rank: CONTROL → RECON → BUILD → CHALLENGE → VERIFY.
+For lower-level/manual operation, boot a team from the capability router. The
+default `small` preset creates a Codex lead. Claude is a declared candidate,
+but fallback is disabled unless the operator explicitly passes
+`--allow-fallback`; `first_available` then walks `lead.candidates` in order.
+Panes render by rank: CONTROL → RECON → BUILD → CHALLENGE → VERIFY.
 
 ```bash
 just fleet <feature>                              # default small: lead only
@@ -141,7 +146,7 @@ and the supported wrappers now enforce important parts of them: interactive
 agents inherit an environment allowlist; advisory Codex runs read-only;
 OpenCode challengers and Claude verification use plan/read-only modes; local
 dispatch uses instance/heavy leases. Direct manual `cmux send` can change the
-visible pane but cannot bind a contract-v2 tracked run; keep one writer and use
+visible pane but cannot bind a contract-v3 tracked run; keep one writer and use
 `fleet-send.sh` for every authoritative turn.
 The CONTROL lead alone uses `danger-full-access` so it can reach the cmux Unix
 socket; its environment is still allowlisted.
@@ -162,9 +167,11 @@ Fleet Control socket. Existing authentication is copied and CMUX hooks are
 installed through a fixed controller-owned bridge; unrelated hook commands and
 broad controller sandbox settings are not copied.
 Pass `--target-repo <path>` to `fleet-up` and each write-authority instance
-gets a dedicated `fleet/<feature>/<instance>` branch and worktree at the target
-repo's current `HEAD`. Existing branches fail closed; teardown removes only an
-unchanged branch and preserves committed output. Local-worker token spend
+gets a dedicated `fleet/<feature>/<instance>` branch in an isolated clone at
+the target repo's current `HEAD`. The clone has its own Git metadata and no
+remote or alternates, so it cannot advance target refs directly. Existing
+branches fail closed; CONTROL publishes verified output during teardown by a
+durable compare-and-swap intent. Local-worker token spend
 accrues in the ledger and `fleet-dispatch` refuses once observed spend reaches
 `limits.local_token_budget_per_feature`; this is a soft dispatch-time cap, not
 a reservation. `fleet-wait` fires a `cmux notify` ESCALATION on timeout.
@@ -196,10 +203,11 @@ fails closed instead of leaving a shell that can mistake a prompt for a command.
 
 `fleet-up.sh` writes `orchestration/runs/fleet-<feature>.manifest`:
 
-- `manifest_contract_version=2`, `execution_profile`, and
+- `manifest_contract_version=3`, `execution_profile`, and
   `tracking_protocol=control-v1` describe enforcement without changing the
-  router's declared capabilities. Legacy manifests normalize to `native` plus
-  `legacy-cmux` and may be inspected/migrated with `fleet_manifest.py`.
+  router's declared capabilities. Contracts v1/v2 remain readable for
+  standalone fleets; mission-bound v1/v2 runs must be restarted because an
+  in-place migration cannot invent their compiled launch binding.
 
 ```
 schema_version=3

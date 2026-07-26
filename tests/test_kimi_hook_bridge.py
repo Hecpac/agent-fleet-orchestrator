@@ -24,6 +24,8 @@ from fleet_ledger import events_for_run  # noqa: E402
 WORKSPACE_UUID = "00000000-0000-0000-0000-000000000001"
 SURFACE_UUID = "00000000-0000-0000-0000-000000000101"
 SESSION_ID = "00000000-0000-0000-0000-000000000101"
+MISSION_ID = "00000000-0000-4000-8000-000000000201"
+GENERATION_ID = "00000000-0000-4000-8000-000000000301"
 
 
 def wire_record(timestamp: float, message_type: str, payload: dict) -> dict:
@@ -40,20 +42,22 @@ class KimiHookBridgeTests(unittest.TestCase):
         self.root = Path(self.tempdir.name)
         self.work = self.root / "work"
         self.work.mkdir()
-        self.share = self.root / "share"
-        self.share.mkdir()
         self.hooks = self.root / "hooks"
         self.hooks.mkdir()
         self.state_root = self.root / "state"
         self.surface_state = self.state_root / SURFACE_UUID
         self.surface_state.mkdir(parents=True)
+        self.share = self.surface_state / "share"
+        self.share.mkdir()
         self.events = self.surface_state / "events.jsonl"
         # kimi-code layout: the CLI mints the session under the isolated
         # home; the test plays the CLI's role and creates it first.
         work_hash = hashlib.sha256(
             str(self.work.resolve()).encode("utf-8")
         ).hexdigest()[:12]
-        self.session_root = self.share / "sessions" / f"wd_cwd_{work_hash}"
+        self.session_root = (
+            self.share / "sessions" / f"wd_{self.work.name}_{work_hash}"
+        )
         cli_session = (
             self.session_root
             / "session_11111111-1111-4111-8111-111111111111"
@@ -61,10 +65,12 @@ class KimiHookBridgeTests(unittest.TestCase):
             / "main"
         )
         cli_session.mkdir(parents=True)
+        for directory, _, _ in os.walk(self.root):
+            Path(directory).chmod(0o700)
         self.transcript = kimi_hook_bridge.wire_path(
             self.share, self.work, SESSION_ID
         )
-        self.assertEqual(self.transcript, cli_session / "wire.jsonl")
+        self.assertEqual(self.transcript, (cli_session / "wire.jsonl").resolve())
 
     def bridge_command(self) -> list[str]:
         return [
@@ -80,6 +86,10 @@ class KimiHookBridgeTests(unittest.TestCase):
             WORKSPACE_UUID,
             "--surface-id",
             SURFACE_UUID,
+            "--mission-id",
+            MISSION_ID,
+            "--generation-id",
+            GENERATION_ID,
             "--hook-dir",
             str(self.hooks),
             "--events-file",
@@ -87,7 +97,7 @@ class KimiHookBridgeTests(unittest.TestCase):
             "--provider",
             "moonshot-ai",
             "--model",
-            "moonshot-ai/kimi-k3",
+            "kimi-code/k3",
             "--poll-interval",
             "0.02",
         ]
@@ -131,7 +141,7 @@ class KimiHookBridgeTests(unittest.TestCase):
         response = "review complete\nFLEET_RESULT:run-1:DONE"
         self.transcript.parent.mkdir(parents=True, exist_ok=True)
         rows = [
-            {"type": "metadata", "protocol_version": "1.10"},
+            {"type": "metadata", "protocol_version": "1.4"},
             wire_record(100.0, "TurnBegin", {"user_input": prompt}),
             wire_record(101.0, "ContentPart", {"type": "text", "text": response}),
             wire_record(102.0, "TurnEnd", {}),
@@ -139,6 +149,7 @@ class KimiHookBridgeTests(unittest.TestCase):
         self.transcript.write_text(
             "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
         )
+        self.transcript.chmod(0o600)
         self.wait_for(
             lambda: self.events.exists()
             and len(self.events.read_text(encoding="utf-8").splitlines()) == 2
@@ -160,8 +171,92 @@ class KimiHookBridgeTests(unittest.TestCase):
         )
         self.assertEqual(session["workspaceId"], WORKSPACE_UUID)
         self.assertEqual(session["surfaceId"], SURFACE_UUID)
+        self.assertEqual(session["missionId"], MISSION_ID)
+        self.assertEqual(session["generationId"], GENERATION_ID)
         self.assertEqual(session["provider"], "moonshot-ai")
-        self.assertEqual(session["model"], "moonshot-ai/kimi-k3")
+        self.assertEqual(session["model"], "kimi-code/k3")
+
+    def test_bridge_maps_wire_1_4_turn_lifecycle(self) -> None:
+        begin = kimi_hook_bridge.hook_event(
+            record_index=7,
+            record={"type": "turn.prompt", "input": [], "time": 1785101249515},
+            session_id=SESSION_ID,
+            workspace_id=WORKSPACE_UUID,
+            surface_id=SURFACE_UUID,
+        )
+        self.assertEqual(begin["name"], "agent.hook.UserPromptSubmit")
+        self.assertEqual(begin["occurred_at"], "2026-07-26T21:27:29.515000+00:00")
+        self.assertIsNone(
+            kimi_hook_bridge.hook_event(
+                record_index=15,
+                record={
+                    "type": "context.append_loop_event",
+                    "event": {"type": "step.end", "finishReason": "tool_calls"},
+                    "time": 1785101260000,
+                },
+                session_id=SESSION_ID,
+                workspace_id=WORKSPACE_UUID,
+                surface_id=SURFACE_UUID,
+            )
+        )
+        end = kimi_hook_bridge.hook_event(
+            record_index=16,
+            record={
+                "type": "context.append_loop_event",
+                "event": {"type": "step.end", "finishReason": "end_turn"},
+                "time": 1785101270265,
+            },
+            session_id=SESSION_ID,
+            workspace_id=WORKSPACE_UUID,
+            surface_id=SURFACE_UUID,
+        )
+        self.assertEqual(end["name"], "agent.hook.Stop")
+
+    def test_frontier_extracts_wire_1_4_completed_turn(self) -> None:
+        run_id = "run-wire-1-4"
+        stopped_ms = 1785101270265
+        rows = [
+            {"type": "metadata", "protocol_version": "1.4"},
+            {
+                "type": "turn.prompt",
+                "input": [
+                    {"type": "text", "text": f"FLEET_RESULT:{run_id}:<STATUS>"}
+                ],
+                "time": stopped_ms - 1000,
+            },
+            {
+                "type": "context.append_loop_event",
+                "event": {
+                    "type": "content.part",
+                    "part": {
+                        "type": "text",
+                        "text": f"STATUS: DONE\nFLEET_RESULT:{run_id}:DONE",
+                    },
+                },
+                "time": stopped_ms - 1,
+            },
+            {
+                "type": "context.append_loop_event",
+                "event": {"type": "step.end", "finishReason": "end_turn"},
+                "time": stopped_ms,
+            },
+            {"type": "usage.record", "time": stopped_ms},
+        ]
+        with (
+            mock.patch.object(
+                fleet_frontier,
+                "session_record",
+                return_value={"provider": "moonshot-ai", "model": "kimi-code/k3"},
+            ),
+            mock.patch.object(fleet_frontier, "_transcript_rows", return_value=rows),
+        ):
+            response, provider, model = fleet_frontier.kimi_turn_evidence(
+                f"kimi-{SESSION_ID}",
+                run_id,
+                "2026-07-26T21:27:50.265000+00:00",
+            )
+        self.assertIn(f"FLEET_RESULT:{run_id}:DONE", response)
+        self.assertEqual((provider, model), ("moonshot-ai", "kimi-code/k3"))
 
     def test_bridge_rejects_a_second_watcher_for_the_same_surface(self) -> None:
         self.start_bridge()
@@ -177,6 +272,15 @@ class KimiHookBridgeTests(unittest.TestCase):
         self.assertEqual(duplicate.returncode, 2)
         self.assertIn("another Kimi bridge owns this surface", duplicate.stderr)
 
+    def test_bridge_rejects_lock_with_unsafe_mode(self) -> None:
+        lock = self.surface_state / ".bridge.lock"
+        lock.touch(mode=0o600)
+        lock.chmod(0o644)
+        with self.assertRaisesRegex(
+            kimi_hook_bridge.KimiBridgeError, "owner-bound mode 0600"
+        ):
+            kimi_hook_bridge.acquire_bridge_lock(self.surface_state)
+
     def test_frontier_extracts_exact_completed_kimi_turn_and_identity(self) -> None:
         run_id = "run-kimi-evidence"
         prompt = f"inspect\nFLEET_RESULT:{run_id}:<STATUS>"
@@ -187,7 +291,7 @@ class KimiHookBridgeTests(unittest.TestCase):
             "".join(
                 json.dumps(row) + "\n"
                 for row in (
-                    {"type": "metadata", "protocol_version": "1.3"},
+                    {"type": "metadata", "protocol_version": "1.10"},
                     wire_record(100.0, "TurnBegin", {"user_input": prompt}),
                     wire_record(
                         101.0, "ContentPart", {"type": "text", "text": response}
@@ -197,16 +301,23 @@ class KimiHookBridgeTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        self.transcript.chmod(0o600)
         kimi_hook_bridge.record_session(
             self.hooks,
+            share_dir=self.share,
             session_id=SESSION_ID,
             workspace_id=WORKSPACE_UUID,
             surface_id=SURFACE_UUID,
+            mission_id=MISSION_ID,
+            generation_id=GENERATION_ID,
             transcript_path=self.transcript,
             provider="moonshot-ai",
-            model="moonshot-ai/kimi-k3",
+            model="kimi-code/k3",
         )
-        with mock.patch.dict(os.environ, {"CMUX_HOOK_DIR": str(self.hooks)}):
+        with (
+            mock.patch.object(fleet_frontier, "KIMI_STATE_ROOT", self.state_root),
+            mock.patch.dict(os.environ, {"CMUX_HOOK_DIR": str(self.hooks)}),
+        ):
             evidence = fleet_frontier.kimi_turn_evidence(
                 f"kimi-{SESSION_ID}",
                 run_id,
@@ -214,7 +325,7 @@ class KimiHookBridgeTests(unittest.TestCase):
             )
         self.assertEqual(
             evidence,
-            (response, "moonshot-ai", "moonshot-ai/kimi-k3"),
+            (response, "moonshot-ai", "kimi-code/k3"),
         )
 
     def test_kimi_event_store_rejects_symlink(self) -> None:
@@ -222,7 +333,7 @@ class KimiHookBridgeTests(unittest.TestCase):
         target.write_text("", encoding="utf-8")
         self.events.symlink_to(target)
         with mock.patch.object(fleet_frontier, "KIMI_STATE_ROOT", self.state_root):
-            with self.assertRaisesRegex(fleet_frontier.FrontierError, "symlink"):
+            with self.assertRaisesRegex(fleet_frontier.FrontierError, "safe Kimi"):
                 fleet_frontier.kimi_hook_events(SURFACE_UUID)
 
     def test_kimi_events_complete_a_control_v1_frontier_run(self) -> None:
@@ -261,14 +372,16 @@ class KimiHookBridgeTests(unittest.TestCase):
                 workspace_uuid=WORKSPACE_UUID,
                 surface_uuid=SURFACE_UUID,
                 provider="moonshot-ai",
-                model="moonshot-ai/kimi-k3",
+                model="kimi-code/k3",
                 hook_source="kimi",
+                mission_id=MISSION_ID,
+                generation_id=GENERATION_ID,
                 run_id=run_id,
             )
             now = time.time() + 1
             response = f"verified\nFLEET_RESULT:{run_id}:DONE"
             rows = [
-                {"type": "metadata", "protocol_version": "1.3"},
+                {"type": "metadata", "protocol_version": "1.10"},
                 wire_record(now, "TurnBegin", {"user_input": prepared["prompt"]}),
                 wire_record(
                     now + 1,
@@ -281,14 +394,18 @@ class KimiHookBridgeTests(unittest.TestCase):
             self.transcript.write_text(
                 "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
             )
+            self.transcript.chmod(0o600)
             kimi_hook_bridge.record_session(
                 self.hooks,
+                share_dir=self.share,
                 session_id=SESSION_ID,
                 workspace_id=WORKSPACE_UUID,
                 surface_id=SURFACE_UUID,
+                mission_id=MISSION_ID,
+                generation_id=GENERATION_ID,
                 transcript_path=self.transcript,
                 provider="moonshot-ai",
-                model="moonshot-ai/kimi-k3",
+                model="kimi-code/k3",
             )
             for index, row in ((2, rows[1]), (4, rows[3])):
                 event = kimi_hook_bridge.hook_event(
@@ -359,6 +476,7 @@ class KimiHookBridgeTests(unittest.TestCase):
             str(self.work.resolve()).encode("utf-8")
         ).hexdigest()
         (self.share / "sessions" / legacy_hash).mkdir(parents=True)
+        (self.share / "sessions" / legacy_hash).chmod(0o700)
         with self.assertRaisesRegex(
             kimi_hook_bridge.KimiBridgeError, "legacy kimi-cli"
         ):
@@ -379,6 +497,8 @@ class KimiHookBridgeTests(unittest.TestCase):
         def mint() -> None:
             time.sleep(0.4)
             minted.mkdir(parents=True)
+            for directory, _, _ in os.walk(self.session_root):
+                Path(directory).chmod(0o700)
 
         thread = threading.Thread(target=mint)
         thread.start()
@@ -388,7 +508,7 @@ class KimiHookBridgeTests(unittest.TestCase):
             )
         finally:
             thread.join()
-        self.assertEqual(resolved, minted / "wire.jsonl")
+        self.assertEqual(resolved, (minted / "wire.jsonl").resolve())
 
 
 if __name__ == "__main__":

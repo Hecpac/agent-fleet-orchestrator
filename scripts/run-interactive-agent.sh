@@ -19,11 +19,11 @@ codex_runtime_permission_name=""
 kimi_bridge_pid=""
 kimi_bridge_python=""
 kimi_events_file=""
-kimi_config_file=""
 kimi_session_id=""
 kimi_share_dir=""
 kimi_state_root="${FLEET_KIMI_STATE_ROOT:-/tmp/agent-fleet-orchestrator-kimi}"
 kimi_work_dir=""
+kimi_generation_id="${FLEET_LAUNCH_ID:-}"
 
 case "$execution_profile" in
   native|sandboxed|regulated) ;;
@@ -290,6 +290,13 @@ prepare_opencode_data_home() {
     mkdir -m 700 "$opencode_state_dir"
   fi
   xdg_data="$opencode_state_dir/data"
+  if [[ -L "$xdg_data" || ( -e "$xdg_data" && ! -d "$xdg_data" ) ]]; then
+    echo "OpenCode evidence data home is unsafe for surface $surface_id" >&2
+    exit 2
+  fi
+  if [[ ! -e "$xdg_data" ]]; then
+    mkdir -m 700 "$xdg_data"
+  fi
 }
 
 compiled_workflow="${FLEET_COMPILED_WORKFLOW:-}"
@@ -509,77 +516,73 @@ case "$role_type" in
     fi
     ;;
   kimi)
-    controller_kimi_config="$controller_home/.kimi/config.toml"
+    # kimi-code 0.29+ owns authentication under ~/.kimi-code.  The legacy
+    # ~/.kimi tree is migration input and can contain stale refresh tokens;
+    # never seed an isolated Fleet surface from it.
+    controller_kimi_config="$controller_home/.kimi-code/config.toml"
     if [[ ! -f "$controller_kimi_config" || -L "$controller_kimi_config" ]]; then
       echo "Kimi controller configuration is unavailable" >&2
       exit 2
     fi
     if [[ "${FLEET_HEALTHCHECK:-0}" == "1" ]]; then
       kimi_share_dir="$isolated_home/.kimi"
+      mkdir -p "$kimi_share_dir"
+      chmod 700 "$kimi_share_dir"
+      cp "$controller_kimi_config" "$kimi_share_dir/config.toml"
+      chmod 600 "$kimi_share_dir/config.toml"
+      controller_kimi_credentials="$controller_home/.kimi-code/credentials/kimi-code.json"
+      if [[ -f "$controller_kimi_credentials" && ! -L "$controller_kimi_credentials" ]]; then
+        mkdir -p "$kimi_share_dir/credentials"
+        chmod 700 "$kimi_share_dir/credentials"
+        cp "$controller_kimi_credentials" "$kimi_share_dir/credentials/kimi-code.json"
+        chmod 600 "$kimi_share_dir/credentials/kimi-code.json"
+      fi
     else
       if [[ ! "${CMUX_WORKSPACE_ID:-}" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ \
-        || ! "${CMUX_SURFACE_ID:-}" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+        || ! "${CMUX_SURFACE_ID:-}" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ \
+        || ! "$kimi_generation_id" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]; then
         echo "Kimi Fleet launch requires canonical cmux workspace/surface identities" >&2
         exit 2
       fi
-      if [[ "$kimi_state_root" != /* || -L "$kimi_state_root" ]]; then
-        echo "Kimi evidence state root must not be a symlink" >&2
-        exit 2
-      fi
-      mkdir -p "$kimi_state_root"
-      chmod 700 "$kimi_state_root"
       canonical_surface_id="$(printf '%s' "$CMUX_SURFACE_ID" | tr '[:lower:]' '[:upper:]')"
       kimi_state_dir="$kimi_state_root/$canonical_surface_id"
-      if [[ -L "$kimi_state_dir" || ( -e "$kimi_state_dir" && ! -d "$kimi_state_dir" ) ]]; then
-        echo "Kimi evidence state is unsafe for surface $canonical_surface_id" >&2
-        exit 2
-      fi
-      mkdir -p "$kimi_state_dir"
-      chmod 700 "$kimi_state_dir"
       kimi_share_dir="$kimi_state_dir/share"
       kimi_events_file="$kimi_state_dir/events.jsonl"
       kimi_session_id="$(printf '%s' "$CMUX_SURFACE_ID" | tr '[:upper:]' '[:lower:]')"
       kimi_work_dir="$(pwd -P)"
+      if (( fleet_agent_mcp_enabled != 1 )); then
+        echo "Kimi Fleet role requires an authenticated Fleet Control endpoint" >&2
+        exit 2
+      fi
+      controller_kimi_credentials="$controller_home/.kimi-code/credentials/kimi-code.json"
+      provision_args=(
+        provision --root "$kimi_state_root"
+        --surface-id "$CMUX_SURFACE_ID"
+        --workspace-id "$CMUX_WORKSPACE_ID"
+        --mission-id "${FLEET_MISSION_ID:-}"
+        --generation-id "$kimi_generation_id"
+        --config-source "$controller_kimi_config"
+        --mcp-command "$fleet_agent_mcp_python"
+        --mcp-proxy "$fleet_agent_mcp_proxy"
+      )
+      if [[ -f "$controller_kimi_credentials" && ! -L "$controller_kimi_credentials" ]]; then
+        provision_args+=(--credential-source "$controller_kimi_credentials")
+      fi
+      if ! PYTHONPATH="$repo_root/scripts" python3 "$repo_root/scripts/fleet_kimi_state.py" \
+          "${provision_args[@]}" >/dev/null; then
+        echo "Kimi persistent state could not be provisioned safely" >&2
+        exit 2
+      fi
     fi
-    if [[ -L "$kimi_share_dir" || ( -e "$kimi_share_dir" && ! -d "$kimi_share_dir" ) ]]; then
-      echo "Kimi share state is unsafe" >&2
-      exit 2
-    fi
-    # kimi-code (>= 0.28) resolves config, credentials, mcp.json, and the
-    # session store from one KIMI_CODE_HOME root. The fleet provisions an
-    # isolated home per surface: the legacy --config-file/--work-dir/
-    # --session flags and KIMI_SHARE_DIR are gone from the CLI.
-    mkdir -p "$kimi_share_dir"
-    chmod 700 "$kimi_share_dir"
-    cp "$controller_kimi_config" "$kimi_share_dir/config.toml"
-    chmod 600 "$kimi_share_dir/config.toml"
-    controller_kimi_credentials="$controller_home/.kimi/credentials/kimi-code.json"
-    if [[ -f "$controller_kimi_credentials" && ! -L "$controller_kimi_credentials" ]]; then
-      mkdir -p "$kimi_share_dir/credentials"
-      chmod 700 "$kimi_share_dir/credentials"
-      cp "$controller_kimi_credentials" "$kimi_share_dir/credentials/kimi-code.json"
-      chmod 600 "$kimi_share_dir/credentials/kimi-code.json"
-    fi
+    # kimi-code resolves configuration, credentials, MCP, and sessions from
+    # one per-surface home. Persistent destinations are provisioned above by
+    # descriptor-bound operations; the healthcheck uses only its ephemeral home.
     keep+=(
       "KIMI_CODE_HOME=$kimi_share_dir"
       "KIMI_CODE_NO_AUTO_UPDATE=1"
       "KIMI_CLI_NO_AUTO_UPDATE=1"
     )
     if [[ "$(basename "$1")" == "kimi" && "${FLEET_HEALTHCHECK:-0}" != "1" ]]; then
-      if (( fleet_agent_mcp_enabled != 1 )); then
-        echo "Kimi Fleet role requires an authenticated Fleet Control endpoint" >&2
-        exit 2
-      fi
-      python3 -c '
-import json
-import sys
-path, command, proxy = sys.argv[1:4]
-with open(path, "w", encoding="utf-8") as handle:
-    json.dump({"mcpServers": {"fleet_control": {
-        "command": command, "args": [proxy]
-    }}}, handle, separators=(",", ":"))
-' "$kimi_share_dir/mcp.json" "$fleet_agent_mcp_python" "$fleet_agent_mcp_proxy"
-      chmod 600 "$kimi_share_dir/mcp.json"
       kimi_bridge_python="$(command -v python3)"
     fi
     ;;
@@ -588,29 +591,14 @@ with open(path, "w", encoding="utf-8") as handle:
     prepare_opencode_data_home
     xdg_state="$isolated_home/xdg/state"
     mkdir -p "$xdg_config" "$xdg_data" "$xdg_state"
-    for mapping in \
-      "$controller_home/.config/opencode:$xdg_config" \
-      "$controller_home/.local/share/opencode:$xdg_data" \
-      "$controller_home/.local/state/opencode:$xdg_state"; do
-      source_dir="${mapping%%:*}"
-      destination_root="${mapping#*:}"
-      if [[ -d "$source_dir" ]]; then
-        if [[ -L "$source_dir" ]]; then
-          echo "OpenCode provider state root must not be a symlink: $source_dir" >&2
-          exit 2
-        fi
-        if [[ "$destination_root" == "$xdg_data" \
-          && -d "$destination_root/$(basename "$source_dir")" ]]; then
-          # The controller removes this durable evidence home only after it has
-          # persisted a terminal frontier receipt. Preserve it for provider
-          # restart/reconciliation until then.
-          validate_isolated_provider_tree "$destination_root/$(basename "$source_dir")"
-          continue
-        fi
-        cp -R "$source_dir" "$destination_root/"
-        validate_isolated_provider_tree "$destination_root/$(basename "$source_dir")"
-      fi
-    done
+    chmod 700 "$xdg_config" "$xdg_data" "$xdg_state"
+    # Do not seed a fleet process with the controller's global OpenCode config,
+    # plugins, database, history, or symlinks. A live surface may reuse only the
+    # provider state that this same isolated surface created on an earlier
+    # launch, and that tree is revalidated before use.
+    if [[ -d "$xdg_data/opencode" ]]; then
+      validate_isolated_provider_tree "$xdg_data/opencode"
+    fi
     # The canonical fleet agents live in the orchestrator repository, not in
     # an arbitrary --target-repo checkout. Install the fixed role set into the
     # isolated global OpenCode config so `--agent` resolves identically from
@@ -689,8 +677,8 @@ with open(path, "w", encoding="utf-8") as handle:
       keep+=("OPENCODE_CONFIG_CONTENT=$opencode_inline_config")
     fi
     # OpenCode may allow its own truncated-output directory after the agent's
-    # catch-all external deny. Never seed that exception with controller
-    # history; the isolated process may populate only its fresh copy.
+    # catch-all external deny. Remove provider output left by an earlier launch;
+    # the isolated process may populate only a fresh directory for this run.
     rm -rf -- "$xdg_data/opencode/tool-output"
     keep+=(
       "XDG_CONFIG_HOME=$xdg_config"
@@ -825,6 +813,8 @@ if [[ "$role_type" == "kimi" && "$provider_basename" == "kimi" \
     --session-id "$kimi_session_id" \
     --workspace-id "$CMUX_WORKSPACE_ID" \
     --surface-id "$CMUX_SURFACE_ID" \
+    --mission-id "${FLEET_MISSION_ID:-}" \
+    --generation-id "$kimi_generation_id" \
     --hook-dir "${CMUX_HOOK_DIR:-$controller_home/.cmuxterm}" \
     --events-file "$kimi_events_file" \
     --provider moonshot-ai \

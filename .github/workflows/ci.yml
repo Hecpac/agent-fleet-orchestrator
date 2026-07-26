@@ -29,6 +29,11 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install portable runtime dependencies
+        run: |
+          python -m pip install --disable-pip-version-check uv==0.9.26
+          uv --version
+
       - name: Prepare diagnostics directory
         run: mkdir -p ci-artifacts
 

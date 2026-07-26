@@ -66,9 +66,10 @@ convertir el comando en una prueba de salud de cada proveedor. El boot valida el
 roster completo antes del primer efecto CMUX. Los roles GLM y MiniMax requieren,
 respectivamente, `ZHIPU_API_KEY` y `MINIMAX_API_KEY`; Codex y Claude requieren
 sus sesiones autenticadas. El rol Kimi requiere `kimi` instalado y una
-configuración autenticada en `~/.kimi/config.toml`; el launcher fija
-`moonshot-ai/kimi-k3` y copia esa configuración únicamente al home efímero del
-proceso.
+configuración autenticada en `~/.kimi-code/config.toml`; el launcher fija
+`kimi-code/k3` y copia únicamente esa configuración y su credencial actual al
+home aislado por surface que se conserva para reconciliación. El árbol legado
+`~/.kimi` es entrada de migración y nunca se importa a una surface Fleet.
 
 Codex es el Lead predeterminado. Claude solo se selecciona con
 `--lead-provider claude` o mediante fallback explícitamente habilitado con
@@ -139,13 +140,21 @@ Todos los workflows con assurance resuelven `fleet_dialogue` como
 - Los roles OpenCode son filesystem-read sin shell: solo `read`, `glob` y `grep`
   quedan habilitados, `external_directory` se deniega y el launcher valida la
   política resuelta antes de boot; solo se exceptúa el `tool-output` efímero y
-  vacío de esa instancia. FDP-2 entrega Git mediante un evidence pack
-  durable generado por CONTROL.
-- Kimi usa wrappers de `ReadFile`, `ReadMediaFile` y `Grep` confinados al
-  checkout objetivo, sin shell ni escritura. Como CMUX no ofrece hook Kimi
-  nativo, un bridge del controlador convierte `TurnBegin`/`TurnEnd` de Wire en
-  señales metadata-only; la respuesta completa se verifica en el log Wire, no
-  en el texto visible del pane.
+  vacío de esa instancia. Cada proceso parte de configuración y estado XDG
+  limpios: no copia plugins, skills, base de datos, historial ni symlinks del
+  OpenCode personal del controlador. Solo persiste por superficie el estado
+  propio necesario para reconciliación. FDP-2 entrega Git mediante un evidence
+  pack durable generado por CONTROL.
+- En Missions, Kimi arranca con `--plan`, un contrato `AGENTS.md` inyectado y un
+  reader clone sellado read-only. El preset guiado standalone todavía no ofrece
+  esa misma frontera y no debe usarse como revisión autoritativa. Como CMUX no
+  ofrece hook Kimi nativo, un bridge del controlador convierte
+  eventos de turno de Wire 1.2/1.3/1.4/1.10 en señales metadata-only; la
+  respuesta completa se verifica en el log Wire, no en el texto visible del
+  pane. El estado persistente queda ligado a surface, workspace, Mission y
+  generación de launch. `fleet-down` solo lo retira a cuarentena después de un
+  terminal durable liberable y quiescencia confirmada; `indeterminate`, lease
+  retenido, identidad dudosa o bridge vivo preservan estado y evidencia.
 - `run_id`, UUID de workspace/surface, proveedor, modelo y, cuando aplica,
   variante deben coincidir. La ambigüedad falla cerrada.
 - Un preset que declara `identity_groups` exige tuplas
@@ -338,7 +347,7 @@ Los presets disponibles son `dan`, `small`, `audit`, `implementation_review`,
 | `small` | guiado: solo lead | Tarea acotada y secuencial. |
 | `audit` | guiado: analysis, challenge, verify | Perspectivas con identidad diversa y revisión supplied-diff. |
 | `implementation_review` | guiado: build, verify | Un writer y un reviewer local con identidad distinta. |
-| `kimi_review` | guiado: build, verify | Codex implementa y Kimi K3 hace revisión read-only de contexto largo. |
+| `kimi_review` | guiado: build, verify | Preset standalone no autoritativo hasta alcanzar paridad con el reader clone de Mission. |
 | `frontier_verification` | guiado: build, challenge, verify | Writer, GLM read-only y Claude verifier. |
 | `fleet_dialogue` | asegurado: maker, checker, challenge, verify | FDP-2 y FDP-3 con gates completos. |
 | `hotfix_validated` | guiado: candidate_codex, candidate_minimax, verify | Candidatos paralelos que aún requieren verificación. |

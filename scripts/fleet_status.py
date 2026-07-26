@@ -224,6 +224,12 @@ def _updated_at(value: Any) -> float | None:
     parsed = float(value)
     if not math.isfinite(parsed) or parsed < 0:
         raise ValueError("invalid hook timestamp")
+    # Hook producers historically used epoch seconds. kimi-code emits JavaScript
+    # epoch milliseconds, so normalize that one unambiguous range at ingestion.
+    if 100_000_000_000 <= parsed < 10_000_000_000_000:
+        return parsed / 1000.0
+    if parsed >= 10_000_000_000:
+        raise ValueError("invalid hook timestamp unit")
     return parsed
 
 

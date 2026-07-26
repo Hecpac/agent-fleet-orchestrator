@@ -235,9 +235,12 @@ explicitly authorized lane rather than an automatic smoke.
 Frontier roles run interactive agent CLIs tracked by cmux's agent panel:
 `codex`, `minimax` (opencode + MiniMax-M3, `MINIMAX_API_KEY`), and `glm`
 (opencode + GLM-5.2, `ZHIPU_API_KEY`). The `kimi` role pins
-`moonshot-ai/kimi-k3` and is available through the guided `kimi_review` preset.
+`kimi-code/k3` and is available through the guided `kimi_review` preset.
 It requires an authenticated Kimi CLI configuration and may incur provider
 charges; boot/preflight does not submit an inference request.
+Only Mission-bound Kimi launches currently receive the sealed read-only reader
+clone and injected `AGENTS.md` contract. Treat standalone guided Kimi presets as
+non-authoritative until they gain the same isolation boundary.
 
 Panes are ordered by capability rank rather than argument accident:
 `CONTROL → RECON → BUILD → CHALLENGE → VERIFY`. `instance_id` is separate from
@@ -455,18 +458,24 @@ assistant completed before that Stop and reads full text plus provider/model
 through the read-only `opencode db` interface. Codex and Claude likewise bind
 the exact turn through their source-specific hook session and transcript files;
 their terminal chrome is never completion evidence. Kimi has no native CMUX
-hook integration, so a controller-owned bridge tails its Wire 1.2/1.3 log,
+hook integration, so a controller-owned bridge tails its Wire 1.2/1.3/1.4/1.10 log,
 publishes metadata-only submit/stop events, and verifies the bounded
 `TurnBegin`/`TurnEnd` response before accepting the final sentinel. Kimi's Wire
 record does not embed model identity; the isolated launcher therefore attests
-the exact provider/model command in the per-surface session record. Every
+the exact provider/model command and surface/workspace/Mission/launch generation
+in the per-surface session record. `fleet-down` quarantines that exact tree only
+after releasable durable completion and confirmed workspace/bridge quiescence;
+indeterminate or lease-retained state remains intact for recovery. Every
 interactive role pins a model before dispatch. Missing or mismatched evidence
 retains the lease as `indeterminate`.
 OpenCode reviewers are additionally deny-by-default: only the built-in
 `read`, `glob`, and `grep` tools resolve enabled; Bash, external roots, and
 every unlisted/future tool remain denied. The only external exception is
 OpenCode's fresh isolated `tool-output` directory; controller history is not
-copied into it. The launcher validates that exact
+copied into it. The launcher starts with clean XDG config/state roots and does
+not import the controller's OpenCode plugins, skills, database, history, or
+symlinks; only same-surface provider data may persist for reconciliation. It
+validates that exact
 merged provider policy inside the isolated XDG environment before TUI boot.
 Catch-up requires the recorded baseline and continuous boot-scoped audit
 sequence; truncated or corrupt audit evidence is rejected. Event ACKs are

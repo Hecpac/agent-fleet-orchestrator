@@ -114,6 +114,20 @@ class FleetCmuxLauncherJSONTests(unittest.TestCase):
         self.assertTrue(spec_path.read_bytes().endswith(b"\n"))
         self.assertEqual(descriptor["spec_sha256"], fleet_cmux_launcher._digest(spec))
 
+    def test_verified_launch_id_is_injected_as_runtime_generation(self) -> None:
+        descriptor = self.create()
+        with (
+            mock.patch.object(fleet_cmux_launcher.os, "chdir"),
+            mock.patch.object(fleet_cmux_launcher.os, "execvpe") as execute,
+        ):
+            fleet_cmux_launcher.execute_spec(
+                self.runs,
+                descriptor["launch_id"],
+                expected_digest=descriptor["spec_sha256"],
+            )
+        environment = execute.call_args.args[2]
+        self.assertEqual(environment["FLEET_LAUNCH_ID"], descriptor["launch_id"])
+
     def test_non_utf8_environment_fails_before_launch_store_creation(self) -> None:
         with self.assertRaisesRegex(
             fleet_cmux_launcher.LaunchError, "cannot be canonicalized"

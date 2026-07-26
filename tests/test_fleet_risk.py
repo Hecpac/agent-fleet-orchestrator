@@ -50,6 +50,62 @@ class FleetRiskTests(unittest.TestCase):
                 self.assertIn(category, result["categories"])
                 self.assertTrue(result["requires_confirmation"])
 
+    def test_spanish_and_accented_objectives_are_classified(self) -> None:
+        result = risk.assess(
+            workflow_minimum="low",
+            objective=(
+                "Borra la base de datos de producción y envía un correo a clientes"
+            ),
+            target="/tmp/repository",
+            repository_root="/tmp/repository",
+        )
+        self.assertEqual(result["level"], "high")
+        self.assertTrue(
+            {"production", "destructive", "external_side_effect"}
+            <= set(result["categories"])
+        )
+
+    def test_indirect_destructive_wording_is_classified(self) -> None:
+        result = risk.assess(
+            workflow_minimum="low",
+            objective="Remove all records from the live database and notify customers",
+            target="/tmp/repository",
+            repository_root="/tmp/repository",
+        )
+        self.assertEqual(result["level"], "high")
+        self.assertTrue(
+            {"production", "destructive", "external_side_effect"}
+            <= set(result["categories"])
+        )
+
+    def test_benign_spanish_repository_work_stays_low(self) -> None:
+        result = risk.assess(
+            workflow_minimum="low",
+            objective="Refactoriza el analizador y ejecuta las pruebas unitarias",
+            target="/tmp/repository",
+            repository_root="/tmp/repository",
+        )
+        self.assertEqual(result["level"], "low")
+        self.assertEqual(result["categories"], ["repository_local"])
+
+    def test_common_spanish_effect_imperatives_are_classified(self) -> None:
+        cases = (
+            ("Despliega el servicio", "external_side_effect"),
+            ("Publica una nueva versión", "external_side_effect"),
+            ("Cobra el pago pendiente", "money"),
+            ("Paga la factura", "money"),
+        )
+        for objective, category in cases:
+            with self.subTest(objective=objective):
+                result = risk.assess(
+                    workflow_minimum="low",
+                    objective=objective,
+                    target="/tmp/repository",
+                    repository_root="/tmp/repository",
+                )
+                self.assertEqual(result["level"], "high")
+                self.assertIn(category, result["categories"])
+
     def test_override_is_floor_and_risk_never_decreases(self) -> None:
         result = risk.assess(
             workflow_minimum="low",

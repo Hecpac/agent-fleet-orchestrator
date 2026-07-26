@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Any
+import unicodedata
 
 
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "unknown": 3}
@@ -24,14 +25,51 @@ CATEGORY_RISK = {
     "unknown": "unknown",
 }
 PATTERNS = {
-    "production": re.compile(r"\b(prod(?:uction)?|live environment|release to customers?)\b", re.I),
-    "money": re.compile(r"\b(payment|charge|refund|invoice|purchase|bank|money|billing)\b", re.I),
-    "credentials": re.compile(r"\b(secret|credential|api[-_ ]?key|password|token|private key)\b", re.I),
-    "private_data": re.compile(r"\b(private data|personal data|customer data|pii|phi|ssn)\b", re.I),
-    "destructive": re.compile(r"\b(delete|destroy|drop table|wipe|purge|force push|reset --hard)\b", re.I),
-    "regulated": re.compile(r"\b(regulated|hipaa|pci(?:-dss)?|sox|gdpr|compliance retention)\b", re.I),
+    "production": re.compile(
+        r"\b(prod(?:uction)?|live (?:environment|database|system)|customer[- ]facing|"
+        r"release to customers?|produccion|entorno productivo|ambiente productivo|"
+        r"sistema en vivo|base de datos en vivo)\b",
+        re.I,
+    ),
+    "money": re.compile(
+        r"\b(payment|charge|refund|invoice|purchase|bank|money|billing|"
+        r"pag(?:o|ar|a|ue|uen|ado)|cobr(?:o|ar|a|e|en|ado)|"
+        r"reembolso|factura|compra|banco|dinero|facturacion)\b",
+        re.I,
+    ),
+    "credentials": re.compile(
+        r"\b(secret|credential|api[-_ ]?key|password|token|private key|secreto|"
+        r"credencial(?:es)?|clave de api|contrasena|llave privada)\b",
+        re.I,
+    ),
+    "private_data": re.compile(
+        r"\b(private data|personal data|customer data|pii|phi|ssn|datos privados|"
+        r"datos personales|datos de clientes?|informacion personal)\b",
+        re.I,
+    ),
+    "destructive": re.compile(
+        r"\b(delete|destroy|drop (?:the )?table|truncate|wipe|purge|erase|"
+        r"remove all (?:rows|records|data)|force push|reset --hard|"
+        r"borr(?:a|ar|e|en|ado|ados)|elimin(?:a|ar|e|en|ado|ados)|"
+        r"destru(?:ye|ir|ya|yan|ido)|vaci(?:a|ar|e|en|ado)|"
+        r"purg(?:a|ar|ue|uen|ado)|trunc(?:a|ar|que|quen|ado)|"
+        r"borrar todos? los (?:registros|datos)|"
+        r"eliminar todos? los (?:registros|datos))\b",
+        re.I,
+    ),
+    "regulated": re.compile(
+        r"\b(regulated|hipaa|pci(?:-dss)?|sox|gdpr|compliance retention|regulado|"
+        r"regulada|retencion normativa|cumplimiento normativo)\b",
+        re.I,
+    ),
     "external_side_effect": re.compile(
-        r"\b(deploy|publish|send (?:an )?(?:email|message)|open (?:a )?pr|push to|call external|modify cloud)\b",
+        r"\b(deploy|publish|send (?:an )?(?:email|message)|notify (?:the )?customers?|"
+        r"open (?:a )?pr|push to|call external|modify cloud|"
+        r"despleg(?:ar|ado)|desplieg(?:a|ue|uen)|public(?:ar|a|e|en|ado)|"
+        r"envi(?:a|ar|e|en|ado) (?:un |una )?(?:correo|email|mensaje)|"
+        r"notific(?:a|ar|o|e|en|ado) (?:a |al |a los )?clientes?|"
+        r"abrir (?:un )?pr|subir (?:cambios )?a|llamar (?:a un )?servicio externo|"
+        r"modificar (?:la )?nube)\b",
         re.I,
     ),
 }
@@ -39,6 +77,14 @@ PATTERNS = {
 
 class RiskError(ValueError):
     """Risk input or monotonic transition is invalid."""
+
+
+def _normalized_text(value: str) -> str:
+    """Return a case-folded, accent-insensitive string for policy matching."""
+    decomposed = unicodedata.normalize("NFKD", value)
+    return "".join(
+        char for char in decomposed if not unicodedata.combining(char)
+    ).casefold()
 
 
 def max_risk(*levels: str) -> str:
@@ -52,10 +98,12 @@ def classify_categories(
 ) -> list[str]:
     if not isinstance(objective, str) or not objective.strip():
         raise RiskError("objective must be non-empty")
+    normalized_objective = _normalized_text(objective)
+    normalized_target = _normalized_text(target)
     categories = {
         category
         for category, pattern in PATTERNS.items()
-        if pattern.search(objective) or pattern.search(target)
+        if pattern.search(normalized_objective) or pattern.search(normalized_target)
     }
     target_path = Path(target).expanduser()
     root = Path(repository_root).expanduser().resolve() if repository_root else None

@@ -347,6 +347,10 @@ def execute_spec(runs_dir: Path | str, launch_id: str, *, expected_digest: str) 
     publish_acceptance(runs_dir, launch_id, expected_digest=expected_digest)
     environment = os.environ.copy()
     environment.update(spec["environment"])
+    # The immutable launch identifier is the provider-state generation.  It is
+    # derived from the already digest-verified spec instead of accepting an
+    # ambient value that could drift from the durable launch receipt.
+    environment["FLEET_LAUNCH_ID"] = launch_id
     os.chdir(spec["cwd"])
     os.execvpe(spec["argv"][0], spec["argv"], environment)
 

@@ -913,6 +913,7 @@ tie-breaker.
 - `tests/test_router_config.py::RouterConfigTests::test_interactive_roles_declare_supported_source_and_model_identity`
 - `tests/test_fleet_up.py::FleetUpTests::test_frontier_preset_is_reproducible_and_ordered`
 - `tests/test_run_interactive_agent.py::InteractiveAgentEnvironmentTests::test_opencode_live_surface_uses_deterministic_ephemeral_data_home`
+- `tests/test_run_interactive_agent.py::InteractiveAgentEnvironmentTests::test_opencode_rejects_symlink_data_home_before_launch`
 
 `why:` OpenCode emits multiple completed Stops for one turn. Stops without the
 feed plugin's structured final-context marker remain wake-ups and cannot
@@ -931,13 +932,59 @@ identity persisted before dispatch. Missing, malformed, temporally late, or
 mismatched evidence terminalizes indeterminate while retaining the lease; it
 never degrades to success by inference.
 
+## Structured Kimi completion follows the installed Wire contract
+
+`rule: kimi_completion_requires_supported_wire_and_pinned_identity`
+
+`enforced_by:`
+
+- `tests/test_kimi_hook_bridge.py::KimiHookBridgeTests::test_frontier_extracts_exact_completed_kimi_turn_and_identity`
+- `tests/test_kimi_hook_bridge.py::KimiHookBridgeTests::test_kimi_events_complete_a_control_v1_frontier_run`
+- `tests/test_fleet_wait.py::FleetWaitLedgerAuthorityTests::test_kimi_terminal_before_subscription_reconciles_from_wire_bridge`
+
+`why:` The installed kimi-code 0.29.1 runtime emits Wire 1.4, while historical
+records may use Wire 1.2, 1.3, or 1.10. The controller-owned bridge and the terminal
+evidence reader must accept the same closed protocol allowlist. Completion binds
+one exact run-tagged turn, final sentinel, provider `moonshot-ai`, and router-
+pinned model `kimi-code/k3`; an unknown Wire version, ambiguous turn, or identity
+drift remains indeterminate instead of degrading to terminal chrome.
+
+## Kimi surface state retires only after durable certainty and quiescence
+
+`rule: kimi_surface_state_is_generation_bound_and_fail_closed_until_quiescent`
+
+`enforced_by:`
+
+- `tests/test_kimi_state_lifecycle.py::KimiStateLifecycleTests::test_retirement_quarantines_exact_quiescent_generation_and_unbinds`
+- `tests/test_kimi_state_lifecycle.py::KimiStateLifecycleTests::test_retirement_preserves_everything_while_bridge_lock_is_live`
+- `tests/test_kimi_state_lifecycle.py::KimiStateLifecycleTests::test_frontier_retirement_preserves_indeterminate_and_retained_state`
+- `tests/test_kimi_state_lifecycle.py::KimiStateLifecycleTests::test_frontier_retirement_requires_durable_releasable_terminal`
+- `tests/test_kimi_state_lifecycle.py::KimiStateLifecycleTests::test_provision_rejects_symlink_destination_without_touching_target`
+- `tests/test_kimi_state_lifecycle.py::KimiStateLifecycleTests::test_opencode_cleanup_never_runs_for_indeterminate_retained_terminal`
+- `tests/test_kimi_hook_bridge.py::KimiHookBridgeTests::test_bridge_rejects_lock_with_unsafe_mode`
+- `tests/test_fleet_cmux_launcher.py::FleetCmuxLauncherJSONTests::test_verified_launch_id_is_injected_as_runtime_generation`
+
+`why:` A Kimi pane is reusable across turns, so a terminal frontier event alone
+does not prove that its TUI, Wire writer, or bridge has stopped. Persistent
+configuration, credentials, transcript, events, and the global session binding
+are tied to the exact CMUX surface, workspace, Mission, and digest-verified
+launch generation. Every destination and evidence read is owner/mode checked
+through no-follow descriptors. Teardown first makes CMUX absence durable, then
+requires every run in the generation to have a releasable terminal and the
+bridge lock to be quiescent before atomically moving the exact surface tree to
+retirement quarantine and removing only its matching session binding. A live
+bridge, identity mismatch, nonterminal run, `indeterminate`, or retained lease
+preserves the entire active tree and binding. OpenCode follows the same
+uncertainty rule and never removes provider state for an indeterminate or
+lease-retained terminal.
+
 ## Single-submit OpenCode prompt transport
 
 `rule: opencode_prompt_transport_is_one_physical_submission`
 
 `enforced_by:`
 
-- `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_prompt_transport_is_one_submission_with_exact_logical_prompt`
+- `tests/test_fleet_frontier.py::FleetFrontierTests::test_opencode_prompt_contract_is_the_exact_logical_prompt`
 - `tests/test_fleet_frontier.py::FleetFrontierTests::test_non_opencode_prompt_transport_keeps_multiline_contract`
 - `tests/test_spec_coherence.py::SpecCoherenceTests::test_fdp2_contract_and_documentation_remain_aligned`
 

@@ -1076,7 +1076,7 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             )
         self.assertEqual(values, {"mission": mission_id, "policy": "control-only"})
 
-    def test_opencode_receives_only_isolated_provider_xdg_subtrees(self) -> None:
+    def test_opencode_does_not_import_controller_provider_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             for relative in (
@@ -1104,7 +1104,7 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             ))
         for value in values.values():
             self.assertIn("/tmp/fleet_home.", value["root"])
-            self.assertTrue(value["opencode"])
+            self.assertFalse(value["opencode"])
             self.assertFalse(value["other"])
         self.assertFalse(values["XDG_DATA_HOME"]["tool_output"])
 
@@ -1146,12 +1146,22 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
                 "'provider': os.path.isfile(os.environ['XDG_DATA_HOME'] + '/opencode/provider.json')"
                 "}",
             ))
+            provider_state = Path(values["data"]) / "opencode"
+            provider_state.mkdir(parents=True)
+            (provider_state / "provider-owned.json").write_text(
+                "{}\n", encoding="utf-8"
+            )
+            tool_output = provider_state / "tool-output"
+            tool_output.mkdir()
+            (tool_output / "stale.txt").write_text("stale\n", encoding="utf-8")
             resumed = self.parse(self.run_role(
                 "glm",
                 extra_env={"HOME": str(home), "CMUX_SURFACE_ID": surface_uuid},
                 expression="{"
                 "'data': os.environ['XDG_DATA_HOME'],"
-                "'provider': os.path.isfile(os.environ['XDG_DATA_HOME'] + '/opencode/provider.json')"
+                "'controller_provider': os.path.isfile(os.environ['XDG_DATA_HOME'] + '/opencode/provider.json'),"
+                "'provider_owned': os.path.isfile(os.environ['XDG_DATA_HOME'] + '/opencode/provider-owned.json'),"
+                "'tool_output': os.path.exists(os.environ['XDG_DATA_HOME'] + '/opencode/tool-output')"
                 "}",
             ))
         self.assertEqual(
@@ -1161,13 +1171,35 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
         self.assertEqual(resumed["data"], values["data"])
         self.assertTrue(values["config"].startswith(values["fleet_home"] + "/"))
         self.assertTrue(values["state"].startswith(values["fleet_home"] + "/"))
-        self.assertTrue(values["provider"])
-        self.assertTrue(resumed["provider"])
+        self.assertFalse(values["provider"])
+        self.assertFalse(resumed["controller_provider"])
+        self.assertTrue(resumed["provider_owned"])
+        self.assertFalse(resumed["tool_output"])
         self.assertTrue(Path(values["data"]).exists())
         self.assertTrue(fleet_frontier.cleanup_opencode_data_home(surface_uuid))
         self.assertFalse(Path(values["data"]).exists())
 
-    def test_opencode_preserves_relative_symlinks_that_stay_inside_provider_state(self) -> None:
+    def test_opencode_rejects_symlink_data_home_before_launch(self) -> None:
+        surface_uuid = str(uuid.uuid4()).upper()
+        surface_root = fleet_frontier.OPENCODE_STATE_ROOT / surface_uuid
+        surface_root.mkdir(parents=True)
+        with tempfile.TemporaryDirectory() as directory:
+            outside = Path(directory) / "outside"
+            outside.mkdir()
+            data_home = surface_root / "data"
+            data_home.symlink_to(outside, target_is_directory=True)
+            try:
+                result = self.run_role(
+                    "glm", extra_env={"CMUX_SURFACE_ID": surface_uuid}
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("data home is unsafe", result.stderr)
+                self.assertEqual(list(outside.iterdir()), [])
+            finally:
+                data_home.unlink(missing_ok=True)
+                fleet_frontier.cleanup_opencode_data_home(surface_uuid)
+
+    def test_opencode_does_not_import_controller_plugins_or_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             package = home / ".config" / "opencode" / "node_modules" / "package"
@@ -1179,23 +1211,43 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             values = self.parse(self.run_role(
                 "glm",
                 extra_env={"HOME": str(home)},
-                expression="(lambda p: {'is_link': os.path.islink(p), "
-                "'content': open(p, encoding='utf-8').read().strip()})("
-                "os.environ['XDG_CONFIG_HOME'] + '/opencode/node_modules/.bin/tool')",
+                expression="{'imported': os.path.lexists("
+                "os.environ['XDG_CONFIG_HOME'] + '/opencode/node_modules/.bin/tool')}",
             ))
-        self.assertTrue(values["is_link"])
-        self.assertEqual(values["content"], "internal")
+        self.assertFalse(values["imported"])
 
-    def test_opencode_rejects_symlinks_that_escape_provider_state(self) -> None:
+    def test_opencode_ignores_escaping_symlinks_in_controller_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             provider = home / ".config" / "opencode"
             provider.mkdir(parents=True)
             (home / ".config" / "outside.json").write_text("{}\n", encoding="utf-8")
             (provider / "escape").symlink_to("../outside.json")
-            result = self.run_role("glm", extra_env={"HOME": str(home)})
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("symlink escapes its isolated root", result.stderr)
+            values = self.parse(self.run_role(
+                "glm",
+                extra_env={"HOME": str(home)},
+                expression="{'imported': os.path.lexists("
+                "os.environ['XDG_CONFIG_HOME'] + '/opencode/escape')}",
+            ))
+        self.assertFalse(values["imported"])
+
+    def test_opencode_rejects_symlinks_in_persistent_surface_state(self) -> None:
+        surface_uuid = str(uuid.uuid4()).upper()
+        surface_root = fleet_frontier.OPENCODE_STATE_ROOT / surface_uuid
+        provider = surface_root / "data" / "opencode"
+        provider.mkdir(parents=True)
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                outside = Path(directory) / "outside.json"
+                outside.write_text("{}\n", encoding="utf-8")
+                (provider / "escape").symlink_to(outside)
+                result = self.run_role(
+                    "glm", extra_env={"CMUX_SURFACE_ID": surface_uuid}
+                )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("symlink", result.stderr)
+        finally:
+            fleet_frontier.cleanup_opencode_data_home(surface_uuid)
 
     def test_opencode_tui_starts_only_after_resolved_policy_passes(self) -> None:
         for bash_enabled in (False, True):

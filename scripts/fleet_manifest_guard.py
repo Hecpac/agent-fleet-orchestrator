@@ -473,6 +473,15 @@ def _validate_manifest(values: dict[str, str], root_fd: int, feature: str) -> No
         raise GuardError("manifest feature does not match its active filename")
     workspace_uuid = values.get("workspace_uuid", "")
     _cmux_uuid(workspace_uuid, "manifest workspace_uuid")
+    for key, value in values.items():
+        if not key.endswith(".launch_id"):
+            continue
+        try:
+            canonical_launch = str(uuid.UUID(value))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise GuardError(f"manifest launch generation is invalid: {key}") from exc
+        if value != canonical_launch:
+            raise GuardError(f"manifest launch generation is not canonical: {key}")
 
     target_repo = values.get("target_repo")
     base_sha = values.get("base_sha")

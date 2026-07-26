@@ -143,7 +143,7 @@ status *flags:
 # Standalone guided BUILD exit uses --approved-by <operator-attestation>.
 # Mission-bound assured fleets instead require --approval-event-sha256.
 advance feature phase evidence *flags:
-    python3 scripts/fleet_state.py advance orchestration/runs/fleet-{{feature}}.manifest {{phase}} --evidence {{evidence}} {{flags}}
+    python3 scripts/fleet_state.py advance "${FLEET_RUNS_DIR:-orchestration/runs}/fleet-{{feature}}.manifest" {{phase}} --evidence {{evidence}} {{flags}}
 
 # Send to an interactive agent through UUID and phase validation.
 send feature instance task:

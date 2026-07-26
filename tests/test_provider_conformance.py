@@ -140,7 +140,10 @@ class SubmitSemanticsConformanceTests(unittest.TestCase):
 
     def test_plan_records_publish_provider_submit_semantics(self) -> None:
         plan = router_config.build_plan(
-            self.router, preset_name="kimi_review", run_healthcheck=False
+            self.router,
+            preset_name="kimi_review",
+            run_healthcheck=False,
+            check_runtime_availability=False,
         )
         records = [
             line.split("\x1f")

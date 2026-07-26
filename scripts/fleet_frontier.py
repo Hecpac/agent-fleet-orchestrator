@@ -19,6 +19,7 @@ import uuid
 from typing import Any
 
 import fleet_json
+import fleet_kimi_state
 import fleet_providers
 import fleet_safe_paths
 from fleet_leases import (
@@ -28,7 +29,13 @@ from fleet_leases import (
     read_metadata,
     release,
 )
-from fleet_ledger import TERMINAL_STATUSES, append_event, events_for_run, latest_event
+from fleet_ledger import (
+    TERMINAL_STATUSES,
+    append_event,
+    events_for_run,
+    latest_event,
+    read_records,
+)
 
 
 STATUS_CODES = {
@@ -54,7 +61,7 @@ OPENCODE_STATE_ROOT = Path("/tmp/agent-fleet-orchestrator-opencode")
 KIMI_STATE_ROOT = Path(
     os.environ.get("FLEET_KIMI_STATE_ROOT", "/tmp/agent-fleet-orchestrator-kimi")
 )
-KIMI_WIRE_PROTOCOLS = {"1.2", "1.3"}
+KIMI_WIRE_PROTOCOLS = {"1.2", "1.3", "1.4", "1.10"}
 SAFE_FEATURE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SAFE_RESULT_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -287,8 +294,19 @@ def session_record(session_id: str, *, hook_source: str = "") -> dict[str, Any] 
     if filename is None or not session_id.startswith(prefix):
         return None
     try:
-        data = fleet_json.loads((Path(hook_dir) / filename).read_bytes())
-    except (OSError, fleet_json.FleetJSONError):
+        if hook_source == "kimi":
+            return fleet_kimi_state.read_session_binding(
+                Path(hook_dir), session_id.removeprefix(prefix)
+            )
+        else:
+            raw = (Path(hook_dir) / filename).read_bytes()
+        data = fleet_json.loads(raw)
+    except (
+        OSError,
+        fleet_json.FleetJSONError,
+        fleet_safe_paths.SafePathError,
+        fleet_kimi_state.KimiStateError,
+    ):
         return None
     if not isinstance(data, dict):
         return None
@@ -308,13 +326,25 @@ def session_matches(
     workspace_uuid: str,
     surface_uuid: str,
     hook_source: str = "",
+    mission_id: str | None = None,
+    generation_id: str | None = None,
 ) -> bool:
     record = session_record(session_id, hook_source=hook_source)
-    return bool(
+    matched = bool(
         record
         and str(record.get("workspaceId", "")).upper() == workspace_uuid.upper()
         and str(record.get("surfaceId", "")).upper() == surface_uuid.upper()
     )
+    if not matched:
+        return False
+    if hook_source == "kimi":
+        return bool(
+            mission_id is not None
+            and generation_id is not None
+            and record.get("missionId") == mission_id
+            and record.get("generationId") == generation_id
+        )
+    return True
 
 
 def prompt_with_contract(task: str, run_id: str, *, hook_source: str = "") -> str:
@@ -615,8 +645,15 @@ def _transcript_rows(session_id: str, hook_source: str) -> list[dict[str, Any]]:
     if not isinstance(transcript_path, str) or not transcript_path:
         raise FrontierError(f"{hook_source} session lacks transcript path")
     try:
-        lines = Path(transcript_path).expanduser().read_bytes().splitlines()
-    except OSError as exc:
+        if hook_source == "kimi":
+            surface_id = str(record.get("surfaceId") or "")
+            share = kimi_state_dir(surface_id) / "share"
+            lines = fleet_kimi_state.read_wire(
+                share, Path(transcript_path)
+            ).splitlines()
+        else:
+            lines = Path(transcript_path).expanduser().read_bytes().splitlines()
+    except (OSError, fleet_kimi_state.KimiStateError) as exc:
         raise FrontierError(f"cannot read {hook_source} transcript: {exc}") from exc
     rows: list[dict[str, Any]] = []
     for line in lines:
@@ -639,30 +676,26 @@ def kimi_state_dir(surface_uuid: str) -> Path:
         canonical_surface = str(uuid.UUID(surface_uuid)).upper()
     except ValueError as exc:
         raise FrontierError("Kimi evidence surface id is invalid") from exc
-    if not KIMI_STATE_ROOT.is_absolute():
-        raise FrontierError("Kimi evidence state root must be absolute")
-    surface_root = KIMI_STATE_ROOT / canonical_surface
-    if KIMI_STATE_ROOT.is_symlink() or surface_root.is_symlink():
-        raise FrontierError("Kimi evidence state must not use symlinks")
     try:
-        resolved_root = KIMI_STATE_ROOT.resolve(strict=True)
-        resolved_surface = surface_root.resolve(strict=True)
-        resolved_surface.relative_to(resolved_root)
-    except (OSError, ValueError) as exc:
-        raise FrontierError("Kimi evidence state is unavailable") from exc
-    return resolved_surface
+        root = fleet_safe_paths.canonical_root(KIMI_STATE_ROOT, required_mode=0o700)
+        with fleet_safe_paths.RootedFS(root, root_mode=0o700) as rooted:
+            rooted.list_directory(canonical_surface, directory_modes=(0o700,))
+        return root / canonical_surface
+    except fleet_safe_paths.SafePathError as exc:
+        raise FrontierError(f"Kimi evidence state is unsafe: {exc}") from exc
 
 
 def kimi_hook_events(surface_uuid: str) -> list[dict[str, Any]]:
-    events_path = kimi_state_dir(surface_uuid) / "events.jsonl"
-    if events_path.is_symlink():
-        raise FrontierError("Kimi event evidence must not be a symlink")
+    state_dir = kimi_state_dir(surface_uuid)
     try:
-        lines = events_path.read_bytes().splitlines()
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
-        raise FrontierError("cannot read Kimi event evidence") from exc
+        with fleet_safe_paths.RootedFS(state_dir, root_mode=0o700) as rooted:
+            raw = rooted.read_regular_optional(
+                "events.jsonl", directory_modes=(), file_mode=0o600,
+                max_bytes=64 * 1024 * 1024,
+            )
+        lines = [] if raw is None else raw.splitlines()
+    except fleet_safe_paths.SafePathError as exc:
+        raise FrontierError("cannot read safe Kimi event evidence") from exc
     events: list[dict[str, Any]] = []
     seen: set[str] = set()
     for raw in lines:
@@ -720,6 +753,19 @@ def _kimi_wire_text(payload: Any) -> str:
     return "\n".join(parts)
 
 
+def _kimi_wire_time(row: dict[str, Any], *, milliseconds: bool) -> datetime:
+    key = "time" if milliseconds else "timestamp"
+    value = row.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise FrontierError("Kimi transcript has an invalid timestamp")
+    try:
+        return datetime.fromtimestamp(
+            float(value) / (1000 if milliseconds else 1), timezone.utc
+        )
+    except (OSError, OverflowError, ValueError) as exc:
+        raise FrontierError("Kimi transcript has an invalid timestamp") from exc
+
+
 def kimi_turn_evidence(
     session_id: str, run_id: str, stop_occurred_at: str
 ) -> tuple[str, str, str]:
@@ -745,6 +791,55 @@ def kimi_turn_evidence(
     ]
     if len(metadata) != 1:
         raise FrontierError("Kimi transcript has invalid Wire metadata")
+    if metadata[0].get("protocol_version") == "1.4":
+        marker = f"FLEET_RESULT:{run_id}:<STATUS>"
+        matching_turns = [
+            index
+            for index, row in enumerate(rows)
+            if row.get("type") == "turn.prompt"
+            and marker in _kimi_wire_text(row.get("input"))
+        ]
+        if len(matching_turns) != 1:
+            raise FrontierError("Kimi transcript has ambiguous user binding")
+        begin = matching_turns[0]
+        end = next(
+            (
+                index for index in range(begin + 1, len(rows))
+                if rows[index].get("type") == "turn.prompt"
+            ),
+            len(rows),
+        )
+        turn_rows = rows[begin + 1 : end]
+        turn_end_indexes: list[int] = []
+        for index, row in enumerate(turn_rows):
+            event = row.get("event")
+            if (
+                row.get("type") == "context.append_loop_event"
+                and isinstance(event, dict)
+                and event.get("type") == "step.end"
+                and event.get("finishReason") == "end_turn"
+                and _kimi_wire_time(row, milliseconds=True) == stop_time
+            ):
+                turn_end_indexes.append(index)
+        if len(turn_end_indexes) != 1:
+            raise FrontierError("Kimi transcript lacks one completed TurnEnd")
+        visible: list[str] = []
+        for row in turn_rows[: turn_end_indexes[0]]:
+            event = row.get("event")
+            if (
+                row.get("type") != "context.append_loop_event"
+                or not isinstance(event, dict)
+                or event.get("type") != "content.part"
+                or not isinstance(event.get("part"), dict)
+            ):
+                continue
+            part = event["part"]
+            if part.get("type") == "text" and isinstance(part.get("text"), str):
+                visible.append(part["text"])
+        response = "".join(visible)
+        if not response:
+            raise FrontierError("Kimi transcript has no final assistant response")
+        return response, provider, model
     marker = f"FLEET_RESULT:{run_id}:<STATUS>"
     matching_turns: list[int] = []
     for index, row in enumerate(rows):
@@ -768,19 +863,11 @@ def kimi_turn_evidence(
     turn_rows = rows[begin + 1 : end]
     turn_end_indexes: list[int] = []
     for index, row in enumerate(turn_rows):
-        timestamp = row.get("timestamp")
-        if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
-            raise FrontierError("Kimi transcript has an invalid timestamp")
         message = row.get("message")
         if not isinstance(message, dict) or not isinstance(message.get("payload"), dict):
             raise FrontierError("Kimi transcript has an invalid message")
         if message.get("type") == "TurnEnd":
-            try:
-                wire_stop = datetime.fromtimestamp(
-                    float(timestamp), timezone.utc
-                ).isoformat()
-            except (OSError, OverflowError, ValueError) as exc:
-                raise FrontierError("Kimi transcript has an invalid timestamp") from exc
+            wire_stop = _kimi_wire_time(row, milliseconds=False).isoformat()
             if wire_stop == stop_time.isoformat():
                 turn_end_indexes.append(index)
     if len(turn_end_indexes) != 1 or turn_end_indexes[0] != len(turn_rows) - 1:
@@ -1034,6 +1121,8 @@ def prepare_run(
     model: str = "",
     hook_source: str = "",
     variant: str = "",
+    mission_id: str = "",
+    generation_id: str = "",
     run_id: str = "",
 ) -> dict[str, Any]:
     # Validate every durable/path-bearing identifier before consulting or
@@ -1062,6 +1151,14 @@ def prepare_run(
         raise FrontierError(
             "frontier variant identity contains a forbidden control character"
         )
+    if hook_source == "kimi":
+        try:
+            mission_id = fleet_kimi_state.canonical_mission(mission_id)
+            generation_id = fleet_kimi_state.canonical_uuid(
+                generation_id, "generation_id"
+            )
+        except fleet_kimi_state.KimiStateError as exc:
+            raise FrontierError(f"invalid Kimi lifecycle identity: {exc}") from exc
     try:
         configured_provider = fleet_providers.identity(
             provider, model, variant or None, hook_source
@@ -1104,6 +1201,9 @@ def prepare_run(
         "tracking_protocol": "control-v1",
         "preparing_at": preparing_at,
     }
+    if hook_source == "kimi":
+        preparing["mission_id"] = mission_id
+        preparing["generation_id"] = generation_id
     if variant:
         preparing["variant"] = variant
     if not append_event(ledger, preparing, runs_dir=runs_dir):
@@ -1162,6 +1262,9 @@ def prepare_run(
             "event_oldest_seq": resume.get("oldest_seq"),
             "dispatched_at": dispatched_at,
         }
+        if hook_source == "kimi":
+            event["mission_id"] = mission_id
+            event["generation_id"] = generation_id
         if variant:
             event["variant"] = variant
         if not append_event(ledger, event, runs_dir=runs_dir):
@@ -1208,6 +1311,8 @@ def _common_event(state: dict[str, Any]) -> dict[str, Any]:
         "hook_source",
         "provider_adapter",
         "tracking_protocol",
+        "mission_id",
+        "generation_id",
         "variant",
         "event_boot_id",
         "after_seq",
@@ -1228,6 +1333,14 @@ def _release_frontier_lease(
     if required:
         raise FrontierError(f"owned frontier lease is missing: {lease}")
     return False
+
+
+def _terminal_allows_provider_cleanup(state: dict[str, Any]) -> bool:
+    return bool(
+        state.get("status") in TERMINAL_STATUSES
+        and state.get("status") != "indeterminate"
+        and not state.get("lease_retained")
+    )
 
 
 def terminalize(
@@ -1251,7 +1364,11 @@ def terminalize(
         runs_dir=runs_dir,
     )
     if existing and existing.get("status") in TERMINAL_STATUSES:
-        if existing.get("hook_source") == "opencode" and existing.get("surface_uuid"):
+        if (
+            existing.get("hook_source") == "opencode"
+            and existing.get("surface_uuid")
+            and _terminal_allows_provider_cleanup(existing)
+        ):
             try:
                 cleanup_opencode_data_home(str(existing["surface_uuid"]))
             except FrontierError:
@@ -1302,7 +1419,11 @@ def terminalize(
         )
         or terminal
     )
-    if result.get("hook_source") == "opencode" and result.get("surface_uuid"):
+    if (
+        result.get("hook_source") == "opencode"
+        and result.get("surface_uuid")
+        and _terminal_allows_provider_cleanup(result)
+    ):
         try:
             cleanup_opencode_data_home(str(result["surface_uuid"]))
         except FrontierError:
@@ -1434,6 +1555,8 @@ def process_event(
             workspace_uuid=str(state["workspace_uuid"]),
             surface_uuid=str(state["surface_uuid"]),
             hook_source=expected_source,
+            mission_id=(str(state.get("mission_id") or "") if expected_source == "kimi" else None),
+            generation_id=(str(state.get("generation_id") or "") if expected_source == "kimi" else None),
         ):
             return None
         if state.get("session_id"):
@@ -1491,6 +1614,8 @@ def process_event(
         workspace_uuid=str(state["workspace_uuid"]),
         surface_uuid=str(state["surface_uuid"]),
         hook_source=expected_source,
+        mission_id=(str(state.get("mission_id") or "") if expected_source == "kimi" else None),
+        generation_id=(str(state.get("generation_id") or "") if expected_source == "kimi" else None),
     ):
         return None
     response = ""
@@ -1650,6 +1775,8 @@ def authorize_prompt_submission(
                     workspace_uuid=str(state["workspace_uuid"]),
                     surface_uuid=str(state["surface_uuid"]),
                     hook_source=hook_source,
+                    mission_id=(str(state.get("mission_id") or "") if hook_source == "kimi" else None),
+                    generation_id=(str(state.get("generation_id") or "") if hook_source == "kimi" else None),
                 )
             ):
                 matches.append(event)
@@ -1922,6 +2049,77 @@ def mark_indeterminate(
     )
 
 
+def retire_kimi_surface(
+    runs_dir: Path,
+    *,
+    feature: str,
+    instance: str,
+    workspace_uuid: str,
+    surface_uuid: str,
+    mission_id: str,
+    generation_id: str,
+    hook_dir: Path,
+    workspace_quiesced: bool,
+) -> dict[str, Any]:
+    """Retire one exact Kimi generation after durable terminal + quiescence."""
+    if not workspace_quiesced:
+        raise FrontierError("Kimi retirement requires durable workspace quiescence")
+    feature = _safe_component(feature, "feature", feature=True)
+    instance = _safe_component(instance, "instance")
+    workspace_uuid = _canonical_uuid(workspace_uuid, "workspace_uuid")
+    surface_uuid = _canonical_uuid(surface_uuid, "surface_uuid")
+    try:
+        mission_id = fleet_kimi_state.canonical_mission(mission_id)
+        generation_id = fleet_kimi_state.canonical_uuid(
+            generation_id, "generation_id"
+        )
+    except fleet_kimi_state.KimiStateError as exc:
+        raise FrontierError(f"invalid Kimi retirement identity: {exc}") from exc
+
+    latest_by_run: dict[str, dict[str, Any]] = {}
+    for event in read_records(ledger_path(runs_dir, feature), runs_dir=runs_dir):
+        if event.get("instance") != instance or event.get("hook_source") != "kimi":
+            continue
+        run_id = event.get("run_id")
+        if not isinstance(run_id, str) or not run_id:
+            raise FrontierError("Kimi lifecycle ledger contains an invalid run")
+        latest_by_run[run_id] = event
+    for state in latest_by_run.values():
+        if any(
+            (
+                str(state.get("workspace_uuid") or "").upper() != workspace_uuid,
+                str(state.get("surface_uuid") or "").upper() != surface_uuid,
+                state.get("mission_id") != mission_id,
+                state.get("generation_id") != generation_id,
+            )
+        ):
+            raise FrontierError("Kimi run identity differs from retirement generation")
+        if not _terminal_allows_provider_cleanup(state):
+            raise FrontierError(
+                "Kimi state is preserved: a run is nonterminal, indeterminate, or lease-retained"
+            )
+    try:
+        retired = fleet_kimi_state.retire_surface(
+            KIMI_STATE_ROOT,
+            hook_dir=hook_dir,
+            surface_id=surface_uuid,
+            workspace_id=workspace_uuid,
+            mission_id=mission_id,
+            generation_id=generation_id,
+        )
+    except (fleet_kimi_state.KimiStateError, fleet_safe_paths.SafePathError) as exc:
+        raise FrontierError(f"Kimi surface retirement failed closed: {exc}") from exc
+    return {
+        "status": "retired",
+        "feature": feature,
+        "instance": instance,
+        "surface_uuid": surface_uuid,
+        "generation_id": generation_id,
+        "retired_path": str(retired),
+        "terminal_runs": len(latest_by_run),
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1939,6 +2137,8 @@ def _parser() -> argparse.ArgumentParser:
         prepare.add_argument(f"--{name}", required=True)
     for name in ("provider", "model", "hook-source", "variant"):
         prepare.add_argument(f"--{name}", default="")
+    prepare.add_argument("--mission-id", default="")
+    prepare.add_argument("--generation-id", default="")
     prepare.add_argument("--run-id", default="")
     abandon = sub.add_parser("abandon")
     abandon.add_argument("runs_dir")
@@ -1948,6 +2148,15 @@ def _parser() -> argparse.ArgumentParser:
     indeterminate.add_argument("runs_dir")
     for name in ("feature", "instance", "run-id", "reason"):
         indeterminate.add_argument(f"--{name}", required=True)
+    retire = sub.add_parser("retire-kimi")
+    retire.add_argument("runs_dir")
+    for name in (
+        "feature", "instance", "workspace-uuid", "surface-uuid",
+        "generation-id", "hook-dir",
+    ):
+        retire.add_argument(f"--{name}", required=True)
+    retire.add_argument("--mission-id", default="")
+    retire.add_argument("--workspace-quiesced", action="store_true")
     confirm = sub.add_parser("confirm-submit")
     confirm.add_argument("runs_dir")
     for name in ("workspace-uuid", "hook-source", "since"):
@@ -1976,6 +2185,8 @@ def main() -> int:
                 model=args.model,
                 hook_source=args.hook_source,
                 variant=args.variant,
+                mission_id=args.mission_id,
+                generation_id=args.generation_id,
                 run_id=args.run_id,
             )
         elif args.command == "abandon":
@@ -2012,13 +2223,25 @@ def main() -> int:
                         timeout_seconds=args.timeout,
                     )
                 }
-        else:
+        elif args.command == "mark-indeterminate":
             result = mark_indeterminate(
                 runs_dir,
                 feature=args.feature,
                 instance=args.instance,
                 run_id=args.run_id,
                 reason=args.reason,
+            )
+        else:
+            result = retire_kimi_surface(
+                runs_dir,
+                feature=args.feature,
+                instance=args.instance,
+                workspace_uuid=args.workspace_uuid,
+                surface_uuid=args.surface_uuid,
+                mission_id=args.mission_id,
+                generation_id=args.generation_id,
+                hook_dir=Path(args.hook_dir),
+                workspace_quiesced=args.workspace_quiesced,
             )
         print(json.dumps(result, sort_keys=True))
         return 0

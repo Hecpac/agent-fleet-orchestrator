@@ -343,6 +343,7 @@ class RouterConfigTests(unittest.TestCase):
         kimi = plan["instances"][1]
         self.assertEqual(kimi["provider"], "moonshot-ai")
         self.assertEqual(kimi["model"], "kimi-code/k3")
+        self.assertIn("K3[[:space:]]+thinking", kimi["ready_pattern"])
         self.assertEqual(kimi["hook_source"], "kimi")
         self.assertEqual(kimi["authority"], "verification")
         self.assertEqual(kimi["tool_access"], ["filesystem_read", "fleet_control"])

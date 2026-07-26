@@ -25,6 +25,11 @@ FLEET_STATE = ROOT / "scripts" / "fleet_state.py"
 FLEET_DOWN = ROOT / "scripts" / "fleet-down.sh"
 INTERNAL_WIRING = ROOT / "orchestration" / "INTERNAL_WIRING.md"
 README = ROOT / "README.md"
+JUSTFILE = ROOT / "justfile"
+CHECK_CI = ROOT / "scripts" / "check-ci.sh"
+CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+CI_DOC = ROOT / "docs" / "ci.md"
+FLEET_GUIDE = ROOT / "docs" / "guia-uso-flota.md"
 FLEET_REVIEWER = ROOT / ".opencode" / "agents" / "fleet-reviewer.md"
 MINIMAX_CHECKER = ROOT / ".opencode" / "agents" / "minimax-checker.md"
 GLM_CHALLENGER = ROOT / ".opencode" / "agents" / "glm-challenger.md"
@@ -36,6 +41,22 @@ SKILL_COPIES = (
 
 class SpecCoherenceTests(unittest.TestCase):
     """The router is the single source of truth; prose must not drift from it."""
+
+    def test_local_canary_advance_honors_isolated_runs_directory(self) -> None:
+        recipe = JUSTFILE.read_text(encoding="utf-8")
+        self.assertIn(
+            '"${FLEET_RUNS_DIR:-orchestration/runs}/fleet-{{feature}}.manifest"',
+            recipe,
+        )
+
+    def test_portable_ci_declares_python_floor_and_pinned_uv(self) -> None:
+        gate = CHECK_CI.read_text(encoding="utf-8")
+        workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+        documentation = CI_DOC.read_text(encoding="utf-8")
+        self.assertIn("sys.version_info >= (3, 12)", gate)
+        self.assertIn("uv==0.9.26", workflow)
+        self.assertIn("Python 3.12 o posterior", documentation)
+        self.assertIn("uv==0.9.26", documentation)
 
     def test_internal_wiring_test_references_resolve(self) -> None:
         wiring = INTERNAL_WIRING.read_text(encoding="utf-8")
@@ -108,6 +129,14 @@ class SpecCoherenceTests(unittest.TestCase):
                     router_version,
                     f"{path} shows schema_version={version}; router.yaml is {router_version}",
                 )
+
+    def test_kimi_model_identity_matches_operational_documentation(self) -> None:
+        router = json.loads(ROUTER.read_text(encoding="utf-8"))
+        model = router["roles"]["kimi"]["model"]
+        documents = (README, FLEET_GUIDE, *SKILL_COPIES)
+        for path in documents:
+            with self.subTest(path=path):
+                self.assertIn(model, path.read_text(encoding="utf-8"))
 
     def test_fleet_validation_prompt_locks_exact_fail_closed_lifecycle(self) -> None:
         router = json.loads(ROUTER.read_text(encoding="utf-8"))
@@ -273,7 +302,7 @@ class SpecCoherenceTests(unittest.TestCase):
             "rule: minimax_opencode_roles_require_durable_none_variant", wiring
         )
         self.assertIn(
-            "test_opencode_prompt_transport_is_one_submission_with_exact_logical_prompt",
+            "test_opencode_prompt_contract_is_the_exact_logical_prompt",
             wiring,
         )
         for documented in (

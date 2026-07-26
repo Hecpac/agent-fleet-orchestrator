@@ -13,6 +13,14 @@ una instalación local de hooks de Claude se marcan explícitamente como
 omitidos en runners hospedados y permanecen cubiertos por el lane live de
 macOS; no se sustituyen por credenciales ni servicios falsos.
 
+El contrato portátil requiere Bash, Git, Python 3.12 o posterior y `uv`. El lane
+hospedado fija Python 3.12 e instala de forma reproducible `uv==0.9.26` antes
+de ejecutar el gate, y
+`scripts/check-ci.sh` falla al inicio con un diagnóstico explícito si falta
+alguna de esas dependencias. Los tests de coherencia del router desactivan las
+comprobaciones de binarios de proveedores porque validan configuración
+estática; el lane portátil no necesita instalar Codex, Claude, OpenCode o Kimi.
+
 La validación de `workflows/regulated.yaml` en CI es estática. No implica que
 pueda admitir efectos: el compilador de ejecución exige `hard_total` en todos
 los proveedores resolubles y el run regulado exige WORM externo, dependencias

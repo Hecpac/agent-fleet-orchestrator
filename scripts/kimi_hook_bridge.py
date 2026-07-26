@@ -16,15 +16,17 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
-import tempfile
+import stat
 import time
 import uuid
 from typing import Any
 
 import fleet_json
+import fleet_kimi_state
+import fleet_safe_paths
 
 
-SUPPORTED_WIRE_PROTOCOLS = {"1.2", "1.3", "1.10"}
+SUPPORTED_WIRE_PROTOCOLS = {"1.2", "1.3", "1.4", "1.10"}
 
 
 class KimiBridgeError(RuntimeError):
@@ -42,24 +44,23 @@ def _canonical_uuid(value: str, field: str) -> str:
 
 
 def _safe_directory(path: Path, field: str, *, create: bool = False) -> Path:
-    if path.is_symlink():
-        raise KimiBridgeError(f"{field} must not be a symlink")
     if create:
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        try:
+            path.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
     try:
-        resolved = path.resolve(strict=True)
-    except OSError as exc:
-        raise KimiBridgeError(f"{field} is unavailable") from exc
-    if not resolved.is_dir():
-        raise KimiBridgeError(f"{field} must be a directory")
-    return resolved
+        return fleet_safe_paths.canonical_root(path, required_mode=0o700)
+    except fleet_safe_paths.SafePathError as exc:
+        raise KimiBridgeError(f"{field} is unsafe: {exc}") from exc
 
 
 def wire_path(share_dir: Path, work_dir: Path, session_id: str) -> Path:
     """Resolve the surface's wire.jsonl under an ISOLATED kimi-code home.
 
-    kimi-code (>= 0.28) mints its own session id and lays sessions out as
-    ``sessions/wd_cwd_<sha256(work_dir)[:12]>/session_<id>/agents/main/``.
+    kimi-code mints its own session id.  Version 0.29 lays sessions out as
+    ``sessions/wd_<basename>_<sha256(work_dir)[:12]>/session_<id>/agents/main/``;
+    0.28 used ``wd_cwd_<sha256(work_dir)[:12]>``.
     The fleet cannot choose the id (the legacy ``--session`` flag now only
     resumes), so the bridge discovers it — safely, because ``share_dir`` is
     a per-surface ``KIMI_CODE_HOME``: more than one session directory means
@@ -69,28 +70,61 @@ def wire_path(share_dir: Path, work_dir: Path, session_id: str) -> Path:
     """
     del session_id
     canonical_work_dir = work_dir.resolve(strict=True)
+    try:
+        canonical_share = fleet_safe_paths.canonical_root(
+            share_dir, required_mode=0o700
+        )
+    except fleet_safe_paths.SafePathError as exc:
+        raise KimiBridgeError(f"Kimi share directory is unsafe: {exc}") from exc
     legacy_hash = hashlib.md5(str(canonical_work_dir).encode("utf-8")).hexdigest()
-    legacy_root = share_dir / "sessions" / legacy_hash
     work_hash = hashlib.sha256(str(canonical_work_dir).encode("utf-8")).hexdigest()[:12]
-    session_root = share_dir / "sessions" / f"wd_cwd_{work_hash}"
-    if not session_root.is_dir():
-        if legacy_root.is_dir():
-            raise KimiBridgeError(
-                "legacy kimi-cli session layout found; the fleet requires kimi-code"
+    current_root = f"wd_{canonical_work_dir.name}_{work_hash}"
+    previous_root = f"wd_cwd_{work_hash}"
+    try:
+        with fleet_safe_paths.RootedFS(canonical_share, root_mode=0o700) as rooted:
+            session_roots = rooted.list_directory(
+                "sessions", directory_modes=(0o700,)
             )
+            matching_roots = [
+                name for name in (current_root, previous_root) if name in session_roots
+            ]
+            if len(matching_roots) > 1:
+                raise KimiBridgeError(
+                    "multiple Kimi work roots in one isolated home make evidence ambiguous"
+                )
+            if not matching_roots:
+                if legacy_hash in session_roots:
+                    raise KimiBridgeError(
+                        "legacy kimi-cli session layout found; the fleet requires kimi-code"
+                    )
+                raise KimiBridgeError("Kimi session root has not been created yet")
+            relative_root = f"sessions/{matching_roots[0]}"
+            candidates = [
+                name
+                for name in rooted.list_directory(
+                    relative_root, directory_modes=(0o700, 0o700)
+                )
+                if name.startswith("session_")
+            ]
+    except fleet_safe_paths.SafePathError:
         raise KimiBridgeError("Kimi session root has not been created yet")
-    candidates = sorted(
-        entry
-        for entry in session_root.iterdir()
-        if entry.is_dir() and entry.name.startswith("session_")
-    )
+    candidates.sort()
     if not candidates:
         raise KimiBridgeError("Kimi session root has not been created yet")
     if len(candidates) > 1:
         raise KimiBridgeError(
             "multiple Kimi sessions in one isolated home make evidence ambiguous"
         )
-    return candidates[0] / "agents" / "main" / "wire.jsonl"
+    transcript_parent = f"{relative_root}/{candidates[0]}/agents/main"
+    try:
+        with fleet_safe_paths.RootedFS(canonical_share, root_mode=0o700) as rooted:
+            rooted.list_directory(
+                transcript_parent,
+                directory_modes=(0o700, 0o700, 0o700, 0o700, 0o700),
+            )
+    except fleet_safe_paths.SafePathError as exc:
+        raise KimiBridgeError(f"Kimi session path is unsafe: {exc}") from exc
+    return canonical_share / transcript_parent / "wire.jsonl"
 
 
 def resolve_wire_path(
@@ -130,54 +164,33 @@ def _read_object(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    payload = fleet_json.canonical_bytes(value) + b"\n"
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-    finally:
-        try:
-            os.unlink(temporary)
-        except FileNotFoundError:
-            pass
-
-
 def record_session(
     hook_dir: Path,
     *,
+    share_dir: Path,
     session_id: str,
     workspace_id: str,
     surface_id: str,
+    mission_id: str,
+    generation_id: str,
     transcript_path: Path,
     provider: str,
     model: str,
 ) -> None:
-    session_file = hook_dir / "kimi-hook-sessions.json"
-    lock_path = hook_dir / ".kimi-hook-sessions.lock"
-    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        with os.fdopen(lock_fd, "r+b", closefd=True) as lock:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            document = _read_object(session_file, {"sessions": {}})
-            sessions = document.get("sessions")
-            if not isinstance(sessions, dict):
-                raise KimiBridgeError("kimi-hook-sessions.json has invalid sessions")
-            sessions[session_id] = {
-                "sessionId": session_id,
-                "workspaceId": workspace_id.upper(),
-                "surfaceId": surface_id.upper(),
-                "transcriptPath": str(transcript_path),
-                "provider": provider,
-                "model": model,
-                "updatedAt": int(time.time() * 1000),
-            }
-            _atomic_json(session_file, document)
-    except OSError as exc:
+        fleet_kimi_state.update_session_binding(
+            hook_dir,
+            share_dir=share_dir,
+            session_id=session_id,
+            workspace_id=workspace_id,
+            surface_id=surface_id,
+            mission_id=mission_id,
+            generation_id=generation_id,
+            transcript_path=transcript_path,
+            provider=provider,
+            model=model,
+        )
+    except (fleet_kimi_state.KimiStateError, fleet_safe_paths.SafePathError) as exc:
         raise KimiBridgeError("cannot update Kimi session binding") from exc
 
 
@@ -185,7 +198,12 @@ def _occurred_at(timestamp: Any) -> str:
     if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
         raise KimiBridgeError("Kimi Wire record has an invalid timestamp")
     try:
-        return datetime.fromtimestamp(float(timestamp), timezone.utc).isoformat()
+        value = float(timestamp)
+        # Kimi Wire 1.4 renamed ``timestamp`` to ``time`` and records Unix
+        # milliseconds. Older kimi-code transcripts use Unix seconds.
+        if value >= 100_000_000_000:
+            value /= 1000
+        return datetime.fromtimestamp(value, timezone.utc).isoformat()
     except (OSError, OverflowError, ValueError) as exc:
         raise KimiBridgeError("Kimi Wire record timestamp is out of range") from exc
 
@@ -198,10 +216,26 @@ def hook_event(
     workspace_id: str,
     surface_id: str,
 ) -> dict[str, Any] | None:
-    message = record.get("message")
-    if not isinstance(message, dict) or not isinstance(message.get("payload"), dict):
-        raise KimiBridgeError("Kimi Wire record has an invalid message envelope")
-    message_type = message.get("type")
+    record_type = record.get("type")
+    if record_type == "turn.prompt":
+        message_type = "TurnBegin"
+        timestamp = record.get("time")
+    elif record_type == "context.append_loop_event":
+        loop_event = record.get("event")
+        if not isinstance(loop_event, dict):
+            raise KimiBridgeError("Kimi Wire record has an invalid loop event")
+        if loop_event.get("type") != "step.end" or loop_event.get("finishReason") != "end_turn":
+            return None
+        message_type = "TurnEnd"
+        timestamp = record.get("time")
+    elif record_type is not None:
+        return None
+    else:
+        message = record.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("payload"), dict):
+            raise KimiBridgeError("Kimi Wire record has an invalid message envelope")
+        message_type = message.get("type")
+        timestamp = record.get("timestamp")
     if message_type == "TurnBegin":
         name, phase = "agent.hook.UserPromptSubmit", "received"
     elif message_type == "TurnEnd":
@@ -219,7 +253,7 @@ def hook_event(
         "source": "kimi",
         "workspace_id": workspace_id.upper(),
         "surface_id": surface_id.upper(),
-        "occurred_at": _occurred_at(record.get("timestamp")),
+        "occurred_at": _occurred_at(timestamp),
         "payload": {
             "_source": "kimi",
             "phase": phase,
@@ -230,11 +264,16 @@ def hook_event(
 
 def _existing_event_ids(events_file: Path) -> set[str]:
     try:
-        lines = events_file.read_bytes().splitlines()
-    except FileNotFoundError:
-        return set()
-    except OSError as exc:
-        raise KimiBridgeError("cannot read Kimi event evidence") from exc
+        with fleet_safe_paths.RootedFS(
+            events_file.parent, root_mode=0o700
+        ) as rooted:
+            raw = rooted.read_regular_optional(
+                events_file.name, directory_modes=(), file_mode=0o600,
+                max_bytes=64 * 1024 * 1024,
+            )
+        lines = [] if raw is None else raw.splitlines()
+    except fleet_safe_paths.SafePathError as exc:
+        raise KimiBridgeError("cannot read safe Kimi event evidence") from exc
     result: set[str] = set()
     for raw in lines:
         if not raw.strip():
@@ -251,29 +290,46 @@ def _existing_event_ids(events_file: Path) -> set[str]:
 
 def append_event(events_file: Path, event: dict[str, Any]) -> None:
     payload = fleet_json.canonical_bytes(event) + b"\n"
-    fd = os.open(events_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
-        os.write(fd, payload)
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+        with fleet_safe_paths.RootedFS(
+            events_file.parent, root_mode=0o700
+        ) as rooted:
+            rooted.append_regular(
+                events_file.name, payload, directory_modes=(), file_mode=0o600
+            )
+    except fleet_safe_paths.SafePathError as exc:
+        raise KimiBridgeError("cannot append safe Kimi event evidence") from exc
 
 
 def acquire_bridge_lock(state_dir: Path) -> int:
     lock_path = state_dir / ".bridge.lock"
     if lock_path.is_symlink():
         raise KimiBridgeError("bridge lock must not be a symlink")
-    flags = os.O_RDWR | os.O_CREAT
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     lock_fd = -1
     try:
         lock_fd = os.open(lock_path, flags, 0o600)
+        opened = os.fstat(lock_fd)
+        current = lock_path.lstat()
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != os.geteuid()
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino)
+        ):
+            raise KimiBridgeError("bridge lock is not owner-bound mode 0600")
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError as exc:
         if lock_fd >= 0:
             os.close(lock_fd)
         raise KimiBridgeError("another Kimi bridge owns this surface") from exc
+    except KimiBridgeError:
+        if lock_fd >= 0:
+            os.close(lock_fd)
+        raise
     except OSError as exc:
         if lock_fd >= 0:
             os.close(lock_fd)
@@ -308,6 +364,10 @@ def watch(args: argparse.Namespace) -> int:
     session_id = _canonical_uuid(args.session_id, "session_id")
     workspace_id = _canonical_uuid(args.workspace_id, "workspace_id")
     surface_id = _canonical_uuid(args.surface_id, "surface_id")
+    mission_id = (
+        _canonical_uuid(args.mission_id, "mission_id") if args.mission_id else ""
+    )
+    generation_id = _canonical_uuid(args.generation_id, "generation_id")
     share_dir = _safe_directory(Path(args.share_dir), "share_dir", create=True)
     hook_dir = _safe_directory(Path(args.hook_dir), "hook_dir", create=True)
     state_dir = _safe_directory(Path(args.events_file).parent, "state_dir", create=True)
@@ -318,9 +378,12 @@ def watch(args: argparse.Namespace) -> int:
     transcript = resolve_wire_path(share_dir, Path(args.work_dir), session_id)
     record_session(
         hook_dir,
+        share_dir=share_dir,
         session_id=session_id,
         workspace_id=workspace_id,
         surface_id=surface_id,
+        mission_id=mission_id,
+        generation_id=generation_id,
         transcript_path=transcript,
         provider=args.provider,
         model=args.model,
@@ -331,12 +394,14 @@ def watch(args: argparse.Namespace) -> int:
     # the advisory lock even when the process exits after an unhandled error.
     while True:
         try:
-            raw_content = transcript.read_bytes()
-        except FileNotFoundError:
+            raw_content = fleet_kimi_state.read_wire(
+                share_dir, transcript, missing_ok=True
+            )
+        except fleet_kimi_state.KimiStateError as exc:
+            raise KimiBridgeError("cannot read Kimi Wire transcript") from exc
+        if raw_content is None:
             time.sleep(args.poll_interval)
             continue
-        except OSError as exc:
-            raise KimiBridgeError("cannot read Kimi Wire transcript") from exc
         raw_lines = raw_content.splitlines()
         if raw_content and not raw_content.endswith(b"\n"):
             raw_lines = raw_lines[:-1]
@@ -367,9 +432,12 @@ def watch(args: argparse.Namespace) -> int:
             seen.add(event["id"])
             record_session(
                 hook_dir,
+                share_dir=share_dir,
                 session_id=session_id,
                 workspace_id=workspace_id,
                 surface_id=surface_id,
+                mission_id=mission_id,
+                generation_id=generation_id,
                 transcript_path=transcript,
                 provider=args.provider,
                 model=args.model,
@@ -386,6 +454,8 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--session-id", required=True)
     value.add_argument("--workspace-id", required=True)
     value.add_argument("--surface-id", required=True)
+    value.add_argument("--mission-id", default="")
+    value.add_argument("--generation-id", required=True)
     value.add_argument("--hook-dir", required=True)
     value.add_argument("--events-file", required=True)
     value.add_argument("--provider", required=True)

@@ -58,12 +58,15 @@ provider="$(manifest_value "$instance_id.provider")"
 model="$(manifest_value "$instance_id.model")"
 hook_source="$(manifest_value "$instance_id.hook_source")"
 variant="$(manifest_value "$instance_id.variant")"
+mission_id="$(manifest_value mission_id)"
+generation_id="$(manifest_value "$instance_id.launch_id")"
 
 prepare_args=(prepare "$runs_dir" \
   --feature "$feature" --instance "$instance_id" --role "$role" --phase "$phase" \
   --task "$task" --workspace-uuid "$workspace_uuid" --surface-uuid "$surface_uuid" \
   --provider "$provider" --model "$model" --hook-source "$hook_source" \
-  --variant "$variant")
+  --variant "$variant" --mission-id "$mission_id" \
+  --generation-id "$generation_id")
 [[ -z "$run_id_override" ]] || prepare_args+=(--run-id "$run_id_override")
 prepared="$(python3 "$frontier" "${prepare_args[@]}")"
 run_id="$(jq -er '.run_id // empty' <<< "$prepared")" || exit 75

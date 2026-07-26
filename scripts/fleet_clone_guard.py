@@ -15,6 +15,7 @@ import sys
 from typing import Any
 
 import fleet_json
+import fleet_safe_paths
 from fleet_safe_paths import RootedFS, SafePathError
 
 
@@ -925,11 +926,11 @@ def stage_clone(args: argparse.Namespace) -> Path:
                             os.fchmod(source_clone_fd, transition_mode)
                             os.fsync(source_clone_fd)
                             _checkpoint("after_reader_stage_chmod")
-                        os.rename(
+                        fleet_safe_paths._rename_noreplace(  # type: ignore[attr-defined]
                             static["source_name"],
                             static["staging_name"],
-                            src_dir_fd=root_fd,
-                            dst_dir_fd=staging_fd,
+                            source_fd=root_fd,
+                            destination_fd=staging_fd,
                         )
                         os.fsync(root_fd)
                         os.fsync(staging_fd)
