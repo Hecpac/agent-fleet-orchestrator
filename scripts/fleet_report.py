@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import stat
 import sys
@@ -404,6 +405,9 @@ def build_report(runs_dir: Path, mission_id: str) -> dict[str, Any]:
         or compiled["compiled_digest"] != current["compiled_digest"]
     ):
         raise ReportError("compiled workflow evidence is not bound to the mission ledger")
+    if compiled["resolved"]["preset"] == "astra_sol":
+        import fleet_herdr_report
+        return fleet_herdr_report.build_report(runs_dir, current, compiled, events)
     feature = events[0]["payload"]["feature"]
     archive_report = _archive_report(root)
     legacy_path = runs_dir / f"fleet-{feature}.ledger.jsonl"
@@ -429,6 +433,24 @@ def build_report(runs_dir: Path, mission_id: str) -> dict[str, Any]:
 
 
 def human_report(report: dict[str, Any]) -> str:
+    if report.get("backend") == "herdr":
+        lines = [f"Mission {report['mission_id']} ({report['feature']}): {report['status']} [ledger]",
+            f"Herdr: admissions={report['admissions']['count']} runs={report['outcomes']['runs']} "
+            f"observed_sessions={report['agents']['observed_sessions']}",
+            f"Delegations={report['delegation']['count']} synthesis_turns={report['delegation']['synthesis_turns']}",
+            f"Archive: {report['archive']['state']} anchored={report['archive']['anchored']}",
+            f"Acceptance: {report['acceptance']['status'] if report['acceptance'] else 'unknown'}",
+            "Cost: unknown (no durable billing receipt)"]
+        lines.extend(f"Observed {p['provider']}/{p['model']}: runs={p['runs']}" for p in report["providers"])
+        if report.get("functional"):
+            lines.append(f"Functional: {report['functional']['status']} ({report['functional']['reason']})")
+        if report.get("control"):
+            lines.append(f"Control: requested={report['control']['desired']} confirmed={report['control']['applied']}")
+        timing = report["timing"]
+        lines.append(f"Observed controller wait: {timing.get('controller_wait_seconds')} s; requested pause: {timing.get('requested_pause_seconds')} s; unclassified: {timing.get('unclassified_seconds')} s")
+        for provider in report["providers"]:
+            lines.append(f"Observed usage {provider['model']}: input={provider['prompt_tokens']} output={provider['completion_tokens']} (runtime counters; not billing)")
+        return "\n".join(lines)
     timing = report["timing"]
     delegation = report["delegation"]
     outcomes = report["outcomes"]["counts"]
@@ -468,7 +490,7 @@ def human_report(report: dict[str, Any]) -> str:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runs-dir", default=str(ROOT / "orchestration" / "runs"))
+    parser.add_argument("--runs-dir", default=os.environ.get("FLEET_RUNS_DIR", str(ROOT / "orchestration" / "runs")))
     parser.add_argument("--mission-id", required=True)
     parser.add_argument("--json", action="store_true")
     return parser
@@ -484,6 +506,7 @@ def main(argv: list[str] | None = None) -> int:
             print(human_report(report))
         return 0
     except (
+        ValueError,
         ReportError,
         mission_state.MissionStateError,
         OSError,

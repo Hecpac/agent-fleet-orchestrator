@@ -360,6 +360,11 @@ class KimiHookBridgeTests(unittest.TestCase):
             mock.patch.object(
                 fleet_frontier, "acquire_frontier", return_value=fake_lease
             ),
+            mock.patch.object(
+                fleet_frontier.fleet_kimi_state,
+                "require_bridge_health",
+                return_value={},
+            ),
             mock.patch.dict(os.environ, {"CMUX_HOOK_DIR": str(self.hooks)}),
         ):
             prepared = fleet_frontier.prepare_run(
@@ -468,6 +473,54 @@ class KimiHookBridgeTests(unittest.TestCase):
         ):
             kimi_hook_bridge.wire_path(self.share, self.work, SESSION_ID)
 
+    def test_wire_path_accepts_kimi_code_truncated_workdir_basename(self) -> None:
+        import shutil
+
+        shutil.rmtree(self.session_root)
+        work_hash = hashlib.sha256(
+            str(self.work.resolve()).encode("utf-8")
+        ).hexdigest()[:12]
+        truncated_root = (
+            self.share
+            / "sessions"
+            / f"wd_{self.work.name[:1]}_{work_hash}"
+        )
+        main = (
+            truncated_root
+            / "session_22222222-2222-4222-8222-222222222222"
+            / "agents"
+            / "main"
+        )
+        main.mkdir(parents=True)
+        for directory, _, _ in os.walk(truncated_root):
+            Path(directory).chmod(0o700)
+
+        resolved = kimi_hook_bridge.wire_path(
+            self.share, self.work, SESSION_ID
+        )
+
+        self.assertEqual(resolved, (main / "wire.jsonl").resolve())
+
+    def test_wire_path_rejects_ambiguous_hashed_work_roots(self) -> None:
+        work_hash = hashlib.sha256(
+            str(self.work.resolve()).encode("utf-8")
+        ).hexdigest()[:12]
+        second_root = self.share / "sessions" / f"wd_other_{work_hash}"
+        main = (
+            second_root
+            / "session_22222222-2222-4222-8222-222222222222"
+            / "agents"
+            / "main"
+        )
+        main.mkdir(parents=True)
+        for directory, _, _ in os.walk(second_root):
+            Path(directory).chmod(0o700)
+
+        with self.assertRaisesRegex(
+            kimi_hook_bridge.KimiBridgeError, "multiple Kimi work roots"
+        ):
+            kimi_hook_bridge.wire_path(self.share, self.work, SESSION_ID)
+
     def test_wire_path_rejects_legacy_kimi_cli_layout(self) -> None:
         import shutil
 
@@ -509,6 +562,52 @@ class KimiHookBridgeTests(unittest.TestCase):
         finally:
             thread.join()
         self.assertEqual(resolved, (minted / "wire.jsonl").resolve())
+
+    def test_resolve_wire_path_waits_for_agents_directory(self) -> None:
+        import shutil
+        import threading
+
+        shutil.rmtree(self.session_root)
+        partial = (
+            self.session_root
+            / "session_44444444-4444-4444-8444-444444444444"
+        )
+        partial.mkdir(parents=True)
+        for directory, _, _ in os.walk(self.session_root):
+            Path(directory).chmod(0o700)
+        minted = partial / "agents" / "main"
+
+        def mint_agents() -> None:
+            time.sleep(0.4)
+            minted.mkdir(parents=True)
+            for directory, _, _ in os.walk(partial):
+                Path(directory).chmod(0o700)
+
+        thread = threading.Thread(target=mint_agents)
+        thread.start()
+        try:
+            resolved = kimi_hook_bridge.resolve_wire_path(
+                self.share, self.work, SESSION_ID, timeout_seconds=5
+            )
+        finally:
+            thread.join()
+        self.assertEqual(resolved, (minted / "wire.jsonl").resolve())
+
+    def test_wire_path_rejects_symlinked_agents_directory(self) -> None:
+        import shutil
+
+        session = next(self.session_root.glob("session_*"))
+        shutil.rmtree(session / "agents")
+        outside = self.root / "outside-agents"
+        (outside / "main").mkdir(parents=True)
+        for directory, _, _ in os.walk(outside):
+            Path(directory).chmod(0o700)
+        (session / "agents").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(
+            kimi_hook_bridge.KimiBridgeError, "session path is unsafe"
+        ):
+            kimi_hook_bridge.wire_path(self.share, self.work, SESSION_ID)
 
 
 if __name__ == "__main__":

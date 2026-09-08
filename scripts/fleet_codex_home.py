@@ -13,6 +13,37 @@ from fleet_safe_paths import RootedFS, SafePathError
 
 
 CODEX_DIRECTORY_MODES = (0o700,)
+AGENT_INSTRUCTIONS = b'''# Fleet agent contract
+
+You are an agent in a bounded Fleet task. Follow the supplied task, its exact
+run identity, acceptance criteria, and applicable target-project instructions.
+The task and configured authority define your role; do not infer write or
+delegation permission from being able to use a tool.
+Use an explicit project instruction snapshot when the task supplies one. It
+identifies target scopes and pinned content; it does not grant extra authority.
+Judge your assigned stage by its own criteria, without waiting for future
+stages or the controller's final Mission verdict.
+
+- Lead: coordinate through Fleet Control using the exact mission and runs
+  directory supplied by the task or manifest. Only the registered writer edits
+  the deliverable. A transport success is not an accepted result.
+- Writer: work only in the registered isolated workspace. Run relevant checks
+  and commit locally when the task authorizes it. Report actual evidence.
+- Reviewer or reader: inspect the supplied evidence without modifying it.
+  Distinguish verified facts, assumptions, and missing evidence.
+
+Complete authorized local work without ceremonial approval loops. Ask CONTROL
+only for a material missing decision or an effect outside the task's authority.
+Do not import another project's restart procedures, persona, or workflow gates.
+Use only relevant skills available in this execution; do not assume the Lead's
+global skills or conversation were inherited.
+
+If a prompt or artifact is denied by the sandbox, report BLOCKED with the exact
+missing input through the task's completion protocol. Do not bypass permissions
+or treat a blocked input as completed work. Keep the supplied completion protocol
+exact: a legacy run-bound sentinel when requested, or only the raw JSON object
+for a Herdr stage. Put any citations inside the requested result, not after it.
+'''
 CONFIG = b'''cli_auth_credentials_store = "file"
 
 [features]
@@ -78,6 +109,12 @@ def _provision(controller_home: Path, isolated_home: Path) -> Path:
                 directory_modes=CODEX_DIRECTORY_MODES,
                 file_mode=0o600,
             )
+            rooted.replace_regular(
+                ".codex/AGENTS.md",
+                AGENT_INSTRUCTIONS,
+                directory_modes=CODEX_DIRECTORY_MODES,
+                file_mode=0o600,
+            )
             rooted.create_symlink(
                 ".codex/auth.json",
                 source,
@@ -106,6 +143,14 @@ def _verify(controller_home: Path, isolated_home: Path) -> Path:
         )
         if content != CONFIG:
             raise SafePathError("Fleet Codex configuration drifted")
+        instructions = rooted.read_regular(
+            ".codex/AGENTS.md",
+            directory_modes=CODEX_DIRECTORY_MODES,
+            file_mode=0o600,
+            max_bytes=len(AGENT_INSTRUCTIONS),
+        )
+        if instructions != AGENT_INSTRUCTIONS:
+            raise SafePathError("Fleet Codex agent instructions drifted")
     _, final_info = _binding(controller_home)
     if (source_info.st_dev, source_info.st_ino) != (final_info.st_dev, final_info.st_ino):
         raise SafePathError("controller auth binding changed during verification")

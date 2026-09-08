@@ -220,6 +220,11 @@ def create_mission(
     options = runtime_options or {}
     if not isinstance(options, dict):
         raise MissionError("runtime_options must be an object")
+    if options.get("functional_contract") is not None:
+        import fleet_functional
+        fleet_functional.validate(options["functional_contract"])
+        if compiled["resolved"]["preset"] != "astra_sol":
+            raise MissionError("functional v1 requires the Herdr profile")
     mission_id = _mission_id_for_key(idempotency_key)
     if not runs_dir.exists():
         state.ensure_private_directory(runs_dir)
@@ -300,6 +305,8 @@ def create_mission(
                     max_active_delegations=int(limits["max_active_delegations"]),
                     idempotency_key=f"{idempotency_key}:admission-policy",
                 )
+                if options.get("functional_contract") is not None:
+                    fleet_functional.freeze_policy(runs_dir, mission_id, compiled["compiled_digest"], options["functional_contract"])
                 rooted.assert_root_binding()
                 return mission_id, first_appended and not existed
     except fleet_safe_paths.SafePathError as exc:

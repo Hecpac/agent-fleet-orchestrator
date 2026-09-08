@@ -64,8 +64,26 @@ class FleetCodexHomeTests(unittest.TestCase):
         self.assertNotIn("synthetic-placeholder", (codex_home / "config.toml").read_text())
         self.assertEqual((codex_home.stat().st_mode & 0o777), 0o700)
         self.assertEqual((codex_home / "config.toml").stat().st_mode & 0o777, 0o600)
+        instructions = codex_home / "AGENTS.md"
+        self.assertEqual(instructions.stat().st_mode & 0o777, 0o600)
+        self.assertIn("Fleet agent contract", instructions.read_text())
+        self.assertNotIn("synthetic-placeholder", instructions.read_text())
         verified = self.run_helper("verify")
         self.assertEqual(verified.returncode, 0, verified.stderr)
+
+    def test_rejects_changed_or_linked_agent_instructions(self) -> None:
+        self.assertEqual(self.run_helper("provision").returncode, 0)
+        instructions = self.isolated / ".codex" / "AGENTS.md"
+        original = instructions.read_bytes()
+        instructions.write_bytes(original.replace(b"BLOCKED", b"ACCEPT!"))
+        self.assertEqual(self.run_helper("verify").returncode, 2)
+        instructions.unlink()
+        foreign = self.root / "foreign-instructions.md"
+        foreign.write_bytes(original)
+        foreign.chmod(0o600)
+        instructions.symlink_to(foreign)
+        self.assertEqual(self.run_helper("verify").returncode, 2)
+        self.assertEqual(foreign.read_bytes(), original)
 
     def test_rejects_source_symlink_without_mutating_target(self) -> None:
         target = self.root / "outside-auth.json"

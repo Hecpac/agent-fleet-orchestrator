@@ -22,6 +22,11 @@ SPAN_KINDS = {
     "assurance_requested": "assurance_gate",
     "archive_created": "archive",
     "worm_anchored": "worm_anchor",
+    "herdr_control_requested": "mission_control_request",
+    "herdr_control_applied": "mission_control_confirmation",
+    "herdr_dispatch_intent": "dispatch_attempt",
+    "functional_check_started": "functional_check_start",
+    "functional_check_finished": "functional_check_result",
 }
 SAFE_ATTRIBUTE_FIELDS = {
     "approval_id", "approval_event_sha256", "artifact_id", "base_sha",
@@ -29,6 +34,7 @@ SAFE_ATTRIBUTE_FIELDS = {
     "event_sha256", "final_sha", "instance", "mode", "model", "parent_run_id",
     "objective_sha256", "preset", "provider", "recipient_instance", "recipient_run_id", "risk",
     "run_id", "sequence", "sha256", "status", "variant", "workflow_digest",
+    "request_id", "action", "generation", "attempt_id", "contract_artifact_id", "receipt_artifact_id",
 }
 
 
@@ -70,7 +76,24 @@ def events_to_spans(
         }
     ]
     run_spans: dict[str, str] = {}
+    interval_spans = {}
     for event in events[1:]:
+        if event["kind"] == "herdr_interval_started":
+            payload = event["payload"]
+            interval = {"span_id": "interval:" + payload["interval_id"], "parent_span_id": root_id,
+                "name": payload["kind"], "mission_id": mission_id, "sequence": event["sequence"],
+                "timestamp": event["timestamp"], "end_timestamp": None,
+                "attributes": {"run_id": payload["run_id"], "elapsed_seconds": None, "reason": "interval_end_not_observed"}}
+            spans.append(interval)
+            interval_spans[payload["interval_id"]] = interval
+            continue
+        if event["kind"] == "herdr_interval_finished":
+            payload = event["payload"]
+            interval = interval_spans.get(payload["interval_id"])
+            if interval:
+                interval["end_timestamp"] = event["timestamp"]
+                interval["attributes"].update(elapsed_seconds=payload["elapsed_ns"] / 1e9, reason=None, outcome=payload["outcome"])
+            continue
         name = SPAN_KINDS.get(event["kind"])
         if name is None:
             continue

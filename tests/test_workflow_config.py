@@ -26,7 +26,15 @@ class WorkflowConfigTests(unittest.TestCase):
         self.router = workflow_config.router_config.load_router()
 
     def test_repository_workflows_compile_against_router(self) -> None:
-        expected = {"hotfix", "implementation", "kimi-audit", "local-worm", "research"}
+        expected = {
+            "herdr-implementation",
+            "companion-kimi",
+            "hotfix",
+            "implementation",
+            "kimi-audit",
+            "local-worm",
+            "research",
+        }
         paths = sorted((ROOT / "workflows").glob("*.yaml"))
         compiled = [
             workflow_config.compile_path(path)
@@ -34,6 +42,10 @@ class WorkflowConfigTests(unittest.TestCase):
             if path.name != "regulated.yaml"
         ]
         self.assertEqual({item["workflow"]["name"] for item in compiled}, expected)
+        self.assertTrue(
+            all(item["resolved"]["assurance_mode"] == "assured" for item in compiled
+                if item["workflow"]["name"] != "herdr-implementation")
+        )
         implementation = next(
             item for item in compiled if item["workflow"]["name"] == "implementation"
         )

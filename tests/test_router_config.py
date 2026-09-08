@@ -46,12 +46,14 @@ class RouterConfigTests(unittest.TestCase):
         self.assertEqual(
             set(self.config["presets"]),
             {
+                "astra_sol",
                 "dan",
                 "small",
                 "audit",
                 "frontier_verification",
                 "kimi_audit",
                 "kimi_review",
+                "companion_kimi",
                 "fleet_dialogue",
                 "implementation_review",
                 "hotfix_validated",
@@ -264,6 +266,7 @@ class RouterConfigTests(unittest.TestCase):
 
     def test_preset_order_is_capability_first(self) -> None:
         expected = {
+            "astra_sol": ["worker", "reviewer", "verifier"],
             "dan": ["scout", "builder", "challenger", "verifier"],
             "small": [],
             "audit": ["analysis", "challenge", "verify"],
@@ -280,6 +283,50 @@ class RouterConfigTests(unittest.TestCase):
                     run_healthcheck=False,
                 )
                 self.assertEqual([item["instance_id"] for item in plan["instances"]], instance_ids)
+
+    def test_astra_sol_preset_has_exact_identity_without_fallback(self) -> None:
+        plan = router_config.build_plan(
+            self.config,
+            preset_name="astra_sol",
+            run_healthcheck=False,
+        )
+        self.assertEqual(plan["lead"]["role_type"], "astra_lead")
+        self.assertEqual(plan["lead"]["model"], "gpt-6-astra")
+        for member in [plan["lead"], *plan["instances"]]:
+            self.assertIn('model_reasoning_effort="high"', member["command"])
+        self.assertIn("read-only", plan["lead"]["command"])
+        self.assertNotIn("danger-full-access", plan["lead"]["command"])
+        self.assertEqual(
+            plan["lead"]["tool_access"],
+            ["filesystem", "shell", "git", "fleet_control"],
+        )
+        self.assertNotIn("cmux", plan["lead"]["tool_access"])
+        self.assertEqual(
+            [
+                (
+                    member["instance_id"],
+                    member["role_type"],
+                    member["model"],
+                    member["phase"],
+                    member["authority"],
+                )
+                for member in plan["instances"]
+            ],
+            [
+                ("worker", "sol_worker", "gpt-5.6-sol", "BUILD", "write"),
+                ("reviewer", "sol_reviewer", "gpt-5.6-sol", "CHALLENGE", "advisory"),
+                ("verifier", "sol_verifier", "gpt-5.6-sol", "VERIFY", "verification"),
+            ],
+        )
+        config = copy.deepcopy(self.config)
+        config["roles"]["astra_lead"]["enabled"] = False
+        with self.assertRaisesRegex(router_config.RouterError, "astra_lead.*disabled"):
+            router_config.build_plan(
+                config,
+                preset_name="astra_sol",
+                allow_fallback=True,
+                run_healthcheck=False,
+            )
 
     def test_execution_modes_separate_autonomy_from_assurance(self) -> None:
         dan = router_config.build_plan(
@@ -364,13 +411,26 @@ class RouterConfigTests(unittest.TestCase):
         )
         self.assertEqual(plan["instances"][0]["authority"], "verification")
 
+    def test_companion_kimi_uses_direct_read_only_verifier(self) -> None:
+        plan = router_config.build_plan(
+            self.config, preset_name="companion_kimi", run_healthcheck=False
+        )
+        kimi = next(
+            item for item in plan["instances"] if item["instance_id"] == "kimi_verifier"
+        )
+        self.assertEqual(kimi["role_type"], "kimi_direct_verifier")
+        self.assertEqual(kimi["model"], "kimi-code/k3")
+        self.assertEqual(kimi["authority"], "verification")
+        self.assertEqual(kimi["tool_access"], ["filesystem_read", "fleet_control"])
+        self.assertNotIn("--plan", kimi["command"])
+
     def test_kimi_role_rejects_unsafe_or_unpinned_commands(self) -> None:
         for mutation, error in (
             (("append", "--print"), "unsafe/non-interactive"),
             (("append", "--auto"), "unsafe/non-interactive"),
             (("append", "-S"), "unsafe/non-interactive"),
             (("append", "--continue"), "unsafe/non-interactive"),
-            (("remove", "--plan"), "plan mode exactly once"),
+            (("append", "--plan"), "plan mode at most once"),
             (("insert_subcommand", "acp"), "not a subcommand"),
         ):
             with self.subTest(mutation=mutation):

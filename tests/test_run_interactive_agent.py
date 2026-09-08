@@ -309,6 +309,8 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             "'bootstrap_home_is_controller': os.environ['HOME'] != fleet_home,"
             "'config_under_fleet_home': p.startswith(fleet_home + '/'),"
             "'bootstrap_state': json.load(open(fleet_home + '/.claude.json', encoding='utf-8')),"
+            "'claude_config_dir': os.environ.get('CLAUDE_CONFIG_DIR'),"
+            "'securestorage_config_dir': os.environ.get('CLAUDE_SECURESTORAGE_CONFIG_DIR'),"
             "'session_home': s['env']['HOME'],"
             "'session_user': s['env']['USER'],"
             "'llm_model': os.environ.get('LLM_MODEL'),"
@@ -328,9 +330,18 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
         values = self.parse(result)
         self.assertTrue(values["bootstrap_home_is_controller"])
         self.assertTrue(values["config_under_fleet_home"])
+        self.assertTrue(str(values["claude_config_dir"]).startswith("/tmp/fleet_home."))
+        self.assertEqual(values["securestorage_config_dir"], "")
         bootstrap_state = values["bootstrap_state"]
         self.assertTrue(bootstrap_state["hasCompletedOnboarding"])
-        self.assertLessEqual(set(bootstrap_state), {"hasCompletedOnboarding", "oauthAccount"})
+        self.assertLessEqual(
+            set(bootstrap_state),
+            {"hasCompletedOnboarding", "oauthAccount", "projects"},
+        )
+        self.assertEqual(
+            bootstrap_state["projects"],
+            {str(ROOT.resolve()): {"hasTrustDialogAccepted": True}},
+        )
         if "oauthAccount" in bootstrap_state:
             self.assertEqual(
                 set(bootstrap_state["oauthAccount"]),
@@ -586,6 +597,46 @@ class InteractiveAgentEnvironmentTests(unittest.TestCase):
             server_thread.join(timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "CLAUDE_OK")
+        self.assertFalse(server_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["request"]["method"], "ping")
+
+    def test_claude_opus_healthcheck_uses_the_claude_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_claude = root / "claude"
+            fake_claude.write_text("#!/bin/sh\nprintf 'CLAUDE_OPUS_OK\\n'\n", encoding="utf-8")
+            fake_claude.chmod(0o700)
+            socket_path = root / "specialist.sock"
+            control_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.addCleanup(control_socket.close)
+            control_socket.bind(str(socket_path))
+            socket_path.chmod(0o600)
+            control_socket.listen(1)
+            server_thread, received, errors = self.serve_one_preflight_denial(
+                control_socket
+            )
+            result = subprocess.run(
+                [
+                    "bash", str(RUNNER), "claude_opus", "write", "-",
+                    str(fake_claude), "--version",
+                ],
+                cwd=ROOT,
+                env={
+                    **os.environ,
+                    "HOME": str(root),
+                    "FLEET_CONTROL_SOCKET": str(socket_path),
+                    "FLEET_HEALTHCHECK": "1",
+                },
+                text=True,
+                capture_output=True,
+                timeout=20,
+                check=False,
+            )
+            server_thread.join(timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "CLAUDE_OPUS_OK")
         self.assertFalse(server_thread.is_alive())
         self.assertEqual(errors, [])
         self.assertEqual(len(received), 1)

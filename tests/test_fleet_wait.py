@@ -327,6 +327,11 @@ class FleetWaitLedgerAuthorityTests(FleetWaitTestCase):
         }
         with (
             mock.patch.object(fleet_frontier, "KIMI_STATE_ROOT", state_root),
+            mock.patch.object(
+                fleet_frontier.fleet_kimi_state,
+                "require_bridge_health",
+                return_value={},
+            ),
             mock.patch.object(fleet_frontier, "event_ack", return_value=ack),
             mock.patch.object(
                 fleet_frontier,

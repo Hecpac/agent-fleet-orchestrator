@@ -794,6 +794,55 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
     elif kind == "mission_completing":
         _require_fields(kind, payload, {"lead_artifact_id"})
         _require_sha(payload["lead_artifact_id"], "mission lead_artifact_id")
+    elif kind == "herdr_native_observed":
+        _require_fields(kind, payload, {"attempt", "run_id", "artifact_id", "channel_id", "sequence", "decision", "authority"})
+        attempt = payload["attempt"]
+        if not isinstance(attempt, dict) or set(attempt) != {"mission_id", "generation", "role", "attempt_id"}:
+            raise MissionStateError("invalid native observation attempt")
+        for field in ("mission_id", "generation", "attempt_id"):
+            _require_uuid(attempt[field], "native " + field)
+        if attempt["role"] != "worker" or payload["authority"] != "none" or payload["decision"] not in {"allow", "deny"}:
+            raise MissionStateError("invalid native observation authority")
+        for field in ("artifact_id", "channel_id"):
+            _require_sha(payload[field], "native " + field)
+        _require_uint(payload["sequence"], "native sequence")
+        if payload["run_id"] is not None:
+            _require_uuid(payload["run_id"], "native run_id")
+        if payload["sequence"] == 0 and payload["run_id"] is not None:
+            raise MissionStateError("native bootstrap cannot claim a run")
+        if payload["sequence"] != 0 and payload["decision"] == "allow":
+            raise MissionStateError("native tool authorization is unavailable")
+    elif kind in {"herdr_interval_started", "herdr_interval_finished"}:
+        import fleet_herdr_metrics
+        fleet_herdr_metrics.validate_payload(kind, payload)
+    elif kind in {"herdr_supervision_enabled", "herdr_control_requested", "herdr_control_applied", "herdr_dispatch_intent"}:
+        import fleet_herdr_control
+        fleet_herdr_control.validate_payload(kind, payload)
+    elif kind == "functional_policy_frozen":
+        _require_fields(kind, payload, {"compiled_digest", "spec_artifact_id", "tests_sha256"})
+        for field in payload:
+            _require_sha(payload[field], "functional policy " + field)
+    elif kind == "functional_check_started":
+        _require_fields(kind, payload, {"contract_artifact_id", "attempt_id", "tree_sha"})
+        _require_sha(payload["contract_artifact_id"], "functional contract")
+        _require_uuid(payload["attempt_id"], "functional attempt")
+        if not isinstance(payload["tree_sha"], str) or not GIT_OID.fullmatch(payload["tree_sha"]):
+            raise MissionStateError("invalid functional tree identity")
+    elif kind == "functional_check_finished":
+        _require_fields(kind, payload, {"contract_artifact_id", "attempt_id", "receipt_artifact_id", "status"})
+        _require_sha(payload["contract_artifact_id"], "functional contract")
+        _require_sha(payload["receipt_artifact_id"], "functional receipt")
+        _require_uuid(payload["attempt_id"], "functional attempt")
+        if payload["status"] not in {"passed", "failed", "blocked", "indeterminate"}:
+            raise MissionStateError("invalid functional outcome")
+    elif kind == "herdr_finalization_policy_frozen":
+        _require_fields(kind, payload, {"compiled_digest", "minimum_archive_schema_version",
+                                       "permissions_policy_version", "required_turns"})
+        _require_sha(payload["compiled_digest"], "Herdr finalization compiled_digest")
+        for field, expected in (("minimum_archive_schema_version", 3),
+                                ("permissions_policy_version", 1), ("required_turns", 5)):
+            if type(payload[field]) is not int or payload[field] != expected:
+                raise MissionStateError("unsupported Herdr finalization policy")
     elif kind == "archive_created":
         _require_fields(kind, payload, {"path", "sha256", "mode"})
         _require_nonempty(payload["path"], "archive path")
@@ -2072,6 +2121,8 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
         kind = event["kind"]
         payload = event["payload"]
         _validate_payload(kind, payload)
+        if (kind == "archive_created" or kind == "mission_terminal" and payload.get("status") == "succeeded") and result.get("herdr_control", {}).get("desired", "running") != "running":
+            raise MissionConflict("Herdr control request blocks accepted completion")
         if kind in STATE_EVENT:
             if kind == "workflow_compiled":
                 if result["status"] != "created":
@@ -2521,6 +2572,50 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
             result["risk_categories"] = sorted(
                 set(result["risk_categories"]) | set(payload["categories"])
             )
+        elif kind == "herdr_native_observed":
+            if (event["actor"] != "CONTROL" or result["status"] not in {"booting", "running"}
+                    or payload["attempt"]["mission_id"] != result["mission_id"]):
+                raise MissionConflict("native observation requires active CONTROL")
+            observed = result.setdefault("herdr_native_observations", [])
+            previous = [p for p in observed if p["attempt"] == payload["attempt"]]
+            if (payload["sequence"] != len(previous)
+                    or previous and (previous[-1]["channel_id"] != payload["channel_id"]
+                                     or previous[-1]["decision"] != "allow")):
+                raise MissionConflict("native observation sequence reused or disconnected")
+            observed.append({**payload, "event_sha256": event["event_sha256"]})
+        elif kind in {"herdr_interval_started", "herdr_interval_finished"}:
+            import fleet_herdr_metrics
+            fleet_herdr_metrics.reduce(result, event)
+        elif kind in {"herdr_supervision_enabled", "herdr_control_requested", "herdr_control_applied", "herdr_dispatch_intent"}:
+            import fleet_herdr_control
+            if kind == "herdr_supervision_enabled":
+                result["herdr_legacy_authorizations"] = [a["run_id"] for a in result["admissions"].values()
+                    if a["phase"] in {"authorized", "started", "finalized"}]
+            fleet_herdr_control.reduce(result, event)
+        elif kind == "functional_policy_frozen":
+            if (event["actor"] != "CONTROL" or result["status"] != "compiled"
+                    or payload["compiled_digest"] != result["compiled_digest"] or result.get("functional_policy")):
+                raise MissionConflict("functional policy must be frozen by CONTROL once before boot")
+            result["functional_policy"] = {**payload, "event_sha256": event["event_sha256"]}
+        elif kind == "functional_check_started":
+            if (event["actor"] != "CONTROL" or not result.get("functional_policy")
+                    or result.get("functional_attempt") or result["status"] not in {"running", "completing"}
+                    or result.get("herdr_control", {}).get("desired", "running") != "running"):
+                raise MissionConflict("functional execution requires policy and a unique admitted attempt")
+            _require_no_active_admissions(result, "functional execution")
+            result["functional_attempt"] = {**payload, "event_sha256": event["event_sha256"], "result": None}
+        elif kind == "functional_check_finished":
+            attempt = result.get("functional_attempt")
+            if (event["actor"] != "CONTROL" or not attempt or attempt["result"]
+                    or any(payload[k] != attempt[k] for k in ("contract_artifact_id", "attempt_id"))):
+                raise MissionConflict("functional result lacks its unique matching attempt")
+            attempt["result"] = {**payload, "event_sha256": event["event_sha256"]}
+        elif kind == "herdr_finalization_policy_frozen":
+            if result.get("herdr_finalization_policy") is not None:
+                raise MissionConflict("Herdr finalization policy is immutable")
+            if event["actor"] != "CONTROL" or payload["compiled_digest"] != result["compiled_digest"]:
+                raise MissionStateError("Herdr finalization policy authority mismatch")
+            result["herdr_finalization_policy"] = {**payload, "event_sha256": event["event_sha256"]}
         elif kind == "mission_admission_policy_frozen":
             if result["admission_policy"] is not None:
                 raise MissionConflict("mission admission policy is immutable")
@@ -2987,6 +3082,8 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
         elif kind == "mission_terminal":
             if result["terminal"] is not None:
                 raise MissionConflict("first mission terminal is immutable")
+            if result.get("functional_attempt") and not result["functional_attempt"].get("result"):
+                raise MissionConflict("mission terminal requires functional attempt reconciliation")
             if (
                 result["run_claims"]
                 or result["active_writer"] is not None

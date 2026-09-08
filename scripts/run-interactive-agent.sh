@@ -378,10 +378,14 @@ fi
 # tool environment; Claude's CLI bootstrap is handled explicitly below. Codex
 # and OpenCode retain only the roots their existing hooks/databases require.
 case "$role_type" in
-  claude|claude_reviewer)
+  claude|claude_opus|claude_reviewer)
     claude_config="$isolated_home/.claude"
     mkdir -p "$claude_config"
     chmod 700 "$claude_config"
+    keep+=(
+      "CLAUDE_CONFIG_DIR=$isolated_home"
+      "CLAUDE_SECURESTORAGE_CONFIG_DIR="
+    )
     command -v jq >/dev/null 2>&1 || {
       echo "jq is required to provision isolated Claude settings" >&2
       exit 2
@@ -430,9 +434,12 @@ case "$role_type" in
     # never copy email, profile, history, settings, or credential material.
     controller_claude_state="$controller_home/.claude.json"
     if [[ -f "$controller_claude_state" && ! -L "$controller_claude_state" ]]; then
-      jq '
+      jq --arg workspace "$(pwd -P)" '
         .oauthAccount as $account |
-        {hasCompletedOnboarding: true} +
+        {
+          hasCompletedOnboarding: true,
+          projects: {($workspace): {hasTrustDialogAccepted: true}}
+        } +
         (if (($account | type) == "object"
              and ($account.accountUuid | type) == "string"
              and ($account.organizationUuid | type) == "string")
@@ -444,7 +451,10 @@ case "$role_type" in
          end)
       ' "$controller_claude_state" > "$isolated_home/.claude.json"
     else
-      jq -n '{hasCompletedOnboarding: true}' > "$isolated_home/.claude.json"
+      jq -n --arg workspace "$(pwd -P)" '{
+        hasCompletedOnboarding: true,
+        projects: {($workspace): {hasTrustDialogAccepted: true}}
+      }' > "$isolated_home/.claude.json"
     fi
     chmod 600 "$isolated_home/.claude.json"
     # Claude OAuth is stored in the macOS Keychain under the controller USER
@@ -515,7 +525,7 @@ case "$role_type" in
         -c "default_permissions=\"$codex_runtime_permission_name\""
     fi
     ;;
-  kimi)
+  kimi|kimi_direct_verifier)
     # kimi-code 0.29+ owns authentication under ~/.kimi-code.  The legacy
     # ~/.kimi tree is migration input and can contain stale refresh tokens;
     # never seed an isolated Fleet surface from it.
@@ -756,8 +766,8 @@ provider_basename="$(basename "$1")"
 provider_mcp_preflight=0
 if [[ "$role_type" =~ ^(glm|minimax|minimax_checker)$ && "$provider_basename" == "opencode" ]] \
   || [[ "$role_type" =~ ^(codex|codex_candidate)$ && "$provider_basename" == "codex" ]] \
-  || [[ "$role_type" =~ ^(claude|claude_reviewer|claude_checker)$ && "$provider_basename" == "claude" ]] \
-  || [[ "$role_type" == "kimi" && "$provider_basename" == "kimi" ]]; then
+  || [[ "$role_type" =~ ^(claude|claude_opus|claude_reviewer|claude_checker)$ && "$provider_basename" == "claude" ]] \
+  || [[ "$role_type" =~ ^kimi(_direct_verifier)?$ && "$provider_basename" == "kimi" ]]; then
   provider_mcp_preflight=1
 fi
 if (( fleet_agent_mcp_enabled == 1 && provider_mcp_preflight == 1 )); then
@@ -804,9 +814,17 @@ if (
   unset preflight_json preflight_env
 fi
 
-if [[ "$role_type" == "kimi" && "$provider_basename" == "kimi" \
+if [[ "$role_type" =~ ^kimi(_direct_verifier)?$ && "$provider_basename" == "kimi" \
   && "${FLEET_HEALTHCHECK:-0}" != "1" ]]; then
   /usr/bin/env -i "${keep[@]}" "PYTHONPATH=$repo_root/scripts" "$kimi_bridge_python" \
+    "$repo_root/scripts/kimi_bridge_supervisor.py" \
+    --state-root "$kimi_state_root" \
+    --bridge "$kimi_bridge_python" \
+    --surface-id "$CMUX_SURFACE_ID" \
+    --workspace-id "$CMUX_WORKSPACE_ID" \
+    --mission-id "${FLEET_MISSION_ID:-}" \
+    --generation-id "$kimi_generation_id" \
+    --launch-id "$kimi_generation_id" -- \
     "$repo_root/scripts/kimi_hook_bridge.py" \
     --share-dir "$kimi_share_dir" \
     --work-dir "$kimi_work_dir" \
@@ -819,13 +837,13 @@ if [[ "$role_type" == "kimi" && "$provider_basename" == "kimi" \
     --events-file "$kimi_events_file" \
     --provider moonshot-ai \
     --model kimi-code/k3 \
-    >/dev/null 2>&1 &
+    >/dev/null 2>"$kimi_state_dir/bridge-supervisor.stderr" &
   kimi_bridge_pid=$!
   sleep 0.1
   if ! kill -0 "$kimi_bridge_pid" >/dev/null 2>&1; then
     wait "$kimi_bridge_pid" || true
     kimi_bridge_pid=""
-    echo "Kimi hook bridge failed to start" >&2
+    echo "Kimi hook bridge supervisor failed to start" >&2
     exit 2
   fi
 fi

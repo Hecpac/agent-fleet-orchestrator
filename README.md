@@ -1,9 +1,43 @@
 # Agent Fleet Orchestrator
 
-Hybrid orchestration scaffold for frontier and local open-weight models.
+Mission Control with a Herdr-native default: Astra Lead and three Sol sessions
+for implementation, review and verification. Every role uses `high` reasoning.
+The three Sol roles provide separation of responsibilities, not model diversity.
 
-The project is designed around one rule: frontier models coordinate and decide;
-local models explore, summarize, review, and verify in parallel.
+The canonical `mission-run.py run/dry` default is `herdr-implementation`.
+It requires an explicit Herdr session for execution and an artifact acceptance
+contract for accepted completion. See [Herdr operation](docs/herdr-mission-control.md).
+Older CMUX workflows and archives remain available explicitly; there is no
+automatic fallback from an Astra/Sol Mission to them.
+
+Daily durable reads use an explicit Mission ID and store:
+
+```sh
+FLEET_RUNS_DIR=/absolute/runs just status MISSION_UUID --json
+FLEET_RUNS_DIR=/absolute/runs just mission-report MISSION_UUID --json
+FLEET_RUNS_DIR=/absolute/runs just mission-herdr-archive-verify MISSION_UUID
+```
+
+Reports distinguish five stage runs from four Codex sessions, requested identities
+from transcript observations, and ledger status from verified archive acceptance.
+Unknown usage, cost and pause metrics remain `null` with a reason. Permission
+policy v1 checks every completed turn on collection, recovery and offline
+verification; new archives use v3, while historical v2 archives remain explicitly
+`not_attested`, with optional reassessment reported separately. See the [permission and evidence
+contract](docs/herdr-mission-control.md) for its scope and temporary-directory
+limits. `just legacy-status` retains the historical CMUX radar.
+
+The optional [functional stats contract](docs/herdr-functional-checks.md) adds a
+controller-owned check of the frozen candidate before synthesis and completion.
+It uses an existing local Docker runtime, retains bound execution receipts and
+produces archive v4. Artifact predicates and functional test results remain
+separate evidence; historical archives are never reclassified automatically.
+
+[Single-Mission supervision](docs/herdr-supervision-and-measurement.md) adds
+durable pause/resume and exact cancellation, bounded foreground observation,
+separate wait/pause/unknown measurements and a reproducible provider-free local
+campaign. [Instruction scope](docs/herdr-instruction-scope.md) describes the
+baseline target instructions transferred to each role and their CAS evidence.
 
 ## Operational scope
 
@@ -117,7 +151,10 @@ This path incurs no frontier API inference. Local workers are prompt-only and
 have no authenticated MCP client, filesystem, shell, Git, or direct peer
 channel; put all required evidence in the prompt.
 
-## cmux Fleet Layer
+## Historical CMUX Fleet Layer
+
+The following recipes describe the explicit legacy lane. For the native default,
+use [Herdr Mission Control](docs/herdr-mission-control.md).
 
 Terminal orchestration is wired through the cmux CLI. The canonical roster,
 capabilities, launch commands, display ranks, limits, and presets live in
@@ -176,7 +213,7 @@ integrity record, not a secret container: do not put credentials in the router.
 Effect admission recomputes the selected plan and rejects a changed or resealed
 snapshot before any CMUX effect. Contract v1 remains read-only historical data.
 
-### Dan+ autonomous mode (recommended product path)
+### Dan+ autonomous mode (legacy CMUX lane)
 
 Dan+ keeps Dan's visible, programmable fleet but removes routine phase driving.
 One command boots a heterogeneous team, gives the complete mission to the lead,
@@ -396,10 +433,10 @@ and writes `orchestration/runs/fleet-<feature>.manifest`. The manifest records
 instance-to-surface mappings plus role types, runners, ranks, authority, and
 durable workspace/surface UUIDs.
 
-`just status` is the durable operator radar. It scans pending Decision Briefs
+`just legacy-status` is the historical durable operator radar. It scans pending Decision Briefs
 across every canonical Mission in one `FLEET_RUNS_DIR`, groups them by a
 redacted stable project identity, and renders them before auxiliary cmux hook
-state. `just status --json` emits the machine contract. Status is read-only: an
+state. `just legacy-status --json` emits the machine contract. Status is read-only: an
 expired safe default is labelled `DEFAULT_ELIGIBLE`, never applied. An unsafe or
 invalid Mission ledger remains visible as `INVALID/UNREADABLE`; valid missions
 are still printed and the command exits non-zero.

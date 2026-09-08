@@ -1763,6 +1763,27 @@ def _writer_metadata(
     return commits, object_format, final_tree_sha, declared
 
 
+def verify_acceptance(path: Path, contract: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate the exact verified snapshot; never extract or execute its files."""
+    import fleet_acceptance
+
+    with _ArchiveView(path) as view:
+        contents = view.snapshot()
+        verified = _verify_archive_snapshot(view, contents, repo=None)
+        options = _strict_json(contents.get("runtime-options.json", b"{}"), where="runtime options")
+        if options.get("acceptance_contract") != contract:
+            raise ArchiveError("acceptance contract differs from archived runtime options")
+        if "writer/final-tree.tar" not in contents:
+            raise ArchiveError("acceptance requires the archived final tree")
+        result = fleet_acceptance.evaluate(
+            contract, contents["writer/final-tree.tar"],
+            mission_id=verified["mission_id"], final_sha=verified["final_sha"],
+        )
+        result["archive_content_root_sha256"] = verified["content_root_sha256"]
+        view.rooted.assert_root_binding()
+        return result
+
+
 def verify_archive(path: Path, *, repo: Path | None = None) -> dict[str, Any]:
     with _ArchiveView(path) as view:
         contents = view.snapshot()

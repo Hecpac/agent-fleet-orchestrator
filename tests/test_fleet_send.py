@@ -30,6 +30,9 @@ class FleetSendTests(unittest.TestCase):
             """
             #!/bin/sh
             printf '%s\n' "$*" >> "$FLEET_TEST_CMUX_LOG"
+            if [ "$1" = read-screen ]; then
+                printf '%s\n' "${FLEET_TEST_SCREEN:-}"
+            fi
             exit 0
             """,
         )
@@ -105,8 +108,12 @@ class FleetSendTests(unittest.TestCase):
             "PATH": f"{self.bin}:{os.environ['PATH']}",
             "FLEET_RUNS_DIR": str(self.runs),
             "FLEET_SEND_KEY_DELAY": "0",
+            "FLEET_KIMI_COMPOSER_READY_TIMEOUT": "0",
             "FLEET_KIMI_CONFIRM_SUBMIT_TIMEOUT": "0",
             "FLEET_TEST_CONFIRM_FIRST_FAIL": "1",
+            "FLEET_TEST_SCREEN": (
+                "FLEET_RESULT:00000000-0000-4000-8000-000000000001:<STATUS>"
+            ),
             "FLEET_TEST_CMUX_LOG": str(self.cmux_log),
             "FLEET_TEST_FRONTIER_LOG": str(self.frontier_log),
             "FLEET_TEST_CONFIRM_COUNT": str(self.confirm_count),
@@ -131,6 +138,43 @@ class FleetSendTests(unittest.TestCase):
         self.assertIn(
             "--since 2026-07-20T18:30:16.333420+00:00", frontier_calls
         )
+
+    def test_kimi_does_not_press_enter_before_run_bound_tail_is_visible(
+        self,
+    ) -> None:
+        self._manifest("kimi")
+        env = {
+            **os.environ,
+            "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "FLEET_RUNS_DIR": str(self.runs),
+            "FLEET_SEND_KEY_DELAY": "0",
+            "FLEET_KIMI_COMPOSER_READY_TIMEOUT": "0",
+            "FLEET_TEST_SCREEN": "unrelated composer contents",
+            "FLEET_TEST_CMUX_LOG": str(self.cmux_log),
+            "FLEET_TEST_FRONTIER_LOG": str(self.frontier_log),
+            "FLEET_TEST_CONFIRM_COUNT": str(self.confirm_count),
+        }
+        result = subprocess.run(
+            ["bash", str(FLEET_SEND), "test", "agent", "audit the target", "--json"],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertIn("Enter not sent", result.stderr)
+        cmux_calls = self.cmux_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(
+            [call for call in cmux_calls if call.startswith("send-key ")],
+            [],
+            cmux_calls,
+        )
+        frontier_calls = self.frontier_log.read_text(encoding="utf-8")
+        self.assertIn("mark-indeterminate ", frontier_calls)
+        self.assertNotIn("confirm-submit ", frontier_calls)
 
     def _send_env(self) -> dict[str, str]:
         return {

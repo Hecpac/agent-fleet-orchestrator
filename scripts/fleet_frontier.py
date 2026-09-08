@@ -1221,6 +1221,26 @@ def prepare_run(
             workspace_uuid=workspace_uuid,
             surface_uuid=surface_uuid,
         )
+        if hook_source == "kimi":
+            try:
+                fleet_kimi_state.require_bridge_health(
+                    KIMI_STATE_ROOT,
+                    surface_id=surface_uuid,
+                    workspace_id=workspace_uuid,
+                    mission_id=mission_id,
+                    generation_id=generation_id,
+                )
+            except fleet_kimi_state.KimiStateError as exc:
+                terminalize(
+                    runs_dir,
+                    preparing,
+                    status="indeterminate",
+                    reason="frontier_kimi_bridge_unhealthy",
+                    release_lease=False,
+                )
+                raise FrontierError(
+                    f"Kimi bridge is not healthy before dispatch: {exc}"
+                ) from exc
         prompt_relative = _prompt_relative(feature, run_id)
         prompt_file = runs_dir / prompt_relative
         try:
@@ -1278,20 +1298,29 @@ def prepare_run(
             "submission_transport": submission["transport"],
         }
     except Exception:
-        append_event(
-            ledger,
-            {
-                **preparing,
-                "timestamp": utc_now(),
-                "completed_at": utc_now(),
-                "status": "abandoned",
-                "exit_code": STATUS_CODES["abandoned"],
-                "reason": "frontier_prepare_failed",
-            },
-            runs_dir=runs_dir,
+        current = latest_event(
+            ledger, run_id=run_id, instance=instance, runs_dir=runs_dir
         )
-        if lease is not None:
-            release(runs_dir, run_id, [lease])
+        retained = bool(
+            current
+            and current.get("status") == "indeterminate"
+            and current.get("lease_retained")
+        )
+        if not retained:
+            append_event(
+                ledger,
+                {
+                    **preparing,
+                    "timestamp": utc_now(),
+                    "completed_at": utc_now(),
+                    "status": "abandoned",
+                    "exit_code": STATUS_CODES["abandoned"],
+                    "reason": "frontier_prepare_failed",
+                },
+                runs_dir=runs_dir,
+            )
+            if lease is not None:
+                release(runs_dir, run_id, [lease])
         raise
 
 
@@ -1749,6 +1778,26 @@ def authorize_prompt_submission(
         raise FrontierError("submission authorization requires control-v1 tracking")
     if state.get("submission_event_id"):
         return state
+    if hook_source == "kimi":
+        try:
+            fleet_kimi_state.require_bridge_health(
+                KIMI_STATE_ROOT,
+                surface_id=str(state["surface_uuid"]),
+                workspace_id=str(state["workspace_uuid"]),
+                mission_id=str(state.get("mission_id") or ""),
+                generation_id=str(state.get("generation_id") or ""),
+            )
+        except fleet_kimi_state.KimiStateError as exc:
+            terminalize(
+                runs_dir,
+                state,
+                status="indeterminate",
+                reason="frontier_kimi_bridge_unhealthy",
+                release_lease=False,
+            )
+            raise FrontierError(
+                f"Kimi bridge is not healthy before submission: {exc}"
+            ) from exc
     deadline = time.monotonic() + timeout_seconds
     while True:
         matches: list[dict[str, Any]] = []

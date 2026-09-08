@@ -98,7 +98,42 @@ prompt_path="$(jq -er '.prompt_path // empty' <<< "$prepared")" || exit 75
 send_attempted=1
 since="$(jq -er '.dispatched_at // empty' <<< "$prepared")" || exit 75
 cmux send --surface "$surface" --workspace "$workspace" "$payload" >/dev/null
-[[ "${FLEET_SEND_KEY_DELAY:-0.2}" == "0" ]] || sleep "${FLEET_SEND_KEY_DELAY:-0.2}"
+if [[ "$hook_source" == "kimi" ]]; then
+  # A large bracketed paste can return from `cmux send` before Kimi has
+  # rendered the tail of the composer. Pressing Enter in that window leaves
+  # the prompt visibly queued without producing UserPromptSubmit. The
+  # per-run completion contract is unique, so wait until its literal tail is
+  # visible before issuing Kimi's single, non-repress-safe Enter.
+  kimi_ready_marker="FLEET_RESULT:${run_id}:<STATUS>"
+  kimi_ready_timeout="${FLEET_KIMI_COMPOSER_READY_TIMEOUT:-15}"
+  kimi_ready_poll="${FLEET_KIMI_COMPOSER_READY_POLL_SECONDS:-0.25}"
+  [[ "$kimi_ready_timeout" =~ ^[0-9]+$ ]] || {
+    echo "FLEET_KIMI_COMPOSER_READY_TIMEOUT must be a non-negative integer" >&2
+    exit 75
+  }
+  kimi_ready_deadline=$((SECONDS + kimi_ready_timeout))
+  kimi_composer_ready=0
+  while :; do
+    kimi_screen="$(
+      cmux read-screen --surface "$surface" --workspace "$workspace" --lines 80 \
+        2>/dev/null || true
+    )"
+    if grep -Fq -- "$kimi_ready_marker" <<< "$kimi_screen"; then
+      kimi_composer_ready=1
+      break
+    fi
+    (( SECONDS < kimi_ready_deadline )) || break
+    [[ "$kimi_ready_poll" == "0" ]] || sleep "$kimi_ready_poll"
+  done
+  if (( kimi_composer_ready == 0 )); then
+    echo "Kimi composer did not expose the run-bound payload tail; Enter not sent" >&2
+    exit 75
+  fi
+  kimi_send_key_delay="${FLEET_KIMI_SEND_KEY_DELAY:-${FLEET_SEND_KEY_DELAY:-0.5}}"
+  [[ "$kimi_send_key_delay" == "0" ]] || sleep "$kimi_send_key_delay"
+else
+  [[ "${FLEET_SEND_KEY_DELAY:-0.2}" == "0" ]] || sleep "${FLEET_SEND_KEY_DELAY:-0.2}"
+fi
 cmux send-key --surface "$surface" --workspace "$workspace" enter >/dev/null
 confirmed=0
 # The submit semantics are declared per CLI in router.providers and copied

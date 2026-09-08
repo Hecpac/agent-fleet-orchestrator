@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "scripts" / "run-interactive-agent.sh"
 WORKSPACE_UUID = "00000000-0000-0000-0000-000000000001"
 SURFACE_UUID = "00000000-0000-0000-0000-000000000101"
+MISSION_ID = "00000000-0000-4000-8000-000000000201"
 
 
 class KimiRouterRuntimeTests(unittest.TestCase):
@@ -134,7 +135,7 @@ class KimiRouterRuntimeTests(unittest.TestCase):
                 [
                     "bash",
                     str(RUNNER),
-                    "kimi",
+                    "kimi_direct_verifier",
                     "verification",
                     "-",
                     str(fake_kimi),
@@ -152,6 +153,7 @@ class KimiRouterRuntimeTests(unittest.TestCase):
                     "CMUX_HOOK_DIR": str(hook_dir),
                     "CMUX_WORKSPACE_ID": WORKSPACE_UUID,
                     "CMUX_SURFACE_ID": SURFACE_UUID,
+                    "FLEET_MISSION_ID": MISSION_ID,
                     "FLEET_LAUNCH_ID": "00000000-0000-4000-8000-000000000301",
                 },
                 text=True,
@@ -160,7 +162,22 @@ class KimiRouterRuntimeTests(unittest.TestCase):
                 check=False,
             )
             thread.join(timeout=5)
-            self.assertEqual(result.returncode, 0, result.stderr)
+            runtime_evidence = []
+            for path in sorted(state_root.rglob("*")):
+                if path.is_file() and path.name in {
+                    "binding.json",
+                    "bridge-exit.json",
+                    "bridge-health.json",
+                    "bridge-supervisor.stderr",
+                }:
+                    runtime_evidence.append(
+                        f"{path.relative_to(state_root)}={path.read_text(encoding='utf-8')}"
+                    )
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stderr + "\n" + "\n".join(runtime_evidence),
+            )
             self.assertFalse(thread.is_alive())
             self.assertEqual(errors, [])
             self.assertEqual(len(received), 1)

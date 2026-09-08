@@ -32,7 +32,7 @@
     "instance_id": "lead",
     "phase": "CONTROL",
     "display_rank": 10,
-    "candidates": ["codex", "claude"],
+    "candidates": ["codex", "claude", "astra_lead"],
     "fallback_policy": "first_available",
     "authority": "control",
     "tool_access": ["filesystem", "shell", "git", "cmux"],
@@ -40,12 +40,32 @@
       "planning",
       "architecture",
       "routing",
+      "recon",
       "final_decision",
       "conflict_resolution",
       "high_risk_code_changes"
     ]
   },
   "roles": {
+    "astra_lead": {
+      "phase": "BUILD",
+      "runner": "interactive",
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "hook_source": "codex",
+      "transport": "pointer",
+      "command": ["codex", "--model", "gpt-6-astra", "-c", "model_reasoning_effort=\"high\""],
+      "healthcheck": ["codex", "login", "status"],
+      "ready_pattern": "^[[:space:]]*›[[:space:]].+",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["implementation", "deep_diagnosis", "code_review", "second_opinion"],
+      "tool_access": ["filesystem", "shell", "git", "fleet_control"],
+      "authority": "write",
+      "resource_class": "remote",
+      "display_rank": 30,
+      "concurrency": 1
+    },
     "triage": {
       "phase": "RECON",
       "runner": "local",
@@ -129,6 +149,63 @@
       "display_rank": 30,
       "concurrency": 2
     },
+    "sol_worker": {
+      "phase": "BUILD",
+      "runner": "interactive",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "hook_source": "codex",
+      "transport": "pointer",
+      "command": ["codex", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"high\""],
+      "healthcheck": ["codex", "login", "status"],
+      "ready_pattern": "^[[:space:]]*›[[:space:]].+",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["implementation", "deep_diagnosis", "code_review", "second_opinion"],
+      "tool_access": ["filesystem", "shell", "git", "fleet_control"],
+      "authority": "write",
+      "resource_class": "remote",
+      "display_rank": 31,
+      "concurrency": 1
+    },
+    "sol_reviewer": {
+      "phase": "CHALLENGE",
+      "runner": "interactive",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "hook_source": "codex",
+      "transport": "pointer",
+      "command": ["codex", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"high\""],
+      "healthcheck": ["codex", "login", "status"],
+      "ready_pattern": "^[[:space:]]*›[[:space:]].+",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["architecture_challenge", "code_review", "risk_analysis"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read", "fleet_control"],
+      "authority": "advisory",
+      "resource_class": "remote",
+      "display_rank": 40,
+      "concurrency": 1
+    },
+    "sol_verifier": {
+      "phase": "VERIFY",
+      "runner": "interactive",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "hook_source": "codex",
+      "transport": "pointer",
+      "command": ["codex", "--model", "gpt-5.6-sol", "-c", "model_reasoning_effort=\"high\""],
+      "healthcheck": ["codex", "login", "status"],
+      "ready_pattern": "^[[:space:]]*›[[:space:]].+",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["independent_code_review", "test_reproduction", "contract_checking"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read", "fleet_control"],
+      "authority": "verification",
+      "resource_class": "remote",
+      "display_rank": 50,
+      "concurrency": 1
+    },
     "claude": {
       "phase": "BUILD",
       "runner": "interactive",
@@ -137,6 +214,25 @@
       "hook_source": "claude",
       "transport": "pointer",
       "command": ["claude", "--model", "claude-fable-5", "--no-chrome"],
+      "healthcheck": ["claude", "auth", "status"],
+      "ready_pattern": "^[[:space:]]*❯[[:space:]]*$|new task\\?",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["planning", "architecture", "implementation", "deep_diagnosis"],
+      "tool_access": ["filesystem", "shell", "git", "fleet_control"],
+      "authority": "write",
+      "resource_class": "remote",
+      "display_rank": 31,
+      "concurrency": 1
+    },
+    "claude_opus": {
+      "phase": "BUILD",
+      "runner": "interactive",
+      "provider": "anthropic",
+      "model": "claude-opus-5",
+      "hook_source": "claude",
+      "transport": "pointer",
+      "command": ["claude", "--model", "claude-opus-5", "--effort", "xhigh", "--no-chrome"],
       "healthcheck": ["claude", "auth", "status"],
       "ready_pattern": "^[[:space:]]*❯[[:space:]]*$|new task\\?",
       "enabled": true,
@@ -277,6 +373,25 @@
       "display_rank": 50,
       "concurrency": 1
     },
+    "kimi_direct_verifier": {
+      "phase": "VERIFY",
+      "runner": "interactive",
+      "provider": "moonshot-ai",
+      "model": "kimi-code/k3",
+      "hook_source": "kimi",
+      "transport": "inline-tokenized",
+      "command": ["kimi", "--model", "kimi-code/k3"],
+      "healthcheck": ["kimi", "doctor"],
+      "ready_pattern": "Welcome to Kimi|kimi-code|ctrl-x|context left|/help|K3[[:space:]]+thinking",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["independent_code_review", "long_context_review", "architecture_challenge"],
+      "tool_access": ["filesystem_read", "fleet_control"],
+      "authority": "verification",
+      "resource_class": "remote",
+      "display_rank": 50,
+      "concurrency": 1
+    },
     "claude_reviewer": {
       "phase": "VERIFY",
       "runner": "interactive",
@@ -298,6 +413,18 @@
     }
   },
   "presets": {
+    "astra_sol": {
+      "description": "Herdr-native autonomous fleet with one explicit Astra Lead and three role-scoped Sol agents.",
+      "mode": "autonomous",
+      "include_lead": true,
+      "lead_provider": "astra_lead",
+      "lead_tool_access": ["filesystem", "shell", "git", "fleet_control"],
+      "instances": [
+        {"instance_id": "worker", "role_type": "sol_worker"},
+        {"instance_id": "reviewer", "role_type": "sol_reviewer"},
+        {"instance_id": "verifier", "role_type": "sol_verifier"}
+      ]
+    },
     "dan": {
       "description": "Dan+ autonomous visible team: one lead dynamically delegates to heterogeneous specialists and owns synthesis.",
       "mode": "autonomous",
@@ -359,6 +486,17 @@
       "include_lead": true,
       "instances": [
         {"instance_id": "verify", "role_type": "kimi"}
+      ]
+    },
+    "companion_kimi": {
+      "description": "Mission-bound companion roster with Claude Opus, one local analyst, and Kimi K3 verification.",
+      "mode": "autonomous",
+      "include_lead": true,
+      "identity_groups": [["local_worker", "opus_worker", "kimi_verifier"]],
+      "instances": [
+        {"instance_id": "local_worker", "role_type": "general_worker"},
+        {"instance_id": "opus_worker", "role_type": "claude_opus"},
+        {"instance_id": "kimi_verifier", "role_type": "kimi_direct_verifier"}
       ]
     },
     "fleet_dialogue": {

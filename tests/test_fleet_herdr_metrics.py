@@ -1,0 +1,78 @@
+import unittest
+
+from tests import test_fleet_herdr_control
+import fleet_herdr_metrics as metrics
+import fleet_trace
+import fleet_mission_state as state
+
+
+def event(kind, **payload):
+    return {"type": "event_msg", "payload": {"type": kind, **payload}}
+
+
+def count(total, last=None):
+    return event("token_count", info={"total_token_usage": total, "last_token_usage": last})
+
+
+class UsageTests(unittest.TestCase):
+    def test_cumulative_delta_avoids_double_counting_duplicate_snapshots(self):
+        base = {"input_tokens":100, "output_tokens":10, "cached_input_tokens":20}
+        final = {"input_tokens":300, "output_tokens":40, "cached_input_tokens":80}
+        rows = [count(base), event("task_started",turn_id="t"),count(final),count(final),event("task_complete",turn_id="t")]
+        result = metrics.usage(rows,"t")
+        self.assertEqual((result["prompt_tokens"],result["completion_tokens"],result["cached_input_tokens"]),(200,30,60))
+        self.assertEqual(result["usage_scope"],"observed_runtime_counters_not_billing")
+
+    def test_first_turn_baseline_requires_observed_total_equal_last(self):
+        first = {"input_tokens":10,"output_tokens":2,"cached_input_tokens":0}
+        end = {"input_tokens":30,"output_tokens":5,"cached_input_tokens":10}
+        rows = [event("task_started",turn_id="t"),count(first,first),count(end),event("task_complete",turn_id="t")]
+        self.assertEqual(metrics.usage(rows,"t")["prompt_tokens"],30)
+        rows[1]=count(first)
+        self.assertIsNone(metrics.usage(rows,"t")["prompt_tokens"])
+
+    def test_counter_reset_and_overlapping_turns_remain_unknown(self):
+        first={"input_tokens":100,"output_tokens":10,"cached_input_tokens":20}
+        smaller={"input_tokens":50,"output_tokens":5,"cached_input_tokens":10}
+        rows=[count(first),event("task_started",turn_id="t"),count(smaller),event("task_complete",turn_id="t")]
+        self.assertEqual(metrics.usage(rows,"t")["usage_reason"],"usage_counter_reset_or_regression")
+        rows.insert(2,event("task_started",turn_id="other"))
+        self.assertEqual(metrics.usage(rows,"t")["usage_reason"],"overlapping_turn_usage")
+        rows=[event("task_started",turn_id="other"),count(first),event("task_started",turn_id="t"),
+              count(first),event("task_complete",turn_id="t")]
+        self.assertEqual(metrics.usage(rows,"t")["usage_reason"],"overlapping_turn_usage")
+
+
+class IntervalTests(unittest.TestCase):
+    def test_open_wait_is_unknown_and_trace_does_not_invent_duration(self):
+        helper=test_fleet_herdr_control.HerdrControlTests()
+        helper.setUp()
+        try:
+            helper.request("pause")
+            identifier="0a6b6f2e-060d-413f-95ab-8b64a8d3e070"
+            state.append_event(helper.runs,helper.mid,kind="herdr_interval_started",actor="CONTROL",idempotency_key="lost-observation",
+                payload={"interval_id":identifier,"kind":"controller_wait","run_id":None})
+            events=state.read_events(state.ledger_path(helper.runs,helper.mid))
+            timing=metrics.timing(helper.current(),events,[])
+            self.assertIsNone(timing["controller_wait_seconds"])
+            self.assertEqual(timing["controller_wait_observed_seconds"],0)
+            span=next(s for s in fleet_trace.events_to_spans(events) if s["span_id"]=="interval:"+identifier)
+            self.assertIsNone(span["end_timestamp"])
+            self.assertIsNone(span["attributes"]["elapsed_seconds"])
+        finally:
+            helper.doCleanups()
+
+    def test_wall_partition_does_not_add_overlapping_pause_and_execution(self):
+        def stamp(second):return "2026-09-07T01:00:"+str(second).zfill(2)+"Z"
+        events=[{"kind":"mission_created","timestamp":stamp(0),"payload":{}},
+            {"kind":"herdr_control_requested","timestamp":stamp(2),"payload":{"action":"pause"}},
+            {"kind":"herdr_control_applied","timestamp":stamp(5),"payload":{"action":"pause"}},
+            {"kind":"herdr_control_requested","timestamp":stamp(8),"payload":{"action":"resume"}},
+            {"kind":"mission_terminal","timestamp":stamp(10),"payload":{}}]
+        current={"status":"failed","herdr_control":{},"herdr_intervals":{"i":{"kind":"controller_wait","started_at":stamp(0),"ended_at":stamp(5),"elapsed_ns":5_000_000_000}}}
+        result=metrics.timing(current,events,[{"started_at":stamp(0),"ended_at":stamp(5)}])
+        self.assertEqual(result["requested_pause_seconds"],6)
+        self.assertEqual(result["paused_seconds"],3)
+        self.assertEqual(result["controller_wait_seconds"],5)
+        self.assertEqual(sum(result["wall_partition"].values()),10)
+        self.assertEqual(result["wall_partition"]["unknown"],2)

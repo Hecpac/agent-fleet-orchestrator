@@ -19,6 +19,9 @@ from typing import Any, Mapping
 import uuid
 
 import fleet_admission
+import fleet_acceptance
+import fleet_functional
+import fleet_herdr_control
 import fleet_artifacts
 import fleet_archive
 import fleet_audit_client
@@ -26,6 +29,11 @@ import fleet_assured_runner
 import fleet_control
 import fleet_control_service
 import fleet_json
+import fleet_herdr
+import fleet_herdr_launch
+import fleet_herdr_runtime
+import fleet_herdr_archive
+import fleet_herdr_mission
 import fleet_ledger
 import fleet_manifest
 import fleet_mission
@@ -902,11 +910,22 @@ def request_assurance(
 def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
     root = mission_state.mission_root(runs_dir, mission_id)
     compiled, initial = effect_compiled(runs_dir, mission_id)
+    if compiled["resolved"]["preset"] == "astra_sol":
+        return fleet_herdr_mission.drive(runs_dir, mission_id)
     options = load_durable_json(
         runs_dir,
         Path("missions") / mission_id / "runtime-options.json",
         directory_modes=(0o700, 0o700),
     )
+    acceptance_contract = options.get("acceptance_contract")
+    creation = load_durable_json(
+        runs_dir, Path("missions") / mission_id / "creation-request.json",
+        directory_modes=(0o700, 0o700),
+    )
+    creation_key = creation["idempotency_key"]
+    if str(uuid.uuid5(uuid.NAMESPACE_URL, "fleet-mission:" + creation_key)) != mission_id:
+        raise MissionRunError("mission creation identity mismatch")
+    fleet_acceptance.check_binding(creation_key, acceptance_contract)
     objective = load_mission_text(
         runs_dir,
         mission_id,
@@ -1001,6 +1020,26 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                     )
                     if lifecycle.get("stopped_at") is None:
                         audit_lifecycle.stop()
+            acceptance_result = {
+                "status": "not_evaluated",
+                "mode": "artifact_contract" if acceptance_contract else "legacy",
+            }
+            terminal_reason = str((current.get("terminal") or {}).get("reason", ""))
+            if acceptance_contract is not None and (
+                current["status"] == "succeeded" or terminal_reason.startswith("artifact acceptance ")
+            ):
+                acceptance_result = load_durable_json(
+                    runs_dir, Path("missions") / mission_id / "acceptance-result.json",
+                    directory_modes=(0o700, 0o700),
+                )
+                expected_reason = (
+                    "artifact acceptance " + str(acceptance_result.get("status"))
+                    + "; receipt sha256=" + fleet_acceptance.digest(acceptance_result)
+                )
+                if (terminal_reason != expected_reason
+                        or acceptance_result.get("mission_id") != mission_id
+                        or acceptance_result.get("contract_sha256") != fleet_acceptance.digest(acceptance_contract)):
+                    raise MissionRunError("terminal acceptance receipt binding mismatch")
             return {
                 "mission_id": mission_id,
                 "feature": feature,
@@ -1008,6 +1047,7 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                 "result_file": result_file,
                 "result": result_text,
                 "head_sha256": current["head_sha256"],
+                "acceptance": acceptance_result,
             }
 
         if current["status"] == "compiled":
@@ -1431,6 +1471,11 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
                 timeout_seconds=timeout_seconds,
             )
             prompt_sha = mission_state.artifact_id(prompt)
+            if acceptance_contract is not None:
+                prompt += "\nArtifact acceptance contract (all requirements mandatory):\n" + json.dumps(
+                    acceptance_contract, ensure_ascii=False, sort_keys=True
+                )
+                prompt_sha = mission_state.artifact_id(prompt)
             lead_member = compiled["resolved"]["lead"]
             lead_hook_source = (
                 lead_member.get("hook_source")
@@ -1827,6 +1872,17 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
             continue
 
         if current["status"] == "archived":
+            acceptance = None
+            if acceptance_contract is not None:
+                acceptance = fleet_archive.verify_acceptance(root / "archive", acceptance_contract)
+                if acceptance["mission_id"] != mission_id:
+                    raise MissionRunError("acceptance Mission identity mismatch")
+                with fleet_safe_paths.RootedFS(runs_dir) as store:
+                    store.atomic_write(
+                        Path("missions") / mission_id / "acceptance-result.json",
+                        fleet_json.canonical_bytes(acceptance) + b"\n",
+                        directory_modes=(0o700, 0o700), file_mode=0o600,
+                    )
             if current.get("approval") is not None:
                 audit_lifecycle = fleet_audit_client.AuditLifecycle(
                     runs_dir, mission_id
@@ -1835,17 +1891,21 @@ def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
             mission_state.append_terminal(
                 runs_dir,
                 mission_id,
-                status="succeeded",
-                reason="lead result accepted and unified archive verified",
-                idempotency_key="controller:terminal:succeeded",
+                status="failed" if acceptance and acceptance["status"] != "accepted" else "succeeded",
+                reason=(
+                    "artifact acceptance " + acceptance["status"] + "; receipt sha256="
+                    + fleet_acceptance.digest(acceptance)
+                    if acceptance else "legacy completion: lead result and archive verified; artifact acceptance not evaluated"
+                ),
+                idempotency_key="controller:terminal:acceptance" if acceptance else "controller:terminal:succeeded",
             )
             manifest = parse_manifest(manifest_path)
             cmux_signal(
                 manifest,
                 mission_id,
-                status="complete",
+                status="failed" if acceptance and acceptance["status"] != "accepted" else "complete",
                 progress=1.0,
-                message="mission succeeded",
+                message="artifact acceptance rejected" if acceptance and acceptance["status"] != "accepted" else "mission succeeded",
                 notify=True,
             )
             continue
@@ -2105,6 +2165,12 @@ def create_and_drive(
     allow_dirty_baseline: bool,
     teardown: bool,
     execution_profile: str = "native",
+    acceptance_contract: dict[str, Any] | None = None,
+    router_path: Path | None = None,
+    herdr_session: str | None = None,
+    herdr_runtime_root: str | None = None,
+    herdr_launch_manifest: dict[str, Any] | None = None,
+    functional_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not FEATURE.fullmatch(feature):
         raise MissionRunError("invalid feature")
@@ -2119,7 +2185,33 @@ def create_and_drive(
         runs_dir = fleet_safe_paths.canonical_root(runs_dir)
     except fleet_safe_paths.SafePathError as exc:
         raise MissionRunError("unsafe mission runs root") from exc
-    compiled = workflow_config.compile_path(workflow_path(workflow_name))
+    compiled = workflow_config.compile_path(
+        workflow_path(workflow_name), router_path=router_path
+    )
+    herdr_runtime_options = {}
+    if herdr_runtime_root is not None:
+        if compiled["resolved"]["preset"] != "astra_sol":
+            raise MissionRunError("Herdr runtime layout requires astra_sol")
+        herdr_runtime_options = {"herdr_layout": {"version": 2, "runtime_root": herdr_runtime_root},
+                                 "herdr_input_policy": "independent-v1"}
+        fleet_herdr_runtime.candidate_path(runs_dir, str(uuid.UUID(int=0)),
+                                          herdr_runtime_options, target_repo)
+    if herdr_launch_manifest is not None:
+        if not herdr_runtime_options:
+            raise MissionRunError("observed launch requires --herdr-runtime-root")
+        herdr_runtime_options["herdr_launch_manifest"] = fleet_herdr_launch.validate_manifest(herdr_launch_manifest)
+    if compiled["resolved"]["preset"] == "astra_sol":
+        herdr_session = herdr_session or os.environ.get("HERDR_SESSION")
+        if not isinstance(herdr_session, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", herdr_session):
+            raise MissionRunError("Herdr requires an explicit --herdr-session or inherited HERDR_SESSION")
+        if acceptance_contract is None:
+            raise MissionRunError("Herdr run requires --acceptance-contract before launching agents")
+        if compiled["workflow"]["limits"]["token_budget"] > 0:
+            raise MissionRunError("Herdr token-budget enforcement is not available; refusing bounded launch")
+    if acceptance_contract is not None:
+        fleet_acceptance.validate(acceptance_contract)
+        if compiled["workflow"]["archive"]["content_policy"] != "full" or not compiled["workflow"]["archive"]["include_final_tree"]:
+            raise MissionRunError("artifact acceptance requires a full archive with final tree")
     enforce_audit_trust(compiled, [], execution_profile)
     timeout = timeout_seconds or int(compiled["workflow"]["limits"]["deadline_seconds"])
     if timeout < 60:
@@ -2132,6 +2224,15 @@ def create_and_drive(
         f"{objective_hash[:16]}:{target_hash[:16]}:{runs_hash[:16]}"
     )
     manifest_path = runs_dir / f"fleet-{feature}.manifest"
+    if herdr_runtime_options:
+        key += ":herdr-runtime:" + mission_state.artifact_id(mission_state.canonical_bytes(herdr_runtime_options))
+    if functional_contract is not None:
+        fleet_functional.validate(functional_contract)
+        if compiled["resolved"]["preset"] != "astra_sol":
+            raise MissionRunError("functional v1 requires Herdr")
+        key += ":functional:" + fleet_functional.digest(functional_contract)
+    if acceptance_contract is not None:
+        key = fleet_acceptance.bound_key(key, acceptance_contract)
     if (
         git_is_dirty(target_repo)
         and not allow_dirty_baseline
@@ -2149,11 +2250,15 @@ def create_and_drive(
         base_sha=git_value(target_repo, "rev-parse", "HEAD"),
         idempotency_key=key,
         runtime_options={
+            **herdr_runtime_options,
             "risk_override": risk_override,
             "timeout_seconds": timeout,
             "teardown": teardown,
             "allow_dirty_baseline": allow_dirty_baseline,
             "execution_profile": execution_profile,
+            **({"herdr_session": herdr_session} if herdr_session else {}),
+            **({"acceptance_contract": acceptance_contract} if acceptance_contract is not None else {}),
+            **({"functional_contract": functional_contract} if functional_contract is not None else {}),
         },
     )
     return drive_mission(runs_dir, mission_id)
@@ -2168,13 +2273,26 @@ def dry_run(
     risk_override: str,
     timeout_seconds: int | None,
     execution_profile: str = "native",
+    acceptance_contract: dict[str, Any] | None = None,
+    router_path: Path | None = None,
+    functional_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     target_repo = exact_git_toplevel(target_repo)
+    if functional_contract is not None:
+        fleet_functional.validate(functional_contract)
     try:
         execution_profile = fleet_manifest.validate_profile(execution_profile)
     except fleet_manifest.ManifestError as exc:
         raise MissionRunError(str(exc)) from exc
-    compiled = workflow_config.compile_path(workflow_path(workflow_name))
+    compiled = workflow_config.compile_path(
+        workflow_path(workflow_name), router_path=router_path
+    )
+    if functional_contract is not None and compiled["resolved"]["preset"] != "astra_sol":
+        raise MissionRunError("functional contracts require the Herdr astra_sol workflow")
+    if acceptance_contract is not None:
+        fleet_acceptance.validate(acceptance_contract)
+        if compiled["workflow"]["archive"]["content_policy"] != "full" or not compiled["workflow"]["archive"]["include_final_tree"]:
+            raise MissionRunError("artifact acceptance requires a full archive with final tree")
     assessment = fleet_risk.assess(
         workflow_minimum=compiled["workflow"]["risk"]["minimum"],
         objective=objective,
@@ -2196,25 +2314,40 @@ def dry_run(
         "timeout_seconds": timeout,
         "execution_profile": execution_profile,
         "effects": [],
+        **({"functional": {"schema_version": 1, "spec_sha256": fleet_functional.digest(functional_contract),
+                            "check_id": functional_contract["check_id"]}} if functional_contract is not None else {}),
+        "backend": "herdr" if compiled["resolved"]["preset"] == "astra_sol" else "cmux-legacy",
+        "acceptance": {"mode": "artifact_contract", "contract_sha256": fleet_acceptance.digest(acceptance_contract)} if acceptance_contract is not None else {"mode": "legacy_not_evaluated"},
     }
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--runs-dir", default=str(DEFAULT_RUNS_DIR))
+    parser.add_argument("--runs-dir", default=os.environ.get("FLEET_RUNS_DIR", str(DEFAULT_RUNS_DIR)))
     commands = parser.add_subparsers(dest="command", required=True)
 
     for name in ("run", "dry"):
         command = commands.add_parser(name)
         command.add_argument("feature")
         command.add_argument("objective")
-        command.add_argument("--workflow", default="implementation")
+        command.add_argument("--workflow", default="herdr-implementation")
+        command.add_argument("--herdr-session", help="explicit Herdr session frozen in mission runtime options")
+        if name == "run":
+            command.add_argument("--herdr-runtime-root", help="existing private physical directory outside runs/source; enables layout v2 and independent role inputs")
+            command.add_argument("--herdr-launch-manifest", type=Path, help="pinned local Herdr/Codex images; records launch inputs only, not effective sandbox binding")
         command.add_argument("--target-repo", default=os.getcwd())
         command.add_argument(
             "--risk", default="auto", choices=("auto", *fleet_risk.RISK_ORDER)
         )
         command.add_argument("--timeout", type=int)
         command.add_argument("--json", action="store_true")
+        command.add_argument(
+            "--router",
+            type=Path,
+            help="router path used to compile the durable mission authority",
+        )
+        command.add_argument("--acceptance-contract", type=Path)
+        command.add_argument("--functional-contract", type=Path, help="versioned required functional check frozen before launch")
         command.add_argument(
             "--execution-profile",
             default="native",
@@ -2227,8 +2360,35 @@ def _parser() -> argparse.ArgumentParser:
     resume = commands.add_parser("resume")
     resume.add_argument("--mission-id", required=True)
     resume.add_argument("--json", action="store_true")
+    for name in ("pause", "cancel-mission"):
+        command = commands.add_parser(name, help="persist a Mission control request without waiting for the driver lock")
+        command.add_argument("--mission-id", required=True)
+        command.add_argument("--reason", required=True)
+        command.add_argument("--idempotency-key", required=True)
+        command.add_argument("--generation")
+        command.add_argument("--json", action="store_true")
+    supervise = commands.add_parser("supervise", help="bounded foreground supervision of one explicit Herdr Mission")
+    supervise.add_argument("--mission-id", required=True)
+    supervise.add_argument("--seconds", type=float, default=60)
+    supervise.add_argument("--poll-seconds", type=float, default=0.25)
+    supervise.add_argument("--json", action="store_true")
     show = commands.add_parser("show")
     show.add_argument("--mission-id", required=True)
+    status = commands.add_parser("status", help="read durable Mission status without contacting a runtime")
+    status.add_argument("--mission-id", required=True)
+    status.add_argument("--json", action="store_true")
+
+    cancel = commands.add_parser("cancel", help="cancel an exact admitted Herdr run; never a focused pane")
+    cancel.add_argument("--mission-id", required=True)
+    cancel.add_argument("--run-id", required=True)
+    cancel.add_argument("--generation")
+    cancel.add_argument("--reason", required=True)
+    cancel.add_argument("--idempotency-key", required=True)
+    cancel.add_argument("--json", action="store_true")
+    retry = commands.add_parser("retry-start", help="recover an exited, unsubmitted startup in its exact owned pane")
+    retry.add_argument("--mission-id", required=True)
+    retry.add_argument("--instance", choices=("lead", "worker", "reviewer", "verifier"), required=True)
+    retry.add_argument("--json", action="store_true")
 
     assurance = commands.add_parser("request-assurance")
     assurance.add_argument("--mission-id", required=True)
@@ -2238,11 +2398,72 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def cancel_herdr_run(runs_dir: Path, mission_id: str, *, run_id: str,
+                     reason: str, idempotency_key: str, generation: str | None = None) -> dict[str, Any]:
+    mission_id = mission_state.normalize_uuid(mission_id, "mission_id")
+    try:
+        value = fleet_herdr_control.request(runs_dir, mission_id, action="cancel", run_id=run_id,
+            reason=reason, idempotency_key=idempotency_key, generation=generation)
+    except mission_state.MissionStateError as exc:
+        raise MissionRunError(str(exc)) from exc
+    if "request_id" not in value:
+        return {**value, "cancelled": False}
+    return {**drive_mission(runs_dir, mission_id), "control_request": value, "cancel_requested": True}
+
+
+def mission_status(runs_dir: Path, mission_id: str) -> dict[str, Any]:
+    compiled, current = fleet_mission.load_mission_compiled(runs_dir, mission_id, mode="read")
+    admissions = [{k: a.get(k) for k in ("run_id", "recipient_instance", "phase", "active", "writer", "terminal")}
+                  for a in current["admissions"].values()]
+    cancelled = current.get("cancelled_runs", {})
+    result = {"mission_id": current["mission_id"], "feature": current["feature"],
+        **({"control": fleet_herdr_control.view(current)} if "herdr_control" in current else {}),
+        "backend": "herdr" if compiled["resolved"]["preset"] == "astra_sol" else "cmux-legacy",
+        "status": current["status"], "terminal": current.get("terminal"), "admissions": admissions,
+        "cancellations": [{"run_id": run, "state": "confirmed" if any(
+            a["run_id"] == run and a.get("terminal", {}).get("status") == "abandoned"
+            for a in admissions if isinstance(a.get("terminal"), dict)) else "requested"} for run in cancelled],
+        "head_sha256": current["head_sha256"]}
+    root = Path("missions") / current["mission_id"]
+    with fleet_safe_paths.RootedFS(runs_dir) as fs:
+        entries = fs.list_directory(root, directory_modes=(0o700, 0o700))
+        if "herdr-backend.json" in entries:
+            backend = fleet_json.loads(fs.read_regular(root / "herdr-backend.json",
+                directory_modes=(0o700, 0o700), file_mode=0o600, max_bytes=16 * 1024 * 1024))
+            if backend.get("mission_id") != current["mission_id"] or backend.get("compiled_digest") != compiled["compiled_digest"]:
+                raise MissionRunError("status backend binding mismatch")
+            result["runtime"] = {"phase": backend["phase"], "session": backend["session"],
+                "workspace": backend["workspace"], "members": [{k: m.get(k) for k in (
+                    "instance_id", "model", "start_phase", "pane_id", "agent_session")}
+                    for m in backend["members"]],
+                "submissions": [{k: s.get(k) for k in ("run_id", "instance_id", "status", "cancel_attempted")}
+                    for s in backend["submissions"].values()]}
+        if "herdr-archive" in entries:
+            try:
+                result["archive"] = fleet_herdr_archive.verify(runs_dir, current["mission_id"])
+                result["acceptance"] = result["archive"]["acceptance"]
+            except (fleet_herdr_archive.HerdrArchiveError, fleet_safe_paths.SafePathError) as exc:
+                result["archive"] = {"valid": False, "error": str(exc)}
+        if "herdr-teardown.json" in entries:
+            result["cleanup"] = "complete"
+    if current["status"] not in mission_state.TERMINAL_STATUSES:
+        result["next_action"] = "resume to reconcile durable results, pending decisions or cancellation"
+    return result
+
+
 def emit(value: dict[str, Any], *, json_mode: bool) -> None:
     if json_mode:
         print(json.dumps(value, ensure_ascii=False, sort_keys=True))
         return
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
+
+
+def response_exit_code(value: Mapping[str, Any]) -> int:
+    if "next_action" in value or value.get("status") == "blocked":
+        return 3
+    if value.get("status") in {"failed", "indeterminate", "abandoned"}:
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2258,6 +2479,9 @@ def main(argv: list[str] | None = None) -> int:
                 risk_override=args.risk,
                 timeout_seconds=args.timeout,
                 execution_profile=args.execution_profile,
+                acceptance_contract=fleet_acceptance.load(args.acceptance_contract) if args.acceptance_contract else None,
+                functional_contract=fleet_functional.load(args.functional_contract) if args.functional_contract else None,
+                router_path=args.router,
             )
             emit(value, json_mode=args.json)
             return 0
@@ -2272,17 +2496,65 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=args.timeout,
                 allow_dirty_baseline=args.allow_dirty_baseline,
                 teardown=args.teardown,
+                herdr_session=args.herdr_session,
+                herdr_runtime_root=args.herdr_runtime_root,
+                herdr_launch_manifest=mission_state.loads_strict(args.herdr_launch_manifest.read_bytes()) if args.herdr_launch_manifest else None,
                 execution_profile=args.execution_profile,
+                acceptance_contract=fleet_acceptance.load(args.acceptance_contract) if args.acceptance_contract else None,
+                functional_contract=fleet_functional.load(args.functional_contract) if args.functional_contract else None,
+                router_path=args.router,
             )
             emit(value, json_mode=args.json)
-            return 3 if "next_action" in value else 0
+            return response_exit_code(value)
         if args.command == "resume":
+            current = fleet_mission.load_state(runs_dir, args.mission_id)
+            if current["status"] not in mission_state.TERMINAL_STATUSES and fleet_herdr_control.view(current)["desired"] == "pause_requested":
+                fleet_herdr_control.request(runs_dir, args.mission_id, action="resume", reason="explicit resume",
+                    idempotency_key="resume-" + str(uuid.uuid4()))
             value = drive_mission(runs_dir, args.mission_id)
             emit(value, json_mode=args.json)
-            return 3 if "next_action" in value else 0
+            return response_exit_code(value)
         if args.command == "show":
             emit(fleet_mission.load_state(runs_dir, args.mission_id), json_mode=False)
             return 0
+        if args.command == "status":
+            value = mission_status(runs_dir, args.mission_id)
+            emit(value, json_mode=args.json)
+            return 1 if value.get("archive", {}).get("valid") is False else 0
+        if args.command == "cancel":
+            value = cancel_herdr_run(runs_dir, args.mission_id, run_id=args.run_id,
+                reason=args.reason, idempotency_key=args.idempotency_key, generation=args.generation)
+            emit(value, json_mode=args.json)
+            return response_exit_code(value)
+        if args.command in {"pause", "cancel-mission"}:
+            value = fleet_herdr_control.request(runs_dir, args.mission_id,
+                action="pause" if args.command == "pause" else "cancel", reason=args.reason,
+                idempotency_key=args.idempotency_key, generation=args.generation)
+            emit(value, json_mode=args.json)
+            return 0
+        if args.command == "supervise":
+            value = fleet_herdr_mission.supervise(runs_dir, args.mission_id,
+                seconds=args.seconds, poll_seconds=args.poll_seconds)
+            emit(value, json_mode=args.json)
+            return response_exit_code(value)
+        if args.command == "retry-start":
+            mission_id = mission_state.normalize_uuid(args.mission_id, "mission_id")
+            with fleet_safe_paths.RootedFS(runs_dir) as fs:
+                with fs.exclusive_lock(Path("missions") / mission_id / "herdr-driver.lock",
+                        directory_modes=(0o700, 0o700), blocking=False) as acquired:
+                    if not acquired:
+                        raise MissionRunError("driver busy; startup retry was not attempted")
+                    driver = fleet_herdr_mission._Driver(runs_dir, mission_id)
+                    driver.load()
+                    if fleet_herdr_control.view(driver.current())["desired"] != "running":
+                        raise MissionRunError("control request blocks startup retry; resume the Mission explicitly")
+                    if driver.current()["status"] != "booting":
+                        raise MissionRunError("startup retry requires a booting Herdr mission")
+                    driver.check_candidate()
+                    driver.backend().retry_unsubmitted_start(args.instance)
+            value = drive_mission(runs_dir, mission_id)
+            emit(value, json_mode=args.json)
+            return response_exit_code(value)
         if args.command == "request-assurance":
             categories = sorted(
                 {item.strip() for item in args.categories.split(",") if item.strip()}
@@ -2300,6 +2572,16 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         raise MissionRunError("unknown command")
     except (
+        fleet_herdr.HerdrBackendError,
+        fleet_herdr_launch.LaunchError,
+        fleet_herdr_runtime.RuntimeContractError,
+        fleet_herdr_archive.HerdrArchiveError,
+        fleet_herdr_mission.HerdrMissionError,
+        fleet_safe_paths.SafePathError,
+        fleet_acceptance.AcceptanceError,
+        fleet_functional.FunctionalError,
+        fleet_json.FleetJSONError,
+        OSError,
         MissionRunError,
         mission_state.MissionStateError,
         workflow_config.WorkflowError,

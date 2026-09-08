@@ -1,3 +1,5 @@
+runs_dir := env_var_or_default("FLEET_RUNS_DIR", "orchestration/runs")
+
 check:
     ./scripts/check-env.sh
 
@@ -31,16 +33,46 @@ provider-validate:
 
 # Canonical durable Mission Control entry points.
 mission feature objective *flags:
-    python3 scripts/mission-run.py run {{feature}} "{{objective}}" {{flags}}
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" run {{feature}} "{{objective}}" {{flags}}
 
 mission-dry feature objective *flags:
-    python3 scripts/mission-run.py dry {{feature}} "{{objective}}" {{flags}}
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" dry {{feature}} "{{objective}}" {{flags}}
+
+# Mandatory artifact acceptance contract through the default Herdr workflow.
+mission-verified feature objective contract *flags:
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" run {{feature}} "{{objective}}" --acceptance-contract "{{contract}}" {{flags}}
 
 mission-show mission_id:
-    python3 scripts/mission-run.py show --mission-id {{mission_id}}
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" show --mission-id {{mission_id}}
+
+mission-status mission_id *flags:
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" status --mission-id {{mission_id}} {{flags}}
+
+# Context observation for explicit live agents; --publish only adds expiring UI badges.
+herdr-context session_config roster *flags:
+    python3 -B scripts/fleet_herdr_context.py --session-config "{{session_config}}" --roster "{{roster}}" {{flags}}
+
+# Opt-in continuity controller. Default action only reads durable status.
+herdr-continuity session_config plan state_dir *flags:
+    python3 -B scripts/fleet_herdr_continuity.py --session-config "{{session_config}}" --plan "{{plan}}" --state-dir "{{state_dir}}" {{flags}}
 
 mission-resume mission_id *flags:
-    python3 scripts/mission-run.py resume --mission-id {{mission_id}} {{flags}}
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" resume --mission-id {{mission_id}} {{flags}}
+
+mission-supervise mission_id seconds="60":
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" supervise --mission-id "{{mission_id}}" --seconds "{{seconds}}" --json
+
+mission-pause mission_id reason key:
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" pause --mission-id "{{mission_id}}" --reason "{{reason}}" --idempotency-key "{{key}}" --json
+
+mission-cancel-mission mission_id reason key *flags:
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" cancel-mission --mission-id "{{mission_id}}" --reason "{{reason}}" --idempotency-key "{{key}}" {{flags}} --json
+
+herdr-campaign output:
+    python3 scripts/fleet_herdr_campaign.py --output "{{output}}"
+
+mission-cancel mission_id run_id reason key *flags:
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" cancel --mission-id {{mission_id}} --run-id {{run_id}} --reason "{{reason}}" --idempotency-key {{key}} {{flags}}
 
 mission-approve mission_id scope *flags:
     python3 scripts/fleet-approve.py --runs-dir orchestration/runs --mission-id {{mission_id}} --scope {{scope}} {{flags}}
@@ -60,11 +92,22 @@ mission-archive mission_id manifest *flags:
 mission-archive-verify archive *flags:
     python3 scripts/fleet_archive.py verify {{archive}} {{flags}}
 
+mission-herdr-archive-verify mission_id *flags:
+    python3 scripts/fleet_herdr_archive.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} {{flags}}
+
+# Read-only runtime discovery; never pulls an image or launches a provider.
+functional-spec tests:
+    python3 scripts/fleet_functional.py spec --tests "{{tests}}"
+
+# Execute the frozen required check, or return its durable existing receipt.
+mission-functional-run mission_id:
+    python3 scripts/fleet_functional.py run --runs-dir "{{runs_dir}}" --mission-id {{mission_id}}
+
 mission-report mission_id *flags:
-    python3 scripts/fleet_report.py --mission-id {{mission_id}} {{flags}}
+    python3 scripts/fleet_report.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} {{flags}}
 
 mission-trace mission_id *flags:
-    python3 scripts/fleet_export_trace.py --mission-id {{mission_id}} {{flags}}
+    python3 scripts/fleet_export_trace.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} {{flags}}
 
 mission-control-start mission_id:
     python3 scripts/fleet_control_service.py --runs-dir orchestration/runs --mission-id {{mission_id}} start
@@ -93,7 +136,7 @@ manifest-inspect manifest:
 manifest-migrate manifest *flags:
     python3 scripts/fleet_manifest.py migrate {{manifest}} {{flags}}
 
-# One-command Dan+ mission: visible autonomous lead, dynamic delegation, exact completion.
+# Explicit legacy CMUX Dan+ entry point; the normal entry point is `mission`.
 # Ex: just dan checkout-fix "fix checkout retries and verify the regression"
 dan feature task *flags:
     python3 scripts/fleet-run.py {{feature}} "{{task}}" {{flags}}
@@ -135,8 +178,12 @@ fleet-down feature:
 race name task *roles:
     ./scripts/fleet-race.sh {{name}} "{{task}}" {{roles}}
 
-# Durable Decision Brief radar first; CMUX hook state remains auxiliary.
-status *flags:
+# Daily status reads native Mission evidence; an explicit mission ID is required.
+status mission_id *flags:
+    python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" status --mission-id {{mission_id}} {{flags}}
+
+# Historical CMUX radar, explicitly outside the daily Herdr path.
+legacy-status *flags:
     python3 scripts/fleet_status.py {{flags}}
 
 # Advance the durable capability gate with an evidence reference.

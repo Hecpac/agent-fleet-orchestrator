@@ -73,9 +73,9 @@ class KimiAdapter(BaseAdapter):
         models = _option_values(command, "--model") + _option_values(command, "-m")
         if models != [identity.model]:
             raise ProviderError("Kimi launch command does not bind the configured model")
-        if command.count("--plan") != 1:
+        if command.count("--plan") > 1:
             raise ProviderError(
-                "Kimi fleet command must start in plan mode exactly once"
+                "Kimi fleet command may select plan mode at most once"
             )
         return value
 

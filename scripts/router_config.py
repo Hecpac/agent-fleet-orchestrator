@@ -745,7 +745,7 @@ def validate_router(config: dict[str, Any]) -> None:
         _expect_keys(
             preset,
             required={"description", "include_lead", "instances"},
-            optional={"lead_provider", "mode", "identity_groups"},
+            optional={"lead_provider", "lead_tool_access", "mode", "identity_groups"},
             where=f"router.presets.{preset_name}",
         )
         if not isinstance(preset["description"], str) or not preset["description"]:
@@ -754,6 +754,20 @@ def validate_router(config: dict[str, Any]) -> None:
             raise RouterError(f"router.presets.{preset_name}.include_lead must be boolean")
         if "lead_provider" in preset and preset["lead_provider"] not in candidates:
             raise RouterError(f"router.presets.{preset_name}.lead_provider is not a lead candidate")
+        if "lead_tool_access" in preset:
+            if not preset["include_lead"]:
+                raise RouterError(
+                    f"router.presets.{preset_name}.lead_tool_access requires include_lead"
+                )
+            tools = _expect_string_list(
+                preset["lead_tool_access"],
+                f"router.presets.{preset_name}.lead_tool_access",
+                nonempty=True,
+            )
+            if "fleet_control" not in tools:
+                raise RouterError(
+                    f"router.presets.{preset_name}.lead_tool_access requires fleet_control"
+                )
         if preset.get("mode", "guided") not in EXECUTION_MODES:
             raise RouterError(
                 f"router.presets.{preset_name}.mode must be one of {sorted(EXECUTION_MODES)}"
@@ -900,10 +914,11 @@ def select_lead(
         if available:
             command = list(role["command"])
             if role["provider"] == "openai":
-                # CONTROL must reach the cmux Unix socket. The environment is
-                # still allowlisted by run-interactive-agent.sh; other Codex
-                # instances remain workspace-write or read-only.
-                command += ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+                # Herdr coordination lives in the host driver. The reasoning
+                # Lead only needs to read the candidate; legacy CMUX leads
+                # retain their existing socket access contract.
+                sandbox = "read-only" if role_type == "astra_lead" else "danger-full-access"
+                command += ["--sandbox", sandbox, "--ask-for-approval", "never"]
             return {
                 "instance_id": config["lead"]["instance_id"],
                 "role_type": role_type,
@@ -969,6 +984,7 @@ def build_plan(
         instances = parse_instance_specs(config, specs)
         include_lead = True
         preset_lead = None
+        preset_lead_tools = None
         execution_mode = "guided"
         identity_groups: list[list[str]] = []
     else:
@@ -980,6 +996,7 @@ def build_plan(
         instances = copy.deepcopy(preset["instances"])
         include_lead = preset["include_lead"]
         preset_lead = preset.get("lead_provider")
+        preset_lead_tools = preset.get("lead_tool_access")
         execution_mode = preset.get("mode", "guided")
         identity_groups = copy.deepcopy(preset.get("identity_groups", []))
 
@@ -988,10 +1005,12 @@ def build_plan(
         lead = select_lead(
             config,
             lead_provider or preset_lead,
-            allow_fallback=allow_fallback,
+            allow_fallback=allow_fallback and preset_lead is None,
             run_healthcheck=run_healthcheck,
             check_runtime_availability=check_runtime_availability,
         )
+        if preset_lead_tools is not None:
+            lead["tool_access"] = list(preset_lead_tools)
     resolved = _materialize_instances(config, instances)
     warnings: list[str] = []
     local_count = sum(item["runner"] == "local" for item in resolved)

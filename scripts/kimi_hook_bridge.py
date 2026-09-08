@@ -85,9 +85,26 @@ def wire_path(share_dir: Path, work_dir: Path, session_id: str) -> Path:
             session_roots = rooted.list_directory(
                 "sessions", directory_modes=(0o700,)
             )
-            matching_roots = [
-                name for name in (current_root, previous_root) if name in session_roots
+            # kimi-code 0.29 truncates long workspace basenames before adding
+            # the stable workdir hash (currently to 40 characters).  Bind to
+            # that hash instead of guessing the truncation width.  The home is
+            # surface-isolated, and more than one matching root remains an
+            # ambiguity that must fail closed.
+            hashed_roots = [
+                name
+                for name in session_roots
+                if name.startswith("wd_") and name.endswith(f"_{work_hash}")
             ]
+            matching_roots = sorted(
+                set(
+                    [
+                        name
+                        for name in (current_root, previous_root)
+                        if name in session_roots
+                    ]
+                    + hashed_roots
+                )
+            )
             if len(matching_roots) > 1:
                 raise KimiBridgeError(
                     "multiple Kimi work roots in one isolated home make evidence ambiguous"
@@ -123,6 +140,12 @@ def wire_path(share_dir: Path, work_dir: Path, session_id: str) -> Path:
                 directory_modes=(0o700, 0o700, 0o700, 0o700, 0o700),
             )
     except fleet_safe_paths.SafePathError as exc:
+        # kimi-code creates the session directory before it creates
+        # agents/main.  That partial layout is a normal startup state, so let
+        # resolve_wire_path keep polling.  Other descriptor failures (for
+        # example a symlink or wrong ownership/mode) remain fatal.
+        if str(exc).startswith("rooted directory is missing: "):
+            raise KimiBridgeError("Kimi session root has not been created yet") from exc
         raise KimiBridgeError(f"Kimi session path is unsafe: {exc}") from exc
     return canonical_share / transcript_parent / "wire.jsonl"
 

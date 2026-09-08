@@ -83,6 +83,19 @@ class MissionRunTests(unittest.TestCase):
         control_patch.start()
         self.addCleanup(control_patch.stop)
 
+    def write_astra_sol_router(self) -> Path:
+        router = json.loads(
+            (ROOT / "orchestration" / "router.yaml").read_text(encoding="utf-8")
+        )
+        astra_lead = json.loads(json.dumps(router["roles"]["codex"]))
+        astra_lead["model"] = "gpt-6-astra"
+        astra_lead["command"] = ["codex", "--model", "gpt-6-astra"]
+        router["roles"]["astra_lead"] = astra_lead
+        router["lead"]["candidates"] = ["astra_lead"]
+        path = self.tmp / "astra-sol-router.json"
+        path.write_text(json.dumps(router), encoding="utf-8")
+        return path
+
     def test_assurance_handoff_outer_timeout_encloses_child_deadlines(self) -> None:
         self.assertEqual(mission_run.assurance_handoff_command_timeout({}), 600)
         self.assertEqual(
@@ -372,6 +385,72 @@ class MissionRunTests(unittest.TestCase):
         )
         manifest_path.chmod(0o600)
 
+    def test_default_cli_selects_herdr_with_no_silent_profile_fallback(self) -> None:
+        args = mission_run._parser().parse_args(["dry", "native", "inspect"])
+        self.assertEqual(args.workflow, "herdr-implementation")
+        value = mission_run.dry_run(feature="native", objective="inspect the parser",
+            workflow_name=args.workflow, target_repo=self.target, risk_override="auto", timeout_seconds=300)
+        self.assertEqual(value["backend"], "herdr")
+        self.assertEqual(value["resolved"]["lead"]["model"], "gpt-6-astra")
+        self.assertEqual([m["model"] for m in value["resolved"]["instances"]], ["gpt-5.6-sol"] * 3)
+        self.assertFalse(self.runs.exists())
+
+    def test_herdr_requires_acceptance_contract_before_mission_creation(self) -> None:
+        with self.assertRaisesRegex(mission_run.MissionRunError, "acceptance-contract"):
+            mission_run.create_and_drive(self.runs, feature="native", objective="inspect",
+                workflow_name="herdr-implementation", target_repo=self.target, risk_override="auto",
+                timeout_seconds=300, allow_dirty_baseline=False, teardown=False, herdr_session="fixture")
+        self.assertFalse((self.runs / "missions").exists())
+
+    def test_herdr_cancel_records_request_before_driver_without_legacy_transport(self) -> None:
+        mid, run = str(uuid.uuid4()), str(uuid.uuid4())
+        (self.runs / "missions" / mid).mkdir(parents=True, mode=0o700)
+        self.runs.chmod(0o700)
+        (self.runs / "missions").chmod(0o700)
+        calls = []
+        with mock.patch.object(mission_run.fleet_herdr_control, "request", side_effect=lambda *a, **k: calls.append(("request", k)) or {"request_id": "fixture", "recorded": True}), \
+             mock.patch.object(mission_run, "drive_mission", side_effect=lambda *a: calls.append(("drive", a)) or {"status": "abandoned"}):
+            value = mission_run.cancel_herdr_run(self.runs, mid, run_id=run, reason="fixture cancel", idempotency_key="cancel1")
+        self.assertEqual(value["status"], "abandoned")
+        self.assertEqual([c[0] for c in calls], ["request", "drive"])
+        self.assertEqual(calls[0][1]["run_id"], run)
+
+    def test_herdr_cancel_rejects_unknown_run_and_does_not_signal_terminal_run(self) -> None:
+        mid, run = str(uuid.uuid4()), str(uuid.uuid4())
+        (self.runs / "missions" / mid).mkdir(parents=True, mode=0o700)
+        self.runs.chmod(0o700)
+        (self.runs / "missions").chmod(0o700)
+        with mock.patch.object(mission_run.fleet_herdr_control, "request") as request, \
+             mock.patch.object(mission_run, "drive_mission") as drive:
+            request.side_effect = mission_run.mission_state.MissionStateError("unknown admitted run")
+            with self.assertRaisesRegex(mission_run.MissionRunError, "unknown admitted run"):
+                mission_run.cancel_herdr_run(self.runs, mid, run_id=run, reason="cancel", idempotency_key="c")
+            request.side_effect = None
+            request.return_value = {"status": "succeeded", "recorded": False, "reason": "terminal"}
+            value = mission_run.cancel_herdr_run(self.runs, mid, run_id=run, reason="cancel", idempotency_key="c")
+            self.assertFalse(value["cancelled"])
+            drive.assert_not_called()
+
+    def test_herdr_cancel_request_is_not_blocked_by_driver_wait_lock(self) -> None:
+        mid, run = str(uuid.uuid4()), str(uuid.uuid4())
+        (self.runs / "missions" / mid).mkdir(parents=True, mode=0o700)
+        self.runs.chmod(0o700)
+        (self.runs / "missions").chmod(0o700)
+        with mission_run.fleet_safe_paths.RootedFS(self.runs) as fs:
+            with fs.exclusive_lock(Path("missions") / mid / "herdr-driver.lock", directory_modes=(0o700, 0o700)):
+                with mock.patch.object(mission_run.fleet_herdr_control, "request", return_value={"request_id":"fixture","recorded":True}) as record, \
+                     mock.patch.object(mission_run,"drive_mission",return_value={"next_action":"driver busy"}):
+                    value = mission_run.cancel_herdr_run(self.runs, mid, run_id=run, reason="cancel", idempotency_key="c")
+                    self.assertTrue(value["cancel_requested"])
+                    self.assertIn("driver busy", value["next_action"])
+                    record.assert_called_once()
+
+    def test_status_archive_corruption_returns_nonzero_without_runtime_effects(self) -> None:
+        with mock.patch.object(mission_run, "mission_status", return_value={"status": "succeeded", "archive": {"valid": False}}), \
+             mock.patch.object(mission_run, "emit"), mock.patch.object(mission_run, "drive_mission") as drive:
+            self.assertEqual(mission_run.main(["status", "--mission-id", str(uuid.uuid4()), "--json"]), 1)
+            drive.assert_not_called()
+
     def test_dry_run_compiles_and_assesses_without_creating_state(self) -> None:
         result = subprocess.run(
             [
@@ -398,7 +477,171 @@ class MissionRunTests(unittest.TestCase):
         value = json.loads(result.stdout)
         self.assertEqual(value["effects"], [])
         self.assertEqual(value["risk"]["level"], "low")
+        default_compiled = mission_run.workflow_config.compile_path(
+            ROOT / "workflows" / "implementation.yaml"
+        )
+        self.assertEqual(value["compiled_digest"], default_compiled["compiled_digest"])
+        self.assertEqual(value["resolved"], default_compiled["resolved"])
         self.assertFalse(self.runs.exists())
+
+    def test_dry_run_compiles_explicit_router_without_creating_state(self) -> None:
+        router_path = self.write_astra_sol_router()
+        result = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "--runs-dir",
+                str(self.runs),
+                "dry",
+                "router-preview",
+                "inspect the explicit router",
+                "--workflow",
+                "implementation",
+                "--target-repo",
+                str(self.target),
+                "--router",
+                str(router_path),
+                "--json",
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["resolved"]["lead"]["model"], "gpt-6-astra")
+        self.assertIn(
+            "gpt-5.6-sol",
+            {member["model"] for member in value["resolved"]["instances"]},
+        )
+        self.assertEqual(value["effects"], [])
+        self.assertFalse(self.runs.exists())
+
+    def test_run_persists_explicit_router_before_fleet_effects(self) -> None:
+        router_path = self.write_astra_sol_router()
+        result = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "--runs-dir",
+                str(self.runs),
+                "run",
+                "router-create",
+                "deploy this to production",
+                "--workflow",
+                "implementation",
+                "--target-repo",
+                str(self.target),
+                "--router",
+                str(router_path),
+                "--json",
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 3, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(value["status"], "awaiting_assurance_confirmation")
+        mission_root = self.runs / "missions" / value["mission_id"]
+        compiled = mission_run.fleet_mission.load_compiled(
+            mission_root / "compiled-workflow.json"
+        )
+        self.assertEqual(compiled["resolved"]["lead"]["model"], "gpt-6-astra")
+        self.assertEqual(
+            compiled["router_snapshot"]["roles"]["astra_lead"]["model"],
+            "gpt-6-astra",
+        )
+        self.assertIn(
+            "gpt-5.6-sol",
+            {member["model"] for member in compiled["resolved"]["instances"]},
+        )
+        events = mission_run.mission_state.read_events(
+            mission_run.mission_state.ledger_path(self.runs, value["mission_id"]),
+            expected_mission_id=value["mission_id"],
+        )
+        self.assertNotIn("fleet_boot_started", {event["kind"] for event in events})
+        self.assertFalse((self.runs / "fleet-router-create.manifest").exists())
+
+    def test_invalid_explicit_router_fails_before_mission_creation(self) -> None:
+        missing_router = self.tmp / "missing-router.json"
+        result = subprocess.run(
+            [
+                "python3",
+                str(SCRIPT),
+                "--runs-dir",
+                str(self.runs),
+                "run",
+                "invalid-router",
+                "inspect the explicit router",
+                "--workflow",
+                "implementation",
+                "--target-repo",
+                str(self.target),
+                "--router",
+                str(missing_router),
+                "--json",
+            ],
+            cwd=ROOT,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"cannot load router {missing_router}", result.stderr)
+        self.assertFalse((self.runs / "missions").exists())
+
+    def test_run_exit_code_contract(self) -> None:
+        cases = (
+            ({"status": "succeeded"}, 0),
+            ({"status": "blocked"}, 3),
+            ({"status": "failed"}, 1),
+            ({"status": "indeterminate"}, 1),
+            ({"status": "abandoned"}, 1),
+            ({"next_action": "approve then resume"}, 3),
+        )
+        for value, expected in cases:
+            with (
+                self.subTest(value=value),
+                mock.patch.object(
+                    mission_run, "create_and_drive", return_value=value
+                ) as create,
+                mock.patch.object(mission_run, "emit") as emit,
+            ):
+                result = mission_run.main(["run", "exit-contract", "inspect status"])
+            self.assertEqual(result, expected)
+            create.assert_called_once()
+            emit.assert_called_once_with(value, json_mode=False)
+
+    def test_resume_exit_code_contract(self) -> None:
+        cases = (
+            ({"status": "succeeded"}, 0),
+            ({"status": "blocked"}, 3),
+            ({"status": "failed"}, 1),
+            ({"status": "indeterminate"}, 1),
+            ({"status": "abandoned"}, 1),
+            ({"next_action": "approve then resume"}, 3),
+        )
+        for value, expected in cases:
+            with (
+                self.subTest(value=value),
+                mock.patch.object(
+                    mission_run, "drive_mission", return_value=value
+                ) as drive,
+                mock.patch.object(mission_run.fleet_mission, "load_state", return_value={"status":"running"}),
+                mock.patch.object(mission_run, "emit") as emit,
+            ):
+                result = mission_run.main(
+                    ["resume", "--mission-id", "in-memory-mission"]
+                )
+            self.assertEqual(result, expected)
+            drive.assert_called_once()
+            emit.assert_called_once_with(value, json_mode=False)
 
     def test_mission_rejects_target_subdirectory_before_creation(self) -> None:
         subdir = self.target / "docs"

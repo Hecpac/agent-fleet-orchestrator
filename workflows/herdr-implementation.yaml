@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "name": "herdr-implementation",
+  "description": "Herdr implementation with Astra Lead and three role-separated Sol sessions",
+  "preset": "astra_sol",
+  "autonomy": {"owner": "lead", "allow_parallel": true, "allow_subdelegation": false, "max_delegation_depth": 0},
+  "capabilities": {"available": ["recon", "build", "challenge", "verify"], "required_outcomes": ["lead_result", "worker_result", "reviewer_result", "verifier_result"], "writer": "build"},
+  "risk": {"minimum": "low", "allow_lead_escalation": true, "high_action": "confirm_assured"},
+  "assurance": {"profile": "none", "preset": "astra_sol", "minimum_gates": []},
+  "audit": {"mode": "signed", "trust_scope": "local-development", "worm_required_for": ["regulated"]},
+  "archive": {"mode": "incremental", "content_policy": "full", "include_final_tree": true, "include_git_delta": true},
+  "limits": {"deadline_seconds": 7200, "token_budget": 0, "budget_mode": "soft", "delegation_credits": 8, "max_active_delegations": 4}
+}

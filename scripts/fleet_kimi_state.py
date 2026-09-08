@@ -23,6 +23,8 @@ SESSION_FILE = "kimi-hook-sessions.json"
 SESSION_LOCK = ".kimi-hook-sessions.lock"
 SURFACE_BINDING = "binding.json"
 SURFACE_LOCK = ".bridge.lock"
+BRIDGE_HEALTH = "bridge-health.json"
+BRIDGE_RECEIPT = "bridge-exit.json"
 LIFECYCLE_LOCK = ".lifecycle.lock"
 RETIRED_DIR = ".retired"
 RETIRED_SENSITIVE_FILES = (
@@ -169,6 +171,225 @@ def read_surface_binding(root: Path, surface_id: str) -> dict[str, Any]:
     if raw != _canonical_json(value):
         raise KimiStateError("Kimi surface binding bytes are not canonical")
     return value
+
+
+def bridge_document(
+    *,
+    surface_id: str,
+    workspace_id: str,
+    mission_id: str,
+    generation_id: str,
+    launch_id: str,
+    pid: int,
+    started_at: int,
+    status: str,
+    ended_at: int | None = None,
+    exit_code: int | None = None,
+    stderr_sha256: str | None = None,
+    stderr_tail: str | None = None,
+) -> dict[str, Any]:
+    """Build canonical, owner-bound bridge health or terminal evidence."""
+    if (
+        status not in {"ready", "exited"}
+        or isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid <= 0
+    ):
+        raise KimiStateError("Kimi bridge status is invalid")
+    if (
+        isinstance(started_at, bool)
+        or not isinstance(started_at, int)
+        or started_at <= 0
+    ):
+        raise KimiStateError("Kimi bridge start timestamp is invalid")
+    value: dict[str, Any] = {
+        "schemaVersion": SCHEMA_VERSION,
+        "surfaceId": canonical_uuid(surface_id, "surface_id", upper=True),
+        "workspaceId": canonical_uuid(workspace_id, "workspace_id", upper=True),
+        "missionId": canonical_mission(mission_id),
+        "generationId": canonical_uuid(generation_id, "generation_id"),
+        "launchId": canonical_uuid(launch_id, "launch_id"),
+        "pid": pid,
+        "startedAt": started_at,
+        "status": status,
+    }
+    if status == "exited":
+        if (
+            isinstance(ended_at, bool)
+            or not isinstance(ended_at, int)
+            or ended_at < started_at
+        ):
+            raise KimiStateError("Kimi bridge end timestamp is invalid")
+        if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+            raise KimiStateError("Kimi bridge exit code is invalid")
+        if not isinstance(stderr_sha256, str) or not re.fullmatch(
+            r"[0-9a-f]{64}", stderr_sha256
+        ):
+            raise KimiStateError("Kimi bridge stderr digest is invalid")
+        if (
+            not isinstance(stderr_tail, str)
+            or len(stderr_tail.encode("utf-8")) > 1024
+            or "\x00" in stderr_tail
+        ):
+            raise KimiStateError("Kimi bridge stderr summary is invalid")
+        value.update(
+            {
+                "endedAt": ended_at,
+                "exitCode": exit_code,
+                "stderrSha256": stderr_sha256,
+                "stderrTail": stderr_tail,
+            }
+        )
+    return value
+
+
+def _read_bridge_document(
+    rooted: fleet_safe_paths.RootedFS,
+    surface: str,
+    name: str,
+) -> tuple[bytes, dict[str, Any]] | None:
+    raw = rooted.read_regular_optional(
+        f"{surface}/{name}",
+        directory_modes=(0o700,),
+        file_mode=0o600,
+        max_bytes=MAX_BINDING_BYTES,
+    )
+    if raw is None:
+        return None
+    value = _parse_object(raw, f"Kimi {name}")
+    return raw, value
+
+
+def publish_bridge_status(root: Path, document: dict[str, Any]) -> None:
+    """Publish one canonical health/exit record; conflicts fail closed."""
+    expected = bridge_document(
+        surface_id=document.get("surfaceId"),
+        workspace_id=document.get("workspaceId"),
+        mission_id=document.get("missionId"),
+        generation_id=document.get("generationId"),
+        launch_id=document.get("launchId"),
+        pid=document.get("pid"),
+        started_at=document.get("startedAt"),
+        status=document.get("status"),
+        ended_at=document.get("endedAt"),
+        exit_code=document.get("exitCode"),
+        stderr_sha256=document.get("stderrSha256"),
+        stderr_tail=document.get("stderrTail"),
+    )
+    if document != expected:
+        raise KimiStateError("Kimi bridge status is not canonical")
+    root = ensure_private_root(root)
+    surface = expected["surfaceId"]
+    name = BRIDGE_HEALTH if expected["status"] == "ready" else BRIDGE_RECEIPT
+    try:
+        with fleet_safe_paths.RootedFS(root, root_mode=0o700) as rooted:
+            binding_raw = rooted.read_regular(
+                f"{surface}/{SURFACE_BINDING}",
+                directory_modes=(0o700,),
+                file_mode=0o600,
+                max_bytes=MAX_BINDING_BYTES,
+            )
+            binding = _validate_binding(
+                _parse_object(binding_raw, "Kimi surface binding")
+            )
+            expected_binding = binding_document(
+                surface_id=expected["surfaceId"],
+                workspace_id=expected["workspaceId"],
+                mission_id=expected["missionId"],
+                generation_id=expected["generationId"],
+            )
+            if binding_raw != _canonical_json(binding) or binding != expected_binding:
+                raise KimiStateError("Kimi bridge lifecycle identity drift")
+            if expected["status"] == "exited":
+                health_record = _read_bridge_document(rooted, surface, BRIDGE_HEALTH)
+                if health_record is not None:
+                    health_raw, health = health_record
+                    canonical_health = bridge_document(
+                        surface_id=health.get("surfaceId"),
+                        workspace_id=health.get("workspaceId"),
+                        mission_id=health.get("missionId"),
+                        generation_id=health.get("generationId"),
+                        launch_id=health.get("launchId"),
+                        pid=health.get("pid"),
+                        started_at=health.get("startedAt"),
+                        status="ready",
+                    )
+                    if (
+                        health_raw != _canonical_json(canonical_health)
+                        or health != canonical_health
+                        or any(
+                            expected[key] != canonical_health[key]
+                            for key in (
+                                "surfaceId",
+                                "workspaceId",
+                                "missionId",
+                                "generationId",
+                                "launchId",
+                                "pid",
+                                "startedAt",
+                            )
+                        )
+                    ):
+                        raise KimiStateError("Kimi bridge lifecycle identity drift")
+            rooted.atomic_write(
+                f"{surface}/{name}",
+                _canonical_json(expected),
+                directory_modes=(0o700,),
+                file_mode=0o600,
+                require_absent=True,
+            )
+    except fleet_safe_paths.SafePathError as exc:
+        raise KimiStateError(f"unsafe Kimi bridge status: {exc}") from exc
+
+
+def require_bridge_health(
+    root: Path,
+    *,
+    surface_id: str,
+    workspace_id: str,
+    mission_id: str,
+    generation_id: str,
+) -> dict[str, Any]:
+    """Return only a live exact bridge with no terminal receipt."""
+    root = ensure_private_root(root)
+    surface = canonical_uuid(surface_id, "surface_id", upper=True)
+    try:
+        with fleet_safe_paths.RootedFS(root, root_mode=0o700) as rooted:
+            if _read_bridge_document(rooted, surface, BRIDGE_RECEIPT) is not None:
+                raise KimiStateError("Kimi bridge has already exited")
+            record = _read_bridge_document(rooted, surface, BRIDGE_HEALTH)
+            if record is None:
+                raise KimiStateError("Kimi bridge health is unavailable")
+            raw, value = record
+        expected = bridge_document(
+            surface_id=surface_id,
+            workspace_id=workspace_id,
+            mission_id=mission_id,
+            generation_id=generation_id,
+            launch_id=value.get("launchId"),
+            pid=value.get("pid"),
+            started_at=value.get("startedAt"),
+            status="ready",
+        )
+        if raw != _canonical_json(expected) or value != expected:
+            raise KimiStateError("Kimi bridge health is not canonical")
+        # A pid proves nothing once the supervisor dies without writing its exit
+        # receipt: the operating system recycles the number and `os.kill(pid, 0)`
+        # then reports an unrelated process as the bridge. The live hook bridge
+        # holds SURFACE_LOCK for its whole lifetime and the kernel releases it on
+        # exit, so acquiring that lock here means no bridge is running.
+        with fleet_safe_paths.RootedFS(root, root_mode=0o700) as rooted:
+            with rooted.exclusive_lock(
+                f"{surface}/{SURFACE_LOCK}",
+                directory_modes=(0o700,),
+                create_directories=False,
+                blocking=False,
+            ) as acquired:
+                if acquired:
+                    raise KimiStateError("Kimi bridge is not alive")
+        return expected
+    except fleet_safe_paths.SafePathError as exc:
+        raise KimiStateError(f"unsafe Kimi bridge health: {exc}") from exc
 
 
 def provision(
@@ -444,9 +665,9 @@ def _validate_session_record(session_id: str, value: Any) -> dict[str, Any]:
 
 
 def read_session_binding(hook_dir: Path, session_id: str) -> dict[str, Any] | None:
-    hook_root = fleet_safe_paths.canonical_root(hook_dir, required_mode=0o700)
     session = canonical_uuid(session_id, "session_id")
     try:
+        hook_root = fleet_safe_paths.canonical_root(hook_dir, required_mode=0o700)
         with fleet_safe_paths.RootedFS(hook_root, root_mode=0o700) as rooted:
             raw = rooted.read_regular_optional(
                 SESSION_FILE, directory_modes=(), file_mode=0o600,
