@@ -28,6 +28,7 @@ class WorkflowConfigTests(unittest.TestCase):
     def test_repository_workflows_compile_against_router(self) -> None:
         expected = {
             "herdr-implementation",
+            "herdr-minimal-implementation",
             "herdr-research-implementation",
             "companion-kimi",
             "hotfix",
@@ -45,7 +46,8 @@ class WorkflowConfigTests(unittest.TestCase):
         self.assertEqual({item["workflow"]["name"] for item in compiled}, expected)
         self.assertTrue(
             all(item["resolved"]["assurance_mode"] == "assured" for item in compiled
-                if item["workflow"]["name"] not in {"herdr-implementation", "herdr-research-implementation"})
+                if item["workflow"]["name"] not in {"herdr-implementation", "herdr-minimal-implementation",
+                                                    "herdr-research-implementation"})
         )
         implementation = next(
             item for item in compiled if item["workflow"]["name"] == "implementation"

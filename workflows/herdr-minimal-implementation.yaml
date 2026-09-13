@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "name": "herdr-minimal-implementation",
+  "description": "Opt-in minimal Herdr implementation with one Sol/high Worker and one Build turn",
+  "preset": "sol_minimal_v1",
+  "autonomy": {"owner": "worker", "allow_parallel": false, "allow_subdelegation": false, "max_delegation_depth": 0},
+  "capabilities": {"available": ["build"], "required_outcomes": ["worker_result"], "writer": "build"},
+  "risk": {"minimum": "low", "allow_lead_escalation": false, "high_action": "fail"},
+  "assurance": {"profile": "none", "preset": "sol_minimal_v1", "minimum_gates": []},
+  "audit": {"mode": "signed", "trust_scope": "local-development", "worm_required_for": ["regulated"]},
+  "archive": {"mode": "incremental", "content_policy": "full", "include_final_tree": true, "include_git_delta": true},
+  "limits": {"deadline_seconds": 3600, "token_budget": 0, "budget_mode": "soft", "delegation_credits": 1, "max_active_delegations": 1}
+}

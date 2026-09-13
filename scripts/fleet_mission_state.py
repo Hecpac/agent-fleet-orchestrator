@@ -646,7 +646,7 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         if ("herdr_profile" in payload) is not ("herdr_profile_sha256" in payload):
             raise MissionStateError("Herdr profile creation binding is incomplete")
         if "herdr_profile" in payload:
-            if payload["herdr_profile"] != "astra_sol_research_v1":
+            if payload["herdr_profile"] not in {"astra_sol_research_v1", "sol_minimal_v1"}:
                 raise MissionStateError("unsupported Herdr profile creation binding")
             _require_sha(payload["herdr_profile_sha256"], "herdr_profile_sha256")
         validate_target_repo(payload["target_repo"])
@@ -800,8 +800,12 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
             payload["approval_event_sha256"], "assurance started approval reference"
         )
     elif kind == "mission_completing":
-        _require_fields(kind, payload, {"lead_artifact_id"})
-        _require_sha(payload["lead_artifact_id"], "mission lead_artifact_id")
+        if set(payload) == {"lead_artifact_id"}:
+            _require_sha(payload["lead_artifact_id"], "mission lead_artifact_id")
+        elif set(payload) == {"completion_artifact_id"}:
+            _require_sha(payload["completion_artifact_id"], "mission completion_artifact_id")
+        else:
+            raise MissionStateError("mission_completing fields are invalid")
     elif kind in {"inference_policy_frozen", "inference_request_reserved", "inference_request_finished"}:
         import fleet_herdr_inference
         try:
@@ -852,18 +856,21 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
     elif kind == "herdr_finalization_policy_frozen":
         legacy = {"compiled_digest", "minimum_archive_schema_version",
                   "permissions_policy_version", "required_turns"}
-        research = legacy | {"herdr_profile", "herdr_profile_sha256"}
+        versioned = legacy | {"herdr_profile", "herdr_profile_sha256"}
         fields = set(payload)
-        if fields != legacy and fields != research:
+        if fields != legacy and fields != versioned:
             raise MissionStateError("Herdr finalization policy fields are invalid")
         _require_sha(payload["compiled_digest"], "Herdr finalization compiled_digest")
-        if fields == research:
-            if (payload["herdr_profile"] != "astra_sol_research_v1"
-                    or any(type(payload[field]) is not int or payload[field] != expected
-                           for field, expected in (("minimum_archive_schema_version", 6),
-                                                   ("permissions_policy_version", 3),
-                                                   ("required_turns", 6)))):
-                raise MissionStateError("unsupported Research finalization policy")
+        if fields == versioned:
+            contracts = {
+                "astra_sol_research_v1": (6, 3, 6),
+                "sol_minimal_v1": (7, 4, 1),
+            }
+            expected = contracts.get(payload["herdr_profile"])
+            if (expected is None or any(type(payload[field]) is not int or payload[field] != value
+                    for field, value in zip(("minimum_archive_schema_version",
+                                             "permissions_policy_version", "required_turns"), expected))):
+                raise MissionStateError("unsupported versioned Herdr finalization policy")
             _require_sha(payload["herdr_profile_sha256"], "Herdr profile digest")
         else:
             for field, expected in (("minimum_archive_schema_version", 3),

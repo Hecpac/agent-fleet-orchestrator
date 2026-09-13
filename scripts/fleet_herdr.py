@@ -263,9 +263,9 @@ class HerdrBackend:
             self.profile = fleet_herdr_profile.resolve_profile(self.compiled)
         except fleet_herdr_profile.ProfileError as exc:
             raise HerdrBackendError(str(exc)) from exc
-        if self.profile is fleet_herdr_profile.RESEARCH and (launch_manifest is not None or not personal_cli):
-            raise HerdrBackendError("Research profile requires the personal Codex lane without experimental launch")
-        if self.profile is fleet_herdr_profile.RESEARCH:
+        if self.profile is not fleet_herdr_profile.LEGACY and (launch_manifest is not None or not personal_cli):
+            raise HerdrBackendError("versioned profile requires the personal Codex lane without experimental launch")
+        if self.profile is not fleet_herdr_profile.LEGACY:
             self.initial_runtime_contract = dict(versions.TASK_CONTEXT_CONTRACT)
         self.context = None
         self.member_contract = self.profile.members
@@ -361,7 +361,8 @@ class HerdrBackend:
 
     def _compiled_members(self) -> list[dict[str, Any]]:
         resolved = self.compiled["resolved"]
-        members = [resolved.get("lead"), *resolved.get("instances", [])]
+        members = [member for member in [resolved.get("lead"), *resolved.get("instances", [])]
+                   if member is not None]
         if len(members) != len(self.member_contract) or any(
             not isinstance(member, dict) for member in members
         ):
@@ -458,7 +459,7 @@ class HerdrBackend:
             "preset": self.profile.preset,
             **({"herdr_profile": self.profile.profile_id,
                 "herdr_profile_sha256": self.profile.digest}
-               if self.profile is fleet_herdr_profile.RESEARCH else {}),
+               if self.profile is not fleet_herdr_profile.LEGACY else {}),
             "phase": "new",
             "workspace": {
                 "label": f"fleet-{self.feature}-{short}-{generation_short}",
@@ -493,7 +494,7 @@ class HerdrBackend:
             "router_digest": self.compiled["router_digest"],
             "preset": self.profile.preset,
         }
-        if self.profile is fleet_herdr_profile.RESEARCH:
+        if self.profile is not fleet_herdr_profile.LEGACY:
             bindings.update(herdr_profile=self.profile.profile_id,
                             herdr_profile_sha256=self.profile.digest)
         if any(state.get(key) != value for key, value in bindings.items()):
@@ -614,6 +615,8 @@ class HerdrBackend:
                 or submission.get("agent_session") != member.get("agent_session")
                 or not SHA256.fullmatch(str(submission.get("prompt_sha256", "")))
                 or not isinstance(submission.get("cancel_attempted"), bool)
+                or submission.get("usage_baseline_artifact_id") is not None
+                and not SHA256.fullmatch(str(submission.get("usage_baseline_artifact_id")))
                 or submission.get("candidate_tree_sha") is not None
                 and not mission_state.GIT_OID.fullmatch(
                     str(submission.get("candidate_tree_sha"))
@@ -973,6 +976,8 @@ class HerdrBackend:
                                 ("worker", "lead", "right"),
                                 ("reviewer", "worker", "down"),
                                 ("verifier", "research", "down"))
+                    elif self.profile is fleet_herdr_profile.MINIMAL:
+                        grid = ()
                     for instance_id, source_id, direction in grid:
                         member = members_by_id[instance_id]
                         if member["pane_id"] is None:
@@ -1364,6 +1369,9 @@ class HerdrBackend:
                             "Herdr agent is not quiescent for an unambiguous prompt"
                         )
                     self._require_deliverable(member)
+                    usage_baseline_artifact_id = self._capture_usage_baseline(
+                        run_id=normalized_run, prompt_sha256=prompt_sha256,
+                        generation=state["generation"], member=member)
                     submission = {
                         "run_id": normalized_run,
                         "instance_id": instance_id,
@@ -1378,6 +1386,8 @@ class HerdrBackend:
                         "candidate_tree_sha": prompt_contract["candidate_tree_sha"],
                         "phase": "prepared",
                         "status": "queued",
+                        "prepared_at": _now(),
+                        "usage_baseline_artifact_id": usage_baseline_artifact_id,
                         "cancel_attempted": False,
                     }
                     state["submissions"][normalized_run] = submission
@@ -1715,11 +1725,107 @@ class HerdrBackend:
             row_bytes.append(line)
         return rows, row_bytes, str(path), hashlib.sha256(raw).hexdigest()
 
+    @staticmethod
+    def _usage_counts(value: Any) -> dict[str, int] | None:
+        keys = ("input_tokens", "output_tokens", "cached_input_tokens")
+        if (not isinstance(value, dict)
+                or any(type(value.get(key)) is not int or value[key] < 0 for key in keys)
+                or value["cached_input_tokens"] > value["input_tokens"]):
+            return None
+        return {key: value[key] for key in keys}
+
+    def _capture_usage_baseline(self, *, run_id: str, prompt_sha256: str,
+                                generation: str, member: Mapping[str, Any]) -> str:
+        """Pin the cumulative counter frontier before a prompt can be sent."""
+        session = member.get("agent_session")
+        evidence: dict[str, Any] = {"schema_version": 1,
+            "kind": "herdr_usage_baseline", "mission_id": self.mission_id,
+            "run_id": run_id, "prompt_sha256": prompt_sha256,
+            "generation": generation, "agent_session": _copy(session),
+            "captured_at": _now(), "status": "unknown", "counts": None,
+            "source": None, "reason": "session_identity_not_available_before_dispatch",
+            "transcript_sha256": None, "captured_rows": 0}
+        if session is not None:
+            rows, row_bytes, _, _ = self._transcript_rows(session["value"])
+            prefix_sha = hashlib.sha256(b"".join(row_bytes)).hexdigest() if row_bytes else None
+            evidence.update(transcript_sha256=prefix_sha,
+                            captured_rows=len(rows))
+            metadata = [row for row in rows if row.get("type") == "session_meta"
+                        and isinstance(row.get("payload"), dict)
+                        and row["payload"].get("id") == session["value"]]
+            # A rotated/reset live transcript cannot become a new zero baseline
+            # after this same owned session already completed a durable run.
+            prior_pins = []
+            try:
+                with fleet_safe_paths.RootedFS(self.runs_dir) as rooted:
+                    prior_state = self._load(rooted)
+                    for prior_run, prior in prior_state["submissions"].items():
+                        if (prior_run == run_id or prior.get("instance_id") != member["instance_id"]
+                                or prior.get("generation") != generation or not prior.get("submitted_at")):
+                            continue
+                        previous = self._load_result(rooted, prior_run)
+                        if previous is None or previous["evidence"]["agent_session"] != session:
+                            raise ValueError("prior session result unavailable")
+                        pin = previous["evidence"]["transcript_artifact_id"]
+                        retained = fleet_artifacts.get_bytes(self.runs_dir, self.mission_id, pin)
+                        retained_rows = retained.splitlines(keepends=True)
+                        # Collection retains metadata then the exact bound segment.
+                        segment = b"".join(retained_rows[1:])
+                        if not segment or segment not in b"".join(row_bytes):
+                            raise ValueError("prior session transcript changed")
+                        prior_pins.append(previous["result_artifact_id"])
+            except (ValueError, RuntimeError, OSError, KeyError, TypeError):
+                evidence["reason"] = "prior_session_history_unavailable_or_changed"
+                return fleet_artifacts.put_bytes(self.runs_dir, self.mission_id,
+                    fleet_json.canonical_bytes(evidence))["artifact_id"]
+            if prior_pins:
+                evidence["prior_result_artifact_ids"] = sorted(prior_pins)
+            active: set[str] = set()
+            snapshots = []
+            invalid_counter = False
+            counter_regression = False
+            for row in rows:
+                payload = row.get("payload", {})
+                if row.get("type") != "event_msg" or not isinstance(payload, dict):
+                    continue
+                if payload.get("type") == "task_started" and isinstance(payload.get("turn_id"), str):
+                    active.add(payload["turn_id"])
+                elif payload.get("type") == "task_complete":
+                    active.discard(payload.get("turn_id"))
+                elif payload.get("type") == "token_count":
+                    counts = self._usage_counts((payload.get("info") or {}).get("total_token_usage"))
+                    if counts is not None:
+                        if snapshots and any(counts[k] < snapshots[-1][k] for k in counts):
+                            counter_regression = True
+                        snapshots.append(counts)
+                    else:
+                        invalid_counter = True
+            if len(metadata) != 1 or metadata[0]["payload"].get("model_provider") != "openai":
+                evidence["reason"] = "session_metadata_unavailable_or_ambiguous"
+            elif active:
+                evidence["reason"] = "overlapping_turn_at_dispatch"
+            elif invalid_counter:
+                evidence["reason"] = "invalid_usage_counter_snapshot"
+            elif counter_regression:
+                evidence["reason"] = "usage_counter_reset_or_regression"
+            elif snapshots:
+                evidence.update(status="known", counts=snapshots[-1],
+                    source="pre_dispatch_session_counter", reason=None)
+            elif not any(row.get("type") == "event_msg"
+                         and row.get("payload", {}).get("type") == "task_started" for row in rows):
+                evidence.update(status="known",
+                    counts={"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0},
+                    source="observed_empty_session_before_first_turn", reason=None)
+            else:
+                evidence["reason"] = "prior_turn_has_no_counter_frontier"
+        return fleet_artifacts.put_bytes(self.runs_dir, self.mission_id,
+                                         fleet_json.canonical_bytes(evidence))["artifact_id"]
+
     def _transcript_result(
         self,
         submission: Mapping[str, Any],
         member: Mapping[str, Any],
-    ) -> tuple[dict[str, Any], bytes, str, str, bytes, str] | None:
+    ) -> tuple[dict[str, Any], bytes, str, str, bytes, str, dict[str, Any]] | None:
         agent_session = member["agent_session"]["value"]
         rows, row_bytes, transcript_path, _ = self._transcript_rows(agent_session)
         if not rows:
@@ -1806,9 +1912,30 @@ class HerdrBackend:
         # differs. The strict evidence verifier below rejects that mismatch
         # after retaining both versions, so recovery cannot spin or admit it.
         complete_index = completed[0][0]
-        transcript_segment = row_bytes[metadata[0][0]] + b"".join(
-            row_bytes[start : complete_index + 1]
-        )
+        segment_start = start
+        usage_frontier = {"status": "not_applicable", "reason": None}
+        baseline_id = submission.get("usage_baseline_artifact_id")
+        if baseline_id is not None:
+            baseline = fleet_json.loads(fleet_artifacts.get_bytes(
+                self.runs_dir, self.mission_id, baseline_id))
+            captured_rows = baseline.get("captured_rows")
+            prefix_valid = (type(captured_rows) is int and 0 <= captured_rows <= start)
+            if prefix_valid and baseline.get("transcript_sha256") is not None:
+                prefix_valid = (hashlib.sha256(b"".join(row_bytes[:captured_rows])).hexdigest()
+                                == baseline["transcript_sha256"])
+            if prefix_valid:
+                segment_start = captured_rows
+                usage_frontier = {"status": "verified", "reason": None}
+            else:
+                # A session transcript is mutable external evidence. Its
+                # replacement/reset makes the counter delta unknown, but does
+                # not invalidate an otherwise bound completed role result.
+                usage_frontier = {"status": "unknown",
+                    "reason": "usage_baseline_transcript_frontier_changed"}
+        selected = list(range(segment_start, complete_index + 1))
+        if metadata[0][0] not in selected:
+            selected.insert(0, metadata[0][0])
+        transcript_segment = b"".join(row_bytes[index] for index in selected)
         transcript_sha256 = hashlib.sha256(transcript_segment).hexdigest()
         final_bytes = final_text.encode("utf-8")
         try:
@@ -1824,6 +1951,7 @@ class HerdrBackend:
             transcript_path,
             transcript_segment,
             transcript_sha256,
+            usage_frontier,
         )
 
     def collect_result(self, run_id: str) -> dict[str, Any] | None:
@@ -1868,6 +1996,7 @@ class HerdrBackend:
                         transcript_path,
                         transcript_segment,
                         transcript_sha256,
+                        usage_frontier,
                     ) = observed
                     expected = {
                         "schema_version": 1,
@@ -1894,6 +2023,17 @@ class HerdrBackend:
                     transcript_artifact = fleet_artifacts.put_bytes(
                         self.runs_dir, self.mission_id, transcript_segment
                     )
+                    baseline_id = submission.get("usage_baseline_artifact_id")
+                    if baseline_id is not None:
+                        baseline = fleet_json.loads(fleet_artifacts.get_bytes(
+                            self.runs_dir, self.mission_id, baseline_id))
+                        if (not isinstance(baseline, dict)
+                                or baseline.get("mission_id") != self.mission_id
+                                or baseline.get("run_id") != normalized_run
+                                or baseline.get("prompt_sha256") != submission["prompt_sha256"]
+                                or baseline.get("generation") != state["generation"]
+                                or baseline.get("agent_session") not in (None, member["agent_session"])):
+                            raise HerdrBackendError("usage baseline CAS binding mismatch")
                     result = {
                         **raw_result,
                         "artifact_id": final_artifact["artifact_id"],
@@ -1912,6 +2052,9 @@ class HerdrBackend:
                             "transcript_path": transcript_path,
                             "transcript_sha256": transcript_sha256,
                             "transcript_artifact_id": transcript_artifact["artifact_id"],
+                            **({"usage_baseline_artifact_id": baseline_id}
+                               if baseline_id is not None else {}),
+                            "usage_baseline_frontier": usage_frontier,
                         },
                     }
                     try:

@@ -1,6 +1,6 @@
 # Arranque de una sesión privada Herdr/Codex
 
-El backend oficial actual fija Herdr 0.9.0/Codex 0.153.4 y aplica el guard de
+El backend personal oficial actual fija Herdr 0.9.0/Codex 0.154.0 y aplica el guard de
 superficie antes de cada envío. Consulta el [contrato de versiones](herdr-cli-versions.md):
 los ensayos históricos descritos abajo no prueban la recuperación después de
 reiniciar el servidor con las versiones nuevas.
@@ -50,14 +50,20 @@ que la política efectiva esté atestada.
 
 ## Objetivo y restricciones
 
-El clasificador existente busca palabras en el objetivo, sin interpretar
-negaciones. `No ... hacer commit, push o deploy` elevó una revisión local a riesgo
-alto por la palabra `deploy`. El intento quedó registrado y fue retirado por el
-controlador. El objetivo positivo se volvió a expresar con la misma revisión
-local; el párrafo completo de restricciones se conservó literalmente en CAS y
-en `scope_constraints` de cada prompt real. No se cambió el clasificador ni se
-redujo el riesgo de un registro existente. Esta separación no sirve para ocultar
-efectos solicitados: toda acción positiva debe permanecer en el objetivo evaluado.
+El clasificador conserva su política existente. El ajuste léxico opcional para
+frases como `Document token metrics` queda diferido: una excepción global
+cambiaría también los carriles históricos. No se reduce el riesgo de un registro
+existente ni se ocultan efectos solicitados.
+
+El entorno personal (`PATH`, `HOME`, `CODEX_HOME` y `ZDOTDIR`) se pasa
+explícitamente tanto al workspace como a cada split: no se confía en herencia de
+shell. El home privado necesita el hook `SessionStart` oficial para publicar la
+identidad. Un modal de confianza se detiene antes del prompt; si la identidad no
+aparece después del envío, el resultado no puede admitirse y se reconcilia el
+mismo run sin reenviarlo. La confianza persistida solo
+habilita ese hook exacto; la identidad efectiva aún debe aparecer en receipt y
+transcript. Una skill inyectada después del prompt, incluida una que no estaba en
+el catálogo congelado, invalida la evidencia y nunca se normaliza.
 
 ## Recuperación y evidencia
 

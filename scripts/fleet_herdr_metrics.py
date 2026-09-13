@@ -148,7 +148,7 @@ def timing(current, events, runs):
     return result
 
 
-def usage(rows, turn_id):
+def usage(rows, turn_id, baseline=None, *, baseline_frontier=None):
     unknown = {"prompt_tokens": None, "completion_tokens": None, "cached_input_tokens": None,
                "usage_source": None, "usage_reason": "no_assignable_turn_usage"}
     starts = [i for i,r in enumerate(rows) if r.get("type") == "event_msg" and r.get("payload", {}).get("type") == "task_started" and r["payload"].get("turn_id") == turn_id]
@@ -167,12 +167,28 @@ def usage(rows, turn_id):
             active_before.discard(payload.get("turn_id"))
     if active_before:
         return {**unknown, "usage_reason": "overlapping_turn_usage"}
+    if baseline is not None and any(
+            r.get("type") == "event_msg"
+            and r.get("payload", {}).get("type") == "task_started"
+            for r in rows[:first]):
+        return {**unknown, "usage_reason": "overlapping_turn_usage"}
     if any(r.get("type") == "event_msg" and r.get("payload", {}).get("type") == "task_started" for r in rows[first+1:last]):
         return {**unknown, "usage_reason": "overlapping_turn_usage"}
+    if baseline_frontier is not None:
+        if (not isinstance(baseline_frontier, dict)
+                or baseline_frontier.get("status") not in {"verified", "not_applicable", "unknown"}):
+            return {**unknown, "usage_reason": "invalid_usage_baseline_frontier"}
+        if baseline_frontier["status"] == "unknown":
+            reason = baseline_frontier.get("reason")
+            return {**unknown, "usage_reason": reason if isinstance(reason, str) and reason
+                    else "unknown_usage_baseline_frontier"}
     def counts(value):
         keys = ("input_tokens", "output_tokens", "cached_input_tokens")
-        return {k:value[k] for k in keys} if isinstance(value,dict) and all(type(value.get(k)) is int and value[k]>=0 for k in keys) else None
+        return ({k:value[k] for k in keys} if isinstance(value,dict)
+                and all(type(value.get(k)) is int and value[k]>=0 for k in keys)
+                and value["cached_input_tokens"] <= value["input_tokens"] else None)
     snapshots = []
+    invalid_snapshot = False
     for index,row in enumerate(rows[:last]):
         p = row.get("payload", {})
         if row.get("type") == "event_msg" and p.get("type") == "token_count":
@@ -180,11 +196,34 @@ def usage(rows, turn_id):
             total = counts(info.get("total_token_usage"))
             if total is not None:
                 snapshots.append((index,total,counts(info.get("last_token_usage"))))
+            else:
+                invalid_snapshot = True
     inside = [s for s in snapshots if s[0] > first]
     before = [s for s in snapshots if s[0] < first]
+    if invalid_snapshot:
+        return {**unknown, "usage_reason": "invalid_usage_counter_snapshot"}
     if not inside:
-        return unknown
-    if before:
+        return {**unknown, "usage_reason": "invalid_usage_counter_snapshot" if invalid_snapshot
+                else unknown["usage_reason"]}
+    if baseline is not None:
+        if (not isinstance(baseline, dict) or baseline.get("kind") != "herdr_usage_baseline"
+                or baseline.get("status") not in {"known", "unknown"}):
+            return {**unknown, "usage_reason": "invalid_usage_baseline_evidence"}
+        if baseline["status"] == "unknown":
+            reason = baseline.get("reason")
+            return {**unknown, "usage_reason": reason if isinstance(reason, str) and reason else "unknown_usage_baseline"}
+        baseline_counts = counts(baseline.get("counts"))
+        if baseline_counts is None:
+            return {**unknown, "usage_reason": "invalid_usage_baseline_evidence"}
+        source = baseline.get("source")
+        if source not in {"pre_dispatch_session_counter", "observed_empty_session_before_first_turn"}:
+            return {**unknown, "usage_reason": "invalid_usage_baseline_evidence"}
+        # The retained prefix starts at the dispatch frontier. New counters
+        # before task_started cannot be attributed to this bound turn.
+        if any(total != baseline_counts for _, total, _ in before):
+            return {**unknown, "usage_reason": "usage_counter_changed_before_bound_turn"}
+        baseline = baseline_counts
+    elif before:
         baseline, source = before[-1][1], "prior_session_counter"
     elif inside[0][1] == inside[0][2] and not any(r.get("payload", {}).get("type") == "task_started" for r in rows[:first]):
         baseline, source = dict.fromkeys(inside[0][1],0), "first_total_equals_last_in_first_session_turn"
@@ -196,6 +235,11 @@ def usage(rows, turn_id):
             return {**unknown, "usage_reason": "usage_counter_reset_or_regression"}
         prior = total
     delta = {k:prior[k]-baseline[k] for k in prior}
+    if delta["cached_input_tokens"] > delta["input_tokens"]:
+        return {**unknown, "usage_reason": "invalid_usage_counter_delta"}
+    usage_source = ("bound_codex_transcript_pre_dispatch_cas_delta"
+                    if source in {"pre_dispatch_session_counter", "observed_empty_session_before_first_turn"}
+                    else "bound_codex_transcript_cumulative_delta")
     return {"prompt_tokens":delta["input_tokens"], "completion_tokens":delta["output_tokens"],
-        "cached_input_tokens":delta["cached_input_tokens"], "usage_source":"bound_codex_transcript_cumulative_delta",
+        "cached_input_tokens":delta["cached_input_tokens"], "usage_source":usage_source,
         "usage_baseline":source, "usage_reason":None, "usage_scope":"observed_runtime_counters_not_billing"}

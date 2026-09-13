@@ -1,4 +1,4 @@
-"""Herdr archives v2-v5 (historical) and v6 (durable Research evidence).
+"""Herdr archives v2-v5 (historical), v6 Research and v7 minimal evidence.
 
 The existing CMUX archive format remains unchanged. This format records a Git
 tree (including uncommitted candidate changes) without creating a commit.
@@ -23,6 +23,7 @@ import fleet_json
 import fleet_herdr_evidence
 import fleet_herdr_permissions
 import fleet_herdr_profile
+import fleet_herdr_metrics
 import fleet_herdr_sdd
 import fleet_functional
 import fleet_mission
@@ -349,15 +350,17 @@ def _capture_contents(runs_dir, mission_id, role_results, backend_state, compile
         contents["sdd/binding.json"] = sdd["binding"]
     # Reject missing or incompatible recorded permissions before staging files.
     attest_admissions(contents, current, frozen["candidate_repo"], profile=profile)
-    schema_version = profile.archive_schema_version if profile is fleet_herdr_profile.RESEARCH else (5 if sdd is not None else (4 if functional is not None else 3))
-    index = {"schema_version": schema_version, "permissions_policy_version": profile.permissions_policy_version if profile is fleet_herdr_profile.RESEARCH else (2 if options.get("herdr_capsule_manifest") else 1), "backend": "herdr", "mission_id": mission_id,
+    versioned = profile is not fleet_herdr_profile.LEGACY
+    schema_version = profile.archive_schema_version if versioned else (5 if sdd is not None else (4 if functional is not None else 3))
+    index = {"schema_version": schema_version, "permissions_policy_version": profile.permissions_policy_version if versioned else (2 if options.get("herdr_capsule_manifest") else 1), "backend": "herdr", "mission_id": mission_id,
         "compiled_digest": compiled["compiled_digest"], "ledger_head": current["head_sha256"],
         "base_sha": current["base_sha"], "final_tree_sha": frozen["tree_sha"],
         "entries": {name: {"sha256": _sha(content), "bytes": len(content)} for name, content in sorted(contents.items())}}
-    if profile is fleet_herdr_profile.RESEARCH:
+    if versioned:
         index.update({"herdr_profile": profile.profile_id,
-                      "herdr_profile_sha256": profile.digest,
-                      "investigated_tree_sha": research["tree_sha"]})
+                      "herdr_profile_sha256": profile.digest})
+    if profile is fleet_herdr_profile.RESEARCH:
+        index["investigated_tree_sha"] = research["tree_sha"]
     if sum(map(len, contents.values())) > 128 * 1024 * 1024:
         raise HerdrArchiveError("archive exceeds size limit")
     return contents, index
@@ -421,6 +424,7 @@ def attest_admissions(contents: dict[str, bytes], current: dict[str, Any], cwd: 
     options = fleet_json.loads(contents["runtime-options.json"])
     capsule_manifest = options.get("herdr_capsule_manifest")
     proofs = {}
+    usage_by_run = {}
     for admission in admissions:
         role = expected[admission["request_key"]]
         recorded = admission.get("result")
@@ -441,8 +445,28 @@ def attest_admissions(contents: dict[str, bytes], current: dict[str, Any], cwd: 
                 permission_version=profile.permissions_policy_version)
         except fleet_herdr_evidence.EvidenceError as exc:
             raise HerdrArchiveError(f"{admission['request_key']} permission evidence: {exc}") from exc
+        evidence = result["evidence"]
+        baseline = None
+        baseline_id = evidence.get("usage_baseline_artifact_id")
+        if baseline_id is not None:
+            try:
+                baseline = fleet_json.loads(read(baseline_id))
+            except (KeyError, TypeError, fleet_json.FleetJSONError) as exc:
+                raise HerdrArchiveError("usage baseline CAS is unavailable") from exc
+            if (not isinstance(baseline, dict)
+                    or baseline.get("mission_id") != current["mission_id"]
+                    or baseline.get("run_id") != admission["run_id"]
+                    or baseline.get("prompt_sha256") != admission["task_sha256"]
+                    or baseline.get("generation") != evidence.get("generation")
+                    or baseline.get("agent_session") not in (None, evidence["agent_session"])):
+                raise HerdrArchiveError("usage baseline binding mismatch")
+        transcript = fleet_json.load_jsonl(read(evidence["transcript_artifact_id"]))
+        usage_by_run[admission["run_id"]] = fleet_herdr_metrics.usage(
+            transcript, result["turn_id"], baseline,
+            baseline_frontier=evidence.get("usage_baseline_frontier"))
     return {"status": "attested", "policy_version": 2 if capsule_manifest else profile.permissions_policy_version,
-            "scope": "external_seatbelt_capsule" if capsule_manifest else "recorded_codex_turn_configuration", "runs": len(proofs), "by_run": proofs}
+            "scope": "external_seatbelt_capsule" if capsule_manifest else "recorded_codex_turn_configuration",
+            "runs": len(proofs), "by_run": proofs, "usage_by_run": usage_by_run}
 
 
 def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
@@ -453,10 +477,10 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
     with fleet_safe_paths.RootedFS(runs_dir) as store:
         raw = _read(store, archive / "archive-index.json")
         index = fleet_json.loads(raw)
-        if not isinstance(index, dict) or raw != _bytes(index) or (type(index.get("schema_version")) is not int or index["schema_version"] not in {2, 3, 4, 5, 6}) or index.get("backend") != "herdr" or index.get("mission_id") != mission_id:
+        if not isinstance(index, dict) or raw != _bytes(index) or (type(index.get("schema_version")) is not int or index["schema_version"] not in {2, 3, 4, 5, 6, 7}) or index.get("backend") != "herdr" or index.get("mission_id") != mission_id:
             raise HerdrArchiveError("invalid Herdr archive index")
         if index["schema_version"] >= 3 and (type(index.get("permissions_policy_version")) is not int
-                or index["permissions_policy_version"] not in {1, 2, 3}):
+                or index["permissions_policy_version"] not in {1, 2, 3, 4}):
             raise HerdrArchiveError("archive permission policy version is invalid")
         contents = {}
         entries = index.get("entries")
@@ -473,14 +497,18 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
             profile = fleet_herdr_profile.resolve_profile(compiled)
         except fleet_herdr_profile.ProfileError as exc:
             raise HerdrArchiveError(str(exc)) from exc
-        if index["schema_version"] == 6:
-            if (profile is not fleet_herdr_profile.RESEARCH
+        if index["schema_version"] in {6, 7}:
+            expected_profile = (fleet_herdr_profile.RESEARCH if index["schema_version"] == 6
+                                else fleet_herdr_profile.MINIMAL)
+            if (profile is not expected_profile
                     or index.get("herdr_profile") != profile.profile_id
                     or index.get("herdr_profile_sha256") != profile.digest
                     or index.get("permissions_policy_version") != profile.permissions_policy_version):
-                raise HerdrArchiveError("Research archive profile binding mismatch")
+                raise HerdrArchiveError("versioned archive profile binding mismatch")
         elif profile is not fleet_herdr_profile.LEGACY:
-            raise HerdrArchiveError("Research profile requires archive schema v6")
+            if profile is fleet_herdr_profile.RESEARCH:
+                raise HerdrArchiveError("Research profile requires archive schema v6")
+            raise HerdrArchiveError("minimal profile requires archive schema v7")
         events = [fleet_json.loads(line) for line in contents["ledger.jsonl"].splitlines()]
         archived_state = state.derive_state(events)
         state.verify_events(events)
@@ -592,7 +620,9 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
         roles = fleet_json.loads(contents["role-results.json"])
         if set(roles) != profile.result_roles or any(roles[role].get("artifact_id") != _sha(contents[f"results/{role}.txt"]) for role in profile.result_roles):
             raise HerdrArchiveError("archive role artifact binding mismatch")
-        members = {member["instance_id"]: member for member in [compiled["resolved"]["lead"], *compiled["resolved"]["instances"]]}
+        members = {member["instance_id"]: member for member in
+                   [compiled["resolved"].get("lead"), *compiled["resolved"]["instances"]]
+                   if member is not None}
         for role, result in roles.items():
             matches = [a for a in archived_state["admissions"].values() if a["recipient_instance"] == role and a["run_id"] == result.get("run_id")]
             if len(matches) != 1:
@@ -707,7 +737,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
         if bool(functional_spec) != bool(archived_state.get("functional_policy")):
             raise HerdrArchiveError("archive functional options/policy mismatch")
         if functional_spec is not None:
-            if (index["schema_version"] not in {4, 5, 6} or fleet_functional.digest(fleet_functional.validate(functional_spec))
+            if (index["schema_version"] not in {4, 5, 6, 7} or fleet_functional.digest(fleet_functional.validate(functional_spec))
                     != archived_state["functional_policy"]["spec_artifact_id"]):
                 raise HerdrArchiveError("archive functional contract/schema mismatch")
             try:

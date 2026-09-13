@@ -74,6 +74,16 @@ The native execution admission block remains in place. Verified behavior is
 instruction delivery and recovery with provider-free fixtures, not autonomous
 model behavior, skill obedience or runtime effect containment.
 
+Role criteria are deliberately different: Research answers material uncertainty
+with pinned sources and negative cases; Reviewer examines the complete change for
+actionable defects and may report none; Verifier reproduces acceptance/evidence
+on the same frozen tree; Synthesis reconciles discrepancies only when selected.
+The minimal profile selects only Build from creation. Research-profile Build tasks
+created through the official entry also carry `input_evidence` under
+`bounded-cas-v1`: useful summaries plus bounded CAS detail references, never all
+transcripts or a global catalog. Worker summaries must identify findings used or
+discarded. This is auditability of delivery rather than proof of obedience.
+
 Focused verification (reuses local Git history; creates no commits):
 
 ```sh

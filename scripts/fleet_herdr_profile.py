@@ -9,7 +9,8 @@ import fleet_json
 
 LEGACY_PRESET = "astra_sol"
 RESEARCH_PRESET = "astra_sol_research_v1"
-HERDR_PRESETS = frozenset({LEGACY_PRESET, RESEARCH_PRESET})
+MINIMAL_PRESET = "sol_minimal_v1"
+HERDR_PRESETS = frozenset({LEGACY_PRESET, RESEARCH_PRESET, MINIMAL_PRESET})
 
 
 @dataclass(frozen=True)
@@ -115,7 +116,22 @@ RESEARCH = HerdrProfile(
     allow_experimental_launch=False,
 )
 
-BY_PRESET = {profile.preset: profile for profile in (LEGACY, RESEARCH)}
+MINIMAL = HerdrProfile(
+    profile_id=MINIMAL_PRESET,
+    preset=MINIMAL_PRESET,
+    stages=(("build", "worker", "build"),),
+    members=(("worker", "sol_worker", "gpt-5.6-sol", "BUILD", "write"),),
+    input_policy="minimal-build-v1",
+    permissions_policy_version=4,
+    minimum_archive_schema_version=7,
+    archive_schema_version=7,
+    result_roles=frozenset({"worker"}),
+    writer_instance="worker",
+    allow_capsule=False,
+    allow_experimental_launch=False,
+)
+
+BY_PRESET = {profile.preset: profile for profile in (LEGACY, RESEARCH, MINIMAL)}
 
 
 class ProfileError(ValueError):
@@ -131,7 +147,8 @@ def resolve_profile(compiled: dict[str, Any]) -> HerdrProfile:
         resolved = compiled["resolved"]
         workflow = compiled["workflow"]
         profile = BY_PRESET[resolved["preset"]]
-        members = [resolved["lead"], *resolved["instances"]]
+        members = [member for member in [resolved.get("lead"), *resolved["instances"]]
+                   if member is not None]
     except (KeyError, TypeError) as exc:
         raise ProfileError("compiled workflow has no supported Herdr profile") from exc
     actual = [
@@ -159,6 +176,15 @@ def resolve_profile(compiled: dict[str, Any]) -> HerdrProfile:
             != {"lead_result", "research_result", "worker_result", "reviewer_result", "verifier_result"}
         ):
             raise ProfileError("Research workflow contract is incomplete")
+    if profile is MINIMAL:
+        if (
+            workflow.get("name") != "herdr-minimal-implementation"
+            or workflow.get("autonomy", {}).get("owner") != "worker"
+            or workflow.get("autonomy", {}).get("allow_parallel") is not False
+            or workflow.get("assurance", {}).get("profile") != "none"
+            or workflow.get("capabilities", {}).get("required_outcomes") != ["worker_result"]
+        ):
+            raise ProfileError("minimal workflow contract is incomplete")
     return profile
 
 
@@ -209,15 +235,15 @@ def validate_profile_binding(
         elif supplied != runtime_binding(profile):
             raise ProfileError("historical Herdr profile binding drift")
     elif supplied != runtime_binding(profile):
-        raise ProfileError("Research Herdr profile binding is missing or changed")
-    if profile is RESEARCH:
+        raise ProfileError("versioned Herdr profile binding is missing or changed")
+    if profile in {RESEARCH, MINIMAL}:
         from fleet_herdr_personal import PROFILE as PERSONAL_PROFILE
         if runtime_options.get("herdr_personal_cli") != PERSONAL_PROFILE:
-            raise ProfileError("Research profile requires its exact personal Codex CLI binding")
+            raise ProfileError("versioned profile requires its exact personal Codex CLI binding")
         if (runtime_options.get("herdr_capsule_manifest") is not None
                 or runtime_options.get("herdr_launch_manifest") is not None
                 or "executor" in runtime_options):
-            raise ProfileError("Research profile does not accept an alternate runtime executor")
+            raise ProfileError("versioned profile does not accept an alternate runtime executor")
     if current is not None:
         expected = creation_binding(compiled)
         observed = {

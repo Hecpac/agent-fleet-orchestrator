@@ -32,6 +32,33 @@ def verify_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: st
                       runtime_contract: dict[str, Any] | None = None,
                       expected_provider: str = "openai") -> dict[str, Any]:
     """Accept only a uniquely bound completed turn; no live filesystem/UI reads."""
+    return _inspect_transcript(raw, agent_session=agent_session, model=model, turn_id=turn_id,
+        prompt_sha256=prompt_sha256, final_bytes=final_bytes, permission_policy=permission_policy,
+        runtime_contract=runtime_contract, expected_provider=expected_provider)
+
+
+def observe_rejected_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: str,
+                                prompt_sha256: str, final_bytes: bytes,
+                                runtime_contract=None, expected_provider="openai"):
+    """Telemetry only after a retained rejection; never admission or permission authority.
+
+    Bind the unique completed turn and final CAS bytes even when its context or
+    completion rendering violated the strict contract. All identity, ordering,
+    model, version and ambiguity checks remain mandatory.
+    """
+    _inspect_transcript(raw, agent_session=agent_session, model=model, turn_id=turn_id,
+        prompt_sha256=prompt_sha256, final_bytes=final_bytes, runtime_contract=runtime_contract,
+        expected_provider=expected_provider, observation_only=True)
+    return {"status": "observed_rejected_turn", "authority": "none"}
+
+
+def _inspect_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: str,
+                      prompt_sha256: str, final_bytes: bytes,
+                      permission_policy: dict[str, Any] | None = None,
+                      runtime_contract: dict[str, Any] | None = None,
+                      expected_provider: str = "openai",
+                      observation_only: bool = False) -> dict[str, Any]:
+    """Accept only a uniquely bound completed turn; no live filesystem/UI reads."""
     if not raw or len(raw) > 32 * 1024 * 1024 or not raw.endswith(b"\n"):
         raise EvidenceError("transcript must be bounded complete JSONL")
     if not all(isinstance(value, str) and value for value in (agent_session, model, turn_id, prompt_sha256)):
@@ -81,10 +108,10 @@ def verify_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: st
         raise EvidenceError("evidence extends beyond the bound turn")
     if sum(r.get("type") == "event_msg" and r["payload"].get("type") == "task_started" for r in rows[start:end]) != 1:
         raise EvidenceError("task_started is ambiguous")
-    if any(r.get("type") == "response_item" and r["payload"].get("type") == "message"
+    if not observation_only and any(r.get("type") == "response_item" and r["payload"].get("type") == "message"
            and r["payload"].get("role") == "user" for r in rows[prompt_index + 1:end]):
         raise EvidenceError("additional user input after bound prompt")
-    if runtime_contract == versions.TASK_CONTEXT_CONTRACT:
+    if not observation_only and runtime_contract == versions.TASK_CONTEXT_CONTRACT:
         for row in rows[start:prompt_index]:
             payload = row["payload"]
             if (row.get("type") == "response_item" and payload.get("role") == "user"
@@ -110,7 +137,7 @@ def verify_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: st
     if (len(completions) != 1 or completions[0][0] <= finals[0][0]
             or completions[0][1].get("turn_id") != turn_id
             or not isinstance(completions[0][1].get("last_agent_message"), str)
-            or completions[0][1].get("last_agent_message", "").encode() != final_bytes
+            or (not observation_only and completions[0][1].get("last_agent_message", "").encode() != final_bytes)
             or completions[0][0] != len(rows) - 1):
         raise EvidenceError("task_complete binding mismatch")
     if permission_policy is None:

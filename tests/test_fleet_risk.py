@@ -30,6 +30,15 @@ class FleetRiskTests(unittest.TestCase):
         )
         self.assertEqual(medium["level"], "medium")
 
+    def test_token_metrics_preserves_existing_classifier_policy(self) -> None:
+        benign = risk.classify_categories(
+            "Document token metrics for the local report", "/tmp/repository", "/tmp/repository")
+        self.assertIn("credentials", benign)
+        sensitive = risk.classify_categories(
+            "Document token metrics and read API token credential",
+            "/tmp/repository", "/tmp/repository")
+        self.assertIn("credentials", sensitive)
+
     def test_high_categories_pause_before_effect(self) -> None:
         for phrase, category in (
             ("deploy this to production", "production"),

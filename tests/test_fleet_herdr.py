@@ -903,6 +903,49 @@ class HerdrBackendTests(unittest.TestCase):
         self.assertEqual(observed["status"], "working")
         self.assertFalse(any(call[1:3] == ["agent", "prompt"] for call in operations))
 
+    def test_reused_session_baseline_requires_retained_prior_turn_history(self):
+        backend = self.booted()
+        run_id = str(uuid.uuid4())
+        prompt = self.prompt(run_id)
+        backend.submit(run_id, prompt, instance_id="lead")
+        current = backend.state()
+        member = next(m for m in current["members"] if m["instance_id"] == "lead")
+        session = member["agent_session"]["value"]
+        final = {**json.loads(prompt)["result_contract"], "status":"PASS",
+                 "summary":"fixture prior Plan", "artifacts":[]}
+        self.write_transcript(agent_session=session,member=member,prompt=prompt,final=final)
+        path = self.transcripts[session]
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        counts={"input_tokens":100,"output_tokens":10,"cached_input_tokens":20}
+        rows.insert(-2,{"type":"event_msg","payload":{"type":"token_count",
+            "info":{"total_token_usage":counts,"last_token_usage":counts}}})
+        path.write_text(''.join(json.dumps(row)+'\n' for row in rows))
+        previous = backend.collect_result(run_id)
+        def capture():
+            pin = backend._capture_usage_baseline(run_id=str(uuid.uuid4()),
+                prompt_sha256="f"*64,generation=current["generation"],member=member)
+            return fleet_json.loads(fleet_artifacts.get_bytes(self.runs,self.mission_id,pin))
+        good=capture()
+        self.assertEqual(good["counts"],counts)
+        self.assertEqual(good["prior_result_artifact_ids"],[previous["result_artifact_id"]])
+        reset = {"type":"event_msg","payload":{"type":"token_count",
+            "info":{"total_token_usage":dict.fromkeys(counts,0)}}}
+        invalid = copy.deepcopy(reset)
+        invalid["payload"]["info"]["total_token_usage"]["cached_input_tokens"] = 999
+        for suffix, reason in (([reset],"usage_counter_reset_or_regression"),
+                ([invalid,rows[-3]],"invalid_usage_counter_snapshot")):
+            path.write_text(''.join(json.dumps(row)+'\n' for row in rows+suffix))
+            bad=capture()
+            self.assertEqual(bad["status"],"unknown")
+            self.assertEqual(bad["reason"],reason)
+        for replacement in ([rows[0]], [rows[0],rows[-3]]):
+            path.write_text(''.join(json.dumps(row)+'\n' for row in replacement))
+            missing=capture()
+            self.assertEqual(missing["status"],"unknown")
+            self.assertEqual(missing["reason"],"prior_session_history_unavailable_or_changed")
+        path.unlink()
+        self.assertEqual(backend.collect_result(run_id),previous)
+
     def test_collect_result_binds_transcript_turn_prompt_and_cas(self) -> None:
         backend = self.booted()
         run_id = str(uuid.uuid4())

@@ -85,3 +85,39 @@ class EvidenceTests(unittest.TestCase):
         prior[2]["payload"]["content"][0]["text"] = "task"
         with self.assertRaises(evidence.EvidenceError):
             evidence.verify_transcript(self.raw(self.rows[:1] + prior + self.rows[1:]), **self.expected)
+
+
+class RejectedObservationTests(unittest.TestCase):
+    setUp = EvidenceTests.setUp
+    raw = EvidenceTests.raw
+
+    def test_observation_has_no_authority_and_does_not_relax_admission(self):
+        for change in ("context", "rendering"):
+            rows = copy.deepcopy(self.rows)
+            if change == "context":
+                extra = copy.deepcopy(rows[3])
+                extra["payload"]["content"][0]["text"] = "<skill>outside frozen task</skill>"
+                rows.insert(4, extra)
+            else:
+                rows[-1]["payload"]["last_agent_message"] = "different rendering"
+            with self.subTest(change=change):
+                with self.assertRaises(evidence.EvidenceError):
+                    evidence.verify_transcript(self.raw(rows), **self.expected)
+                observed = evidence.observe_rejected_transcript(self.raw(rows), **self.expected)
+                self.assertEqual(observed["authority"], "none")
+                with self.assertRaises(evidence.EvidenceError):
+                    evidence.verify_transcript(self.raw(rows), **self.expected)
+
+    def test_observation_rejects_identity_ambiguity_and_ordering(self):
+        variants = [self.rows[:-1], self.rows+[self.rows[-1]],
+                    self.rows[:4]+[self.rows[3]]+self.rows[4:]]
+        for index, field, value in [(0,"id","wrong"),(0,"model_provider","wrong"),
+                (2,"model","wrong"),(2,"effort","low"),(5,"turn_id","wrong")]:
+            rows=copy.deepcopy(self.rows); rows[index]["payload"][field]=value
+            variants.append(rows)
+        for rows in variants:
+            with self.assertRaises(evidence.EvidenceError):
+                evidence.observe_rejected_transcript(self.raw(rows), **self.expected)
+        for field,value in (("prompt_sha256","0"*64),("final_bytes",b"wrong"),("turn_id","wrong")):
+            with self.assertRaises(evidence.EvidenceError):
+                evidence.observe_rejected_transcript(self.raw(), **{**self.expected,field:value})

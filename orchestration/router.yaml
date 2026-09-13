@@ -432,6 +432,14 @@
     }
   },
   "presets": {
+    "sol_minimal_v1": {
+      "description": "Opt-in minimal Herdr implementation with one Sol writer and one Build turn.",
+      "mode": "autonomous",
+      "include_lead": false,
+      "instances": [
+        {"instance_id": "worker", "role_type": "sol_worker"}
+      ]
+    },
     "astra_sol_research_v1": {
       "description": "Opt-in Herdr profile with durable Astra Research and one Sol candidate writer.",
       "mode": "autonomous",

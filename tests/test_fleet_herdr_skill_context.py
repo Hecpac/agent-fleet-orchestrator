@@ -201,6 +201,40 @@ class RejectedEvidenceRecoveryTests(unittest.TestCase):
         self.transcript_edit = lambda rows: rows.__setitem__(slice(-2, -2), [injected(n, 'turn-protocol-plan') for n in NINE])
         return self.drive()
 
+    def test_rejected_execution_telemetry_survives_offline_without_admission(self):
+        import fleet_report
+        self.stage = 'plan'; self.mutate = lambda result: None
+        def edit(rows):
+            counts = {"input_tokens":150, "output_tokens":20, "cached_input_tokens":30}
+            rows.insert(-2, {"type":"event_msg", "payload":{"type":"token_count",
+                "info":{"total_token_usage":counts,"last_token_usage":counts}}})
+            rows.insert(-2, injected('deploy', 'turn-protocol-plan'))
+        self.transcript_edit = edit
+        capture = self.Backend._capture_usage_baseline
+        def seed_empty_session(backend, **kwargs):
+            session = kwargs['member']['agent_session']['value']
+            path = self.helper.tmp / ('empty-' + session + '.jsonl')
+            metadata = {"type":"session_meta", "timestamp":"2026-09-06T00:00:00Z",
+                "payload":{"id":session,"model_provider":"openai","cli_version":self.fake.codex_version}}
+            path.write_text(json.dumps(metadata) + '\n')
+            self.transcripts[session] = path
+            return capture(backend, **kwargs)
+        with mock.patch.object(self.Backend, '_capture_usage_baseline', seed_empty_session):
+            rejected = self.drive()
+        before = self.current(); calls = len(self.fake.calls)
+        report = fleet_report.build_report(self.runs, self.mid)
+        run = report['runs'][0]
+        self.assertEqual(run['result_disposition'], 'rejected_execution_evidence')
+        self.assertIsNotNone(run['observed'])
+        self.assertEqual((run['prompt_tokens'],run['completion_tokens'],run['cached_input_tokens']), (150,20,30))
+        for path in self.transcripts.values(): path.unlink()
+        self.assertEqual(fleet_report.build_report(self.runs,self.mid), report)
+        self.assertEqual(self.current(), before)
+        self.assertEqual(len(self.fake.calls), calls)
+        self.assertIsNone(self.admission()['result'])
+        self.assertEqual(len(before['admissions']),1)
+        self.assertIn('evidence_rejection', rejected)
+
     def test_rejection_prevents_downstream_and_repeated_pause_resume_resends(self):
         from fleet_herdr_mission import control, _Driver
         result = self.reject_plan(); proof = result['evidence_rejection']

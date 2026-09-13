@@ -9,7 +9,9 @@ from typing import Any
 import fleet_artifacts
 import fleet_functional
 import fleet_herdr_archive
+import fleet_herdr
 import fleet_herdr_evidence
+import fleet_herdr_rejection
 import fleet_herdr_control
 import fleet_herdr_metrics
 import fleet_herdr_profile
@@ -32,6 +34,25 @@ def _seconds(start, end):
         return round(value, 6) if value >= 0 else None
     except (ValueError, TypeError, AttributeError):
         return None
+
+
+def _covered_seconds(ranges):
+    parsed = []
+    for start, end in ranges:
+        try:
+            a, b = (datetime.fromisoformat(value.replace("Z", "+00:00"))
+                    for value in (start, end))
+        except (ValueError, TypeError, AttributeError):
+            continue
+        if a.tzinfo is not None and b.tzinfo is not None and b >= a:
+            parsed.append((a.timestamp(), b.timestamp()))
+    merged = []
+    for start, end in sorted(parsed):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return (round(sum(end - start for start, end in merged), 6) if parsed else None), len(parsed)
 
 
 def _archive(runs: Path, mid: str, names: list[str]) -> dict[str, Any]:
@@ -74,7 +95,9 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
         with fleet_safe_paths.RootedFS(runs) as fs:
             capsule_manifest = fleet_json.loads(fs.read_regular(relative / "runtime-options.json",
                 directory_modes=(0o700, 0o700), file_mode=0o600, max_bytes=16*1024*1024))["herdr_capsule_manifest"]
-    members = {m["instance_id"]: m for m in [compiled["resolved"]["lead"], *compiled["resolved"]["instances"]]}
+    members = {m["instance_id"]: m for m in
+               [compiled["resolved"].get("lead"), *compiled["resolved"]["instances"]]
+               if m is not None}
     records = []
     sessions = set()
     groups = defaultdict(list)
@@ -95,12 +118,32 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
             "timing_reason": "no_bound_turn_timestamps",
             "prompt_tokens": None, "completion_tokens": None,
             "usage_reason": "turn_usage_not_normalized", "cost_usd": None,
-            "cost_reason": "no_durable_billing_receipt"}
+            "cost_reason": "no_durable_billing_receipt",
+            "result_disposition": "not_observed",
+            "prepared_at": submission.get("prepared_at") if isinstance(submission, dict) else None,
+            "submitted_at": submission.get("submitted_at") if isinstance(submission, dict) else None,
+            "preparation_seconds": _seconds(submission.get("prepared_at"), submission.get("submitted_at"))
+                if isinstance(submission, dict) else None}
         result_receipt = admission.get("result")
-        if result_receipt:
+        result_pin = result_receipt.get("artifact_id") if isinstance(result_receipt, dict) else None
+        disposition = "admitted_result" if result_pin else None
+        if result_pin is None and isinstance(backend, dict) and isinstance(submission, dict):
+            try:
+                proof = fleet_herdr_rejection.load(runs, mid, run, backend)
+                if proof is None:
+                    proof = fleet_herdr.load_result_rejection(runs, mid, run)
+                if proof is not None:
+                    result_pin = proof["observed_result_artifact_id"]
+                    disposition = ("rejected_execution_evidence" if proof["kind"] ==
+                                   "herdr_execution_evidence_rejection" else "rejected_role_protocol")
+            except (ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
+                record["observation_reason"] = f"invalid_rejection_evidence: {exc}"
+        if disposition is not None:
+            record["result_disposition"] = disposition
+        if result_pin:
             try:
                 read = lambda digest: fleet_artifacts.get_bytes(runs, mid, digest)
-                result = fleet_json.loads(read(result_receipt["artifact_id"]))
+                result = fleet_json.loads(read(result_pin))
                 evidence = result["evidence"]
                 evidence_contract = evidence.get("runtime_contract")
                 if evidence_contract is not None:
@@ -108,9 +151,13 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
                 if evidence_contract != runtime_contract:
                     raise ValueError("Herdr report result runtime contract differs from validated backend")
                 session = evidence["agent_session"]["value"]
+                observed_provider = (result_receipt.get("provider") if isinstance(result_receipt, dict)
+                                     else "openai")
+                observed_model = (result_receipt.get("model") if isinstance(result_receipt, dict)
+                                  else members[role]["model"])
                 if (result["mission_id"] != mid or result["run_id"] != run or result["instance_id"] != role
-                        or result_receipt["provider"] != "openai"
-                        or result_receipt["model"] != members[role]["model"]
+                        or observed_provider != "openai"
+                        or observed_model != members[role]["model"]
                         or evidence["agent_session"].get("kind") != "id"
                         or evidence["prompt_sha256"] != admission["task_sha256"]
                         or evidence["transcript_sha256"] != evidence["transcript_artifact_id"]):
@@ -120,16 +167,32 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
                     fleet_herdr_evidence.verify_result(result, read_artifact=read, role=role,
                         cwd=fleet_json.loads(read(evidence["capsule_launch_artifact_id"]))["candidate"]["realpath"],
                         prompt_sha256=admission["task_sha256"], capsule_manifest=capsule_manifest, current=current)
-                fleet_herdr_evidence.verify_transcript(transcript, agent_session=session,
-                    model=result_receipt["model"], turn_id=result["turn_id"],
+                inspect_transcript = (fleet_herdr_evidence.observe_rejected_transcript
+                    if disposition == "rejected_execution_evidence"
+                    else fleet_herdr_evidence.verify_transcript)
+                inspect_transcript(transcript, agent_session=session,
+                    model=observed_model, turn_id=result["turn_id"],
                     prompt_sha256=admission["task_sha256"], final_bytes=read(result["artifact_id"]),
                     runtime_contract=runtime_contract, expected_provider="fleet-local" if is_capsule else "openai")
-                observed = {"provider": "fleet-local" if is_capsule else "openai", "model": result_receipt["model"], "effort": "high",
+                observed = {"provider": "fleet-local" if is_capsule else "openai", "model": observed_model, "effort": "high",
                             "agent_session": session, "source": "bound_codex_transcript"}
                 if is_capsule:
                     observed["provider_execution"] = fleet_json.loads(read(evidence["capsule_report_artifact_id"]))["provider_execution"]
                 rows = fleet_json.load_jsonl(transcript)
-                record.update(fleet_herdr_metrics.usage(rows, result["turn_id"]))
+                baseline = None
+                baseline_id = evidence.get("usage_baseline_artifact_id")
+                if baseline_id is not None:
+                    if (not isinstance(submission, dict)
+                            or submission.get("usage_baseline_artifact_id") != baseline_id):
+                        raise ValueError("usage baseline differs from durable submission")
+                    baseline = fleet_json.loads(read(baseline_id))
+                    if (baseline.get("mission_id") != mid or baseline.get("run_id") != run
+                            or baseline.get("prompt_sha256") != admission["task_sha256"]
+                            or baseline.get("generation") != evidence.get("generation")
+                            or baseline.get("agent_session") not in (None, evidence["agent_session"])):
+                        raise ValueError("usage baseline identity mismatch")
+                record.update(fleet_herdr_metrics.usage(rows, result["turn_id"], baseline,
+                    baseline_frontier=evidence.get("usage_baseline_frontier")))
                 bound = [r for r in rows if r.get("type") == "event_msg" and r["payload"].get("turn_id") == result["turn_id"]]
                 for kind, field in (("task_started", "started_at"), ("task_complete", "ended_at")):
                     match = [r for r in bound if r["payload"].get("type") == kind]
@@ -137,10 +200,11 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
                 record["execution_seconds"] = _seconds(record["started_at"], record["ended_at"])
                 if record["execution_seconds"] is not None:
                     record["timing_reason"] = None
-                record.update(observed=observed, observation_reason=None)
+                record.update(observed=observed, observation_reason=None,
+                              result_disposition=disposition)
                 sessions.add(session)
                 groups[(observed["provider"], observed["model"])].append(record)
-            except (ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
+            except (ValueError, RuntimeError, OSError, KeyError, TypeError, AttributeError) as exc:
                 record["observation_reason"] = f"invalid_or_unavailable_evidence: {exc}"
         records.append(record)
     counts = Counter(r["status"] for r in records)
@@ -154,13 +218,23 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
         matching = groups[(group["provider"], group["model"])]
         observed = [r for r in matching if r["prompt_tokens"] is not None and r["completion_tokens"] is not None]
         complete = len(observed) == len(matching)
+        sources = {r.get("usage_source") for r in observed}
         group.update(prompt_tokens=sum(r["prompt_tokens"] for r in observed) if complete else None,
             completion_tokens=sum(r["completion_tokens"] for r in observed) if complete else None,
             usage_observed_runs=len(observed), usage_total_runs=len(matching),
-            usage_source="bound_codex_transcript_cumulative_delta" if complete else None,
+            usage_source=(next(iter(sources)) if complete and len(sources) == 1
+                          else "mixed_verified_runtime_counter_deltas" if complete else None),
             usage_reason=None if complete else "some_runs_lack_assignable_usage")
     observed_runs = sum(r["observed"] is not None for r in records)
     completed = current["status"] in fleet_mission_state.TERMINAL_STATUSES
+    startup_attempts = [attempt for member in (backend or {}).get("members", [])
+                        if isinstance(member, dict)
+                        for attempt in member.get("start_attempts", [])
+                        if isinstance(attempt, dict)]
+    startup_seconds, startup_known = _covered_seconds(
+        (attempt.get("started_at"), attempt.get("ready_at")) for attempt in startup_attempts)
+    preparation_seconds, preparation_known = _covered_seconds(
+        (record.get("prepared_at"), record.get("submitted_at")) for record in records)
     try:
         functional = fleet_functional.report(runs, mid, current)
     except (ValueError, RuntimeError, KeyError, TypeError, OSError) as exc:
@@ -189,6 +263,14 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
         "timing": {"started_at": events[0]["timestamp"], "ended_at": events[-1]["timestamp"] if completed else None,
             "wall_time_seconds": _seconds(events[0]["timestamp"], events[-1]["timestamp"]) if completed else None,
             "controller_wait_seconds": None, "requested_pause_seconds": None,
+            "startup_observed_seconds": startup_seconds,
+            "startup_completed_attempts": startup_known,
+            "startup_reason": ("startup_intervals_not_observed" if not startup_attempts else
+                None if startup_known == len(startup_attempts) else "one_or_more_startup_intervals_are_unknown"),
+            "preparation_observed_seconds": preparation_seconds,
+            "preparation_completed_intervals": preparation_known,
+            "preparation_reason": ("preparation_intervals_not_observed" if not records else
+                None if preparation_known == len(records) else "one_or_more_preparation_intervals_are_unknown"),
             "reason": "no_complete_controller_and_pause_interval_evidence",
             **fleet_herdr_metrics.timing(current, events, records)},
         "archive": archive, "acceptance": archive.get("acceptance") if archive["verified"] else None,

@@ -2193,6 +2193,10 @@ def create_and_drive(
     compiled = workflow_config.compile_path(
         workflow_path(workflow_name), router_path=router_path
     )
+    if (fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"])
+            and fleet_herdr_profile.resolve_profile(compiled) is fleet_herdr_profile.MINIMAL
+            and acceptance_contract is None):
+        raise MissionRunError("minimal Herdr profile requires --acceptance-contract")
     is_herdr = fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"])
     profile = fleet_herdr_profile.resolve_profile(compiled) if is_herdr else None
     if sdd_plan_path is not None and not is_herdr:
@@ -2220,6 +2224,10 @@ def create_and_drive(
         herdr_runtime_options["herdr_launch_manifest"] = fleet_herdr_launch.validate_manifest(herdr_launch_manifest)
     if is_herdr:
         herdr_runtime_options = {**fleet_herdr_profile.runtime_binding(profile), **herdr_runtime_options}
+        if profile is fleet_herdr_profile.RESEARCH:
+            # New official Research missions freeze useful CAS-backed transfer.
+            # Existing missions recover their already persisted runtime options.
+            herdr_runtime_options["herdr_handoff_policy"] = fleet_herdr_runtime.HANDOFF_POLICY
         if herdr_capsule_manifest is None and herdr_launch_manifest is None:
             from fleet_herdr_personal import PROFILE
             herdr_runtime_options["herdr_personal_cli"] = PROFILE
@@ -2310,6 +2318,10 @@ def dry_run(
     compiled = workflow_config.compile_path(
         workflow_path(workflow_name), router_path=router_path
     )
+    if (fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"])
+            and fleet_herdr_profile.resolve_profile(compiled) is fleet_herdr_profile.MINIMAL
+            and acceptance_contract is None):
+        raise MissionRunError("minimal Herdr profile requires --acceptance-contract")
     if functional_contract is not None and not fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
         raise MissionRunError("functional contracts require a supported Herdr workflow")
     if acceptance_contract is not None:

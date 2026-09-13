@@ -215,7 +215,8 @@ class _Driver:
         if self.compiled["workflow"].get("assurance", {}).get("profile") != "none":
             raise HerdrMissionError("Herdr driver requires assurance none")
         resolved = self.compiled["resolved"]
-        self.members = [resolved["lead"], *resolved["instances"]]
+        self.members = [member for member in [resolved.get("lead"), *resolved["instances"]]
+                        if member is not None]
         self.session = self.options.get("herdr_session")
         if not isinstance(self.session, str) or not self.session.strip():
             raise HerdrMissionError("durable herdr_session is required; no implicit session fallback")
@@ -631,11 +632,14 @@ class _Driver:
             "Do not wait for the controller's subsequent archive or terminal verdict."
         )
         stage_instructions = (
-            "Plan: provide a bounded implementation plan. Research: inspect and report source evidence. "
-            "Build: implement and run focused tests using Plan and Research. "
-            "Review: inspect contracts and diff. Verify: independently validate with temporary outputs, "
-            "without modifying candidate. Synthesis: reconcile Plan, Research, Build, Review and Verify "
-            "results, including Research source evidence, and report residual risks. "
+            "Plan: provide a bounded implementation plan. Research: answer material uncertainties with "
+            "pinned source evidence and concrete negative tests. Build: implement and run focused tests "
+            "using the bounded Plan/Research handoff, and identify which findings were used or discarded "
+            "in the summary. Review: inspect the complete change for actionable defects, binding errors, "
+            "risks and omitted cases; explicitly report none when none are found. Verify: independently "
+            "reproduce acceptance and evidence against the same frozen tree, using temporary outputs and "
+            "without modifying candidate. Synthesis: reconcile discrepancies, evidence limits and the "
+            "Plan, Research, Build, Review and Verify results, including Research source evidence. "
             if research_profile else
             "Plan: provide a bounded implementation plan. Build: implement and run focused tests using Plan. "
             "Review: inspect contracts and diff. Verify: independently validate with temporary outputs, "
@@ -651,12 +655,15 @@ class _Driver:
                 "tests with evidence that the implementation meets the acceptance criteria. Do not wait for "
                 "Review, Verify or Synthesis."),
             "research": ("PASS when your read-only investigation supplies concrete source evidence relevant to "
-                "the objective against the controller-pinned investigated snapshot. Do not modify candidate files, "
+                "material questions in the objective against the controller-pinned investigated snapshot. Include "
+                "source locations/hashes, bounded recommendations and negative tests. Do not modify candidate files, "
                 "make implementation decisions on behalf of Build, or wait for later stages."),
-            "review": ("PASS when your read-only review of the frozen candidate contracts and diff finds no "
-                "blocking defects, with concrete evidence. Report discovered defects as FAIL; do not wait for Verify or Synthesis."),
-            "verify": ("PASS when you independently reproduce the required behavior and validate acceptance "
-                "criteria on the frozen candidate, using temporary outputs without changing candidate files. "
+            "review": ("PASS when your read-only review of the frozen candidate contracts and complete diff finds no "
+                "blocking defect in bindings, compatibility, acceptance gates, sole-writer enforcement, duplicate-send "
+                "recovery or scope. Report actionable defects as FAIL, or explicitly report none; do not repeat Research "
+                "or wait for Verify/Synthesis."),
+            "verify": ("PASS when you independently reproduce the required behavior and validate acceptance and its "
+                "evidence on the exact frozen candidate tree, using temporary outputs without changing candidate files. "
                 "Report reproduced failures as FAIL; do not wait for Synthesis."),
             "synthesis": synthesis_criteria,
         }[stage]
@@ -693,6 +700,21 @@ class _Driver:
                 "candidate_tree_sha": frozen["tree_sha"] if frozen else None}}
         if stage == "research":
             task["investigated_snapshot"] = frozen
+            task["material_questions"] = [
+                "Which source assumptions or lifecycle bindings could invalidate the requested change?",
+                "Which existing real entry points and negative fixtures must the implementation reuse?",
+                "What evidence remains unknown or cannot be inferred from model-authored summaries?",
+            ]
+        if (stage == "build" and self.options.get("herdr_handoff_policy") is not None):
+            if self.options["herdr_handoff_policy"] != fleet_herdr_runtime.HANDOFF_POLICY:
+                raise HerdrMissionError("unsupported Herdr handoff policy")
+            try:
+                task["input_evidence"] = fleet_herdr_runtime.bounded_handoff(
+                    mission_id=self.mid, stage=stage, input_artifact_ids=inputs,
+                    current=self.current(),
+                    read_artifact=lambda digest: fleet_artifacts.get_bytes(self.runs, self.mid, digest))
+            except fleet_herdr_runtime.RuntimeContractError as exc:
+                raise HerdrMissionError(str(exc)) from exc
         if getattr(self, "sdd_packet", None) is not None:
             task["sdd_plan"] = self.sdd_packet
         if self.options.get("herdr_capsule_manifest") is not None:
@@ -1158,10 +1180,50 @@ class _Driver:
                     raise HerdrMissionError(f"{stage.title()} changed the candidate before writer admission")
             if stage in {"review", "verify", "synthesis"}:
                 self.freeze()  # archive rejects any drift, including read-only role writes
+        if self.profile is fleet_herdr_profile.MINIMAL:
+            stopped = self.control_stop(backend)
+            if stopped is not None:
+                return stopped
+            # The minimal profile has no Synthesis turn on which to hang closure.
+            # Freeze and run the same external functional gate after its sole
+            # writer has finalized; a Worker PASS is never the acceptance gate.
+            frozen = self.freeze()
+            current = self.current()
+            if current.get("functional_policy"):
+                new_functional = not (isinstance(current.get("functional_attempt"), dict)
+                                      and current["functional_attempt"].get("result"))
+                if new_functional and not self.revalidate_sdd():
+                    return self.response(next_action="SDD plan binding failed closed before new functional check: "
+                                         + str(self.sdd_error))
+                try:
+                    functional = metrics.observe(self.runs, self.mid,
+                        "controller_operation" if current.get("functional_attempt") else "functional_execution",
+                        lambda: fleet_functional.run(self.runs, self.mid, frozen,
+                                                     interrupt=self.functional_interrupt))
+                except state.MissionConflict:
+                    stopped = self.control_stop(backend)
+                    if stopped is not None:
+                        return stopped
+                    raise
+                stopped = self.control_stop(backend)
+                if stopped is not None:
+                    return stopped
+                if functional["status"] != "passed":
+                    if functional["status"] == "failed":
+                        state.append_terminal(self.runs, self.mid, status="failed",
+                            reason="required functional tests failed",
+                            idempotency_key="functional:terminal")
+                        return self.finish(self.response(functional=functional))
+                    return self.response(functional=functional,
+                        next_action="required functional check " + functional["status"]
+                                    + "; reconcile without automatic replay")
         if set(results) != self.profile.result_roles:
             raise HerdrMissionError("all selected Herdr profile role results are mandatory")
         if self.current()["status"] == "running":
-            self.event("mission_completing", "completing", {"lead_artifact_id": results["lead"]["artifact_id"]})
+            completion = ({"completion_artifact_id": results["worker"]["artifact_id"]}
+                          if self.profile is fleet_herdr_profile.MINIMAL else
+                          {"lead_artifact_id": results["lead"]["artifact_id"]})
+            self.event("mission_completing", "completing", completion)
         archive = _archive()
         stopped = self.control_stop(backend)
         if stopped is not None:

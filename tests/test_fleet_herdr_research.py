@@ -23,6 +23,7 @@ import fleet_herdr_mission as driver
 import fleet_herdr_permissions as permissions
 import fleet_herdr_profile as profiles
 import fleet_herdr_report
+import fleet_herdr_runtime
 import fleet_json
 import fleet_functional
 import fleet_functional_runner
@@ -145,6 +146,7 @@ class ResearchProfileTests(unittest.TestCase):
         return {"herdr_session": "research-fixture", "acceptance_contract": self.contract,
                 "teardown": False, "timeout_seconds": 7200,
                 "herdr_personal_cli": PROFILE,
+                "herdr_handoff_policy": fleet_herdr_runtime.HANDOFF_POLICY,
                 **profiles.runtime_binding(self.profile), **extra}
 
     def create(self, *, options=None, key="research-fixture", sdd_plan_path=None):
@@ -179,6 +181,13 @@ class ResearchProfileTests(unittest.TestCase):
         self.assertIn("Research source evidence", synthesis_task["instructions"])
         self.assertEqual(len(synthesis_task["input_artifact_ids"]), 5)
         self.assertIn(research["result"]["artifact_id"], synthesis_task["input_artifact_ids"])
+        build_task = next(task for task in ResearchBackend.tasks.values()
+                          if task["stage"] == "build")
+        self.assertEqual(build_task["input_evidence"]["policy"], "bounded-cas-v1")
+        self.assertEqual([entry["stage"] for entry in build_task["input_evidence"]["inputs"]],
+                         ["plan", "research"])
+        self.assertTrue(all(entry["summary"].startswith("Evidence")
+                            for entry in build_task["input_evidence"]["inputs"]))
         sessions = {value["evidence"]["agent_session"]["value"]
                     for value in ResearchBackend.results.values()}
         self.assertEqual(len(sessions), 5)
@@ -245,6 +254,15 @@ class ResearchProfileTests(unittest.TestCase):
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(ResearchBackend.tasks[research_run], before[research_run])
         self.assertEqual(len([c for c in ResearchBackend.calls if c[0] == "submit"]), 6)
+
+    def test_historical_creation_without_handoff_policy_keeps_id_only_task(self):
+        options = self.options()
+        options.pop("herdr_handoff_policy")
+        mid = self.create(options=options, key="research-historical-handoff")
+        self.assertEqual(driver.drive(self.runs, mid)["status"], "succeeded")
+        build = next(task for task in ResearchBackend.tasks.values()
+                     if task["stage"] == "build")
+        self.assertNotIn("input_evidence", build)
 
     def test_research_mutation_blocks_first_build_before_admission(self):
         mid = self.create()

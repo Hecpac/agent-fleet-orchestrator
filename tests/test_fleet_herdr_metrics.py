@@ -42,6 +42,37 @@ class UsageTests(unittest.TestCase):
               count(first),event("task_complete",turn_id="t")]
         self.assertEqual(metrics.usage(rows,"t")["usage_reason"],"overlapping_turn_usage")
 
+    def test_cached_delta_must_be_subset_even_when_cumulative_snapshots_are_valid(self):
+        base = {"input_tokens":100,"output_tokens":10,"cached_input_tokens":0}
+        final = {"input_tokens":105,"output_tokens":11,"cached_input_tokens":10}
+        rows = [count(base),event("task_started",turn_id="t"),count(final),event("task_complete",turn_id="t")]
+        result = metrics.usage(rows,"t")
+        self.assertIsNone(result["prompt_tokens"])
+        self.assertEqual(result["usage_reason"],"invalid_usage_counter_delta")
+
+    def test_invalid_snapshot_is_never_silently_skipped(self):
+        base = {"input_tokens":100,"output_tokens":10,"cached_input_tokens":20}
+        valid = {"input_tokens":150,"output_tokens":20,"cached_input_tokens":30}
+        invalid = {**valid,"cached_input_tokens":999}
+        for sequence in ([count(valid),count(invalid)], [count(invalid),count(valid)]):
+            rows = [count(base),event("task_started",turn_id="t"),*sequence,event("task_complete",turn_id="t")]
+            result = metrics.usage(rows,"t")
+            self.assertIsNone(result["prompt_tokens"])
+            self.assertEqual(result["usage_reason"],"invalid_usage_counter_snapshot")
+
+    def test_dispatch_to_start_gap_cannot_add_prior_usage_to_the_new_turn(self):
+        base={"input_tokens":100,"output_tokens":10,"cached_input_tokens":20}
+        between={"input_tokens":120,"output_tokens":12,"cached_input_tokens":25}
+        final={"input_tokens":150,"output_tokens":20,"cached_input_tokens":30}
+        baseline={"kind":"herdr_usage_baseline","status":"known","counts":base,
+                  "source":"pre_dispatch_session_counter"}
+        rows=[count(between),event("task_started",turn_id="t"),count(final),event("task_complete",turn_id="t")]
+        observed=metrics.usage(rows,"t",baseline,baseline_frontier={"status":"verified"})
+        self.assertIsNone(observed["prompt_tokens"])
+        self.assertEqual(observed["usage_reason"],"usage_counter_changed_before_bound_turn")
+        rows[0]=count(base)
+        self.assertEqual(metrics.usage(rows,"t",baseline)["prompt_tokens"],50)
+
 
 class IntervalTests(unittest.TestCase):
     def test_open_wait_is_unknown_and_trace_does_not_invent_duration(self):

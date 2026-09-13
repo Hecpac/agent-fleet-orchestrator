@@ -104,6 +104,18 @@ class HerdrReportTests(unittest.TestCase):
         state.append_event(helper.runs, mid, kind="archive_created", actor="CONTROL", idempotency_key="anchor",
             payload={"path": proof["path"], "sha256": proof["index_sha256"], "mode": "herdr"})
 
+    def test_absent_startup_intervals_remain_unknown_and_overlap_is_not_added(self):
+        helper, mid, compiled, current = self.official_report_fixture()
+        report=fleet_herdr_report.build_report(helper.runs,current,compiled,
+            state.read_events(state.ledger_path(helper.runs,mid)))
+        self.assertIsNone(report["timing"]["startup_observed_seconds"])
+        self.assertEqual(report["timing"]["startup_reason"],"startup_intervals_not_observed")
+        self.assertEqual(fleet_herdr_report._covered_seconds([]),(None,0))
+        self.assertEqual(fleet_herdr_report._covered_seconds([(None,None)]),(None,0))
+        self.assertEqual(fleet_herdr_report._covered_seconds([
+            ("2026-09-06T00:00:00Z","2026-09-06T00:00:02Z"),
+            ("2026-09-06T00:00:01Z","2026-09-06T00:00:03Z")]),(3,2))
+
     def test_five_turns_four_sessions_and_unknown_metrics_are_read_only(self):
         helper, mid, proof = self.staged()
         self.anchor(helper, mid, proof)
@@ -178,6 +190,63 @@ class HerdrReportTests(unittest.TestCase):
         run = next(r for r in report["runs"] if r["run_id"] == admission["run_id"])
         self.assertEqual((run["transport_status"], run["status"]), ("settled", "pending"))
         self.assertIsNone(run["observed"])
+
+    def test_rejected_completed_turn_usage_is_observed_but_not_admitted(self):
+        helper, mid, compiled, current = self.official_report_fixture()
+        current = copy.deepcopy(current)
+        admission = next(iter(current["admissions"].values()))
+        recorded = dict(admission["result"])
+        result = fleet_json.loads(fleet_artifacts.get_bytes(
+            helper.runs, mid, recorded["artifact_id"]))
+        rows = fleet_json.load_jsonl(fleet_artifacts.get_bytes(
+            helper.runs, mid, result["evidence"]["transcript_artifact_id"]))
+        complete = next(index for index, row in enumerate(rows)
+                        if row.get("payload", {}).get("type") == "task_complete")
+        rows.insert(complete, {"type": "event_msg", "payload": {"type": "token_count",
+            "info": {"total_token_usage": {"input_tokens": 150,
+                "output_tokens": 20, "cached_input_tokens": 30}}}})
+        baseline = {"schema_version": 1, "kind": "herdr_usage_baseline",
+            "mission_id": mid, "run_id": admission["run_id"],
+            "prompt_sha256": admission["task_sha256"],
+            "generation": "fixture-generation", "agent_session": result["evidence"]["agent_session"],
+            "captured_at": "2026-09-06T00:00:00Z", "status": "known",
+            "counts": {"input_tokens": 100, "output_tokens": 10,
+                       "cached_input_tokens": 20},
+            "source": "pre_dispatch_session_counter", "reason": None,
+            "transcript_sha256": "a" * 64, "captured_rows": 5}
+        baseline_id = fleet_artifacts.put_bytes(helper.runs, mid,
+            fleet_json.canonical_bytes(baseline))["artifact_id"]
+        result["evidence"].update(generation="fixture-generation",
+                                  usage_baseline_artifact_id=baseline_id)
+        self.repin_report_result(helper, mid, admission, result, rows)
+        observed_id = admission["result"]["artifact_id"]
+        proof = {"schema_version": 1, "kind": "herdr_role_protocol_rejection",
+            "mission_id": mid, "run_id": admission["run_id"],
+            "instance_id": admission["recipient_instance"],
+            "prompt_sha256": admission["task_sha256"],
+            "observed_result_artifact_id": observed_id, "reason": "fixture rejection"}
+        proof_id = fleet_artifacts.put_bytes(helper.runs, mid,
+            fleet_json.canonical_bytes(proof))["artifact_id"]
+        root = helper.runs / "missions" / mid
+        pointer = root / f"herdr-result-rejection-{admission['run_id']}.json"
+        pointer.write_bytes(fleet_json.canonical_bytes({"artifact_id": proof_id}) + b"\n")
+        pointer.chmod(0o600)
+        backend_path = root / "herdr-backend.json"
+        backend = fleet_json.loads(backend_path.read_bytes())
+        backend["submissions"][admission["run_id"]] = {
+            "status": "settled", "usage_baseline_artifact_id": baseline_id,
+            "prepared_at": "2026-09-06T00:00:00Z",
+            "submitted_at": "2026-09-06T00:00:01Z"}
+        backend_path.write_bytes(fleet_json.canonical_bytes(backend) + b"\n")
+        admission.update(phase="started", active=True, terminal=None, result=None)
+
+        report = fleet_herdr_report.build_report(helper.runs, current, compiled,
+            state.read_events(state.ledger_path(helper.runs, mid)))
+        run = next(item for item in report["runs"] if item["run_id"] == admission["run_id"])
+        self.assertEqual(run["result_disposition"], "rejected_role_protocol")
+        self.assertEqual((run["prompt_tokens"], run["completion_tokens"],
+                          run["cached_input_tokens"]), (50, 10, 10))
+        self.assertEqual(run["status"], "pending")
 
     def test_herdr_report_ignores_foreign_mission_and_shared_feature_ledger(self):
         helper, mid, _, _ = self.fixture()

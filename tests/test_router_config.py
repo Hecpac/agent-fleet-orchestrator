@@ -48,6 +48,7 @@ class RouterConfigTests(unittest.TestCase):
             {
                 "astra_sol",
                 "astra_sol_research_v1",
+                "sol_minimal_v1",
                 "dan",
                 "small",
                 "audit",

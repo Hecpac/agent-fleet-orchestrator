@@ -16,6 +16,15 @@ runtime/creation evidence and the immutable `mission_created` payload, then
 rechecked against the compiled snapshot during resume, control, report and
 archive verification.
 
+The proportional opt-in workflow `herdr-minimal-implementation` selects
+`sol_minimal_v1`: one Sol/high Worker, one Build admission and no synthetic
+Lead, Review, Verify or Synthesis stage. Creation requires an acceptance
+contract and freezes the profile digest. After Build the same controller freezes
+the candidate, runs any configured functional contract, evaluates external
+artifact acceptance and performs offline archive verification. A Worker `PASS`
+therefore cannot close a failed predicate. Its isolated permission policy v4 and
+archive schema v7 do not migrate or reinterpret either historical profile.
+
 ```sh
 python3 scripts/mission-run.py dry research-sample "Investigate then implement" \
   --workflow herdr-research-implementation \
@@ -106,6 +115,13 @@ recovery observes the same run; it does not automatically resend the prompt.
 This is a single physical attempt with durable reconciliation, not an unconditional
 exactly-once delivery guarantee.
 
+The minimal profile follows this identical backend route: official personal
+environment, exact argv/version/trust checks, context preview, delivery-surface
+guard, task/admission/dispatch binding and late session identity collection.
+`interactive_ready` alone is insufficient. Persisted hook trust does not replace
+the receipt/transcript link, and any additional runtime-selected skill still
+rejects the completed turn. It has fewer selected stages, not a second launcher.
+
 Herdr `idle`, `done`, and `settled` only describe execution state. A role result
 requires its bound Codex transcript, a completed turn, the expected model and
 reasoning, structured output, and matching artifact hashes. After Worker finishes,
@@ -132,6 +148,15 @@ turn attestations. Input policy `independent-research-v1` gives Build Plan plus
 Research; gives Review and Verify the same Plan+Research+Build inputs without
 either verdict; and gives Synthesis all prior results. A missing, blocked or
 invalid Research result prevents the first Build admission.
+
+New official Research creations additionally freeze handoff policy
+`bounded-cas-v1`. The Build task contains bounded Plan/Research summaries,
+artifact checks and detailed CAS references after their Mission/run/role/admission
+bindings and hashes are verified. The complete task is stored in CAS and reused
+unchanged after recovery. Oversize content, role substitution or unavailable CAS
+evidence fails closed. This makes transfer observable; it does not prove that the
+model obeyed a finding. Historical missions without this creation option retain
+their original ID-only task contract.
 
 Before Research, CONTROL captures `research-snapshot.json` plus tree and patch
 CAS. The Research task CAS embeds that exact receipt and tree hash. Immediately
@@ -188,6 +213,10 @@ change a file cited by Research. SDD and functional evidence remain independent,
 optional additions inside v6. Verification can proceed after the candidate and
 mutable source files disappear because all required bytes are in CAS/archive.
 Completion requires policy v3, six turns, schema v6 and the frozen profile digest.
+The minimal counterpart requires policy v4, one turn, schema v7 and its own
+frozen digest. Reviewer and Verifier remain independent under profiles that
+select them; running them in parallel is a deferred scheduler optimization, not
+part of these role contracts.
 
 `scripts/fleet_herdr_opencode_evidence.py` is a separate standard-library,
 offline reader for one explicitly bound native OpenCode export segment. It

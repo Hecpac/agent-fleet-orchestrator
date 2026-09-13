@@ -10,11 +10,13 @@ from typing import Any
 
 VERSION = 1
 RESEARCH_VERSION = 3
+MINIMAL_VERSION = 4
 MINIMUM_ARCHIVE_SCHEMA_VERSION = 3
 REQUIRED_TURNS = 5
 MODELS = {"lead": "gpt-6-astra", "worker": "gpt-5.6-sol",
           "reviewer": "gpt-5.6-sol", "verifier": "gpt-5.6-sol"}
 RESEARCH_MODELS = {**MODELS, "research": "gpt-6-astra"}
+MINIMAL_MODELS = {"worker": "gpt-5.6-sol"}
 
 
 class PermissionError(ValueError):
@@ -24,9 +26,9 @@ class PermissionError(ValueError):
 def finalization_policy(compiled_digest: str, *, capsule: bool = False,
                         profile=None) -> dict[str, Any]:
     """Controller policy frozen in the Mission ledger, never inferred from an index."""
-    if profile is not None and profile.permissions_policy_version == RESEARCH_VERSION:
+    if profile is not None and profile.permissions_policy_version in {RESEARCH_VERSION, MINIMAL_VERSION}:
         if capsule:
-            raise PermissionError("Research permission policy does not support capsule execution")
+            raise PermissionError("versioned permission policy does not support capsule execution")
         return {"compiled_digest": compiled_digest,
                 "minimum_archive_schema_version": profile.minimum_archive_schema_version,
                 "permissions_policy_version": profile.permissions_policy_version,
@@ -39,7 +41,8 @@ def finalization_policy(compiled_digest: str, *, capsule: bool = False,
 
 
 def policy(role: str, cwd: str, *, version: int = VERSION) -> dict[str, Any]:
-    models = MODELS if version == VERSION else RESEARCH_MODELS if version == RESEARCH_VERSION else None
+    models = (MODELS if version == VERSION else RESEARCH_MODELS if version == RESEARCH_VERSION
+              else MINIMAL_MODELS if version == MINIMAL_VERSION else None)
     if type(version) is not int or models is None or not isinstance(role, str) or role not in models:
         raise PermissionError("unsupported Herdr permission policy/role")
     if (not isinstance(cwd, str) or not PurePosixPath(cwd).is_absolute()

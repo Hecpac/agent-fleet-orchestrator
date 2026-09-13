@@ -66,7 +66,9 @@ def load(runs, mid, run, backend):
         fleet_herdr_evidence.verify_result(result, read_artifact=read,
             role=member['instance_id'], cwd=backend['target_repo'],
             prompt_sha256=submission['prompt_sha256'], agent_session=member['agent_session']['value'],
-            permission_version=3 if backend.get('herdr_profile') == fleet_herdr_profile.RESEARCH.profile_id else 1)
+            permission_version=({fleet_herdr_profile.RESEARCH.profile_id: 3,
+                                 fleet_herdr_profile.MINIMAL.profile_id: 4}.get(
+                                     backend.get('herdr_profile'), 1)))
     except fleet_herdr_evidence.EvidenceError as exc:
         if str(exc) != proof['reason']:
             raise ValueError('evidence rejection reason no longer reproduces') from exc

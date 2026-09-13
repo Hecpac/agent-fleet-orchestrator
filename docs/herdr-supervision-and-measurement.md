@@ -12,6 +12,18 @@ FLEET_RUNS_DIR=/absolute/runs just mission-resume MISSION_UUID --json
 FLEET_RUNS_DIR=/absolute/runs just mission-cancel-mission MISSION_UUID "Stop this Mission" cancel-1 --generation GENERATION_UUID
 ```
 
+To observe the same Mission through closure or a durable block without renewing
+180-second windows, use one explicit budget (at most one hour):
+
+```sh
+python3 -B scripts/mission-run.py --runs-dir /absolute/runs supervise \
+  --mission-id MISSION_UUID --seconds 3600 --json
+```
+
+This remains a bounded foreground process: it creates no daemon, extends no
+deadline and sends no replacement task when observation expires. A later call
+continues the same Mission/run/dispatch.
+
 Pause/cancel commands persist requests without acquiring the long-lived driver
 or supervisor lock. They do not imply that work has stopped. A driver observes
 the request at its next safe boundary. `pause_requested` permits the admitted
@@ -72,10 +84,30 @@ unclassified remainder. Monotonic measurement and timestamp coverage are distinc
 
 Token normalization takes differences between observed cumulative session
 counters around the bound turn. Duplicate snapshots do not multiply usage.
-Absent baselines, overlapping turns or counter resets yield null with a reason.
+Before dispatch the official backend pins a CAS baseline with Mission, run,
+prompt, generation and observed session identity. Reports and offline archives
+use that immutable frontier rather than rereading an earlier portion of a mutable
+session. A reused session must also retain its prior completed CAS transcript
+segment; a truncated history cannot establish a new zero baseline. Counters
+that change between dispatch and task_started remain unattributed.
+Absent/mixed baselines, overlapping turns, invalid cached-input subsets
+or counter resets yield null with a reason. Every retained counter snapshot and
+the resulting delta must be valid; a later invalid snapshot cannot be skipped
+in favor of an earlier valid total.
 For the first session turn, a first total exactly equal to last-call usage can
 establish a zero baseline. These are observed runtime counters, not invoices or
 estimated spend. Model cost remains null without a durable billing receipt.
+Completed turns rejected by permission or role protocol still contribute any
+valid observed delta exactly once and are labelled separately from admitted
+results. Execution rejections must first reproduce from retained CAS evidence.
+A separate observation-only check binds the unique session, prompt, turn, model,
+final bytes and completion ordering; it may observe rejected context or completion
+rendering without granting admission or permission authority. Identity mismatches
+and ambiguous completions remain unobservable, while their verified rejection
+disposition is retained.
+Startup and preparation coverage is exposed from existing timestamps;
+overlap is unioned and missing endpoints remain unknown. Coordinator activity
+without instrumentation is never converted into tokens or active time.
 Trace export includes control requests, confirmations, dispatch attempts and
 observation intervals, and remains observational rather than Mission authority.
 

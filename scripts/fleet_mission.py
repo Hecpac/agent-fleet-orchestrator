@@ -230,6 +230,13 @@ def create_mission(
         if fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
             profile = fleet_herdr_profile.validate_profile_binding(compiled, options)
             profile_binding = fleet_herdr_profile.creation_binding(compiled)
+            if profile is fleet_herdr_profile.MINIMAL:
+                import fleet_acceptance
+                contract = options.get("acceptance_contract")
+                if contract is None:
+                    raise MissionError("minimal Herdr profile requires an acceptance contract at creation")
+                fleet_acceptance.validate(contract)
+                fleet_acceptance.check_binding(idempotency_key, contract)
     except fleet_herdr_profile.ProfileError as exc:
         raise MissionError(str(exc)) from exc
     if options.get("functional_contract") is not None:

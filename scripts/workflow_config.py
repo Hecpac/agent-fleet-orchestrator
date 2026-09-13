@@ -166,8 +166,9 @@ def validate_workflow(value: Any) -> None:
         {"owner", "allow_parallel", "allow_subdelegation", "max_delegation_depth"},
         "workflow.autonomy",
     )
-    if autonomy["owner"] != "lead":
-        raise WorkflowError("workflow.autonomy.owner must be lead")
+    expected_owner = "worker" if workflow["preset"] == "sol_minimal_v1" else "lead"
+    if autonomy["owner"] != expected_owner:
+        raise WorkflowError(f"workflow.autonomy.owner must be {expected_owner}")
     _boolean(autonomy["allow_parallel"], "workflow.autonomy.allow_parallel")
     _boolean(autonomy["allow_subdelegation"], "workflow.autonomy.allow_subdelegation")
     depth = _integer(

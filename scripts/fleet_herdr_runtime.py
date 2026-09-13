@@ -6,6 +6,12 @@ from pathlib import Path
 import stat
 
 import fleet_safe_paths
+import fleet_json
+
+
+HANDOFF_POLICY = "bounded-cas-v1"
+HANDOFF_MAX_BYTES = 128 * 1024
+HANDOFF_SUMMARY_MAX_BYTES = 48 * 1024
 
 
 class RuntimeContractError(RuntimeError):
@@ -87,6 +93,10 @@ def role_inputs(stage: str, completed: dict[str, str], policy: str | None) -> li
             return [completed[name] for name in dependencies[stage]]
         except KeyError as exc:
             raise RuntimeContractError("Research stage dependencies are incomplete") from exc
+    if policy == "minimal-build-v1":
+        if stage != "build" or completed:
+            raise RuntimeContractError("minimal Build must have no prior role inputs")
+        return []
     if policy != "independent-v1":
         raise RuntimeContractError("unsupported Herdr input policy")
     dependencies = {"plan": (), "build": ("plan",), "review": ("plan", "build"),
@@ -96,3 +106,63 @@ def role_inputs(stage: str, completed: dict[str, str], policy: str | None) -> li
         return [completed[name] for name in dependencies[stage]]
     except KeyError as exc:
         raise RuntimeContractError("Herdr stage dependencies are incomplete") from exc
+
+
+def bounded_handoff(*, mission_id: str, stage: str, input_artifact_ids: list[str],
+                    current: dict, read_artifact) -> dict:
+    """Resolve a small, role-bound Plan/Research handoff from admitted CAS.
+
+    The task still carries the historical ID list.  This additive package makes
+    the useful content observable for new missions without rewriting an already
+    admitted task during recovery.
+    """
+    if stage != "build":
+        raise RuntimeContractError("bounded handoff is currently defined only for Build")
+    expected = {"herdr:plan": "plan", "herdr:research": "research"}
+    admissions = {}
+    for admission in current.get("admissions", {}).values():
+        name = expected.get(admission.get("request_key"))
+        if name is not None:
+            if name in admissions:
+                raise RuntimeContractError("handoff role has multiple admissions")
+            admissions[name] = admission
+    if set(admissions) != set(expected.values()) or len(input_artifact_ids) != 2:
+        raise RuntimeContractError("Build handoff requires exactly Plan and Research")
+    entries = []
+    for name, artifact_id in zip(("plan", "research"), input_artifact_ids):
+        admission = admissions[name]
+        recorded = admission.get("result")
+        if (admission.get("phase") != "finalized" or admission.get("active")
+                or admission.get("terminal", {}).get("status") != "succeeded"
+                or not isinstance(recorded, dict) or recorded.get("artifact_id") != artifact_id):
+            raise RuntimeContractError("handoff input is outside its finalized role admission")
+        raw = read_artifact(artifact_id)
+        result = fleet_json.loads(raw)
+        if (not isinstance(result, dict) or result.get("mission_id") != mission_id
+                or result.get("run_id") != admission.get("run_id")
+                or result.get("instance_id") != admission.get("recipient_instance")
+                or result.get("status") != "PASS"):
+            raise RuntimeContractError("handoff result binding differs from its admission")
+        summary = result.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise RuntimeContractError("handoff result has no usable summary")
+        if len(summary.encode("utf-8")) > HANDOFF_SUMMARY_MAX_BYTES:
+            raise RuntimeContractError("handoff summary exceeds its explicit bound")
+        references = result.get("evidence_artifact_ids", [])
+        checks = result.get("artifacts", [])
+        if (not isinstance(references, list) or any(not isinstance(pin, str) for pin in references)
+                or not isinstance(checks, list)):
+            raise RuntimeContractError("handoff evidence references are invalid")
+        # Reading every pin now proves availability and hash identity in this CAS;
+        # detailed bytes remain available from artifact_store without bulk injection.
+        for pin in references:
+            read_artifact(pin)
+        entries.append({"stage": name, "instance_id": admission["recipient_instance"],
+            "run_id": admission["run_id"], "result_artifact_id": artifact_id,
+            "summary": summary, "artifact_checks": checks,
+            "evidence_artifact_ids": references})
+    package = {"schema_version": 1, "policy": HANDOFF_POLICY,
+               "mission_id": mission_id, "target_stage": stage, "inputs": entries}
+    if len(fleet_json.canonical_bytes(package)) > HANDOFF_MAX_BYTES:
+        raise RuntimeContractError("bounded handoff package exceeds its explicit limit")
+    return package

@@ -90,8 +90,8 @@ class FakeBackend:
         final = fleet_artifacts.put_bytes(self.runs, self.mid, final_bytes)
         turn_id = f"turn-{run_id}"
         agent_session = str(uuid.uuid5(uuid.UUID(self.mid), f"session:{instance_id}"))
-        member = next(m for m in [self.compiled["resolved"]["lead"], *self.compiled["resolved"]["instances"]]
-                      if m["instance_id"] == instance_id)
+        member = next(m for m in [self.compiled["resolved"].get("lead"), *self.compiled["resolved"]["instances"]]
+                      if m is not None and m["instance_id"] == instance_id)
         rows = [
             {"type": "session_meta", "payload": {"id": agent_session, "model_provider": "openai"}},
             {"type": "event_msg", "payload": {"type": "task_started", "turn_id": turn_id}},
