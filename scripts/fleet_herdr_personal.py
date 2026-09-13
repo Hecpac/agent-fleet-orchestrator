@@ -79,17 +79,16 @@ def require_command(backend,command,executable):
         if len(members)!=1 or command != [executable,'--session',backend.session,*backend._start_arguments(members[0])[1:]]:
             raise ValueError('personal start differs from role arguments')
     elif operation==('pane','split'):
-        if (len(command)!=11 or command[5] not in {m['pane_id'] for m in saved['members']}
+        if (len(command)<11 or command[5] not in {m['pane_id'] for m in saved['members']}
                 or command[6]!='--direction' or command[7] not in {'right','down'}
-                or command[8:]!=['--cwd',str(backend.target_repo),'--no-focus']):
+                or command[8:]!=['--cwd',str(backend.target_repo),
+                                 *backend._personal_environment_arguments(),'--no-focus']):
             raise ValueError('personal pane differs from owned layout')
     else:
         expected=[executable,'--session',backend.session,'workspace','create','--cwd',str(backend.target_repo),
             '--label',saved['workspace']['label'],'--env','FLEET_MISSION_ID='+backend.mission_id,
             '--env','FLEET_HERDR_GENERATION='+saved['generation'],'--env','FLEET_HERDR_SESSION='+backend.session,
-            '--env','PATH='+backend.environment['PATH']]
-        for name in ('CODEX_HOME','HOME'):
-            if backend.environment.get(name): expected+=['--env',name+'='+backend.environment[name]]
+            *backend._personal_environment_arguments()]
         expected+=['--no-focus']
         if command!=expected or saved['workspace']['create_phase']!='creating':
             raise ValueError('personal workspace differs from owned creation intent')

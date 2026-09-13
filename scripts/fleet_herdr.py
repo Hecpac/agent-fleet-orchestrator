@@ -741,6 +741,13 @@ class HerdrBackend:
             ),
         }
 
+    def _personal_environment_arguments(self) -> list[str]:
+        if not self.personal_cli:
+            return []
+        return [arg for name in ("PATH", "CODEX_HOME", "HOME", "ZDOTDIR")
+                if self.environment.get(name)
+                for arg in ("--env", f"{name}={self.environment[name]}")]
+
     def _start_arguments(self, member: Mapping[str, Any]) -> list[str]:
         self._check_context()
         launch = self._compiled_launch(member)
@@ -936,12 +943,8 @@ class HerdrBackend:
                                     f"FLEET_HERDR_GENERATION={state['generation']}",
                                     "--env",
                                     f"FLEET_HERDR_SESSION={self.session}",
-                                    "--env",
-                                    f"PATH={self.environment['PATH']}",
-                                    *(["--env", f"CODEX_HOME={self.environment['CODEX_HOME']}"]
-                                      if self.personal_cli and self.environment.get("CODEX_HOME") else []),
-                                    *(["--env", f"HOME={self.environment['HOME']}"]
-                                      if self.personal_cli and self.environment.get("HOME") else []),
+                                    *(self._personal_environment_arguments() if self.personal_cli
+                                      else ["--env", f"PATH={self.environment['PATH']}"]),
                                     "--no-focus",
                                 ]
                             ),
@@ -990,6 +993,7 @@ class HerdrBackend:
                                         direction,
                                         "--cwd",
                                         str(self.target_repo),
+                                        *self._personal_environment_arguments(),
                                         "--no-focus",
                                     ]
                                 ),
@@ -1796,8 +1800,11 @@ class HerdrBackend:
                 completed.append((index, row["payload"]))
         if not completed:
             return None
-        if len(completed) != 1 or completed[0][1].get("last_agent_message") != final_text:
+        if len(completed) != 1:
             raise HerdrBackendError("Codex task_complete binding is ambiguous")
+        # Preserve a uniquely identified completion even when its rendered text
+        # differs. The strict evidence verifier below rejects that mismatch
+        # after retaining both versions, so recovery cannot spin or admit it.
         complete_index = completed[0][0]
         transcript_segment = row_bytes[metadata[0][0]] + b"".join(
             row_bytes[start : complete_index + 1]

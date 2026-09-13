@@ -116,6 +116,37 @@ class StartupContextTests(unittest.TestCase):
         with self.assertRaisesRegex(backend_module.ExecutionEvidenceRejected, 'additional user input'):
             self.complete(lambda rows: rows.insert(-2, injected('slice-gate')))
 
+    def test_completion_rendering_mismatch_is_retained_and_rejected_offline(self):
+        def mismatch(rows):
+            final = next(r['payload'] for r in rows if r.get('type') == 'response_item'
+                         and r['payload'].get('phase') == 'final_answer')
+            value = json.loads(final['content'][0]['text'])
+            value['summary'] += '<oai-mem-citation>fixture</oai-mem-citation>'
+            final['content'][0]['text'] = json.dumps(value)
+            # Completion retains the original text, as observed in FLEET-004.
+        with self.assertRaisesRegex(backend_module.ExecutionEvidenceRejected, 'task_complete binding mismatch') as caught:
+            self.complete(mismatch)
+        proof = caught.exception.proof
+        observed = fleet_json.loads(cas.get_bytes(self.f.runs, self.f.mission_id, proof['observed_result_artifact_id']))
+        self.assertIn(b'<oai-mem-citation>', cas.get_bytes(self.f.runs, self.f.mission_id, observed['artifact_id']))
+        prompts = len(self.f.fake.prompted_agents)
+        for path in self.f.transcripts.values(): path.unlink()
+        with self.assertRaises(backend_module.ExecutionEvidenceRejected) as recovered:
+            self.b.collect_result(self.run)
+        self.assertEqual(recovered.exception.proof, proof)
+        self.assertEqual(len(self.f.fake.prompted_agents), prompts)
+        self.assertFalse((self.f.runs / self.b._result_relative(self.run)).exists())
+
+    def test_arbitrary_completion_mismatch_is_not_normalized(self):
+        def mismatch(rows):
+            rows[-1]['payload']['last_agent_message'] = '{"status":"FAIL"}'
+        with self.assertRaisesRegex(backend_module.ExecutionEvidenceRejected, 'task_complete binding mismatch'):
+            self.complete(mismatch)
+
+    def test_duplicate_completion_is_still_ambiguous(self):
+        with self.assertRaisesRegex(backend_module.HerdrBackendError, 'task_complete binding is ambiguous'):
+            self.complete(lambda rows: rows.append(copy.deepcopy(rows[-1])))
+
     def test_skill_before_prompt_cannot_evade_context_rule(self):
         with self.assertRaisesRegex(backend_module.ExecutionEvidenceRejected, 'outside frozen task'):
             self.complete(lambda rows: rows.insert(2, injected('deploy')))
@@ -224,6 +255,16 @@ class RejectedEvidenceRecoveryTests(unittest.TestCase):
         self.assertEqual(len(self.fake.calls), calls)
         self.assertTrue(self.admission()['active'])
         self.assertFalse(self.current()['cancelled_runs'])
+
+
+class RejectedCompletionRecoveryTests(RejectedEvidenceRecoveryTests):
+    """The same pause/cancel/no-resend invariants cover completion mismatch."""
+    def reject_plan(self):
+        self.stage = 'plan'; self.mutate = lambda result: None
+        def mismatch(rows):
+            rows[-1]['payload']['last_agent_message'] = '{"status":"FAIL"}'
+        self.transcript_edit = mismatch
+        return self.drive()
 
 
 class ResearchEndToEndTests(unittest.TestCase):

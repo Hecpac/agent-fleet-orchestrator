@@ -50,6 +50,29 @@ class PersonalTests(unittest.TestCase):
         with self.assertRaises(ValueError):personal.require_command(self.backend,['herdr','--session','other','agent','start','x'],'herdr')
         with self.assertRaises(ValueError):personal.require_command(self.backend,['herdr','--session','mission-control-test','agent','future-operation','x'],'herdr')
 
+    def test_private_shell_directory_uses_same_guarded_workspace_entry(self):
+        self.backend.environment['ZDOTDIR'] = '/synthetic/private-shell'
+        actual_guard = personal.require_command
+        checked = []
+
+        def check(backend, command, executable):
+            actual_guard(backend, command, executable)
+            if command[3:5] in (['workspace', 'create'], ['pane', 'split']):
+                checked.append(command)
+                changed = [s.replace('ZDOTDIR=/synthetic/private-shell',
+                                     'ZDOTDIR=/synthetic/unselected-shell') for s in command]
+                with self.assertRaisesRegex(ValueError, 'workspace differs|pane differs'):
+                    actual_guard(backend, changed, executable)
+
+        with mock.patch.object(personal, 'require_command', side_effect=check), \
+             mock.patch.object(herdr.subprocess, 'run', side_effect=self.fake):
+            self.assertEqual(self.backend.boot()['phase'], 'ready')
+        self.assertEqual(len(checked), 4)
+        for command in checked:
+            self.assertIn('ZDOTDIR=/synthetic/private-shell', command)
+            self.assertIn('CODEX_HOME=/synthetic/default-codex-home', command)
+            self.assertIn('PATH=/usr/bin:/bin', command)
+
     def test_prompt_requires_real_admission_before_transport(self):
         with self.assertRaises(ValueError),mock.patch.object(herdr.subprocess,'run') as execute:
             personal.require(self.backend,run_id='00000000-0000-0000-0000-000000000001',prompt_sha256='a'*64,instance_id='worker')
