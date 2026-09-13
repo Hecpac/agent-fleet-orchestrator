@@ -1,5 +1,11 @@
 # Integración local del runtime Herdr
 
+Actualización: el transporte real y el wrapper ahora rechazan nuevos arranques y
+prompts por falta de mediación completa de efectos. Véase
+[denegación nativa antes de efectos](herdr-native-effect-mediation.md).
+Las pruebas de launch/exec descritas abajo son evidencia histórica del carril
+experimental; no habilitan ejecución bajo la admisión actual.
+
 Estado: implementación local opt-in. `INTEGRATION_BINDING=NOT_VERIFIED`.
 Este cambio integra paths, handoffs y observaciones de launch; no declara un
 sandbox efectivo atestado ni una campaña real de cuatro modelos verificada.

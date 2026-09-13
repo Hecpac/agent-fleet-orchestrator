@@ -1,8 +1,17 @@
 # Agent Fleet Orchestrator
 
+The [personal CLI lane](docs/personal-autonomy.md) prepares four idle Herdr/Codex
+roles without a dummy Mission, then assigns work through the existing admission
+and acceptance contracts. Use `just personal-check` and `just personal-prepare`;
+`just fleet` remains the historical CMUX entry point.
+
 Mission Control with a Herdr-native default: Astra Lead and three Sol sessions
 for implementation, review and verification. Every role uses `high` reasoning.
 The three Sol roles provide separation of responsibilities, not model diversity.
+
+For direct API use with OpenCode, the project also includes
+[DeepSeek Flash and V4 Pro configuration](docs/deepseek-api.md), authenticated
+through `DEEPSEEK_API_KEY`. These standalone sessions do not join Herdr Missions.
 
 The canonical `mission-run.py run/dry` default is `herdr-implementation`.
 It requires an explicit Herdr session for execution and an artifact acceptance
@@ -575,7 +584,16 @@ just mission-control-stop <mission_id>
 After completion, `just mission-report <mission_id>`,
 `just mission-trace <mission_id>`, and
 `just mission-archive-verify <archive>` read durable evidence only. Reports and
-exporters never decide completion. Assured workflows require signed audit; a
+exporters never decide completion. Lifecycle-ledger reports preserve missing or
+null token counters as unknown. Both provider/model/variant totals are null
+unless every owned run's latest row supplies both non-negative integer counters;
+explicit zero remains observed zero. `usage_observed_runs` / `usage_total_runs`
+shows measurement coverage, and human output prints `tokens=unknown` when
+incomplete. Earlier snapshots are not substituted for missing final counts.
+This applies equally to live and archived evidence without rewriting history;
+runtime token counts do not establish billed cost.
+
+Assured workflows require signed audit; a
 workflow declaring WORM fails closed unless a real S3 Object Lock COMPLIANCE
 sink supplies versioned, verifiable anchor receipts. `regulated.yaml` can be
 schema-validated for inspection, but effect compilation/execution is
@@ -768,6 +786,6 @@ archive offline with:
 python3 scripts/fleet_assurance_controller.py verify --archive <archive>
 ```
 
-The orchestration playbook (mental model, verbs, wait rules, memory budget)
-lives in both `.agents/skills/cmux/SKILL.md` and `.claude/skills/cmux/SKILL.md`;
-the two copies must stay synchronized.
+The legacy CMUX playbook (mental model, verbs, wait rules, memory budget)
+lives in [the legacy reference](docs/cmux-legacy-reference.md). It is retained
+as documentation, not an active project skill. Herdr is the orchestration lane.

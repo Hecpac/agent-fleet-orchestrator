@@ -182,7 +182,7 @@ se ejercieron, por qué quedaron fuera y cómo podrían probarse en otro intento
 PRESET=audit
 TARGET_REPO=<raíz de agent-fleet-orchestrator>
 OBJECTIVE=Auditar la coherencia entre orchestration/router.yaml, README.md y
-  .agents/skills/cmux/SKILL.md.
+  docs/cmux-legacy-reference.md.
 NEGATIVE_SCOPE=No modificar archivos, no ejecutar acciones destructivas y no
   ampliar la revisión fuera de esos tres documentos.
 EXPECTED_INSTANCES=analysis challenge verify

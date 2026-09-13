@@ -236,17 +236,22 @@ def link_run(runs, mid, member, run_id, prompt_sha256):
 
 def main():
     from fleet_herdr_native import NativeLaunch
+    from fleet_herdr_effects import EffectMediationDenied, require_native_mediation
     native = NativeLaunch()
     try:
         if len(sys.argv) < 4 or sys.argv[1] != "--fleet-launch-intent":
             raise LaunchError("missing CONTROL launch intent; no ambient Codex fallback")
         path, pin = sys.argv[2:4]
         argv, env = consume(path, pin, ["codex", *sys.argv[4:]], native=native)
+        # A validated intent/observer is not all-effect-path mediation. Refuse
+        # before broker fork and native exec, including direct wrapper entry.
+        require_native_mediation()
         native.start(env)
         os.execve(argv[0], argv, env)
     except Exception as exc:
         # Never log argv, environment values or arbitrary OS exception payloads.
-        print(f"fleet launcher refused: {type(exc).__name__}", file=sys.stderr)
+        detail = str(exc) if isinstance(exc, EffectMediationDenied) else type(exc).__name__
+        print(f"fleet launcher refused: {detail}", file=sys.stderr)
         return 126
     finally:
         native.close()

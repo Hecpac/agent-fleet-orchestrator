@@ -1,9 +1,19 @@
----
-name: cmux
-description: Orchestrate agents and terminals through the cmux CLI — create workspaces, boot fleets, send prompts to any pane, read results back, and coordinate the local Ollama workers of this repo. Use whenever the task involves cmux, booting an agent team/fleet, sending a prompt to another terminal/agent, reading another pane's output, or multi-agent orchestration across terminals.
----
+# Legacy CMUX operational reference
 
-# cmux orchestration
+This reference applies only to explicitly selected legacy CMUX work. Herdr is
+the project's orchestration lane. Nothing here authorizes a fleet, subdelegation,
+provider use, notifications or cleanup beyond the current task. It is not a
+Herdr fallback. Preserve existing CMUX readers and historical records.
+
+Consult only the relevant sections: Mental model / Core verbs / Hard rules for
+pane control; Authorized legacy fleets for launch and dispatch; Event-driven
+waiting for completion and recovery; Memory budget / Agent race / Fleet
+etiquette for those specific operations.
+
+Commands, model names and profile details below describe the legacy lane.
+Check the current router and supported wrapper before an authorized operation;
+do not infer active model identity or Herdr configuration from these examples.
+Run the command examples from the repository root.
 
 You control the cmux terminal app through its CLI (`cmux <command>`). Everything
 reduces to one loop: **send → read → decide → repeat**.
@@ -73,37 +83,16 @@ Event stream (prefer listening over polling when waiting on many agents):
    `--print` for a review: those modes can auto-approve shell commands and file
    mutations.
 
-## This repo's fleet pattern
+## Authorized legacy fleets
 
-Rule of the repo: **frontier coordinates, local models execute in parallel.**
+Create or reuse a fleet and dispatch agents only when the user has explicitly
+authorized that legacy CMUX work. Audits, reviews, task size and independent
+subtasks are not automatic delegation triggers. Consult
+`orchestration/router.yaml` for the selected roles and supported wrappers.
+Verify results against source evidence; agreement between agents does not
+establish correctness or independent assurance.
 
-### Delegation policy (decide WHEN to delegate — don't wait to be told)
-
-Before starting any substantial task, classify it and delegate accordingly.
-Consult `orchestration/router.yaml` (`use_for` per role) to pick workers.
-
-DELEGATE (boot/reuse a fleet, dispatch, fleet-wait, then verify + synthesize):
-
-- **Audit / review / "what am I missing?"** → ALWAYS ≥2 workers with distinct
-  perspectives (e.g. codex + minimax, or reviewer + code_worker) before giving
-  your own verdict. Identity-diverse agreement directs investigation but does
-  not prove correctness; disagreement = dig in.
-- **Risky change about to close** (merge, deploy, config touching money/prod)
-  → one separately executed, identity-distinct frontier review is mandatory.
-- **≥3 independent subtasks** → parallelize across workers instead of serial.
-- **Broad search / classification / summarization at scale** → fan out to
-  cheap local workers (triage, light_code); synthesize yourself.
-
-DO IT YOURSELF (delegating is waste):
-
-- Single sequential task, small verification against code, anything a test
-  answers cheaply, conversational turns. (~95% of tasks — delegation is the
-  exception that pays, not the default.)
-
-Always: workers generate, YOU verify claims against source before adopting
-them (small models mark DONE optimistically), and you own the synthesis.
-
-For an end-to-end open mission, prefer Dan+:
+For an explicitly authorized end-to-end legacy CMUX mission, Dan+ is available:
 
 ```bash
 just dan <feature> "<complete objective>" --target-repo <repo>
@@ -304,8 +293,9 @@ rest; treat a missing STATUS block as still-running or failed.
 
 ### Agent race (first success is a candidate)
 
-For hotfix/needle-in-a-haystack tasks, race agents on the same task. Defaults
-are identity-diverse; explicit custom roles may repeat an identity:
+Only when a legacy CMUX race is explicitly authorized, dispatch the selected
+agents on the bounded task. Defaults are identity-diverse; explicit custom
+roles may repeat an identity:
 
 ```bash
 just race <name> "<task>" [instance=role ...]  # defaults come from router
@@ -319,7 +309,7 @@ stop `--any` while another candidate remains viable. Only use
 available for inspection and teardown. A race result is never independent
 assurance, even when its configured identities differ.
 
-### Decision queue (humans are slow — make blocking visible)
+### Decision queue for an authorized legacy fleet
 
 - Check `just status` at session start and before long waits: it lists every
   tracked agent session, surfacing ⚠️ needsInput ones with age. Agents blocked
@@ -335,6 +325,7 @@ assurance, even when its configured identities differ.
   exact durable result to any peer in a later `fleet-send` turn. Never inject a
   raw second prompt into a pane with an active run. In `assured` mode, CONTROL
   mediates the fixed dialogue protocol.
-- On finishing a major task, emit `cmux notify --title "fleet-<feature>" --body
+- When notifications are authorized for the legacy fleet, emit `cmux notify --title "fleet-<feature>" --body
   "<result>"` so the human sees it without watching.
-- Tear down with `just fleet-down <feature>` when work is merged/abandoned.
+- When teardown is authorized, use `just fleet-down <feature>` for the exact
+  owned fleet after confirming quiescence.

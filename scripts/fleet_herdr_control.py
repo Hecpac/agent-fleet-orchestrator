@@ -4,10 +4,11 @@ from __future__ import annotations
 from pathlib import Path
 import uuid
 
-import fleet_json
 import fleet_mission
 import fleet_mission_state as state
 import fleet_safe_paths
+import fleet_herdr_versions
+import fleet_herdr_profile
 
 KINDS = {"herdr_supervision_enabled", "herdr_control_requested", "herdr_control_applied", "herdr_dispatch_intent"}
 
@@ -75,6 +76,7 @@ def reduce(current, event):
         if not request or request["action"] != payload["action"] or request["applied_at"] or control["latest"] != payload["request_id"]:
             raise state.MissionConflict("control acknowledgement differs from current request")
         if payload["action"] in {"pause", "cancel"}:
+            state._require_inference_settled(current)
             active = [a for a in current["admissions"].values() if a["active"]]
             if payload["action"] == "cancel" and active:
                 raise state.MissionConflict("cancel confirmation requires quiescent admissions")
@@ -116,22 +118,34 @@ def enable(runs, mid):
 
 
 def backend_generation(runs, mid):
+    compiled, _ = fleet_mission.load_mission_compiled(runs, mid, mode="read")
     with fleet_safe_paths.RootedFS(runs) as fs:
-        raw = fs.read_regular_optional(Path("missions") / mid / "herdr-backend.json",
-            directory_modes=(0o700, 0o700), file_mode=0o600, max_bytes=16 * 1024 * 1024)
-    if raw is None:
+        backend = fleet_herdr_versions.read_state(fs, Path("missions") / mid / "herdr-backend.json",
+            mission_id=mid, compiled_digest=compiled["compiled_digest"])
+    if backend is None:
         return None
-    backend = fleet_json.loads(raw)
-    if backend.get("mission_id") != mid:
-        raise state.MissionConflict("backend belongs to another Mission")
     return state.normalize_uuid(backend.get("generation"), "backend generation")
 
 
 def request(runs, mid, *, action, reason, idempotency_key, run_id=None, generation=None):
     mid = state.normalize_uuid(mid, "mission_id")
     compiled, initial = fleet_mission.load_mission_compiled(runs, mid, mode="read")
-    if compiled["resolved"]["preset"] != "astra_sol":
-        raise state.MissionConflict("Herdr control requires astra_sol")
+    if not fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
+        raise state.MissionConflict("Herdr control requires a supported Herdr profile")
+    with fleet_safe_paths.RootedFS(runs) as fs:
+        root = Path("missions") / mid
+        options = state.loads_strict(fs.read_regular(root / "runtime-options.json",
+            directory_modes=(0o700, 0o700), file_mode=0o600, max_bytes=16*1024*1024))
+        creation = state.loads_strict(fs.read_regular(root / "creation-request.json",
+            directory_modes=(0o700, 0o700), file_mode=0o600, max_bytes=16*1024*1024))
+    if creation.get("runtime_options") != options:
+        raise state.MissionConflict("Herdr control runtime/creation binding mismatch")
+    try:
+        fleet_herdr_profile.validate_profile_binding(compiled, options, initial)
+        fleet_herdr_profile.validate_creation_binding(
+            compiled, creation.get("request"))
+    except fleet_herdr_profile.ProfileError as exc:
+        raise state.MissionConflict(str(exc)) from exc
     if initial["status"] in state.TERMINAL_STATUSES:
         return {"mission_id": mid, "status": initial["status"], "recorded": False, "reason": "terminal Mission unchanged"}
     state._require_nonempty(idempotency_key, "control idempotency key")

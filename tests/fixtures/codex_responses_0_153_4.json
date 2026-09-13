@@ -1,0 +1,397 @@
+{
+  "provenance": {
+    "cli_version": "0.153.4",
+    "source_request_sha256": "42374f054aa5637db82d4d49ed1f0129af1a7fc259d2b5984efa4ca889b3e640",
+    "scope": "Sanitized captured request; messages, IDs, metadata values and descriptions replaced. Tool schemas and wire layout retained."
+  },
+  "body": {
+    "model": "gpt-5.6-sol",
+    "input": [
+      {
+        "type": "additional_tools",
+        "id": "fixture_item_0",
+        "role": "developer",
+        "tools": [
+          {
+            "type": "namespace",
+            "name": "functions",
+            "description": "Synthetic protocol fixture",
+            "tools": [
+              {
+                "type": "custom",
+                "name": "exec",
+                "description": "Synthetic tool; never executed",
+                "format": {
+                  "type": "grammar",
+                  "syntax": "lark",
+                  "definition": "\nstart: pragma_source | plain_source\npragma_source: PRAGMA_LINE NEWLINE SOURCE\nplain_source: SOURCE\n\nPRAGMA_LINE: /[ \\t]*\\/\\/ @exec:[^\\r\\n]*/\nNEWLINE: /\\r?\\n/\nSOURCE: /[\\s\\S]+/\n"
+                }
+              },
+              {
+                "type": "function",
+                "name": "wait",
+                "description": "Synthetic tool; never executed",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "cell_id": {
+                      "type": "string",
+                      "description": "Identifier of the running exec cell."
+                    },
+                    "max_tokens": {
+                      "type": "number",
+                      "description": "Output token budget for this wait call. Defaults to 10000 tokens."
+                    },
+                    "terminate": {
+                      "type": "boolean",
+                      "description": "True stops the running exec cell; false or omitted waits for output."
+                    },
+                    "yield_time_ms": {
+                      "type": "number",
+                      "description": "Wait before yielding more output. Defaults to 10000 ms."
+                    }
+                  },
+                  "required": [
+                    "cell_id"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "request_user_input",
+                "description": "Synthetic tool; never executed",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "questions": {
+                      "type": "array",
+                      "description": "Questions to show the user. Prefer 1 and do not exceed 3",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "header": {
+                            "type": "string",
+                            "description": "Short header label shown in the UI (12 or fewer chars)."
+                          },
+                          "id": {
+                            "type": "string",
+                            "description": "Stable identifier for mapping answers (snake_case)."
+                          },
+                          "options": {
+                            "type": "array",
+                            "description": "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically.",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "description": {
+                                  "type": "string",
+                                  "description": "One short sentence explaining impact/tradeoff if selected."
+                                },
+                                "label": {
+                                  "type": "string",
+                                  "description": "User-facing label (1-5 words)."
+                                }
+                              },
+                              "required": [
+                                "label",
+                                "description"
+                              ],
+                              "additionalProperties": false
+                            }
+                          },
+                          "question": {
+                            "type": "string",
+                            "description": "Single-sentence prompt shown to the user."
+                          }
+                        },
+                        "required": [
+                          "id",
+                          "header",
+                          "question",
+                          "options"
+                        ],
+                        "additionalProperties": false
+                      }
+                    }
+                  },
+                  "required": [
+                    "questions"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            ]
+          },
+          {
+            "type": "namespace",
+            "name": "collaboration",
+            "description": "Synthetic protocol fixture",
+            "tools": [
+              {
+                "type": "function",
+                "name": "followup_task",
+                "description": "Synthetic tool; never executed",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "description": "Message text to send to the target agent.",
+                      "encrypted": true
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Agent id or canonical task name to send a follow-up task to (from spawn_agent)."
+                    }
+                  },
+                  "required": [
+                    "target",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "interrupt_agent",
+                "description": "Synthetic tool; never executed",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "target": {
+                      "type": "string",
+                      "description": "Agent id or canonical task name to interrupt (from spawn_agent)."
+                    }
+                  },
+                  "required": [
+                    "target"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "list_agents",
+                "description": "Synthetic tool; never executed",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "path_prefix": {
+                      "type": "string",
+                      "description": "Task-path prefix filter without a trailing slash. Omit to list all live agents."
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "send_message",
+                "description": "Synthetic tool; never executed",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "description": "Message text to queue on the target agent.",
+                      "encrypted": true
+                    },
+                    "target": {
+                      "type": "string",
+                      "description": "Relative or canonical task name to message (from spawn_agent)."
+                    }
+                  },
+                  "required": [
+                    "target",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Synthetic tool; never executed",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "fork_turns": {
+                      "type": "string",
+                      "description": "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
+                    },
+                    "message": {
+                      "type": "string",
+                      "description": "Initial plain-text task for the new agent.",
+                      "encrypted": true
+                    },
+                    "model": {
+                      "type": "string",
+                      "description": "Model override for the new agent. Omit unless an explicit override is needed."
+                    },
+                    "reasoning_effort": {
+                      "type": "string",
+                      "description": "Reasoning effort override for the new agent. Omit to inherit the parent effort."
+                    },
+                    "task_name": {
+                      "type": "string",
+                      "description": "Task name for the new agent. Use lowercase letters, digits, and underscores."
+                    }
+                  },
+                  "required": [
+                    "task_name",
+                    "message"
+                  ],
+                  "additionalProperties": false
+                }
+              },
+              {
+                "type": "function",
+                "name": "wait_agent",
+                "description": "Synthetic tool; never executed",
+                "strict": false,
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "timeout_ms": {
+                      "type": "number",
+                      "description": "Timeout in milliseconds. Defaults to 30000, min 10000, max 3600000."
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "id": "fixture_item_1",
+        "role": "developer",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic message 1"
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "id": "fixture_item_2",
+        "role": "developer",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic message 2"
+          },
+          {
+            "type": "input_text",
+            "text": "Synthetic message 2"
+          },
+          {
+            "type": "input_text",
+            "text": "Synthetic message 2"
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "id": "fixture_item_3",
+        "role": "developer",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic message 3"
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "id": "fixture_item_4",
+        "role": "developer",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic message 4"
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "id": "fixture_item_5",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic message 5"
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "id": "fixture_item_6",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic message 6"
+          }
+        ]
+      },
+      {
+        "type": "message",
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic message 7"
+          }
+        ],
+        "phase": "final_answer"
+      },
+      {
+        "type": "message",
+        "id": "fixture_item_8",
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic message 8"
+          }
+        ]
+      }
+    ],
+    "tool_choice": "auto",
+    "parallel_tool_calls": false,
+    "reasoning": {
+      "effort": "high",
+      "context": "all_turns"
+    },
+    "store": false,
+    "stream": true,
+    "include": [
+      "reasoning.encrypted_content"
+    ],
+    "prompt_cache_key": "fixture-session",
+    "text": {
+      "verbosity": "low"
+    },
+    "client_metadata": {
+      "session_id": "fixture-0",
+      "x-codex-window-id": "fixture-1",
+      "x-codex-installation-id": "fixture-2",
+      "thread_id": "fixture-3",
+      "turn_id": "fixture-4",
+      "root_turn_id": "fixture-5",
+      "x-codex-turn-metadata": "fixture-6"
+    }
+  }
+}

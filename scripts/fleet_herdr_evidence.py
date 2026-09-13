@@ -5,7 +5,9 @@ import hashlib
 from typing import Any
 
 import fleet_json
+import fleet_herdr_skill_context
 import fleet_herdr_permissions as permissions
+import fleet_herdr_versions as versions
 
 
 class EvidenceError(ValueError):
@@ -26,7 +28,9 @@ def _text(payload: dict[str, Any], kind: str) -> str:
 
 def verify_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: str,
                       prompt_sha256: str, final_bytes: bytes,
-                      permission_policy: dict[str, Any] | None = None) -> dict[str, Any]:
+                      permission_policy: dict[str, Any] | None = None,
+                      runtime_contract: dict[str, Any] | None = None,
+                      expected_provider: str = "openai") -> dict[str, Any]:
     """Accept only a uniquely bound completed turn; no live filesystem/UI reads."""
     if not raw or len(raw) > 32 * 1024 * 1024 or not raw.endswith(b"\n"):
         raise EvidenceError("transcript must be bounded complete JSONL")
@@ -39,8 +43,15 @@ def verify_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: st
     if any(not isinstance(row, dict) or not isinstance(row.get("payload"), dict) for row in rows):
         raise EvidenceError("transcript row is invalid")
     metadata = [r["payload"] for r in rows if r.get("type") == "session_meta"]
-    if len(metadata) != 1 or metadata[0].get("id") != agent_session or metadata[0].get("model_provider") != "openai":
+    if len(metadata) != 1 or metadata[0].get("id") != agent_session or metadata[0].get("model_provider") != expected_provider:
         raise EvidenceError("session/provider binding mismatch")
+    if runtime_contract is not None:
+        try:
+            contract = versions.validate(runtime_contract)
+        except ValueError as exc:
+            raise EvidenceError(str(exc)) from exc
+        if metadata[0].get("cli_version") != contract["codex_version"]:
+            raise EvidenceError("Codex CLI version differs from bound runtime contract")
     starts = []
     for index, row in enumerate(rows):
         p = row["payload"]
@@ -73,6 +84,14 @@ def verify_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: st
     if any(r.get("type") == "response_item" and r["payload"].get("type") == "message"
            and r["payload"].get("role") == "user" for r in rows[prompt_index + 1:end]):
         raise EvidenceError("additional user input after bound prompt")
+    if runtime_contract == versions.TASK_CONTEXT_CONTRACT:
+        for row in rows[start:prompt_index]:
+            payload = row["payload"]
+            if (row.get("type") == "response_item" and payload.get("role") == "user"
+                    and ("skills.selected_skill_instructions" in payload.get(
+                        "internal_chat_message_metadata_passthrough", {}).get("content_item_kinds", [])
+                         or "<skill>" in _text(payload, "input_text"))):
+                raise EvidenceError("skill input outside frozen task")
     contexts = [r["payload"] for r in rows[start:end] if r.get("type") == "turn_context"]
     if not contexts or any(p.get("turn_id") != turn_id or p.get("model") != model or p.get("effort") != "high" for p in contexts):
         raise EvidenceError("model/effort/turn context mismatch")
@@ -103,7 +122,9 @@ def verify_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: st
 
 
 def verify_result(result: dict[str, Any], *, read_artifact, role: str, cwd: str,
-                  prompt_sha256: str, agent_session: str | None = None) -> dict[str, Any]:
+                  prompt_sha256: str, agent_session: str | None = None,
+                  capsule_manifest=None, current=None,
+                  permission_version: int = permissions.VERSION) -> dict[str, Any]:
     """Common strict rule for collection, cached recovery, driver and archive.
 
     The reader must check CAS identity. Expected role/cwd/prompt come from
@@ -117,10 +138,28 @@ def verify_result(result: dict[str, Any], *, read_artifact, role: str, cwd: str,
                 or proof["prompt_sha256"] != prompt_sha256
                 or proof["transcript_sha256"] != proof["transcript_artifact_id"]):
             raise EvidenceError("permission result identity binding mismatch")
+        if capsule_manifest is not None:
+            import fleet_mission_capsule
+            return fleet_mission_capsule.verify_result(result, read=read_artifact, role=role, cwd=cwd,
+                prompt_sha256=prompt_sha256, expected_manifest=capsule_manifest, current=current)
+        if 'capsule_launch_artifact_id' in proof:
+            raise EvidenceError('capsule evidence requires creation-bound permission policy')
+        if proof.get("runtime_contract") == versions.TASK_CONTEXT_CONTRACT:
+            fleet_herdr_skill_context.validate(fleet_json.loads(read_artifact(proof["context_artifact_id"])))
+            fleet_herdr_skill_context.verify_task(read_artifact(prompt_sha256), role, read_artifact)
+        expected = permissions.policy(role, cwd, version=permission_version)
         return verify_transcript(read_artifact(proof["transcript_artifact_id"]),
-            agent_session=session["value"], model=permissions.MODELS[role],
+            agent_session=session["value"], model=expected["model"],
             turn_id=result["turn_id"], prompt_sha256=prompt_sha256,
             final_bytes=read_artifact(result["artifact_id"]),
-            permission_policy=permissions.policy(role, cwd))
-    except (KeyError, TypeError, permissions.PermissionError) as exc:
+            permission_policy=expected,
+            runtime_contract=proof.get("runtime_contract"))
+    except EvidenceError:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
         raise EvidenceError("permission result evidence is incomplete or incompatible") from exc
+    except RuntimeError as exc:
+        from fleet_herdr_inference import InferenceError
+        if not isinstance(exc, InferenceError):
+            raise
+        raise EvidenceError('capsule permission evidence is incompatible') from exc

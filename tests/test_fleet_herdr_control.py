@@ -140,6 +140,64 @@ class HerdrControlTests(unittest.TestCase):
         with mock.patch.object(fixtures.FakeBackend, "cancel", return_value={**bad, "generation": generation}):
             self.assertEqual(self.helper.run_driver()["status"], "abandoned")
 
+    def test_exact_run_cancel_skips_other_active_admissions_without_closing_mission(self):
+        fixtures.FakeBackend.missing_stage = "plan"
+        self.helper.run_driver()
+        other = next(a for a in self.current()["admissions"].values() if a["active"])
+        task_sha = fixtures.fleet_artifacts.put_bytes(self.runs, self.mid, b"unsent review task")["artifact_id"]
+        target = fixtures.fleet_admission.reserve_many(self.runs, self.mid, requests=[{
+            "request_key": "herdr:review", "run_kind": "specialist", "recipient_instance": "reviewer",
+            "capability": "challenge", "effect_sha256": task_sha, "task_sha256": task_sha,
+            "delegated_budget": 0, "writer": False}], idempotency_key="reserve-review")["admissions"][0]
+        self.assertEqual([a["run_id"] for a in self.current()["admissions"].values() if a["active"]],
+                         [other["run_id"], target["run_id"]])
+        calls = list(fixtures.FakeBackend.calls)
+        deadline = self.current()["admission_policy"]["deadline_at"]
+        self.request("cancel", run_id=target["run_id"])
+
+        result = self.helper.run_driver()
+
+        current = self.current()
+        self.assertEqual(current["admissions"][target["admission_id"]]["phase"], "aborted")
+        self.assertFalse(current["admissions"][target["admission_id"]]["active"])
+        self.assertEqual(current["admissions"][other["admission_id"]], other)
+        self.assertEqual(fixtures.FakeBackend.calls, calls)
+        self.assertEqual(result["status"], "running")
+        self.assertIn("outside cancellation scope", result["next_action"])
+        self.assertEqual(control.view(current)["desired"], "cancel_requested")
+        self.assertEqual(control.view(current)["applied"], "running")
+        self.assertEqual(current["admission_policy"]["deadline_at"], deadline)
+        before = state.ledger_path(self.runs, self.mid).read_bytes()
+        self.helper.run_driver()
+        self.assertEqual(state.ledger_path(self.runs, self.mid).read_bytes(), before)
+        self.assertEqual(fixtures.FakeBackend.calls, calls)
+
+    def test_exact_run_cancel_retains_durable_pass_with_another_reserved_run(self):
+        fixtures.FakeBackend.missing_stage = "plan"
+        self.helper.run_driver()
+        target = next(a for a in self.current()["admissions"].values() if a["active"])
+        task_sha = fixtures.fleet_artifacts.put_bytes(self.runs, self.mid, b"unsent review task")["artifact_id"]
+        other = fixtures.fleet_admission.reserve_many(self.runs, self.mid, requests=[{
+            "request_key": "herdr:review", "run_kind": "specialist", "recipient_instance": "reviewer",
+            "capability": "challenge", "effect_sha256": task_sha, "task_sha256": task_sha,
+            "delegated_budget": 0, "writer": False}], idempotency_key="reserve-review")["admissions"][0]
+        other = self.current()["admissions"][other["admission_id"]]
+        self.request("cancel", run_id=target["run_id"])
+        fixtures.FakeBackend.missing_stage = None
+        calls = len(fixtures.FakeBackend.calls)
+
+        result = self.helper.run_driver()
+
+        current = self.current()
+        settled = current["admissions"][target["admission_id"]]
+        self.assertEqual(settled["phase"], "finalized")
+        self.assertEqual(settled["terminal"]["status"], "succeeded")
+        self.assertEqual(current["admissions"][other["admission_id"]], other)
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(control.view(current)["applied"], "running")
+        self.assertEqual(fixtures.FakeBackend.calls[calls:], [("collect", target["run_id"])])
+        self.assertEqual(self.helper.submitted(), ["plan"])
+
     def test_pause_after_authorization_before_intent_allows_safe_later_send(self):
         original = driver._Driver.dispatch_or_recover
         called = False

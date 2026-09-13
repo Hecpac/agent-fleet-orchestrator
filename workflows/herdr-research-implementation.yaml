@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "name": "herdr-research-implementation",
+  "description": "Opt-in Herdr implementation with durable Astra Research before the sole Sol writer",
+  "preset": "astra_sol_research_v1",
+  "autonomy": {"owner": "lead", "allow_parallel": false, "allow_subdelegation": false, "max_delegation_depth": 0},
+  "capabilities": {"available": ["recon", "build", "challenge", "verify"], "required_outcomes": ["lead_result", "research_result", "worker_result", "reviewer_result", "verifier_result"], "writer": "build"},
+  "risk": {"minimum": "low", "allow_lead_escalation": true, "high_action": "confirm_assured"},
+  "assurance": {"profile": "none", "preset": "astra_sol_research_v1", "minimum_gates": []},
+  "audit": {"mode": "signed", "trust_scope": "local-development", "worm_required_for": ["regulated"]},
+  "archive": {"mode": "incremental", "content_policy": "full", "include_final_tree": true, "include_git_delta": true},
+  "limits": {"deadline_seconds": 7200, "token_budget": 0, "budget_mode": "soft", "delegation_credits": 8, "max_active_delegations": 5}
+}

@@ -1,5 +1,9 @@
 # cmux + fleet: beneficios y buenas prácticas
 
+Referencia del carril histórico de CMUX, solo para trabajo seleccionado y
+autorizado explícitamente. Herdr es el carril de este proyecto; estas prácticas
+no activan flotas, delegación ni cleanup en tareas ordinarias.
+
 Destilado de la adopción real (2026-07-07/08): fleet heterogéneo verificado
 (Claude lead, codex/gpt-5.5, MiniMax-M3, workers Ollama), auditoría de
 unknown-unknowns sobre QTS-ARCHITECT, orquestación por eventos y carrera de
@@ -73,10 +77,10 @@ alcance endurecido es una Mac/un UID; consulta `guia-uso-flota.md` para operar.
    silenciado). Nunca leas ~/.zshrc crudo en un transcript.
 10. **Ganador ≠ correcto.** La carrera (`just race`) da velocidad, no verdad.
     Verifica la respuesta ganadora antes de actuar — especialmente en hotfixes.
-11. **Codifica cada lección en la skill.** `.agents/skills/cmux/SKILL.md` y
-    `.claude/skills/cmux/SKILL.md` son copias sincronizadas de la memoria
-    operativa: cada incidente se vuelve regla dura que el próximo orquestador
-    hereda gratis.
+11. **Documenta solo las lecciones que cambian una decisión.** Las entradas
+    de CMUX se conservan en la referencia operativa común
+    `docs/cmux-legacy-reference.md`, sin una skill activa. Conserva el alcance
+    de cada incidente; no lo conviertas en una regla universal.
 12. **Revisa tus colas de decisión.** Los agentes se detienen (correctamente)
     en decisiones de negocio y pueden esperar horas sin que lo notes (dos
     sesiones esperaron ~1h una elección). Los eventos/notificaciones al humano

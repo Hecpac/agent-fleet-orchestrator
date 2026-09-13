@@ -77,9 +77,22 @@ def parent_identity(candidate: Path, options: dict) -> dict:
 def role_inputs(stage: str, completed: dict[str, str], policy: str | None) -> list[str]:
     if policy is None:
         return list(completed.values())
+    if policy == "independent-research-v1":
+        dependencies = {"plan": (), "research": ("plan",),
+                        "build": ("plan", "research"),
+                        "review": ("plan", "research", "build"),
+                        "verify": ("plan", "research", "build"),
+                        "synthesis": ("plan", "research", "build", "review", "verify")}
+        try:
+            return [completed[name] for name in dependencies[stage]]
+        except KeyError as exc:
+            raise RuntimeContractError("Research stage dependencies are incomplete") from exc
     if policy != "independent-v1":
         raise RuntimeContractError("unsupported Herdr input policy")
     dependencies = {"plan": (), "build": ("plan",), "review": ("plan", "build"),
                     "verify": ("plan", "build"),
                     "synthesis": ("plan", "build", "review", "verify")}
-    return [completed[name] for name in dependencies[stage]]
+    try:
+        return [completed[name] for name in dependencies[stage]]
+    except KeyError as exc:
+        raise RuntimeContractError("Herdr stage dependencies are incomplete") from exc

@@ -12,6 +12,8 @@ import fleet_herdr_archive
 import fleet_herdr_evidence
 import fleet_herdr_control
 import fleet_herdr_metrics
+import fleet_herdr_profile
+import fleet_herdr_versions
 import fleet_json
 import fleet_mission_state
 import fleet_safe_paths
@@ -57,13 +59,21 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
     relative = Path("missions") / mid
     with fleet_safe_paths.RootedFS(runs) as fs:
         names = fs.list_directory(relative, directory_modes=(0o700, 0o700))
-        backend = None
-        if "herdr-backend.json" in names:
-            backend = fleet_json.loads(fs.read_regular(relative / "herdr-backend.json",
-                directory_modes=(0o700, 0o700), file_mode=0o600, max_bytes=16 * 1024 * 1024))
-            if (not isinstance(backend, dict) or backend.get("mission_id") != mid
-                    or backend.get("compiled_digest") != compiled["compiled_digest"]):
-                raise ValueError("Herdr report backend identity mismatch")
+        options = fleet_json.loads(fs.read_regular(relative / "runtime-options.json",
+            directory_modes=(0o700, 0o700), file_mode=0o600, max_bytes=16*1024*1024))
+        creation = fleet_json.loads(fs.read_regular(relative / "creation-request.json",
+            directory_modes=(0o700, 0o700), file_mode=0o600, max_bytes=16*1024*1024))
+        backend = fleet_herdr_versions.read_state(fs, relative / "herdr-backend.json",
+            mission_id=mid, compiled_digest=compiled["compiled_digest"])
+    profile = fleet_herdr_profile.validate_profile_binding(compiled, options, current)
+    fleet_herdr_profile.validate_creation_binding(compiled, creation.get("request"))
+    is_capsule = (backend or {}).get("executor") == "fleet.mission.capsule.v2"
+    runtime_contract = fleet_herdr_versions.state_contract(backend) if backend is not None and not is_capsule else None
+    capsule_manifest = None
+    if is_capsule:
+        with fleet_safe_paths.RootedFS(runs) as fs:
+            capsule_manifest = fleet_json.loads(fs.read_regular(relative / "runtime-options.json",
+                directory_modes=(0o700, 0o700), file_mode=0o600, max_bytes=16*1024*1024))["herdr_capsule_manifest"]
     members = {m["instance_id"]: m for m in [compiled["resolved"]["lead"], *compiled["resolved"]["instances"]]}
     records = []
     sessions = set()
@@ -92,6 +102,11 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
                 read = lambda digest: fleet_artifacts.get_bytes(runs, mid, digest)
                 result = fleet_json.loads(read(result_receipt["artifact_id"]))
                 evidence = result["evidence"]
+                evidence_contract = evidence.get("runtime_contract")
+                if evidence_contract is not None:
+                    evidence_contract = fleet_herdr_versions.validate(evidence_contract)
+                if evidence_contract != runtime_contract:
+                    raise ValueError("Herdr report result runtime contract differs from validated backend")
                 session = evidence["agent_session"]["value"]
                 if (result["mission_id"] != mid or result["run_id"] != run or result["instance_id"] != role
                         or result_receipt["provider"] != "openai"
@@ -101,11 +116,18 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
                         or evidence["transcript_sha256"] != evidence["transcript_artifact_id"]):
                     raise ValueError("Herdr report result identity mismatch")
                 transcript = read(evidence["transcript_artifact_id"])
+                if is_capsule:
+                    fleet_herdr_evidence.verify_result(result, read_artifact=read, role=role,
+                        cwd=fleet_json.loads(read(evidence["capsule_launch_artifact_id"]))["candidate"]["realpath"],
+                        prompt_sha256=admission["task_sha256"], capsule_manifest=capsule_manifest, current=current)
                 fleet_herdr_evidence.verify_transcript(transcript, agent_session=session,
                     model=result_receipt["model"], turn_id=result["turn_id"],
-                    prompt_sha256=admission["task_sha256"], final_bytes=read(result["artifact_id"]))
-                observed = {"provider": "openai", "model": result_receipt["model"], "effort": "high",
+                    prompt_sha256=admission["task_sha256"], final_bytes=read(result["artifact_id"]),
+                    runtime_contract=runtime_contract, expected_provider="fleet-local" if is_capsule else "openai")
+                observed = {"provider": "fleet-local" if is_capsule else "openai", "model": result_receipt["model"], "effort": "high",
                             "agent_session": session, "source": "bound_codex_transcript"}
+                if is_capsule:
+                    observed["provider_execution"] = fleet_json.loads(read(evidence["capsule_report_artifact_id"]))["provider_execution"]
                 rows = fleet_json.load_jsonl(transcript)
                 record.update(fleet_herdr_metrics.usage(rows, result["turn_id"]))
                 bound = [r for r in rows if r.get("type") == "event_msg" and r["payload"].get("turn_id") == result["turn_id"]]
@@ -117,7 +139,7 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
                     record["timing_reason"] = None
                 record.update(observed=observed, observation_reason=None)
                 sessions.add(session)
-                groups[("openai", observed["model"])].append(record)
+                groups[(observed["provider"], observed["model"])].append(record)
             except (ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
                 record["observation_reason"] = f"invalid_or_unavailable_evidence: {exc}"
         records.append(record)
@@ -147,6 +169,7 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
         **({"control": fleet_herdr_control.view(current)} if "herdr_control" in current else {}),
         **({"functional": functional} if functional is not None else {}),
         "feature": current["feature"], "status": current["status"], "status_source": "mission_ledger",
+        "herdr_profile": profile.profile_id,
         "source": {"mission_events": len(events), "mission_head_sha256": current["head_sha256"],
                    "compiled_digest": compiled["compiled_digest"], "durable_only": True},
         "admissions": {"count": len(records), "active": sum(a["active"] for a in current["admissions"].values())},

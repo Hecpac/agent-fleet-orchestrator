@@ -66,6 +66,25 @@
       "display_rank": 30,
       "concurrency": 1
     },
+    "astra_research": {
+      "phase": "RECON",
+      "runner": "interactive",
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "hook_source": "codex",
+      "transport": "pointer",
+      "command": ["codex", "--model", "gpt-6-astra", "-c", "model_reasoning_effort=\"high\""],
+      "healthcheck": ["codex", "login", "status"],
+      "ready_pattern": "^[[:space:]]*›[[:space:]].+",
+      "enabled": true,
+      "requires_env": [],
+      "capabilities": ["research", "recon", "source_verification", "dependency_analysis"],
+      "tool_access": ["filesystem_read", "shell_read", "git_read", "fleet_control"],
+      "authority": "advisory",
+      "resource_class": "remote",
+      "display_rank": 20,
+      "concurrency": 1
+    },
     "triage": {
       "phase": "RECON",
       "runner": "local",
@@ -413,6 +432,19 @@
     }
   },
   "presets": {
+    "astra_sol_research_v1": {
+      "description": "Opt-in Herdr profile with durable Astra Research and one Sol candidate writer.",
+      "mode": "autonomous",
+      "include_lead": true,
+      "lead_provider": "astra_lead",
+      "lead_tool_access": ["filesystem", "shell", "git", "fleet_control"],
+      "instances": [
+        {"instance_id": "research", "role_type": "astra_research"},
+        {"instance_id": "worker", "role_type": "sol_worker"},
+        {"instance_id": "reviewer", "role_type": "sol_reviewer"},
+        {"instance_id": "verifier", "role_type": "sol_verifier"}
+      ]
+    },
     "astra_sol": {
       "description": "Herdr-native autonomous fleet with one explicit Astra Lead and three role-scoped Sol agents.",
       "mode": "autonomous",

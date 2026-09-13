@@ -47,6 +47,7 @@ class RouterConfigTests(unittest.TestCase):
             set(self.config["presets"]),
             {
                 "astra_sol",
+                "astra_sol_research_v1",
                 "dan",
                 "small",
                 "audit",

@@ -12,6 +12,10 @@ def codex_startup_blocker(screen: str) -> str | None:
     if not isinstance(screen, str) or not screen.strip():
         return "empty Codex surface"
     for marker, reason in (
+        ("Do you trust the contents of this directory?", "Codex project trust dialog"),
+        ("Trusting the directory allows project-local config", "Codex project trust dialog"),
+        ("Resuming session", "Codex session is still resuming"),
+        ("Sign in with ChatGPT", "Codex authentication dialog"),
         ("Update available!", "Codex update dialog"),
         ("Hooks need review", "Codex hook trust dialog"),
         ("hook needs review", "Codex hook trust dialog"),

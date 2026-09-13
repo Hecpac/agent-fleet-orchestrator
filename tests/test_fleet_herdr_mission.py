@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 import uuid
 from unittest import mock
@@ -50,8 +51,12 @@ class FakeBackend:
         driver._Driver(self.runs, self.mid).write("herdr-backend.json", self.state())
         return self.state()
 
+    def artifact_path(self, stage):
+        return "answer.txt" if (self.repo / "answer.txt").exists() else "README.md"
+
     def state(self):
-        return {"mission_id": self.mid, "compiled_digest": self.compiled["compiled_digest"],
+        return {"schema_version": 2, "backend_version": "0.8.2",
+                "mission_id": self.mid, "compiled_digest": self.compiled["compiled_digest"],
                 "generation": str(uuid.uuid5(uuid.UUID(self.mid), "fixture-generation")),
                 "session": self.session, "workspace": {"closed": self.closed}}
 
@@ -74,7 +79,7 @@ class FakeBackend:
             assert (self.runs / "missions" / self.mid / "herdr-freeze.json").exists()
             if self.mutate_review:
                 (self.repo / "answer.txt").write_text("tampered\n")
-        path = "answer.txt" if (self.repo / "answer.txt").exists() else "README.md"
+        path = self.artifact_path(task["stage"])
         self.results[run_id] = {"schema_version": 1, "mission_id": self.mid, "run_id": run_id,
             "instance_id": instance_id, "status": self.role_status, "summary": f"Evidence for {task['stage']}",
             "candidate_tree_sha": task["frozen_candidate"]["tree_sha"] if task["frozen_candidate"] else None,
@@ -236,6 +241,166 @@ class HerdrMissionTests(unittest.TestCase):
 
     def run_driver(self):
         return driver.drive(self.runs, self.mid)
+
+    def test_archive_retry_after_control_growth_reuses_selected_snapshot(self):
+        import fleet_herdr_archive as archive
+        import fleet_herdr_control as control
+        original = archive._write
+
+        def interrupt(store, relative, content):
+            original(store, relative, content)
+            if "herdr-archive" in relative.parts and relative.name == "ledger.jsonl":
+                raise OSError("interrupted after archive ledger publication")
+
+        with mock.patch.object(driver, "_archive", return_value=archive), \
+                mock.patch.object(driver.fleet_functional.runner, "execute",
+                                  side_effect=AssertionError("functional work replayed")) as functional:
+            with mock.patch.object(archive, "_write", side_effect=interrupt):
+                with self.assertRaisesRegex(OSError, "interrupted after archive"):
+                    self.run_driver()
+            root = self.runs / "missions" / self.mid / "herdr-archive"
+            selected_ledger = (root / "ledger.jsonl").read_bytes()
+            self.assertEqual(len(self.submitted()), 5)
+            control.request(self.runs, self.mid, action="pause", reason="archive recovery",
+                            idempotency_key="archive-pause")
+            self.assertEqual(self.run_driver()["control"]["applied"], "paused")
+            control.request(self.runs, self.mid, action="resume", reason="archive recovery",
+                            idempotency_key="archive-resume")
+            try:
+                with mock.patch.object(driver._Driver, "prepare_candidate", side_effect=AssertionError("candidate reopened")), \
+                        mock.patch.object(driver._Driver, "backend", side_effect=AssertionError("backend reopened")), \
+                        mock.patch.object(driver.fleet_functional, "run", side_effect=AssertionError("functional recovery revisited")):
+                    result = self.run_driver()
+            except archive.HerdrArchiveError as exc:
+                self.fail(f"archive retry must reuse its selected snapshot: {exc}")
+            self.assertEqual(result["status"], "succeeded")
+            self.assertEqual((root / "ledger.jsonl").read_bytes(), selected_ledger)
+            self.assertTrue(archive.verify(self.runs, self.mid)["valid"])
+            self.assertEqual(self.run_driver()["status"], "succeeded")
+            self.assertEqual(len(self.submitted()), 5)
+            functional.assert_not_called()
+            events = state.read_events(state.ledger_path(self.runs, self.mid))
+            self.assertEqual(sum(e["kind"] == "archive_created" for e in events), 1)
+            self.assertEqual(sum(e["kind"] == "herdr_archive_selected" for e in events), 1)
+
+    def test_archive_completion_boundary_matrix(self):
+        import fleet_herdr_archive as archive
+        import fleet_herdr_control as control
+        boundaries = ("before_completion_verify", "after_completion_verify", "before_anchor",
+                      "after_anchor", "before_terminal", "after_terminal")
+        for boundary in boundaries:
+            for growth in (False, True):
+                if boundary == "after_terminal" and growth:
+                    continue  # The existing reducer forbids every post-terminal append.
+                with self.subTest(boundary=boundary, live_growth=growth):
+                    helper = HerdrMissionTests()
+                    helper.setUp()
+                    try:
+                        original_event, original_verify = state.append_event, archive.verify
+                        def interrupt():
+                            raise OSError("completion boundary interruption")
+                        def event(*args, **kwargs):
+                            kind = kwargs["kind"]
+                            relevant = (kind == "archive_created" and boundary.endswith("anchor")
+                                        or kind == "mission_terminal" and boundary.endswith("terminal"))
+                            if relevant and boundary.startswith("before_"):
+                                interrupt()
+                            result = original_event(*args, **kwargs)
+                            if relevant and boundary.startswith("after_"):
+                                interrupt()
+                            return result
+                        def verify(*args, **kwargs):
+                            relevant = kwargs.get("for_completion") and kwargs.get("require_anchor") is False
+                            if relevant and boundary == "before_completion_verify":
+                                interrupt()
+                            result = original_verify(*args, **kwargs)
+                            if relevant and boundary == "after_completion_verify":
+                                interrupt()
+                            return result
+                        with mock.patch.object(driver, "_archive", return_value=archive), \
+                                mock.patch.object(driver.fleet_functional.runner, "execute", side_effect=AssertionError("functional replay")):
+                            with mock.patch.object(state, "append_event", side_effect=event), \
+                                    mock.patch.object(archive, "verify", side_effect=verify):
+                                with self.assertRaisesRegex(OSError, "completion boundary"):
+                                    helper.run_driver()
+                            selected = fleet_mission.load_state(helper.runs, helper.mid)["herdr_archive_selection"]
+                            root = helper.runs / "missions" / helper.mid / "herdr-archive"
+                            before = {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+                            if growth:
+                                control.request(helper.runs, helper.mid, action="resume", reason="completion restart",
+                                                idempotency_key="completion-restart")
+                            self.assertEqual(helper.run_driver()["status"], "succeeded")
+                            self.assertEqual(helper.run_driver()["status"], "succeeded")
+                            self.assertEqual(len(helper.submitted()), 5)
+                            self.assertEqual(fleet_mission.load_state(helper.runs, helper.mid)["herdr_archive_selection"], selected)
+                            self.assertEqual(before, {p.relative_to(root): p.read_bytes() for p in root.rglob("*") if p.is_file()})
+                            events = state.read_events(state.ledger_path(helper.runs, helper.mid))
+                            self.assertEqual(sum(e["kind"] == "archive_created" for e in events), 1)
+                            self.assertEqual(sum(e["kind"] == "mission_terminal" for e in events), 1)
+                    finally:
+                        helper.doCleanups()
+
+    def test_concurrent_archive_completion_uses_existing_driver_lock(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        import fleet_herdr_archive as archive
+        entered, release = threading.Event(), threading.Event()
+        original = archive.create
+        def held(*args, **kwargs):
+            entered.set()
+            if not release.wait(10):
+                raise AssertionError("fixture did not release archive completion")
+            return original(*args, **kwargs)
+        with mock.patch.object(driver, "_archive", return_value=archive), \
+                mock.patch.object(archive, "create", side_effect=held), ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(self.run_driver)
+            try:
+                self.assertTrue(entered.wait(10))
+                other = self.run_driver()
+                self.assertEqual(other["next_action"], "another Herdr driver owns this mission")
+            finally:
+                release.set()
+            self.assertEqual(first.result(timeout=10)["status"], "succeeded")
+        self.assertEqual(self.run_driver()["status"], "succeeded")
+        self.assertEqual(len(self.submitted()), 5)
+        events = state.read_events(state.ledger_path(self.runs, self.mid))
+        self.assertEqual(sum(e["kind"] == "herdr_archive_selected" for e in events), 1)
+        self.assertEqual(sum(e["kind"] == "archive_created" for e in events), 1)
+
+    def test_selected_partial_still_obeys_pause_and_cancel(self):
+        import fleet_herdr_archive as archive
+        import fleet_herdr_control as control
+        for action in ("pause", "cancel"):
+            with self.subTest(action=action):
+                helper = HerdrMissionTests()
+                helper.setUp()
+                try:
+                    original = archive._write
+                    def interrupt(store, relative, content):
+                        original(store, relative, content)
+                        if "herdr-archive" in relative.parts and relative.name == "ledger.jsonl":
+                            raise OSError("control archive interruption")
+                    with mock.patch.object(driver, "_archive", return_value=archive):
+                        with mock.patch.object(archive, "_write", side_effect=interrupt):
+                            with self.assertRaisesRegex(OSError, "control archive"):
+                                helper.run_driver()
+                        selected = fleet_mission.load_state(helper.runs, helper.mid)["herdr_archive_selection"]
+                        control.request(helper.runs, helper.mid, action=action, reason="selected archive control",
+                                        idempotency_key="selected-control")
+                        result = helper.run_driver()
+                        self.assertEqual(result["control"]["applied"], "paused" if action == "pause" else "cancelled")
+                        events = state.read_events(state.ledger_path(helper.runs, helper.mid))
+                        self.assertFalse(any(e["kind"] == "archive_created" for e in events))
+                        if action == "pause":
+                            control.request(helper.runs, helper.mid, action="resume", reason="resume selected archive",
+                                            idempotency_key="selected-resume")
+                            self.assertEqual(helper.run_driver()["status"], "succeeded")
+                        else:
+                            self.assertEqual(result["status"], "abandoned")
+                        self.assertEqual(len(helper.submitted()), 5)
+                        self.assertEqual(fleet_mission.load_state(helper.runs, helper.mid)["herdr_archive_selection"], selected)
+                finally:
+                    helper.doCleanups()
 
     def submitted(self):
         return [c[1] for c in FakeBackend.calls if c[0] == "submit"]
@@ -873,6 +1038,447 @@ class HerdrMissionTests(unittest.TestCase):
         self.assertEqual(result["status"], "succeeded")
         self.assertTrue(result["archive"]["valid"])
         self.assertEqual(len(self.submitted()), 5)
+
+
+class HerdrProtocolRejectionTests(unittest.TestCase):
+    """Real backend, driver and CAS; only Herdr transport/output is synthetic."""
+
+    def setUp(self):
+        from tests import test_fleet_herdr as transport
+        self.transport = transport
+        self.Backend = driver.fleet_herdr.HerdrBackend
+        self.helper = HerdrMissionTests()
+        self.helper.setUp()
+        self.addCleanup(self.helper.doCleanups)
+        self.runs = self.helper.runs
+        self.mid = self.helper.create(key='protocol-rejection', options={
+            'herdr_session': 'mission-control-test', 'timeout_seconds': 7200, 'teardown': False,
+        })
+        self.fake = transport.FakeHerdr()
+        self.transcripts = {}
+        self.backends = []
+        self.stage = 'build'
+        self.verdict = 'PASS'
+        self.runtime_state = 'working'
+        self.mutate = lambda result: result.update(artifacts=[])
+        self.transcript_edit = lambda rows: None
+
+        def factory(controller):
+            backend = self.Backend(
+                self.runs, self.mid, feature='driver-test', target_repo=controller.candidate,
+                compiled=controller.compiled, session='mission-control-test',
+                environment={'PATH': '/usr/bin:/bin'}, run_command=self.fake,
+                transcript_resolver=self.transcripts.get,
+            )
+            submit = backend.submit
+
+            def observed_submit(run_id, prompt, *, instance_id):
+                observed = submit(run_id, prompt, instance_id=instance_id)
+                task = json.loads(prompt)
+                selected = task['stage'] == self.stage
+                member = next(m for m in backend.state()['members'] if m['instance_id'] == instance_id)
+                if task['stage'] == 'build':
+                    (controller.candidate / 'answer.txt').write_text('implemented\n')
+                final = {
+                    **{k: task['result_contract'][k] for k in ('schema_version', 'mission_id', 'run_id', 'instance_id', 'candidate_tree_sha')},
+                    'status': self.verdict if selected else 'PASS',
+                    'summary': 'Evidence for ' + task['stage'],
+                    'artifacts': [{'path': 'README.md', 'sha256': state.artifact_id((controller.candidate / 'README.md').read_bytes())}],
+                }
+                if selected:
+                    self.mutate(final)
+                fixture = SimpleNamespace(target=controller.candidate, fake=self.fake,
+                                          tmp=self.helper.tmp, transcripts=self.transcripts)
+                transport.HerdrBackendTests.write_transcript(
+                    fixture, agent_session=member['agent_session']['value'], member=member,
+                    prompt=prompt, final=final, turn_id='turn-protocol-' + task['stage'],
+                )
+                if selected:
+                    path = self.transcripts[member['agent_session']['value']]
+                    rows = [json.loads(line) for line in path.read_text().splitlines()]
+                    self.transcript_edit(rows)
+                    path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+                self.fake.agent_states[member['agent_name']] = self.runtime_state if selected else 'done'
+                return observed
+
+            backend.submit = observed_submit
+            self.backends.append(backend)
+            return backend
+
+        patcher = mock.patch.object(driver._Driver, 'backend', factory)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def current(self):
+        return fleet_mission.load_state(self.runs, self.mid)
+
+    def admission(self):
+        return next(a for a in self.current()['admissions'].values() if a['request_key'] == 'herdr:' + self.stage)
+
+    def drive(self):
+        return driver.drive(self.runs, self.mid)
+
+    def operations(self, operation):
+        return [c for c in map(self.fake.operation, self.fake.calls) if c[1:3] == ['agent', operation]]
+
+    def assert_one_prompt(self):
+        prompts = [c for c in self.operations('prompt') if json.loads(c[-1])['stage'] == self.stage]
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(self.operations('send-keys'), [])
+
+    def assert_owned_without_verdict(self):
+        self.assertTrue(self.admission()['active'])
+        self.assertEqual(bool(self.current()['active_writer']), self.stage == 'build')
+        self.assertIsNone(self.admission()['result'])
+        self.assertIsNone(self.admission()['terminal'])
+
+    def reject(self, reason='requires 1..100 artifact checks'):
+        with self.assertRaisesRegex(driver.RoleProtocolError, reason):
+            self.drive()
+        self.assert_owned_without_verdict()
+        proof = self.drive()['protocol_rejection']
+        self.assertEqual(proof['kind'], 'herdr_role_protocol_rejection')
+        self.assertNotIn('status', proof)
+        run_id = self.admission()['run_id']
+        raw = self.backends[-1].collect_result(run_id)
+        self.assertEqual(proof['run_id'], run_id)
+        self.assertEqual(proof['prompt_sha256'], self.admission()['task_sha256'])
+        self.assertEqual(fleet_artifacts.get_bytes(self.runs, self.mid, proof['observed_result_artifact_id']), state.canonical_bytes(raw))
+        with mock.patch.object(driver._Driver, 'validate_result', side_effect=AssertionError('reparsed rejection')):
+            self.assertEqual(self.drive()['protocol_rejection'], proof)
+        self.assert_owned_without_verdict()
+        self.assert_one_prompt()
+        return proof
+
+    def request_cancel(self, key='reject-cancel'):
+        driver.control.request(self.runs, self.mid, action='cancel', reason='fixture rejection cancellation',
+                               idempotency_key=key, run_id=self.admission()['run_id'])
+
+    def set_runtime(self, runtime_state):
+        member = next(m for m in self.backends[-1].state()['members'] if m['instance_id'] == self.admission()['recipient_instance'])
+        self.fake.agent_states[member['agent_name']] = runtime_state
+
+    def test_cached_invalid_role_result_is_durably_rejected_and_cancel_reconciles(self):
+        with self.assertRaisesRegex(driver.HerdrMissionError, 'requires 1..100 artifact checks'):
+            self.drive()
+        admission = self.admission()
+        run_id = admission['run_id']
+        cached = self.backends[-1].collect_result(run_id)
+        before = state.canonical_bytes(cached)
+        self.assertEqual(cached['artifacts'], [])
+        self.assertEqual(cached['turn_id'], 'turn-protocol-build')
+        self.assertTrue(admission['active'])
+        self.assertTrue(self.current()['active_writer'])
+        self.assertIsNone(admission['result'])
+        self.assertIsNone(admission['terminal'])
+        try:
+            resumed = self.drive()
+        except driver.HerdrMissionError as exc:
+            self.fail(f'same invalid cached result was parsed again without durable adjudication: {exc}; active_writer={bool(self.current()["active_writer"])}')
+        rejection = resumed['protocol_rejection']
+        self.assertEqual(rejection['run_id'], run_id)
+        proof = state.loads_strict(fleet_artifacts.get_bytes(self.runs, self.mid, rejection['artifact_id']))
+        self.assertEqual(fleet_artifacts.get_bytes(self.runs, self.mid, proof['observed_result_artifact_id']), before)
+        with mock.patch.object(driver._Driver, 'validate_result', side_effect=AssertionError('reparsed adjudicated result')):
+            self.assertEqual(self.drive()['protocol_rejection'], rejection)
+            driver.control.request(self.runs, self.mid, action='cancel', reason='fixture cancel',
+                                   idempotency_key='invalid-cancel', run_id=run_id)
+            self.assertEqual(self.drive()['status'], 'running')
+            self.assertTrue(self.admission()['active'])
+            self.assertTrue(self.current()['active_writer'])
+            self.assertIsNone(self.admission()['result'])
+            self.assertEqual(self.operations('send-keys'), [])
+            member = next(m for m in self.backends[-1].state()['members'] if m['instance_id'] == 'worker')
+            self.fake.agent_states[member['agent_name']] = 'idle'
+            self.assertEqual(self.drive()['status'], 'abandoned')
+        self.assertFalse(self.admission()['active'])
+        self.assertFalse(self.current()['active_writer'])
+        self.assertEqual(self.admission()['terminal']['status'], 'abandoned')
+        self.assertIsNone(self.admission()['result'])
+        self.assertEqual(state.canonical_bytes(self.backends[-1].collect_result(run_id)), before)
+        prompts = [c for c in self.operations('prompt') if json.loads(c[-1])['stage'] == self.stage]
+        self.assertEqual(len(prompts), 1)
+        self.assertEqual(self.operations('send-keys'), [])
+
+    def test_pass_empty_artifacts_in_plan_has_no_role_verdict(self):
+        self.stage = 'plan'
+        self.reject()
+
+    def test_blocked_empty_artifacts_has_no_role_verdict(self):
+        self.verdict = 'BLOCKED'
+        self.reject()
+
+    def test_fail_empty_artifacts_has_no_role_verdict(self):
+        self.verdict = 'FAIL'
+        self.reject()
+
+    def test_malformed_artifact_item_is_rejected(self):
+        self.mutate = lambda result: result.update(artifacts=['README.md'])
+        self.reject('invalid role artifact contract')
+
+    def test_bad_artifact_hash_is_rejected(self):
+        self.mutate = lambda result: result['artifacts'][0].update(sha256='0' * 64)
+        self.reject('role artifact digest mismatch')
+
+    def test_missing_artifact_reference_is_rejected(self):
+        self.mutate = lambda result: result['artifacts'][0].update(path='missing.txt')
+        self.reject('role artifact is unavailable or unsafe')
+
+    def test_unsafe_artifact_reference_is_rejected(self):
+        self.mutate = lambda result: result['artifacts'][0].update(path='../README.md')
+        self.reject('safe candidate-relative path')
+
+    def test_nul_artifact_path_is_rejected_before_filesystem_lookup(self):
+        self.mutate = lambda result: result['artifacts'][0].update(path='README.md\x00')
+        self.reject('safe candidate-relative path')
+
+    def test_nonlist_artifacts_are_observed_then_rejected(self):
+        self.mutate = lambda result: result.update(artifacts=None)
+        self.reject()
+
+    def test_malformed_status_with_bound_execution_is_rejected(self):
+        self.mutate = lambda result: result.update(status=['PASS'])
+        self.reject('requires PASS/BLOCKED/FAIL')
+
+    def test_empty_summary_with_bound_execution_is_rejected(self):
+        self.mutate = lambda result: result.update(summary='')
+        self.reject('requires PASS/BLOCKED/FAIL')
+
+    def assert_unresolved(self):
+        for _ in range(2):
+            self.assertEqual(self.drive()['status'], 'running')
+            self.assert_owned_without_verdict()
+        run_id = self.admission()['run_id']
+        self.assertIsNone(driver.fleet_herdr.load_result_rejection(self.runs, self.mid, run_id))
+        self.assertFalse((self.runs / 'missions' / self.mid / 'herdr-results' / f'{run_id}.json').exists())
+        self.assert_one_prompt()
+
+    def test_wrong_run_identity_remains_unresolved(self):
+        self.mutate = lambda result: result.update(run_id=str(uuid.uuid4()), artifacts=[])
+        self.assert_unresolved()
+
+    def test_incomplete_transcript_remains_unresolved_then_same_result_can_be_adjudicated(self):
+        self.saved_complete = None
+        def incomplete(rows):
+            self.saved_complete = rows.pop()
+        self.transcript_edit = incomplete
+        self.assert_unresolved()
+        member = next(m for m in self.backends[-1].state()['members'] if m['instance_id'] == 'worker')
+        with self.transcripts[member['agent_session']['value']].open('a') as stream:
+            stream.write(json.dumps(self.saved_complete) + '\n')
+        self.reject()
+
+    def test_unverifiable_permissions_do_not_adjudicate_invalid_result(self):
+        def unverifiable(rows):
+            for row in rows:
+                if row['type'] == 'turn_context':
+                    row['payload'].pop('sandbox_policy', None)
+        self.transcript_edit = unverifiable
+        self.assert_unresolved()
+
+    def test_unbound_non_json_output_remains_unresolved(self):
+        def malformed(rows):
+            rows[-2]['payload']['content'][0]['text'] = 'not a bound role result'
+            rows[-1]['payload']['last_agent_message'] = 'not a bound role result'
+        self.transcript_edit = malformed
+        self.assert_unresolved()
+
+    def assert_valid_verdict(self, verdict, expected):
+        self.verdict = verdict
+        self.mutate = lambda result: None
+        result = self.drive()
+        self.assertEqual(result['status'], expected)
+        self.assertNotIn('protocol_rejection', result)
+        self.assertFalse(self.admission()['active'])
+        self.assertFalse(self.current()['active_writer'])
+        self.assertEqual(self.admission()['terminal']['status'], expected)
+        self.assertIsNotNone(self.admission()['result'])
+        run_id = self.admission()['run_id']
+        self.assertIsNone(driver.fleet_herdr.load_result_rejection(self.runs, self.mid, run_id))
+        calls = list(self.fake.calls)
+        self.assertEqual(self.drive()['status'], expected)
+        self.assertEqual(self.fake.calls, calls)
+        self.assert_one_prompt()
+
+    def test_valid_pass_with_artifacts_keeps_success_path(self):
+        self.assert_valid_verdict('PASS', 'succeeded')
+
+    def test_valid_blocked_with_artifacts_keeps_blocked_path(self):
+        self.assert_valid_verdict('BLOCKED', 'blocked')
+
+    def test_valid_fail_with_artifacts_keeps_failed_path(self):
+        self.assert_valid_verdict('FAIL', 'failed')
+
+    def test_restart_after_observation_before_adjudication(self):
+        collect = self.Backend.collect_result
+        def crash(backend, run_id):
+            raw = collect(backend, run_id)
+            if raw and raw['instance_id'] == 'worker':
+                raise RuntimeError('crash after cached observation')
+            return raw
+        with mock.patch.object(self.Backend, 'collect_result', crash):
+            with self.assertRaisesRegex(RuntimeError, 'crash after cached observation'):
+                self.drive()
+        run_id = self.admission()['run_id']
+        before = state.canonical_bytes(self.backends[-1].collect_result(run_id))
+        self.assertIsNone(driver.fleet_herdr.load_result_rejection(self.runs, self.mid, run_id))
+        self.request_cancel()
+        self.reject()
+        self.assertEqual(state.canonical_bytes(self.backends[-1].collect_result(run_id)), before)
+
+    def interrupted_rejection_write(self, *, after):
+        write = driver._Driver.write
+        def crash(controller, name, value):
+            if name.startswith('herdr-result-rejection-'):
+                self.attempted_proof = value['artifact_id']
+                if after:
+                    write(controller, name, value)
+                raise RuntimeError('interrupted rejection publication')
+            write(controller, name, value)
+        with mock.patch.object(driver._Driver, 'write', crash):
+            with self.assertRaisesRegex(RuntimeError, 'interrupted rejection publication'):
+                self.drive()
+        self.assert_owned_without_verdict()
+        return self.attempted_proof
+
+    def test_restart_before_rejection_pointer_recovers_same_cas_identity(self):
+        attempted = self.interrupted_rejection_write(after=False)
+        self.assertIsNone(driver.fleet_herdr.load_result_rejection(self.runs, self.mid, self.admission()['run_id']))
+        self.assertEqual(self.reject()['artifact_id'], attempted)
+
+    def test_restart_after_rejection_pointer_skips_protocol_parser(self):
+        attempted = self.interrupted_rejection_write(after=True)
+        with mock.patch.object(driver._Driver, 'validate_result', side_effect=AssertionError('reparsed after restart')):
+            self.assertEqual(self.drive()['protocol_rejection']['artifact_id'], attempted)
+        self.assert_owned_without_verdict()
+        self.assert_one_prompt()
+
+    def test_fresh_process_recovers_rejection_from_cas_without_runtime_or_parser(self):
+        proof = self.reject()
+        code = '''
+import json, sys
+from pathlib import Path
+from unittest import mock
+sys.path.insert(0, sys.argv[1])
+import fleet_herdr, fleet_herdr_mission
+with mock.patch.object(fleet_herdr.HerdrBackend, '_default_run', side_effect=AssertionError('runtime invoked')), \\
+     mock.patch.object(fleet_herdr.HerdrBackend, '_default_transcript', side_effect=AssertionError('live transcript read')), \\
+     mock.patch.object(fleet_herdr_mission._Driver, 'validate_result', side_effect=AssertionError('reparsed rejection')):
+    print(json.dumps(fleet_herdr_mission.drive(Path(sys.argv[2]), sys.argv[3])))
+'''
+        child = subprocess.run([sys.executable, '-B', '-c', code, str(ROOT / 'scripts'), str(self.runs), self.mid],
+                               capture_output=True, text=True, timeout=30)
+        self.assertEqual(child.returncode, 0, child.stderr)
+        self.assertEqual(json.loads(child.stdout)['protocol_rejection'], proof)
+        self.assert_owned_without_verdict()
+        self.assert_one_prompt()
+
+    def test_repeated_pause_resume_and_deadline_use_durable_rejection(self):
+        proof = self.reject()
+        with mock.patch.object(driver._Driver, 'validate_result', side_effect=AssertionError('reparsed control result')):
+            for action in ('pause', 'resume', 'pause', 'resume'):
+                driver.control.request(self.runs, self.mid, action=action, reason='fixture ' + action,
+                    idempotency_key=action + str(len(self.current()['herdr_control']['requests'])))
+                self.assertEqual(self.drive()['protocol_rejection'], proof)
+                self.assert_owned_without_verdict()
+            with mock.patch.object(driver._Driver, 'remaining_seconds', return_value=-1):
+                for _ in range(2):
+                    self.assertEqual(self.drive()['status'], 'running')
+                    self.assert_owned_without_verdict()
+                self.set_runtime('idle')
+                self.assertEqual(self.drive()['status'], 'abandoned')
+        self.assertFalse(self.admission()['active'])
+        self.assertIsNone(self.admission()['result'])
+        self.assert_one_prompt()
+
+    def test_restart_before_cancel_and_after_closure_before_admission_finalization(self):
+        proof = self.reject()
+        self.request_cancel()
+        with mock.patch.object(self.Backend, 'cancel', side_effect=RuntimeError('crash before reconciliation')):
+            with self.assertRaisesRegex(RuntimeError, 'crash before reconciliation'):
+                self.drive()
+        self.assertEqual(self.drive()['protocol_rejection'], proof)
+        self.assert_owned_without_verdict()
+        self.set_runtime('idle')
+        with mock.patch.object(fleet_admission, 'finalize', side_effect=RuntimeError('crash before admission finalization')):
+            with self.assertRaisesRegex(RuntimeError, 'crash before admission finalization'):
+                self.drive()
+        self.assert_owned_without_verdict()
+        self.request_cancel()
+        self.assertEqual(self.drive()['status'], 'abandoned')
+        self.assertEqual(self.drive()['status'], 'abandoned')
+        self.assertIsNone(self.admission()['result'])
+        self.assertFalse(self.admission()['active'])
+        self.assert_one_prompt()
+
+    def test_rejection_does_not_expand_cancellation_generation_authority(self):
+        self.reject()
+        calls = list(self.fake.calls)
+        with self.assertRaisesRegex(state.MissionConflict, 'generation does not match owned backend'):
+            driver.control.request(self.runs, self.mid, action='cancel', reason='wrong generation',
+                idempotency_key='wrong-generation', run_id=self.admission()['run_id'], generation=str(uuid.uuid4()))
+        self.assertEqual(self.fake.calls, calls)
+        self.assert_owned_without_verdict()
+        self.assert_one_prompt()
+
+    def test_rejection_cannot_authorize_different_cached_bytes(self):
+        proof = self.reject()
+        self.request_cancel()
+        raw = self.backends[-1].collect_result(proof['run_id'])
+        changed = {**raw, 'turn_id': 'another-turn'}
+        calls = list(self.fake.calls)
+        with mock.patch.object(self.Backend, 'collect_result', return_value=changed):
+            with self.assertRaisesRegex(driver.fleet_herdr.HerdrBackendError, 'rejection differs from observed result'):
+                self.drive()
+        self.assertEqual(self.fake.calls, calls)
+        self.assert_owned_without_verdict()
+        self.assertEqual(self.drive()['protocol_rejection'], proof)
+        self.assert_one_prompt()
+
+    def test_rejection_is_optional_for_historical_readers_and_does_not_add_ledger_events(self):
+        from tests.test_mission_run import mission_run
+        import fleet_report
+        proof = self.reject()
+        root = self.runs / 'missions' / self.mid
+        before = {str(p): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+        with mock.patch('subprocess.run', side_effect=AssertionError('historical reader used runtime')):
+            self.assertEqual(mission_run.mission_status(self.runs, self.mid)['status'], 'running')
+            fleet_report.build_report(self.runs, self.mid)
+            driver.control.backend_generation(self.runs, self.mid)
+        self.assertEqual(before, {str(p): p.read_bytes() for p in root.rglob('*') if p.is_file()})
+        self.assertEqual(list(root.glob('herdr-result-rejection-*.json')), [root / f'herdr-result-rejection-{proof["run_id"]}.json'])
+
+    def test_capsule_rejected_result_still_requires_exact_quiescence_and_cleanup(self):
+        import fleet_mission_capsule as capsule
+        self.reject()
+        run_id = self.admission()['run_id']
+        raw = self.backends[-1].collect_result(run_id)
+        attempt = {'role': 'worker', 'generation': self.backends[-1].state()['generation']}
+        launch = {'attempt': attempt, 'prompt_sha256': self.admission()['task_sha256']}
+        launch_id = fleet_artifacts.put_bytes(self.runs, self.mid, state.canonical_bytes(launch))['artifact_id']
+        adapter = SimpleNamespace(runs=self.runs, mid=self.mid, collect_result=lambda run: raw,
+                                  _name=lambda run, kind: kind)
+        plan_run = next(a['run_id'] for a in self.current()['admissions'].values() if a['request_key'] == 'herdr:plan')
+        plan_result = self.backends[-1].collect_result(plan_run)
+        with mock.patch.object(adapter, 'collect_result', return_value=plan_result), \
+                mock.patch.object(capsule, 'read_json', side_effect=AssertionError('valid result entered cancel reconciliation')):
+            self.assertEqual(capsule.CapsuleBackend.cancel(adapter, plan_run), {'status': 'settled', 'run_id': plan_run})
+        for quiescent, cleanup, exact in ((False, True, True), (True, False, True), (True, True, False), (True, True, True)):
+            with self.subTest(quiescent=quiescent, cleanup=cleanup, exact=exact):
+                report = {'run_id': run_id if exact else str(uuid.uuid4()), 'attempt': attempt,
+                          'quiescence_confirmed': quiescent, 'cleanup_confirmed': cleanup}
+                report_id = fleet_artifacts.put_bytes(self.runs, self.mid, state.canonical_bytes(report))['artifact_id']
+                with mock.patch.object(capsule, 'read_json', return_value={'launch_artifact_id': launch_id, 'report_artifact_id': report_id}):
+                    if not all((quiescent, cleanup, exact)):
+                        with self.assertRaisesRegex(RuntimeError, 'capsule cancellation lacks quiescence'):
+                            capsule.CapsuleBackend.cancel(adapter, run_id)
+                    else:
+                        observed = capsule.CapsuleBackend.cancel(adapter, run_id)
+                        self.assertEqual(observed['status'], 'abandoned')
+                        self.assertEqual(observed['run_id'], run_id)
+                        self.assertEqual(observed['prompt_sha256'], self.admission()['task_sha256'])
+        self.assert_owned_without_verdict()  # the adapter receipt alone never writes the admission
+        self.assert_one_prompt()
 
 
 if __name__ == "__main__":

@@ -623,24 +623,32 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         raise MissionStateError("event payload must be an object")
     if kind == "mission_created":
-        _require_fields(
-            kind,
-            payload,
-            {
-                "feature",
-                "objective_sha256",
-                "target_repo",
-                "base_sha",
-                "workflow_digest",
-                "initial_risk",
-            },
-        )
+        required = {
+            "feature",
+            "objective_sha256",
+            "target_repo",
+            "base_sha",
+            "workflow_digest",
+            "initial_risk",
+        }
+        if not required <= set(payload) or not set(payload) <= required | {
+            "sdd_plan_sha256", "herdr_profile", "herdr_profile_sha256"
+        }:
+            raise MissionStateError("mission_created payload fields do not match schema")
         if not isinstance(payload["feature"], str) or not SAFE_FEATURE.fullmatch(
             payload["feature"]
         ):
             raise MissionStateError("mission feature must be a canonical component")
         _require_sha(payload["objective_sha256"], "objective_sha256")
         _require_sha(payload["workflow_digest"], "workflow_digest")
+        if "sdd_plan_sha256" in payload:
+            _require_sha(payload["sdd_plan_sha256"], "sdd_plan_sha256")
+        if ("herdr_profile" in payload) is not ("herdr_profile_sha256" in payload):
+            raise MissionStateError("Herdr profile creation binding is incomplete")
+        if "herdr_profile" in payload:
+            if payload["herdr_profile"] != "astra_sol_research_v1":
+                raise MissionStateError("unsupported Herdr profile creation binding")
+            _require_sha(payload["herdr_profile_sha256"], "herdr_profile_sha256")
         validate_target_repo(payload["target_repo"])
         if not isinstance(payload["base_sha"], str) or not GIT_OID.fullmatch(
             payload["base_sha"]
@@ -794,6 +802,12 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
     elif kind == "mission_completing":
         _require_fields(kind, payload, {"lead_artifact_id"})
         _require_sha(payload["lead_artifact_id"], "mission lead_artifact_id")
+    elif kind in {"inference_policy_frozen", "inference_request_reserved", "inference_request_finished"}:
+        import fleet_herdr_inference
+        try:
+            fleet_herdr_inference.validate_payload(kind, payload)
+        except fleet_herdr_inference.InferenceError as exc:
+            raise MissionStateError(str(exc)) from exc
     elif kind == "herdr_native_observed":
         _require_fields(kind, payload, {"attempt", "run_id", "artifact_id", "channel_id", "sequence", "decision", "authority"})
         attempt = payload["attempt"]
@@ -836,13 +850,31 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         if payload["status"] not in {"passed", "failed", "blocked", "indeterminate"}:
             raise MissionStateError("invalid functional outcome")
     elif kind == "herdr_finalization_policy_frozen":
-        _require_fields(kind, payload, {"compiled_digest", "minimum_archive_schema_version",
-                                       "permissions_policy_version", "required_turns"})
+        legacy = {"compiled_digest", "minimum_archive_schema_version",
+                  "permissions_policy_version", "required_turns"}
+        research = legacy | {"herdr_profile", "herdr_profile_sha256"}
+        fields = set(payload)
+        if fields != legacy and fields != research:
+            raise MissionStateError("Herdr finalization policy fields are invalid")
         _require_sha(payload["compiled_digest"], "Herdr finalization compiled_digest")
-        for field, expected in (("minimum_archive_schema_version", 3),
-                                ("permissions_policy_version", 1), ("required_turns", 5)):
-            if type(payload[field]) is not int or payload[field] != expected:
-                raise MissionStateError("unsupported Herdr finalization policy")
+        if fields == research:
+            if (payload["herdr_profile"] != "astra_sol_research_v1"
+                    or any(type(payload[field]) is not int or payload[field] != expected
+                           for field, expected in (("minimum_archive_schema_version", 6),
+                                                   ("permissions_policy_version", 3),
+                                                   ("required_turns", 6)))):
+                raise MissionStateError("unsupported Research finalization policy")
+            _require_sha(payload["herdr_profile_sha256"], "Herdr profile digest")
+        else:
+            for field, expected in (("minimum_archive_schema_version", 3),
+                                    ("permissions_policy_version", 1), ("required_turns", 5)):
+                allowed = {1, 2} if field == "permissions_policy_version" else {expected}
+                if type(payload[field]) is not int or payload[field] not in allowed:
+                    raise MissionStateError("unsupported Herdr finalization policy")
+    elif kind == "herdr_archive_selected":
+        _require_fields(kind, payload, {"compiled_digest", "ledger_head", "index_artifact_id"})
+        for field in payload:
+            _require_sha(payload[field], "Herdr archive selection " + field)
     elif kind == "archive_created":
         _require_fields(kind, payload, {"path", "sha256", "mode"})
         _require_nonempty(payload["path"], "archive path")
@@ -1807,7 +1839,17 @@ def _require_admission_actor(admission: dict[str, Any], event: dict[str, Any]) -
         raise MissionConflict("admission actor does not match its sealed lane")
 
 
+def _require_inference_settled(result: dict[str, Any]) -> None:
+    if result.get("inference_policies"):
+        import fleet_herdr_inference
+        try:
+            fleet_herdr_inference.require_settled(result)
+        except fleet_herdr_inference.InferenceError as exc:
+            raise MissionConflict(str(exc)) from exc
+
+
 def _require_no_active_admissions(result: dict[str, Any], where: str) -> None:
+    _require_inference_settled(result)
     if (
         result["run_claims"]
         or result["active_writer"] is not None
@@ -2110,6 +2152,11 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
         "last_sequence": 0,
         "head_sha256": GENESIS_SHA256,
     }
+    if "sdd_plan_sha256" in created:
+        result["sdd_plan_sha256"] = created["sdd_plan_sha256"]
+    if "herdr_profile" in created:
+        result["herdr_profile"] = created["herdr_profile"]
+        result["herdr_profile_sha256"] = created["herdr_profile_sha256"]
     terminal_seen = False
     idempotency_keys: set[str] = set()
     for event in events:
@@ -2572,6 +2619,12 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
             result["risk_categories"] = sorted(
                 set(result["risk_categories"]) | set(payload["categories"])
             )
+        elif kind in {"inference_policy_frozen", "inference_request_reserved", "inference_request_finished"}:
+            import fleet_herdr_inference
+            try:
+                fleet_herdr_inference.reduce(result, event)
+            except fleet_herdr_inference.InferenceError as exc:
+                raise MissionConflict(str(exc)) from exc
         elif kind == "herdr_native_observed":
             if (event["actor"] != "CONTROL" or result["status"] not in {"booting", "running"}
                     or payload["attempt"]["mission_id"] != result["mission_id"]):
@@ -2610,6 +2663,15 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                     or any(payload[k] != attempt[k] for k in ("contract_artifact_id", "attempt_id"))):
                 raise MissionConflict("functional result lacks its unique matching attempt")
             attempt["result"] = {**payload, "event_sha256": event["event_sha256"]}
+        elif kind == "herdr_archive_selected":
+            if result.get("herdr_archive_selection") is not None:
+                raise MissionConflict("Herdr archive snapshot is already selected")
+            if (event["actor"] != "CONTROL" or result["status"] != "completing"
+                    or payload["compiled_digest"] != result["compiled_digest"]
+                    or payload["ledger_head"] != result["head_sha256"]):
+                raise MissionConflict("Herdr archive selection binding mismatch")
+            _require_no_active_admissions(result, "Herdr archive selection")
+            result["herdr_archive_selection"] = {**payload, "event_sha256": event["event_sha256"]}
         elif kind == "herdr_finalization_policy_frozen":
             if result.get("herdr_finalization_policy") is not None:
                 raise MissionConflict("Herdr finalization policy is immutable")
@@ -3082,6 +3144,7 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
         elif kind == "mission_terminal":
             if result["terminal"] is not None:
                 raise MissionConflict("first mission terminal is immutable")
+            _require_inference_settled(result)
             if result.get("functional_attempt") and not result["functional_attempt"].get("result"):
                 raise MissionConflict("mission terminal requires functional attempt reconciliation")
             if (

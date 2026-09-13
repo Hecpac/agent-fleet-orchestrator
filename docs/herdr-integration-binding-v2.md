@@ -1,5 +1,9 @@
 # INTEGRATION_BINDING: primera etapa local, sin activación
 
+Actualización 2026-09-10: las dependencias de compilación y las pruebas dirigidas
+ya están [verificadas](herdr-native-build-verification.md). Los bloqueos de
+toolchain descritos abajo son históricos. La integración nativa sigue incompleta.
+
 Fecha: 2026-09-07. Este documento describe código local autorizado después de la
 auditoría de viabilidad. **La implementación coordinada todavía está incompleta.**
 No hay una operación real Fleet → Herdr → Codex atestada.

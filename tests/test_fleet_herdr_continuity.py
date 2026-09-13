@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 import sys
 
@@ -90,6 +91,419 @@ class ContinuityTests(unittest.TestCase):
         state=self.ctrl.step(manual)
         for _ in range(n-1): state=self.ctrl.step()
         return state
+
+    def issued_phase(self, phase):
+        self.lower('researcher', used=11000); self.lower()
+        state = self.ctrl.step('researcher')
+        for _ in range(10):
+            if state['active']['phase'] == phase:
+                return copy.deepcopy(state['active'])
+            state = self.ctrl.step()
+        self.fail('fixture did not reach ' + phase)
+
+    def restart_controller(self):
+        self.ctrl = c.Controller(self.plan, self.config, c.Store(self.store.root),
+                                 self.live, lambda: self.now)
+
+    def phase_fixture(self, phase, *, delayed_metadata=False, ambiguous=False):
+        fixture = ContinuityTests()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.live.delayed_metadata = delayed_metadata
+        fixture.live.fail_after_send = ambiguous
+        return fixture, fixture.issued_phase(phase)
+
+    def assert_original_intent(self, issued):
+        entry = self.ctrl.status()
+        found = []
+        while entry:
+            op = entry.get('active') or {}
+            if op.get('id') == issued['id'] and op.get('phase') == issued['phase']:
+                found.append(op)
+            entry = c.read_json(self.store.get(entry['previous'])) if entry.get('previous') else None
+        self.assertTrue(found)
+        for op in found:
+            for key in ('since', 'prompt_sha256', 'send_binding'):
+                self.assertEqual(op[key], issued[key])
+            self.assertEqual(op['since'] + self.plan['phase_timeout_seconds'], issued['since'] + 120)
+
+    def response_location(self, issued):
+        key = {'checkpoint_sent': 'source_binding', 'restore_sent': 'new_binding',
+               'lead_sent': 'lead_binding'}[issued['phase']]
+        name = 'lead' if issued['phase'] == 'lead_sent' else issued['member']
+        return name, issued[key]['session']
+
+    def test_late_checkpoint_recovers_exact_evidence_without_timing_reset(self):
+        issued = self.issued_phase('checkpoint_sent')
+        calls = list(self.live.calls)
+        self.now = issued['since'] + 121
+        self.restart_controller()
+        with mock.patch.object(self.ctrl, 'response', wraps=self.ctrl.response) as response:
+            result = self.ctrl.step()
+            self.assertEqual(result['active']['phase'], 'prepared')
+            self.assertEqual(response.call_count, 1)
+        active = result['active']
+        self.assertEqual(active['since'], issued['since'])
+        self.assertEqual(active['id'], issued['id'])
+        checkpoint = c.read_json(self.store.get(active['checkpoint_sha256']))
+        self.assertEqual(checkpoint['renewal_id'], issued['id'])
+        self.assertEqual(checkpoint['source_binding'], issued['source_binding'])
+        raw = self.store.get(checkpoint['summary_transcript'])
+        self.assertEqual(raw, self.live.raw[issued['source_binding']['session']])
+        for _ in range(2):
+            self.now += 121
+            self.restart_controller()
+            self.assertEqual(self.ctrl.reconcile()['active'], active)
+        self.assertEqual(self.live.calls, calls)
+
+    def test_late_restore_repeated_reconcile_preserves_evidence_and_deadline(self):
+        issued = self.issued_phase('restore_sent')
+        calls = list(self.live.calls)
+        self.now = issued['since'] + 121
+        observations = []
+        with mock.patch.object(self.live, 'transcript', wraps=self.live.transcript) as reads:
+            for _ in range(3):
+                self.restart_controller()
+                self.ctrl.step()
+                observations.append(self.ctrl.reconcile())
+                self.now += 121
+            self.assertEqual(reads.call_count, 1)
+        for result in observations:
+            self.assertEqual(result['active']['phase'], 'lead_pending')
+            self.assertEqual(result['active']['since'], issued['since'])
+            self.assertEqual(result['active']['new_since'], issued['new_since'])
+            self.assertEqual(result['active']['id'], issued['id'])
+            raw = self.store.get(result['active']['restoration_transcript'])
+            self.assertEqual(raw, self.live.raw[issued['new_binding']['session']])
+        self.assertEqual(self.live.calls, calls)
+        self.assertEqual(result['completed'], [])
+
+    def test_late_lead_receipt_completes_exact_attempt_without_replay(self):
+        issued = self.issued_phase('lead_sent')
+        calls = list(self.live.calls)
+        self.now = issued['since'] + 121
+        self.restart_controller()
+        result = self.ctrl.step()
+        self.assertIsNone(result['active'])
+        self.assertEqual(len(result['completed']), 1)
+        record = c.read_json(self.store.get(result['completed'][0]))
+        self.assertEqual(record['id'], issued['id'])
+        self.assertEqual(record['since'], issued['since'])
+        self.assertEqual(self.store.get(record['lead_receipt']),
+                         self.live.raw[issued['lead_binding']['session']])
+        for _ in range(2):
+            self.now += 121
+            self.restart_controller()
+            self.ctrl.reconcile()
+            self.assertEqual(self.ctrl.step()['completed'], result['completed'])
+        self.assertEqual(self.live.calls, calls)
+        self.assertEqual(self.ctrl.verify()['completed'][0]['status'], 'PASS')
+
+    def test_late_restoration_blocks_next_transition_even_for_self_lead(self):
+        for name in ('researcher', 'lead'):
+            with self.subTest(member=name):
+                f = ContinuityTests()
+                f.setUp()
+                self.addCleanup(f.doCleanups)
+                f.lower('researcher', used=11000); f.lower('lead', used=11000)
+                state = f.ctrl.step(name)
+                for _ in range(10):
+                    if state['active']['phase'] == 'restore_sent':
+                        break
+                    state = f.ctrl.step()
+                self.assertEqual(state['active']['phase'], 'restore_sent')
+                issued = copy.deepcopy(state['active'])
+                calls = list(f.live.calls)
+                f.now = issued['since'] + 121
+                f.restart_controller()
+                retained = f.ctrl.step()['active']
+                self.assertEqual(retained['phase'], 'lead_pending')
+                self.assertEqual(retained['since'], issued['since'])
+                raw = f.live.raw[issued['new_binding']['session']]
+                self.assertEqual(f.store.get(retained['restoration_transcript']), raw)
+                for _ in range(2):
+                    f.restart_controller()
+                    with mock.patch.object(f.live, 'get', wraps=f.live.get) as read:
+                        result = f.ctrl.step()
+                        self.assertEqual(read.call_count, 0)
+                    self.assertEqual(result['active']['phase'], 'blocked')
+                    self.assertEqual(result['active']['reason'], 'handoff_timeout_reconcile_without_resending')
+                    self.assertEqual(result['completed'], [])
+                    restored = f.ctrl.reconcile()['active']
+                    self.assertEqual(restored['phase'], 'lead_pending')
+                    self.assertEqual(restored['since'], issued['since'])
+                    self.assertEqual(restored['restoration_transcript'], retained['restoration_transcript'])
+                    f.now += 121
+                f.assert_original_intent(issued)
+                self.assertEqual(f.live.calls, calls)
+                self.assertEqual(f.ctrl.verify()['completed'], [])
+
+    def test_result_deadline_boundary_preserves_existing_phase_clocks(self):
+        for phase in ('checkpoint_sent', 'restore_sent', 'lead_sent'):
+            for elapsed in (119, 120, 121):
+                with self.subTest(phase=phase, elapsed=elapsed):
+                    f, issued = self.phase_fixture(phase)
+                    calls = list(f.live.calls)
+                    f.now = issued['since'] + elapsed
+                    with mock.patch.object(f.ctrl, 'response', wraps=f.ctrl.response) as read:
+                        result = f.ctrl.step()
+                        self.assertEqual(read.call_count, 1)
+                    if phase == 'lead_sent':
+                        op = c.read_json(f.store.get(result['completed'][0]))
+                        self.assertEqual(op['since'], issued['since'])
+                        self.assertEqual(op['completed_at'], f.now)
+                    else:
+                        self.assertEqual(result['active']['phase'],
+                                         'prepared' if phase == 'checkpoint_sent' else 'lead_pending')
+                        self.assertEqual(result['active']['since'], issued['since'] if elapsed > 120 else f.now)
+                    f.assert_original_intent(issued)
+                    self.assertEqual(f.live.calls, calls)
+
+    def test_missing_late_results_still_timeout_without_new_wait_window(self):
+        for phase in ('checkpoint_sent', 'restore_sent', 'lead_sent'):
+            with self.subTest(phase=phase):
+                f, issued = self.phase_fixture(phase)
+                _, sid = f.response_location(issued)
+                rows = f.live.raw[sid].splitlines()
+                start = max(i for i, raw in enumerate(rows)
+                            if c.read_json(raw)['payload'].get('type') == 'task_started')
+                f.live.raw[sid] = b'\n'.join(rows[:start + 1]) + b'\n'
+                calls = list(f.live.calls)
+                for elapsed in (119, 121, 500):
+                    f.now = issued['since'] + elapsed
+                    f.restart_controller()
+                    result = f.ctrl.step()
+                    if elapsed <= 120:
+                        self.assertEqual(result['active']['phase'], phase)
+                    else:
+                        self.assertEqual(result['active']['phase'], 'blocked')
+                        self.assertEqual(result['active']['reason'], 'handoff_timeout_reconcile_without_resending')
+                    reconciled = f.ctrl.reconcile()
+                    self.assertEqual(reconciled['active']['since'], issued['since'])
+                    self.assertEqual(reconciled['active']['phase'], phase)
+                    self.assertEqual(reconciled['completed'], [])
+                f.assert_original_intent(issued)
+                self.assertEqual(f.live.calls, calls)
+
+    def test_result_available_after_timeout_block_recovers_same_attempt(self):
+        for phase in ('checkpoint_sent', 'restore_sent', 'lead_sent'):
+            with self.subTest(phase=phase):
+                f, issued = self.phase_fixture(phase)
+                calls = list(f.live.calls)
+                f.now = issued['since'] + 121
+                with mock.patch.object(f.live, 'transcript', side_effect=c.ContinuityError('native_transcript_unavailable')):
+                    self.assertEqual(f.ctrl.step()['active']['phase'], 'blocked')
+                f.now += 121
+                f.restart_controller()
+                self.assertEqual(f.ctrl.reconcile()['active']['since'], issued['since'])
+                result = f.ctrl.step()
+                if phase == 'lead_sent':
+                    self.assertEqual(len(result['completed']), 1)
+                else:
+                    self.assertEqual(result['active']['phase'], 'prepared' if phase == 'checkpoint_sent' else 'lead_pending')
+                    self.assertEqual(result['active']['since'], issued['since'])
+                f.assert_original_intent(issued)
+                self.assertEqual(f.live.calls, calls)
+
+    def test_invalid_late_results_cannot_adjudicate_or_authorize_effects(self):
+        for phase in ('checkpoint_sent', 'restore_sent', 'lead_sent'):
+            for corruption in ('protocol', 'malformed_final', 'wrong_prompt', 'wrong_session',
+                               'wrong_native_session', 'wrong_context', 'wrong_completion', 'incomplete'):
+                with self.subTest(phase=phase, corruption=corruption):
+                    f, issued = self.phase_fixture(phase)
+                    name, sid = f.response_location(issued)
+                    rows = [c.read_json(line) for line in f.live.raw[sid].splitlines()]
+                    final = next(r['payload'] for r in reversed(rows) if r['type'] == 'response_item'
+                                 and r['payload'].get('role') == 'assistant')
+                    complete = next(r['payload'] for r in reversed(rows) if r['payload'].get('type') == 'task_complete')
+                    if corruption in {'protocol', 'malformed_final'}:
+                        value = c.read_json(final['content'][0]['text'])
+                        value['goal' if phase == 'checkpoint_sent' else 'status'] = 'FOREIGN'
+                        text = '{' if corruption == 'malformed_final' else c.encoded(value).decode()
+                        final['content'][0]['text'] = text; complete['last_agent_message'] = text
+                    elif corruption == 'wrong_prompt':
+                        user = next(r['payload'] for r in reversed(rows) if r['payload'].get('role') == 'user')
+                        user['content'][0]['text'] += ' foreign attempt'
+                    elif corruption == 'wrong_session':
+                        f.live.agents[name]['binding']['session'] = str(uuid.uuid4())
+                    elif corruption == 'wrong_native_session':
+                        rows[0]['payload']['id'] = str(uuid.uuid4())
+                    elif corruption == 'wrong_context':
+                        next(r['payload'] for r in reversed(rows) if r['type'] == 'turn_context')['model'] = 'foreign'
+                    elif corruption == 'wrong_completion':
+                        complete['turn_id'] = str(uuid.uuid4())
+                    raw = b'\n'.join(c.encoded(row) for row in rows) + b'\n'
+                    f.live.raw[sid] = raw[:-1] if corruption == 'incomplete' else raw
+                    calls = list(f.live.calls)
+                    result_key = {'checkpoint_sent': 'checkpoint_sha256', 'restore_sent': 'restoration_transcript',
+                                  'lead_sent': 'lead_receipt'}[phase]
+                    for elapsed in (121, 500):
+                        f.now = issued['since'] + elapsed
+                        f.restart_controller()
+                        f.ctrl.reconcile()
+                        result = f.ctrl.step()
+                        self.assertEqual(result['active']['phase'], 'blocked')
+                        self.assertNotIn(result_key, result['active'])
+                        self.assertEqual(result['completed'], [])
+                        self.assertEqual(f.ctrl.reconcile()['active']['since'], issued['since'])
+                    f.assert_original_intent(issued)
+                    self.assertEqual(f.live.calls, calls)
+
+    def test_late_prepared_checkpoint_keeps_existing_next_effect_gates(self):
+        for change in ('none', 'file', 'session', 'work', 'busy'):
+            with self.subTest(change=change):
+                f, issued = self.phase_fixture('checkpoint_sent')
+                f.now = issued['since'] + 121
+                prepared = f.ctrl.step()['active']
+                self.assertEqual(prepared['phase'], 'prepared')
+                self.assertEqual(prepared['since'], issued['since'])
+                calls = list(f.live.calls)
+                if change == 'file': f.file.write_text('changed evidence')
+                elif change == 'session': f.live.agents['researcher']['binding']['session'] = str(uuid.uuid4())
+                elif change == 'work': f.lower('researcher', used=2000)
+                elif change == 'busy': f.live.agents['researcher']['agent_status'] = 'working'
+                f.now += 121
+                f.restart_controller()
+                result = f.ctrl.step()
+                if change == 'none':
+                    # prepared has an existing, explicit timeout exemption.
+                    self.assertEqual(f.live.calls[len(calls):], [('researcher', '/new')])
+                    self.assertEqual(result['active']['phase'], 'new_sent')
+                    self.assertEqual(result['active']['since'], f.now)
+                else:
+                    self.assertEqual(f.live.calls, calls)
+                f.assert_original_intent(issued)
+
+    def test_late_warning_checkpoint_does_not_authorize_renewal(self):
+        self.lower('researcher', used=11000); self.lower()
+        sid = self.live.agents['researcher']['binding']['session']
+        self.live.raw[sid] = self.live.raw[sid].replace(b'"model_context_window":20000', b'"model_context_window":100000').replace(
+            b'"input_tokens":10900', b'"input_tokens":74900').replace(b'"total_tokens":11000', b'"total_tokens":75000')
+        issued = copy.deepcopy(self.ctrl.step()['active'])
+        self.assertFalse(issued['renew'])
+        self.now = issued['since'] + 121
+        result = self.ctrl.step()
+        self.assertIsNone(result['active'])
+        prepared = c.read_json(self.store.get(result['roles']['researcher']['prepared_sha256']))
+        self.assertEqual(prepared['since'], issued['since'])
+        self.assertFalse(prepared['renew'])
+        self.restart_controller(); self.ctrl.step()
+        self.assertEqual(len(self.live.calls), 1)
+        self.assert_original_intent(issued)
+
+    def test_late_lead_receipt_still_requires_unchanged_restoration(self):
+        for change in ('work', 'session', 'file'):
+            with self.subTest(change=change):
+                f, issued = self.phase_fixture('lead_sent')
+                calls = list(f.live.calls)
+                if change == 'work': f.lower('researcher', used=2000)
+                elif change == 'session': f.live.agents['researcher']['binding']['session'] = str(uuid.uuid4())
+                else: f.file.write_text('changed after restore')
+                f.now = issued['since'] + 121
+                result = f.ctrl.step()
+                self.assertEqual(result['active']['phase'], 'blocked')
+                self.assertEqual(result['completed'], [])
+                self.assertNotIn('lead_receipt', result['active'])
+                self.assertEqual(f.live.calls, calls)
+                self.assertEqual(f.ctrl.reconcile()['active']['since'], issued['since'])
+                f.assert_original_intent(issued)
+
+    def test_expired_next_effect_phases_remain_blocked(self):
+        for phase in ('new_sent', 'status_sent', 'lead_pending'):
+            with self.subTest(phase=phase):
+                f, issued = self.phase_fixture(phase, delayed_metadata=phase == 'status_sent')
+                calls = list(f.live.calls)
+                f.now = issued['since'] + 121
+                with mock.patch.object(f.live, 'get', wraps=f.live.get) as read:
+                    result = f.ctrl.step()
+                    self.assertEqual(read.call_count, 0)
+                self.assertEqual(result['active']['phase'], 'blocked')
+                self.assertEqual(result['active']['reason'], 'handoff_timeout_reconcile_without_resending')
+                self.assertEqual(f.ctrl.reconcile()['active']['since'], issued['since'])
+                self.assertEqual(f.live.calls, calls)
+
+    def test_adjudication_crossing_deadline_does_not_refresh_since(self):
+        for phase in ('checkpoint_sent', 'restore_sent'):
+            with self.subTest(phase=phase):
+                f, issued = self.phase_fixture(phase)
+                _, sid = f.response_location(issued)
+                raw = f.live.raw[sid]
+                original = f.store.put
+                def put(content):
+                    if content == raw:
+                        f.now = issued['since'] + 121
+                    return original(content)
+                f.now = issued['since'] + 119
+                with mock.patch.object(f.store, 'put', side_effect=put):
+                    result = f.ctrl.step()
+                self.assertEqual(result['active']['since'], issued['since'])
+                self.assertEqual(result['active']['phase'], 'prepared' if phase == 'checkpoint_sent' else 'lead_pending')
+
+    def test_late_ambiguous_send_observes_completed_exact_attempt(self):
+        for phase in ('checkpoint_sent', 'restore_sent', 'lead_sent'):
+            with self.subTest(phase=phase):
+                f, issued = self.phase_fixture(phase, ambiguous=True)
+                self.assertTrue(issued['send_receipt']['ambiguous'])
+                calls = list(f.live.calls)
+                f.now = issued['since'] + 121
+                f.restart_controller()
+                result = f.ctrl.step()
+                if phase == 'lead_sent': self.assertEqual(len(result['completed']), 1)
+                else: self.assertEqual(result['active']['phase'], 'prepared' if phase == 'checkpoint_sent' else 'lead_pending')
+                f.assert_original_intent(issued)
+                self.assertEqual(f.live.calls, calls)
+
+    def test_late_observation_persistence_interruptions_recover_exact_intent(self):
+        class Interrupted(BaseException): pass
+        original = c.Store.save
+        for phase in ('checkpoint_sent', 'restore_sent', 'lead_sent'):
+            for boundary in ('before_save', 'after_save', 'before_next_transition'):
+                with self.subTest(phase=phase, boundary=boundary):
+                    f, issued = self.phase_fixture(phase)
+                    calls = list(f.live.calls)
+                    f.now = issued['since'] + 121
+                    destination = 'prepared' if phase == 'checkpoint_sent' else 'lead_pending'
+                    def save(store, value):
+                        adjudicated = ((value.get('active') or {}).get('phase') == destination
+                                       if phase != 'lead_sent' else bool(value['completed']))
+                        if adjudicated and boundary == 'before_save': raise Interrupted()
+                        original(store, value)
+                        if adjudicated and boundary == 'after_save': raise Interrupted()
+                    if boundary == 'before_next_transition':
+                        result = f.ctrl.step()
+                        # A completed handoff has no next active transition.
+                        if phase != 'lead_sent':
+                            with mock.patch.object(f.ctrl, 'advance', side_effect=Interrupted):
+                                with self.assertRaises(Interrupted): f.ctrl.step()
+                    else:
+                        with mock.patch.object(c.Store, 'save', new=save):
+                            with self.assertRaises(Interrupted): f.ctrl.step()
+                    f.restart_controller()
+                    durable = f.ctrl.status()
+                    if boundary == 'before_save':
+                        self.assertEqual(durable['active']['phase'], phase)
+                        self.assertEqual(durable['active']['since'], issued['since'])
+                        result = f.ctrl.step()
+                    else:
+                        result = f.ctrl.reconcile()
+                        with mock.patch.object(f.ctrl, 'response', side_effect=AssertionError('adjudicated result read again')):
+                            if phase == 'lead_sent': f.ctrl.step()
+                            else: f.ctrl.reconcile()
+                    if phase == 'lead_sent':
+                        self.assertEqual(len(result['completed']), 1)
+                        retained = c.read_json(f.store.get(result['completed'][0]))
+                        evidence = retained['lead_receipt']
+                    else:
+                        retained = result['active']
+                        self.assertEqual(retained['phase'], destination)
+                        evidence = (c.read_json(f.store.get(retained['checkpoint_sha256']))['summary_transcript']
+                                    if phase == 'checkpoint_sent' else retained['restoration_transcript'])
+                    _, sid = f.response_location(issued)
+                    self.assertEqual(f.store.get(evidence), f.live.raw[sid])
+                    self.assertEqual(retained['since'], issued['since'])
+                    self.assertEqual(retained['id'], issued['id'])
+                    f.assert_original_intent(issued)
+                    self.assertEqual(f.live.calls, calls)
 
     def test_complete_recall_and_lead_receipt_are_durable(self):
         self.lower('researcher',used=11000);self.lower()

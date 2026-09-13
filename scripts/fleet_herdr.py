@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Durable Herdr 0.8.2 backend for a compiled Mission Control roster."""
+"""Version-bound Herdr backend with unchanged historical state readers."""
 
 from __future__ import annotations
 
@@ -19,31 +19,64 @@ import fleet_compiled
 import fleet_artifacts
 import fleet_json
 import fleet_herdr_evidence
+import fleet_herdr_skill_context
+import fleet_herdr_rejection
 import fleet_herdr_permissions
 import fleet_herdr_launch
+import fleet_herdr_startup
+import fleet_herdr_profile
+import fleet_herdr_versions as versions
 import fleet_mission_state as mission_state
 import fleet_safe_paths
 
 
-HERDR_VERSION = "0.8.2"
-PROFILE = "astra_sol"
+HERDR_VERSION = versions.HERDR_VERSION
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 TERMINAL = {"succeeded", "failed", "blocked", "abandoned", "indeterminate"}
 QUIESCENT = {"idle", "done", "blocked"}
-MEMBER_CONTRACT = (
-    ("lead", "astra_lead", "gpt-6-astra", "CONTROL", "control"),
-    ("worker", "sol_worker", "gpt-5.6-sol", "BUILD", "write"),
-    ("reviewer", "sol_reviewer", "gpt-5.6-sol", "CHALLENGE", "advisory"),
-    ("verifier", "sol_verifier", "gpt-5.6-sol", "VERIFY", "verification"),
-)
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 TranscriptResolver = Callable[[str], Optional[Path]]
 
 
 class HerdrBackendError(RuntimeError):
     """The Herdr backend cannot safely reconcile its owned lifecycle."""
+
+
+class ExecutionEvidenceRejected(HerdrBackendError):
+    def __init__(self, proof):
+        self.proof = proof
+        super().__init__("completed result permission evidence: " + proof["reason"])
+
+
+def load_result_rejection(runs_dir: Path, mission_id: str, run_id: str,
+                          *, result: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Read a controller adjudication receipt, never a role or termination verdict."""
+    mission_id = mission_state.normalize_uuid(mission_id, "mission_id")
+    run_id = mission_state.normalize_uuid(run_id, "run_id")
+    with fleet_safe_paths.RootedFS(runs_dir) as fs:
+        raw = fs.read_regular_optional(
+            Path("missions") / mission_id / f"herdr-result-rejection-{run_id}.json",
+            directory_modes=(0o700, 0o700), file_mode=0o600,
+            max_bytes=fleet_artifacts.MAX_ARTIFACT_BYTES)
+    if raw is None:
+        return None
+    pointer = fleet_json.loads(raw)
+    proof_bytes = fleet_artifacts.get_bytes(runs_dir, mission_id, pointer["artifact_id"])
+    proof = fleet_json.loads(proof_bytes)
+    if (proof_bytes != fleet_json.canonical_bytes(proof)
+            or proof.get("schema_version") != 1 or proof.get("kind") != "herdr_role_protocol_rejection"
+            or proof.get("mission_id") != mission_id or proof.get("run_id") != run_id
+            or not isinstance(proof.get("reason"), str) or not proof["reason"]):
+        raise HerdrBackendError("role protocol rejection receipt binding mismatch")
+    observed = fleet_artifacts.get_bytes(runs_dir, mission_id, proof["observed_result_artifact_id"])
+    cached = fleet_json.loads(observed)
+    if (any(cached.get(k) != proof.get(k) for k in ("mission_id", "run_id", "instance_id"))
+            or cached.get("evidence", {}).get("prompt_sha256") != proof.get("prompt_sha256")
+            or result is not None and observed != fleet_json.canonical_bytes(result)):
+        raise HerdrBackendError("role protocol rejection differs from observed result")
+    return {**proof, "artifact_id": pointer["artifact_id"]}
 
 
 def _now() -> str:
@@ -174,6 +207,7 @@ class HerdrBackend:
         compiled: dict[str, Any],
         environment: Mapping[str, str] | None = None,
         launch_manifest: dict[str, Any] | None = None,
+        personal_cli: bool = False,
         run_command: RunCommand | None = None,
         transcript_resolver: TranscriptResolver | None = None,
     ) -> None:
@@ -188,6 +222,10 @@ class HerdrBackend:
         ) as exc:
             raise HerdrBackendError(f"invalid Herdr Mission binding: {exc}") from exc
         self.feature = _nonempty(feature, "feature")
+        if type(personal_cli) is not bool or personal_cli and launch_manifest is not None:
+            raise HerdrBackendError("personal CLI cannot use the experimental launcher")
+        self.personal_cli = personal_cli
+        self.initial_runtime_contract = dict(versions.PERSONAL_CONTRACT if personal_cli else versions.OFFICIAL_CONTRACT)
         self.launch_manifest = fleet_herdr_launch.validate_manifest(launch_manifest) if launch_manifest is not None else None
         if not isinstance(session, str) or not SESSION_NAME.fullmatch(session):
             raise HerdrBackendError("Herdr session must be an explicit safe name")
@@ -217,9 +255,20 @@ class HerdrBackend:
         self.run_command = run_command or self._default_run
         self.transcript_resolver = transcript_resolver or self._default_transcript
         self.relative = Path("missions") / self.mission_id / "herdr-backend.json"
+        self.runtime_relative = Path("missions") / self.mission_id / "herdr-runtime-contract.json"
         self.lock_relative = Path("missions") / self.mission_id / "herdr-backend.lock"
         self.directory_modes = (0o700, 0o700)
         self.result_directory_modes = (0o700, 0o700, 0o700)
+        try:
+            self.profile = fleet_herdr_profile.resolve_profile(self.compiled)
+        except fleet_herdr_profile.ProfileError as exc:
+            raise HerdrBackendError(str(exc)) from exc
+        if self.profile is fleet_herdr_profile.RESEARCH and (launch_manifest is not None or not personal_cli):
+            raise HerdrBackendError("Research profile requires the personal Codex lane without experimental launch")
+        if self.profile is fleet_herdr_profile.RESEARCH:
+            self.initial_runtime_contract = dict(versions.TASK_CONTEXT_CONTRACT)
+        self.context = None
+        self.member_contract = self.profile.members
         self.members = self._compiled_members()
 
     def _default_transcript(self, agent_session: str) -> Path | None:
@@ -230,6 +279,8 @@ class HerdrBackend:
                 raise HerdrBackendError("Codex agent_session has ambiguous role transcripts")
             return matches[0] if matches else None
         codex_home = self.environment.get("CODEX_HOME")
+        if not codex_home and self.personal_cli:
+            codex_home = str(Path(self.environment.get("HOME", str(Path.home()))) / ".codex")
         if not codex_home:
             return None
         root = Path(codex_home).expanduser() / "sessions"
@@ -239,6 +290,19 @@ class HerdrBackend:
         return matches[0] if matches else None
 
     def _default_run(self, command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        from fleet_herdr_effects import EffectMediationDenied, require_control_operation
+        executable = self.launch_manifest["herdr"]["image"]["realpath"] if self.launch_manifest else "herdr"
+        native_executable = self.launch_manifest["codex"]["image"]["realpath"] if self.launch_manifest else "codex"
+        try:
+            require_control_operation(command, executable=executable, native_executable=native_executable, session=self.session)
+        except EffectMediationDenied as exc:
+            if not self.personal_cli:
+                raise HerdrBackendError(str(exc)) from exc
+            from fleet_herdr_personal import require_command
+            try:
+                require_command(self, command, executable)
+            except (ValueError, OSError, RuntimeError) as refusal:
+                raise HerdrBackendError(str(refusal)) from refusal
         return subprocess.run(
             command,
             cwd=kwargs["cwd"],
@@ -250,13 +314,35 @@ class HerdrBackend:
             check=False,
         )
 
+    def _require_execution_mediation(self) -> None:
+        # Refuse known-denied live work before recording a send intent. Trusted
+        # injected transports remain usable for provider-free lifecycle tests.
+        if self.personal_cli:
+            if self.run_command != self._default_run:
+                return
+            from fleet_herdr_personal import require
+            try:
+                require(self)
+            except (ValueError, OSError, RuntimeError) as exc:
+                raise HerdrBackendError(str(exc)) from exc
+            return
+        if self.run_command == self._default_run:
+            from fleet_herdr_effects import EffectMediationDenied, require_native_mediation
+            try:
+                require_native_mediation()
+            except EffectMediationDenied as exc:
+                raise HerdrBackendError(str(exc)) from exc
+
     def _command(
         self, command: list[str], *, timeout: int = 30
     ) -> subprocess.CompletedProcess[str]:
-        if not command or command[0] != "herdr" or "--session" in command:
+        codex_version_check = command == ["codex", "--version"] or (
+            bool(command) and command[0] == "codex" and command[-3:] == ["debug", "prompt-input", fleet_herdr_skill_context.PROBE])
+        if not command or (command[0] != "herdr" and not codex_version_check) or "--session" in command:
             raise HerdrBackendError("Herdr command must use backend session routing")
-        executable = self.launch_manifest["herdr"]["image"]["realpath"] if self.launch_manifest else "herdr"
-        routed = [executable, "--session", self.session, *command[1:]]
+        kind = "codex" if codex_version_check else "herdr"
+        executable = self.launch_manifest[kind]["image"]["realpath"] if self.launch_manifest else kind
+        routed = [executable, *command[1:]] if codex_version_check else [executable, "--session", self.session, *command[1:]]
         observation_deadline = getattr(self, "observation_deadline", None)
         if observation_deadline is not None:
             remaining = observation_deadline - time.monotonic()
@@ -275,14 +361,12 @@ class HerdrBackend:
 
     def _compiled_members(self) -> list[dict[str, Any]]:
         resolved = self.compiled["resolved"]
-        if resolved.get("preset") != PROFILE or resolved.get("mode") != "autonomous":
-            raise HerdrBackendError(f"Herdr backend requires compiled preset {PROFILE}")
         members = [resolved.get("lead"), *resolved.get("instances", [])]
-        if len(members) != len(MEMBER_CONTRACT) or any(
+        if len(members) != len(self.member_contract) or any(
             not isinstance(member, dict) for member in members
         ):
-            raise HerdrBackendError("Herdr compiled roster must contain Astra Lead plus three Sol")
-        expected = [tuple(item) for item in MEMBER_CONTRACT]
+            raise HerdrBackendError("Herdr compiled roster differs from the selected profile")
+        expected = [tuple(item) for item in self.member_contract]
         actual = [
             (
                 member.get("instance_id"),
@@ -321,6 +405,13 @@ class HerdrBackend:
         return list(command)
 
     def _initial_state(self) -> dict[str, Any]:
+        context_pin = None
+        if self.initial_runtime_contract == versions.TASK_CONTEXT_CONTRACT:
+            names = fleet_herdr_skill_context.catalog(self._context_preview([]))
+            self.context = {"policy": fleet_herdr_skill_context.POLICY, "disabled_skills": names}
+            self._check_context()
+            context_pin = fleet_artifacts.put_bytes(self.runs_dir, self.mission_id,
+                fleet_json.canonical_bytes(self.context))["artifact_id"]
         short = self.mission_id.split("-", 1)[0]
         generation = str(uuid.uuid4())
         generation_short = generation.split("-", 1)[0]
@@ -351,10 +442,12 @@ class HerdrBackend:
                 }
             )
         return {
-            "schema_version": 2,
+            "schema_version": 2 if self.launch_manifest else 3,
+            **({"context_artifact_id": context_pin} if context_pin else {}),
+            **({"runtime_contract": dict(self.initial_runtime_contract)} if not self.launch_manifest else {}),
             **({"launch_manifest_sha256": fleet_herdr_launch.digest(self.launch_manifest)} if self.launch_manifest else {}),
             "backend": "herdr",
-            "backend_version": HERDR_VERSION,
+            "backend_version": versions.LEGACY_HERDR_VERSION if self.launch_manifest else HERDR_VERSION,
             "session": self.session,
             "generation": generation,
             "mission_id": self.mission_id,
@@ -362,7 +455,10 @@ class HerdrBackend:
             "target_repo": str(self.target_repo),
             "compiled_digest": self.compiled["compiled_digest"],
             "router_digest": self.compiled["router_digest"],
-            "preset": PROFILE,
+            "preset": self.profile.preset,
+            **({"herdr_profile": self.profile.profile_id,
+                "herdr_profile_sha256": self.profile.digest}
+               if self.profile is fleet_herdr_profile.RESEARCH else {}),
             "phase": "new",
             "workspace": {
                 "label": f"fleet-{self.feature}-{short}-{generation_short}",
@@ -383,18 +479,23 @@ class HerdrBackend:
     def _validate_state(self, state: Any) -> dict[str, Any]:
         if not isinstance(state, dict):
             raise HerdrBackendError("Herdr backend state must be an object")
+        try:
+            versions.state_contract(state)
+        except ValueError as exc:
+            raise HerdrBackendError(str(exc)) from exc
         bindings = {
-            "schema_version": 2,
             "backend": "herdr",
-            "backend_version": HERDR_VERSION,
             "session": self.session,
             "mission_id": self.mission_id,
             "feature": self.feature,
             "target_repo": str(self.target_repo),
             "compiled_digest": self.compiled["compiled_digest"],
             "router_digest": self.compiled["router_digest"],
-            "preset": PROFILE,
+            "preset": self.profile.preset,
         }
+        if self.profile is fleet_herdr_profile.RESEARCH:
+            bindings.update(herdr_profile=self.profile.profile_id,
+                            herdr_profile_sha256=self.profile.digest)
         if any(state.get(key) != value for key, value in bindings.items()):
             raise HerdrBackendError("Herdr backend durable binding drift")
         if state.get("launch_manifest_sha256") != (fleet_herdr_launch.digest(self.launch_manifest) if self.launch_manifest else None):
@@ -431,7 +532,7 @@ class HerdrBackend:
             )
         ):
             raise HerdrBackendError("Herdr backend owned workspace receipt is invalid")
-        expected = [tuple(item) for item in MEMBER_CONTRACT]
+        expected = [tuple(item) for item in self.member_contract]
         actual = [
             (
                 item.get("instance_id"),
@@ -447,7 +548,7 @@ class HerdrBackend:
             raise HerdrBackendError("Herdr backend durable roster drift")
         expected_names = {
             item[0]: f"fleet_{short}_{generation_short}_{item[0]}"
-            for item in MEMBER_CONTRACT
+            for item in self.member_contract
         }
         if any(
             item.get("agent_name") != expected_names.get(item.get("instance_id"))
@@ -529,21 +630,20 @@ class HerdrBackend:
         return state
 
     def _load(self, rooted: fleet_safe_paths.RootedFS) -> dict[str, Any] | None:
-        raw = rooted.read_regular_optional(
-            self.relative,
-            directory_modes=self.directory_modes,
-            file_mode=0o600,
-            max_bytes=4 * 1024 * 1024,
-        )
-        if raw is None:
-            return None
         try:
-            value = fleet_json.loads(raw)
-        except fleet_json.FleetJSONError as exc:
-            raise HerdrBackendError(f"invalid Herdr backend state: {exc}") from exc
-        if raw != fleet_json.canonical_bytes(value) + b"\n":
-            raise HerdrBackendError("Herdr backend state bytes are not canonical")
-        return self._validate_state(value)
+            value = versions.read_state(rooted, self.relative, mission_id=self.mission_id,
+                compiled_digest=self.compiled["compiled_digest"], directory_modes=self.directory_modes)
+        except ValueError as exc:
+            raise HerdrBackendError(str(exc)) from exc
+        if value is not None:
+            self.context = None
+            if value.get("runtime_contract") == versions.TASK_CONTEXT_CONTRACT:
+                self.context = fleet_herdr_skill_context.validate(fleet_json.loads(fleet_artifacts.get_bytes(
+                    self.runs_dir, self.mission_id, value["context_artifact_id"])))
+        return self._validate_state(value) if value is not None else None
+
+    def _runtime_anchor(self, state: Mapping[str, Any]) -> bytes | None:
+        return versions.anchor_bytes(state)
 
     def _save(
         self,
@@ -562,6 +662,10 @@ class HerdrBackend:
                 file_mode=0o600,
             )
         else:
+            anchor = self._runtime_anchor(state)
+            if anchor is not None:
+                rooted.atomic_write(self.runtime_relative, anchor,
+                    directory_modes=self.directory_modes, file_mode=0o600, require_absent=True)
             rooted.atomic_write(
                 self.relative,
                 content,
@@ -570,7 +674,19 @@ class HerdrBackend:
                 require_absent=True,
             )
 
-    def _preflight(self) -> None:
+    def _preflight(self, state: dict[str, Any] | None = None) -> None:
+        contract = versions.state_contract(state) if state is not None else (
+            None if self.launch_manifest else dict(self.initial_runtime_contract))
+        expected_herdr = contract["herdr_version"] if contract else versions.LEGACY_HERDR_VERSION
+        if self.environment.get("HERDR_SESSION") != self.session:
+            raise HerdrBackendError("Herdr backend session binding drift")
+        version = self._command(["herdr", "--version"])
+        if version.returncode != 0 or version.stdout.strip() != f"herdr {expected_herdr}":
+            raise HerdrBackendError(f"Herdr backend requires exact CLI version {expected_herdr}; no implicit runtime migration")
+        if contract:
+            codex = self._command(["codex", "--version"])
+            if codex.returncode != 0 or codex.stdout.strip() != f"codex-cli {contract['codex_version']}":
+                raise HerdrBackendError(f"Herdr backend requires exact Codex CLI version {contract['codex_version']}")
         if self.launch_manifest is not None:
             fleet_herdr_launch.validate_manifest(self.launch_manifest)
             fleet_herdr_launch.install_wrapper(self.runs_dir, self.mission_id)
@@ -579,13 +695,6 @@ class HerdrBackend:
                     relative = Path(self.environment[name]).relative_to(self.runs_dir)
                     fs.atomic_write(relative / ".fleet-owned", b"controller runtime\n",
                                     directory_modes=(0o700,) * len(relative.parts), file_mode=0o600)
-        if self.environment.get("HERDR_SESSION") != self.session:
-            raise HerdrBackendError("Herdr backend session binding drift")
-        version = self._command(["herdr", "--version"])
-        if version.returncode != 0 or version.stdout.strip() != f"herdr {HERDR_VERSION}":
-            raise HerdrBackendError(
-                f"Herdr backend requires exact CLI version {HERDR_VERSION}"
-            )
 
     @staticmethod
     def _workspace_binding(payload: Mapping[str, Any]) -> dict[str, str]:
@@ -633,6 +742,7 @@ class HerdrBackend:
         }
 
     def _start_arguments(self, member: Mapping[str, Any]) -> list[str]:
+        self._check_context()
         launch = self._compiled_launch(member)
         intent = member["start_attempts"][-1].get("launch_intent") if self.launch_manifest and member.get("start_attempts") else None
         return [
@@ -650,10 +760,23 @@ class HerdrBackend:
             "--",
             *(["--fleet-launch-intent", intent["path"], intent["sha256"]] if intent else []),
             *launch[1:],
+            *(fleet_herdr_skill_context.flags(self.context) if self.context is not None else []),
             "-c",
             self._project_trust_override(),
-            *fleet_herdr_permissions.launch_flags(member["instance_id"], str(self.target_repo)),
+            *fleet_herdr_permissions.launch_flags(member["instance_id"], str(self.target_repo),
+                                                  version=self.profile.permissions_policy_version),
         ]
+
+    def _context_preview(self, flags):
+        result = self._command(["codex", *flags, "debug", "prompt-input", fleet_herdr_skill_context.PROBE])
+        if result.returncode != 0:
+            raise HerdrBackendError("local Codex context preview failed")
+        return result.stdout
+
+    def _check_context(self):
+        if self.context is not None and fleet_herdr_skill_context.catalog(
+                self._context_preview(fleet_herdr_skill_context.flags(self.context))):
+            raise HerdrBackendError("host skills remain enabled outside frozen context")
 
     def _project_trust_override(self) -> str:
         project = json.dumps(str(self.target_repo))
@@ -725,6 +848,23 @@ class HerdrBackend:
             raise HerdrBackendError("Herdr agent surface was not observed ready after start")
         return receipt
 
+    def _require_deliverable(self, member: Mapping[str, Any]) -> None:
+        """A ready receipt can describe a modal or a restored metadata-only pane.
+
+        This is a conservative delivery guard, never an acceptance or sandbox
+        proof. No key is sent to dismiss a dialog, and no prompt is retried.
+        """
+        screen = self._command(["herdr", "agent", "read", str(member["agent_name"]),
+                                "--source", "visible"])
+        if screen.returncode != 0 or len(screen.stdout) > 128 * 1024:
+            raise HerdrBackendError("Codex delivery surface is unavailable")
+        reason = fleet_herdr_startup.codex_startup_blocker(screen.stdout)
+        if reason:
+            raise HerdrBackendError(f"Codex delivery blocked before prompt: {reason}")
+        receipt = self._get_agent(member, allow_missing_session=member.get("agent_session") is None)
+        if receipt["agent_status"] not in {"idle", "done"}:
+            raise HerdrBackendError("Codex delivery state changed before prompt")
+
     @staticmethod
     def _freeze_agent_session(
         member: dict[str, Any],
@@ -745,7 +885,6 @@ class HerdrBackend:
         return True
 
     def boot(self) -> dict[str, Any]:
-        self._preflight()
         try:
             with fleet_safe_paths.RootedFS(self.runs_dir) as rooted:
                 with rooted.exclusive_lock(
@@ -754,11 +893,15 @@ class HerdrBackend:
                     file_mode=0o600,
                 ):
                     state = self._load(rooted)
+                    if state is None or state["phase"] != "ready":
+                        self._require_execution_mediation()
+                    self._preflight(state)
                     exists = state is not None
                     if state is None:
                         state = self._initial_state()
                         self._save(rooted, state, exists=False)
                         exists = True
+                    self._check_context()
                     if state["phase"] == "ready":
                         self._revalidate_workspace(state)
                         for member in state["members"]:
@@ -766,6 +909,8 @@ class HerdrBackend:
                                 member,
                                 allow_missing_session=member["agent_session"] is None,
                             )
+                            if state.get("runtime_contract"):
+                                self._require_deliverable(member)
                         return _copy(state)
                     workspace = state["workspace"]
                     if workspace["workspace_id"] is None:
@@ -793,6 +938,10 @@ class HerdrBackend:
                                     f"FLEET_HERDR_SESSION={self.session}",
                                     "--env",
                                     f"PATH={self.environment['PATH']}",
+                                    *(["--env", f"CODEX_HOME={self.environment['CODEX_HOME']}"]
+                                      if self.personal_cli and self.environment.get("CODEX_HOME") else []),
+                                    *(["--env", f"HOME={self.environment['HOME']}"]
+                                      if self.personal_cli and self.environment.get("HOME") else []),
                                     "--no-focus",
                                 ]
                             ),
@@ -813,11 +962,14 @@ class HerdrBackend:
                     members_by_id = {
                         member["instance_id"]: member for member in state["members"]
                     }
-                    grid = (
-                        ("worker", "lead", "right"),
-                        ("reviewer", "lead", "down"),
-                        ("verifier", "worker", "down"),
-                    )
+                    grid = (("worker", "lead", "right"),
+                            ("reviewer", "lead", "down"),
+                            ("verifier", "worker", "down"))
+                    if self.profile is fleet_herdr_profile.RESEARCH:
+                        grid = (("research", "lead", "down"),
+                                ("worker", "lead", "right"),
+                                ("reviewer", "worker", "down"),
+                                ("verifier", "research", "down"))
                     for instance_id, source_id, direction in grid:
                         member = members_by_id[instance_id]
                         if member["pane_id"] is None:
@@ -895,6 +1047,8 @@ class HerdrBackend:
                                 raise HerdrBackendError(
                                     "Herdr agent surface was not observed ready after start"
                                 )
+                        if state.get("runtime_contract"):
+                            self._require_deliverable(member)
                         if ready_receipt["agent_session"] is not None:
                             if (
                                 member["agent_session"] is not None
@@ -934,6 +1088,7 @@ class HerdrBackend:
             raise HerdrBackendError(f"unsafe Herdr backend state: {exc}") from exc
 
     def retry_unsubmitted_start(self, instance_id: str) -> dict[str, Any]:
+        self._require_execution_mediation()
         try:
             with fleet_safe_paths.RootedFS(self.runs_dir) as rooted:
                 with rooted.exclusive_lock(
@@ -944,7 +1099,7 @@ class HerdrBackend:
                     state = self._load(rooted)
                     if state is None:
                         raise HerdrBackendError("Herdr backend state is missing")
-                    self._preflight()
+                    self._preflight(state)
                     workspace = state["workspace"]
                     if (
                         not workspace["owned"]
@@ -1120,6 +1275,13 @@ class HerdrBackend:
         }
         if any(value.get(key) != item for key, item in expected.items()):
             raise HerdrBackendError("Herdr prompt Driver binding mismatch")
+        if self.context is not None:
+            self._check_context()
+            try:
+                fleet_herdr_skill_context.verify_task(prompt, instance_id,
+                    lambda pin: fleet_artifacts.get_bytes(self.runs_dir, self.mission_id, pin))
+            except ValueError as exc:
+                raise HerdrBackendError(str(exc)) from exc
         contract = value.get("result_contract")
         if not isinstance(contract, dict) or any(
             contract.get(key) != item for key, item in expected.items()
@@ -1138,7 +1300,6 @@ class HerdrBackend:
     def submit(
         self, run_id: str, prompt: str, *, instance_id: str = "lead"
     ) -> dict[str, Any]:
-        self._preflight()
         normalized_run = mission_state.normalize_uuid(run_id, "run_id")
         if not isinstance(prompt, str) or not prompt:
             raise HerdrBackendError("Herdr prompt must be non-empty")
@@ -1172,6 +1333,14 @@ class HerdrBackend:
                             )
                             self._save(rooted, state, exists=True)
                         return _copy(current)
+                    self._require_execution_mediation()
+                    if self.personal_cli:
+                        from fleet_herdr_personal import require
+                        try:
+                            require(self, run_id=normalized_run, prompt_sha256=prompt_sha256, instance_id=instance_id)
+                        except (ValueError, OSError, RuntimeError) as exc:
+                            raise HerdrBackendError(str(exc)) from exc
+                    self._preflight(state)
                     receipt = self._get_agent(
                         member,
                         allow_missing_session=member["agent_session"] is None,
@@ -1190,6 +1359,7 @@ class HerdrBackend:
                         raise HerdrBackendError(
                             "Herdr agent is not quiescent for an unambiguous prompt"
                         )
+                    self._require_deliverable(member)
                     submission = {
                         "run_id": normalized_run,
                         "instance_id": instance_id,
@@ -1318,7 +1488,7 @@ class HerdrBackend:
                             }
                         )
                     else:
-                        self._preflight()
+                        self._preflight(state)
                         member = self._member(state, submission["instance_id"])
                         result = self._command(
                             ["herdr", "agent", "get", submission["agent_name"]]
@@ -1359,7 +1529,7 @@ class HerdrBackend:
             raise HerdrBackendError("Herdr submission is missing")
         if submission["status"] in TERMINAL:
             return _copy(submission)
-        self._preflight()
+        self._preflight(state)
         member = self._member(state, submission["instance_id"])
         self._get_agent(
             member, allow_missing_session=member["agent_session"] is None
@@ -1498,12 +1668,16 @@ class HerdrBackend:
         if not isinstance(submission, dict):
             raise HerdrBackendError("cached result lacks its bound submission")
         member = self._member(state, submission["instance_id"])
+        if (evidence.get("runtime_contract") != state.get("runtime_contract")
+                or evidence.get("context_artifact_id") != state.get("context_artifact_id")):
+            raise HerdrBackendError("cached result runtime contract changed or downgraded")
         try:
             fleet_herdr_evidence.verify_result(result,
                 read_artifact=lambda digest: fleet_artifacts.get_bytes(self.runs_dir, self.mission_id, digest),
                 role=member["instance_id"], cwd=str(self.target_repo),
                 prompt_sha256=submission["prompt_sha256"],
-                agent_session=member["agent_session"]["value"])
+                agent_session=member["agent_session"]["value"],
+                permission_version=self.profile.permissions_policy_version)
         except fleet_herdr_evidence.EvidenceError as exc:
             raise HerdrBackendError(f"cached result permission evidence: {exc}") from exc
         return result
@@ -1665,7 +1839,7 @@ class HerdrBackend:
                         raise HerdrBackendError("Herdr submission is missing")
                     member = self._member(state, submission["instance_id"])
                     if member["agent_session"] is None:
-                        self._preflight()
+                        self._preflight(state)
                         receipt = self._get_agent(
                             member, allow_missing_session=True
                         )
@@ -1674,6 +1848,9 @@ class HerdrBackend:
                         ):
                             return None
                         self._save(rooted, state, exists=True)
+                    rejected = fleet_herdr_rejection.load(self.runs_dir, self.mission_id, normalized_run, state)
+                    if rejected is not None:
+                        raise ExecutionEvidenceRejected(rejected)
                     observed = self._transcript_result(submission, member)
                     if observed is None:
                         return None
@@ -1693,14 +1870,8 @@ class HerdrBackend:
                     }
                     if any(raw_result.get(key) != value for key, value in expected.items()):
                         raise HerdrBackendError("Codex final result binding mismatch")
-                    if raw_result.get("status") not in {"PASS", "BLOCKED", "FAIL"}:
-                        raise HerdrBackendError("Codex final result status is invalid")
-                    if not isinstance(raw_result.get("summary"), str) or not raw_result[
-                        "summary"
-                    ].strip():
-                        raise HerdrBackendError("Codex final result summary is empty")
-                    if not isinstance(raw_result.get("artifacts"), list):
-                        raise HerdrBackendError("Codex final result artifacts are invalid")
+                    # Cache attributed execution bytes even when their role protocol
+                    # is invalid. The driver durably adjudicates that separate fact.
                     if raw_result.get("candidate_tree_sha") != submission.get(
                         "candidate_tree_sha"
                     ):
@@ -1721,6 +1892,8 @@ class HerdrBackend:
                         "artifact_id": final_artifact["artifact_id"],
                         "turn_id": turn_id,
                         "evidence": {
+                            **({"runtime_contract": _copy(state["runtime_contract"])} if state.get("runtime_contract") else {}),
+                            **({"context_artifact_id": state["context_artifact_id"]} if state.get("context_artifact_id") else {}),
                             "herdr_session": self.session,
                             "generation": state["generation"],
                             "workspace_id": member["workspace_id"],
@@ -1739,9 +1912,12 @@ class HerdrBackend:
                             read_artifact=lambda digest: fleet_artifacts.get_bytes(self.runs_dir, self.mission_id, digest),
                             role=member["instance_id"], cwd=str(self.target_repo),
                             prompt_sha256=submission["prompt_sha256"],
-                            agent_session=member["agent_session"]["value"])
+                            agent_session=member["agent_session"]["value"],
+                            permission_version=self.profile.permissions_policy_version)
                     except fleet_herdr_evidence.EvidenceError as exc:
-                        raise HerdrBackendError(f"completed result permission evidence: {exc}") from exc
+                        proof = fleet_herdr_rejection.retain(self.runs_dir, self.mission_id,
+                            normalized_run, result, str(exc), rooted)
+                        raise ExecutionEvidenceRejected(proof) from exc
                     envelope_artifact = fleet_artifacts.put_bytes(
                         self.runs_dir,
                         self.mission_id,
@@ -1762,7 +1938,7 @@ class HerdrBackend:
                                 "PASS": "succeeded",
                                 "BLOCKED": "blocked",
                                 "FAIL": "failed",
-                            }[result["status"]],
+                            }.get(str(result.get("status")), "indeterminate"),
                             "artifact_id": result["artifact_id"],
                             "result_artifact_id": result["result_artifact_id"],
                             "turn_id": turn_id,
@@ -1865,12 +2041,17 @@ class HerdrBackend:
                     submission = state["submissions"].get(normalized_run)
                     if not isinstance(submission, dict):
                         raise HerdrBackendError("Herdr submission is missing")
-                    if submission["status"] in TERMINAL and not (
-                        submission["status"] == "indeterminate"
-                        and submission["cancel_attempted"]
-                    ):
-                        return _copy(submission)
-                    self._preflight()
+                    # An uncertain transport outcome is not proof of quiescence;
+                    # an explicit cancellation must reconcile the exact resource.
+                    if submission["status"] in TERMINAL and submission["status"] != "indeterminate":
+                        rejection = load_result_rejection(self.runs_dir, self.mission_id, normalized_run)
+                        if submission["status"] == "abandoned" or rejection is None:
+                            return _copy(submission)
+                        cached = self._load_result(rooted, normalized_run)
+                        if cached is None:
+                            raise HerdrBackendError("rejected result is no longer available")
+                        load_result_rejection(self.runs_dir, self.mission_id, normalized_run, result=cached)
+                    self._preflight(state)
                     member = self._member(state, submission["instance_id"])
                     receipt = self._get_agent(
                         member,
@@ -1989,7 +2170,7 @@ class HerdrBackend:
                     workspace = state["workspace"]
                     if not workspace["owned"] or workspace["closed"]:
                         return False
-                    self._preflight()
+                    self._preflight(state)
                     if workspace["close_attempted"]:
                         if self._get_workspace(workspace) is None:
                             workspace["closed"] = True

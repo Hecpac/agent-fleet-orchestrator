@@ -1,5 +1,10 @@
 # Arranque de una sesión privada Herdr/Codex
 
+El backend oficial actual fija Herdr 0.9.0/Codex 0.153.4 y aplica el guard de
+superficie antes de cada envío. Consulta el [contrato de versiones](herdr-cli-versions.md):
+los ensayos históricos descritos abajo no prueban la recuperación después de
+reiniciar el servidor con las versiones nuevas.
+
 La reproducción de FitScan usa el backend Herdr real y el perfil existente de
 cuatro roles. El controlador operativo está en
 `outputs/frh47_east/drive.py`; consulta `mission.json` para la identidad vigente.

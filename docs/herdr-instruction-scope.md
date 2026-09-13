@@ -5,6 +5,82 @@ There were no existing tracked project `AGENTS.md` files at this change's
 baseline. It is not installed into another repository or the user's global
 Codex home. Historical CMUX workflows keep their own launch path.
 
+## Orchestration and CLI context
+
+Declare Herdr as the project's orchestration layer once in `AGENTS.md`.
+Herdr manages sessions and panes; a CLI such as Codex or OpenCode executes an
+agent, and its provider/model is a separate identity. Users do not need to
+repeat that environment in each request. A direct OpenCode/DeepSeek session
+inside Herdr does not become a registered Mission role or gain closure authority.
+
+Keep each value in its existing authoritative location:
+
+| Context | Source and consumer |
+| --- | --- |
+| Mission, run, role and stage | The task's `mission_id`, `run_id`, `instance_id`, `stage` and `writer` identify the assignment. |
+| Candidate and result scope | The task's `candidate_repo`, `frozen_candidate` and `result_contract` define the role's work and output. Capsule tasks also supply `capsule_context`; host paths there identify resources, not accessible directories. |
+| Herdr session and agent binding | The controller's backend state and run/submission binding identify the exact resources. Roles do not gain permission to control them. |
+| CLI versions and startup behavior | The selected runtime contract is checked by the backend; see [CLI versions](herdr-cli-versions.md). Do not duplicate version numbers in role guidance. |
+| Effective permissions and model identity | Bound execution evidence and transcript verification support these claims; configured labels, pane titles and environment declarations alone do not. |
+
+Shared `role_guidance.common.instruction_scopes` carries this distinction to
+each role, even when the target repository's instructions do not mention Herdr.
+It adds guidance text to the existing bundle, without a new task or runtime
+schema. New Missions freeze that guidance at Plan; existing Missions keep their
+original CAS bundle during recovery. No environment dump or credential values
+are added to task packets. The role uses supplied context and reports material
+missing task information; it does not need to self-attest its model identity.
+
+## Explicit role autonomy and skills
+
+New task packets include `role_guidance`, separate from `project_instructions`.
+One project AGENTS hierarchy defines directory rules; the task identifies the
+role. No global maintainer AGENTS or skill directory is implicitly inherited.
+
+Each role chooses its methods, investigates relevant evidence, resolves
+reversible technical decisions, tries bounded alternatives and finishes its own
+stage without waiting for step-by-step human instructions. It continues
+independent work when blocked and returns a precise dependency and recommendation.
+This does not change the sole writer, effect permissions, delegation policy or
+controller closure authority. A skill never grants permission or overrides the
+task's raw JSON result protocol.
+
+| Role | Selected skills and conditions |
+| --- | --- |
+| Lead | `codex-os`; `entrevista-pre-slice` only for unresolved material user choices; `slice-gate` for synthesis. |
+| Research | `fase-0-recon`; `deep-research` only for broad investigations. |
+| Worker | `fase-0-recon` for unfamiliar code; `smoke-verify`; `impl-notes` for material deviations. |
+| Reviewer | `fase-0-recon`; `slice-gate` for its review criteria. |
+| Verifier | `smoke-verify`; `slice-gate` for its verification criteria. |
+
+The seven skill sources are local copies in `orchestration/role-skills`, not
+changes to installed global skills. `fleet_herdr_role_guidance.py` snapshots the
+contracts, shared rules and full skill content into CAS. Each task receives its
+selected content, use conditions, individual hashes and the bundle artifact ID.
+Later stages and recovery reuse the first Plan's bundle, even when installed
+skills or candidate instructions change. Missing, aliased or oversized sources
+fail closed when creating a bundle. Historical tasks without guidance retain
+their previous behavior; they are not silently upgraded.
+
+References within skills do not provision more skills, tools or subagents.
+In particular `deep-research` metadata `context: fork` / `agent: Explore` does
+not start a runtime agent, and other projects' operational references do not
+apply here. Specialized skills require an explicit future selection.
+
+The default profile retains four roles and five stages. Research is active only
+in the explicit `astra_sol_research_v1` profile, with five roles and six stages;
+its profile, input and acceptance contracts are versioned separately.
+The native execution admission block remains in place. Verified behavior is
+instruction delivery and recovery with provider-free fixtures, not autonomous
+model behavior, skill obedience or runtime effect containment.
+
+Focused verification (reuses local Git history; creates no commits):
+
+```sh
+python3 -B -m unittest tests.test_fleet_herdr_role_guidance
+git diff --check
+```
+
 | Surface | Transfer and authority |
 | --- | --- |
 | Local maintainer | Root project AGENTS plus the current user's authorized task. |
@@ -40,3 +116,51 @@ recovery after a worker edit. Existing backend tests check CLI cwd/arguments;
 ephemeral-home tests execute provisioning and verify its on-disk contract.
 These prove file discovery and transfer, not real-model obedience or automatic
 global-skill inheritance. A provider campaign remains separately authorized.
+
+## Task-inline skills in new Research runtimes
+
+New `astra_sol_research_v1` backends bind `skill_delivery=task-inline-skills-v1`
+in the runtime contract. The official CLI remains the executor. Before startup,
+its local `codex debug prompt-input` preview inventories the available skill names.
+The controller freezes a CAS manifest of disabled host names and uses per-launch
+`skills.config` overrides plus `features.skill_search=false`. A second preview
+must expose no enabled skills; unknown preview formats and newly enabled names
+fail before startup or dispatch. No global Codex configuration is edited.
+
+Skills for the Mission are the existing inline `role_guidance` projection:
+name, source path, content hash, full content, role and condition, bound through
+the CAS bundle and exact task hash. Collection and offline archive verification
+check that projection against the frozen bundle. A same-named installed skill is
+not interchangeable with this source. References such as `$commit` inside a
+procedure do not authorize loading it. No extra selected-skill message is accepted,
+even if its metadata claims runtime origin or its name is selected for the role.
+
+CLI runtime instructions (permissions, environment and built-in operation) remain
+separate from Mission instructions. This mechanism controls skill selection; it
+does not replace the entire CLI system/developer context, attest model obedience,
+or provide OS isolation. Existing backends keep their original runtime contract
+and launch behavior; they are never silently upgraded on recovery. The legacy
+four-member profile and experimental launcher are unchanged.
+
+A completed turn rejected by context/permission verification retains its final,
+transcript and observed envelope in CAS. `herdr-evidence-rejection-<run>.json`
+points to an immutable `herdr_execution_evidence_rejection` receipt, distinct from
+an accepted result and from a role-protocol rejection. Recovery verifies the
+runtime anchor, Mission/run/admission/session/task bindings and reproduces the
+rejection offline. It does not read a replacement live transcript or resend the
+task. Research and Build cannot follow a rejected Plan.
+
+A rejection is not evidence of quiescence. If the admission is still active,
+recovery reports an explicit pause block while retaining `pause_requested` and
+its unapplied request. It does not report `paused`, cancel implicitly on expiry,
+or extend the deadline. Explicit cancellation must pass the existing generation
+and run-scope guards before reconciling the exact execution. A rejected frozen
+task cannot be changed or replayed in place. Continuing the feature after such
+an incident requires authorized closure of that execution and a separately
+authorized corrected Mission; historical evidence remains readable.
+
+Provider-free regression: `python3 -B -m unittest tests.test_fleet_herdr_skill_context`.
+This exercises authorized inline delivery, nine-message rejection, scope/content
+mutation, CAS recovery, pause/deadline/cancel boundaries and the six-stage archive
+using synthetic CLI output. Local preview evidence is distinct from a live model
+campaign, which requires separate authorization.

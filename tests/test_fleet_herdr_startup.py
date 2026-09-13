@@ -18,6 +18,10 @@ class StartupTests(unittest.TestCase):
             "Hooks need review\n1 hook is new or changed.\n2. Trust all and continue",
             "Hooks\n1 hook needs review before it can run.\nPress t to trust all",
             "Hooks\nSessionStart 1 1\nPress enter to view hooks; esc to close",
+            "Do you trust the contents of this directory?\n› 1. Yes, continue\n2. No, quit",
+            "Trusting the directory allows project-local config, hooks, and exec policies to load.",
+            "Resuming session…\n› Ask Codex to do anything",
+            "Sign in with ChatGPT\n› Ask Codex to do anything",
         ]
         for screen in screens:
             with self.subTest(screen=screen):

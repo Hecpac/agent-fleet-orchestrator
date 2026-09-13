@@ -1,0 +1,71 @@
+{
+  "schema_version": "herdr.fleet.roster.v1",
+  "mode": "supervised-maintenance",
+  "mission_enabled": false,
+  "canonical_writer": "worker_sol",
+  "input_policy": "independent-v1",
+  "closure_authority": "controller",
+  "max_canonical_writers": 1,
+  "roles": [
+    {
+      "id": "lead",
+      "role": "lead",
+      "cli": "codex",
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "reasoning_requested": "high",
+      "workspace_access": "read-only",
+      "deliverable": "plan-and-synthesis"
+    },
+    {
+      "id": "research",
+      "role": "research",
+      "cli": "codex",
+      "provider": "openai",
+      "model": "gpt-6-astra",
+      "reasoning_requested": "high",
+      "workspace_access": "read-only",
+      "deliverable": "evidence-report"
+    },
+    {
+      "id": "worker_sol",
+      "role": "worker",
+      "cli": "codex",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "reasoning_requested": "high",
+      "workspace_access": "canonical-candidate",
+      "deliverable": "canonical-candidate"
+    },
+    {
+      "id": "worker_deepseek",
+      "role": "worker",
+      "cli": "opencode",
+      "provider": "deepseek",
+      "model": "deepseek-flash",
+      "reasoning_requested": "thinking",
+      "workspace_access": "isolated-contribution",
+      "deliverable": "isolated-contribution"
+    },
+    {
+      "id": "reviewer",
+      "role": "reviewer",
+      "cli": "codex",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "reasoning_requested": "high",
+      "workspace_access": "read-only",
+      "deliverable": "review-findings"
+    },
+    {
+      "id": "verifier",
+      "role": "verifier",
+      "cli": "codex",
+      "provider": "openai",
+      "model": "gpt-5.6-sol",
+      "reasoning_requested": "high",
+      "workspace_access": "read-only",
+      "deliverable": "verification-result"
+    }
+  ]
+}

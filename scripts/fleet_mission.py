@@ -14,6 +14,7 @@ import uuid
 
 import fleet_admission
 import fleet_compiled
+import fleet_herdr_sdd
 import fleet_json
 import fleet_mission_state as state
 import fleet_safe_paths
@@ -171,8 +172,10 @@ def _created_request(
     target_repo: Path,
     base_sha: str,
     compiled: dict[str, Any],
+    sdd_plan_sha256: str | None = None,
+    profile_binding: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    request = {
         "feature": feature,
         "objective_sha256": state.artifact_id(objective),
         "target_repo": str(target_repo),
@@ -180,6 +183,10 @@ def _created_request(
         "workflow_digest": compiled["workflow_digest"],
         "initial_risk": compiled["workflow"]["risk"]["minimum"],
     }
+    if sdd_plan_sha256 is not None:
+        request["sdd_plan_sha256"] = sdd_plan_sha256
+    request.update(profile_binding or {})
+    return request
 
 
 def _mission_id_for_key(idempotency_key: str) -> str:
@@ -198,6 +205,7 @@ def create_mission(
     base_sha: str,
     idempotency_key: str,
     runtime_options: dict[str, Any] | None = None,
+    sdd_plan_path: Path | None = None,
 ) -> tuple[str, bool]:
     validate_compiled(compiled)
     if not FEATURE.fullmatch(feature):
@@ -210,22 +218,25 @@ def create_mission(
         raise MissionError(str(exc)) from exc
     if not GIT_SHA.fullmatch(base_sha):
         raise MissionError("base_sha must be a full Git object id")
-    request = _created_request(
-        feature=feature,
-        objective=objective,
-        target_repo=target_repo,
-        base_sha=base_sha,
-        compiled=compiled,
-    )
+    import fleet_herdr_profile
+    if sdd_plan_path is not None and not fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
+        raise MissionError("sdd_plan_path requires a supported Herdr profile")
+    mission_id = _mission_id_for_key(idempotency_key)
     options = runtime_options or {}
     if not isinstance(options, dict):
         raise MissionError("runtime_options must be an object")
+    profile_binding = {}
+    try:
+        if fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
+            profile = fleet_herdr_profile.validate_profile_binding(compiled, options)
+            profile_binding = fleet_herdr_profile.creation_binding(compiled)
+    except fleet_herdr_profile.ProfileError as exc:
+        raise MissionError(str(exc)) from exc
     if options.get("functional_contract") is not None:
         import fleet_functional
         fleet_functional.validate(options["functional_contract"])
-        if compiled["resolved"]["preset"] != "astra_sol":
-            raise MissionError("functional v1 requires the Herdr profile")
-    mission_id = _mission_id_for_key(idempotency_key)
+        if not fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
+            raise MissionError("functional v1 requires a supported Herdr profile")
     if not runs_dir.exists():
         state.ensure_private_directory(runs_dir)
     mission_relative = Path("missions") / mission_id
@@ -238,6 +249,91 @@ def create_mission(
             ):
                 existed = mission_id in rooted.list_directory(
                     "missions", directory_modes=(0o700,)
+                )
+                # The verified ledger binding is authoritative for an
+                # already-created identity. It is consulted before any snapshot
+                # publication so a missing/corrupt/symlinked local receipt can
+                # never be treated as permission to freeze a new plan.
+                ledger_present = False
+                ledger_digest = None
+                if existed:
+                    ledger_raw = rooted.read_regular_optional(
+                        mission_relative / "mission.jsonl",
+                        directory_modes=(0o700, 0o700),
+                        file_mode=0o600,
+                    )
+                    if ledger_raw is not None:
+                        events = state.read_events(
+                            state.ledger_path(runs_dir, mission_id),
+                            expected_mission_id=mission_id,
+                        )
+                        if events:
+                            state.verify_events(events)
+                            ledger_present = True
+                            ledger_digest = state.derive_state(events).get("sdd_plan_sha256")
+                existing_request = None
+                if existed:
+                    try:
+                        stored = rooted.read_regular(
+                            mission_relative / "creation-request.json",
+                            directory_modes=(0o700, 0o700),
+                            file_mode=0o600,
+                        )
+                    except fleet_safe_paths.SafePathError:
+                        stored = None
+                    if stored is not None:
+                        durable = state.loads_strict(stored)
+                        candidate = durable.get("request")
+                        if isinstance(candidate, dict):
+                            existing_request = candidate
+                existing_sdd = (
+                    existing_request.get("sdd_plan_sha256")
+                    if existing_request is not None else None
+                )
+                if sdd_plan_path is not None:
+                    if ledger_present:
+                        if ledger_digest is None:
+                            # Already-created legacy identity: never publish a
+                            # new binding. The original Mission and its legacy
+                            # idempotent retry must stay usable.
+                            raise state.MissionConflict(
+                                "Mission already exists without an SDD binding; refusing to add one"
+                            )
+                        if not fleet_herdr_sdd.binding_exists(runs_dir, mission_id):
+                            # Do not silently republish missing evidence from a
+                            # mutable source during recovery.
+                            raise state.MissionConflict(
+                                "Mission SDD binding evidence is missing; refusing to republish from source"
+                            )
+                        sdd_plan_sha256 = fleet_herdr_sdd.freeze(
+                            runs_dir, mission_id, Path(sdd_plan_path)
+                        )
+                        if sdd_plan_sha256 != ledger_digest:
+                            raise state.MissionConflict(
+                                "supplied SDD plan does not match the immutable ledger binding"
+                            )
+                    else:
+                        # Genuine interrupted pre-ledger creation may publish.
+                        sdd_plan_sha256 = fleet_herdr_sdd.freeze(
+                            runs_dir, mission_id, Path(sdd_plan_path)
+                        )
+                else:
+                    if (ledger_digest is not None or existing_sdd is not None
+                            or fleet_herdr_sdd.binding_exists(runs_dir, mission_id)):
+                        # Never strip a prior opt-in binding or recreate the
+                        # Mission as legacy.
+                        raise state.MissionConflict(
+                            "Mission already has a frozen SDD plan; supply the same --sdd-plan to retry"
+                        )
+                    sdd_plan_sha256 = None
+                request = _created_request(
+                    feature=feature,
+                    objective=objective,
+                    target_repo=target_repo,
+                    base_sha=base_sha,
+                    compiled=compiled,
+                    sdd_plan_sha256=sdd_plan_sha256,
+                    profile_binding=profile_binding,
                 )
                 creation = state.canonical_bytes(
                     {

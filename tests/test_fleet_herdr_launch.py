@@ -62,10 +62,11 @@ class LauncherTests(unittest.TestCase):
             cwd=cwd or self.candidate, env={"PATH": "/usr/bin:/bin", "LAUNCH_SECRET": "never-persist-this-sensitive-value",
                 "PYTHONPATH": str(self.candidate), "HOME": str(self.tmp)}, text=True, capture_output=True, timeout=15)
 
-    def test_real_exec_consumed_once_sanitized_and_non_authoritative(self):
+    def test_real_wrapper_denies_exec_consumed_once_sanitized_and_non_authoritative(self):
         result = self.run_wrapper()
-        self.assertEqual((result.returncode, result.stdout), (0, "status=accepted\n"), result.stderr)
-        self.assertEqual((self.candidate / "environment-marker").read_text(), "unset")
+        self.assertEqual((result.returncode, result.stdout), (126, ""), result.stderr)
+        self.assertIn("mediation unavailable for filesystem, network, processes, credentials", result.stderr)
+        self.assertFalse((self.candidate / "environment-marker").exists())
         consumed = json.loads(Path(self.intent["path"]).with_name("consumed.json").read_bytes())
         raw = fleet_artifacts.get_bytes(self.runs, self.mid, consumed["artifact_id"])
         record = json.loads(raw)

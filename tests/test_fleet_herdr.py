@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import uuid
 
 
@@ -46,11 +47,15 @@ class FakeHerdr:
         self.get_error: str | None = None
         self.get_error_once: str | None = None
         self.raise_on_prompt = False
+        self.lose_prompt_ack = False
+        self.lose_cancel_ack = False
         self.close_error: str | None = None
         self.wait_timeout = False
         self.cancel_quiescent = True
         self.workspace_label = ""
-        self.version = "0.8.2"
+        self.version = fleet_herdr.HERDR_VERSION
+        self.codex_version = "0.153.4"
+        self.screen = "OpenAI Codex (v0.153.4)\n› Ask Codex to do anything\n"
         self.start_session_null = False
         self.start_status = "idle"
         self.raise_start_once = False
@@ -64,6 +69,8 @@ class FakeHerdr:
 
     @staticmethod
     def operation(command: list[str]) -> list[str]:
+        if command == ["codex", "--version"]:
+            return command
         if command[:3] == ["herdr", "--session", "mission-control-test"]:
             return ["herdr", *command[3:]]
         raise AssertionError(f"missing explicit Herdr session: {command}")
@@ -98,6 +105,8 @@ class FakeHerdr:
         self.calls.append(list(command))
         self.assert_environment(kwargs)
         command = self.operation(command)
+        if command == ["codex", "--version"]:
+            return subprocess.CompletedProcess(command, 0, f"codex-cli {self.codex_version}\n", "")
         if command == ["herdr", "--version"]:
             return subprocess.CompletedProcess(command, 0, f"herdr {self.version}\n", "")
         if command[:3] == ["herdr", "workspace", "create"]:
@@ -242,6 +251,8 @@ class FakeHerdr:
                 )
             self.agent_states[command[3]] = "working"
             self.prompted_agents.add(command[3])
+            if self.lose_prompt_ack:
+                raise RuntimeError("ACK lost after runtime accepted prompt")
             return completed(
                 command,
                 value={
@@ -254,6 +265,8 @@ class FakeHerdr:
                     }
                 },
             )
+        if command[:3] == ["herdr", "agent", "read"]:
+            return subprocess.CompletedProcess(command, 0, self.screen, "")
         if command[:3] == ["herdr", "agent", "get"]:
             if self.raise_get_once:
                 self.raise_get_once = False
@@ -293,6 +306,8 @@ class FakeHerdr:
         if command[:3] == ["herdr", "agent", "send-keys"]:
             if self.cancel_quiescent:
                 self.agent_states[command[3]] = "idle"
+            if self.lose_cancel_ack:
+                raise RuntimeError("ACK lost after runtime accepted cancellation")
             return completed(command, value={"result": {"sent": True}})
         if command[:3] == ["herdr", "workspace", "close"]:
             if self.close_error:
@@ -434,7 +449,7 @@ class HerdrBackendTests(unittest.TestCase):
             {
                 "type": "session_meta",
                 "timestamp": "2026-09-06T00:00:00Z",
-                "payload": {"id": agent_session, "model_provider": "openai"},
+                "payload": {"id": agent_session, "model_provider": "openai", "cli_version": self.fake.codex_version},
             },
             task_started,
             *([user, *contexts] if context_after_user else [*contexts, user]),
@@ -581,7 +596,7 @@ class HerdrBackendTests(unittest.TestCase):
         operations = [self.fake.operation(call) for call in self.fake.calls]
         self.assertEqual(
             len([call for call in operations if call[1:3] == ["agent", "get"]]),
-            0,
+            4,
         )
 
     def test_starting_recovery_gets_exact_agent_without_duplicate_start(self) -> None:
@@ -693,7 +708,7 @@ class HerdrBackendTests(unittest.TestCase):
         self.assertEqual(recovered["phase"], "ready")
         operations = [self.fake.operation(call) for call in self.fake.calls]
         self.assertEqual(operations[0], ["herdr", "--version"])
-        self.assertEqual(len([call for call in operations if call[1:3] == ["agent", "get"]]), 4)
+        self.assertEqual(len([call for call in operations if call[1:3] == ["agent", "get"]]), 8)
         self.assertFalse(any(call[1:3] == ["workspace", "create"] for call in operations))
 
     def test_submit_once_and_recover_agent_state(self) -> None:
@@ -767,6 +782,115 @@ class HerdrBackendTests(unittest.TestCase):
             backend.submit(run_id, self.prompt(run_id))
         operations = [self.fake.operation(call) for call in self.fake.calls]
         self.assertFalse(any(call[1:3] == ["agent", "prompt"] for call in operations))
+
+    def uncertain_submission(self):
+        backend = self.booted()
+        run_id = str(uuid.uuid4())
+        prompt = self.prompt(run_id)
+        self.fake.lose_prompt_ack = True
+        with self.assertRaisesRegex(RuntimeError, "ACK lost after runtime accepted prompt"):
+            backend.submit(run_id, prompt)
+        backend = self.backend()
+        recovered = backend.recover(run_id)
+        self.assertEqual(recovered["status"], "indeterminate")
+        self.assertFalse(recovered["cancel_attempted"])
+        self.assertEqual(self.fake.agent_states[recovered["agent_name"]], "working")
+        member = backend.state()["members"][0]
+        self.write_active_transcript(member=member, prompt=prompt)
+        return backend, run_id, prompt, member
+
+    def test_uncertain_submit_recover_then_cancel_reconciles_exact_run(self) -> None:
+        backend, run_id, _, member = self.uncertain_submission()
+        cancelled = backend.cancel(run_id)
+        self.assertEqual(cancelled["status"], "abandoned")
+        self.assertEqual(cancelled["run_id"], run_id)
+        self.assertEqual(cancelled["cancel_turn_id"], "turn-active")
+        self.assertEqual(cancelled["agent_session"], member["agent_session"])
+        self.assertEqual(cancelled["generation"], backend.state()["generation"])
+        self.assertEqual(self.fake.agent_states[member["agent_name"]], "idle")
+        self.assertEqual(self.backend().cancel(run_id), cancelled)
+        operations = [self.fake.operation(call) for call in self.fake.calls]
+        self.assertEqual(sum(call[1:3] == ["agent", "prompt"] for call in operations), 1)
+        self.assertEqual(
+            [call for call in operations if call[1:3] == ["agent", "send-keys"]],
+            [["herdr", "agent", "send-keys", member["agent_name"], "ctrl+c"]],
+        )
+
+    def test_uncertain_cancel_refuses_missing_runtime(self) -> None:
+        backend, run_id, _, member = self.uncertain_submission()
+        self.fake.get_error = "agent_not_found"
+        before_cancel = len(self.fake.calls)
+        for _ in range(2):
+            with self.assertRaisesRegex(fleet_herdr.HerdrBackendError, "agent_not_found"):
+                backend.cancel(run_id)
+            observed = backend.state()["submissions"][run_id]
+            self.assertEqual(observed["status"], "indeterminate")
+            self.assertFalse(observed["cancel_attempted"])
+        operations = [self.fake.operation(c) for c in self.fake.calls]
+        self.assertFalse(any(c[1:3] == ["agent", "send-keys"] for c in operations))
+        self.assertEqual(sum(c[1:3] == ["agent", "prompt"] for c in operations), 1)
+        observations = [self.fake.operation(c) for c in self.fake.calls[before_cancel:]]
+        self.assertEqual([c[3] for c in observations if c[1:3] == ["agent", "get"]],
+                         [member["agent_name"], member["agent_name"]])
+
+    def test_uncertain_cancel_requires_exact_active_transcript(self) -> None:
+        backend, run_id, _, member = self.uncertain_submission()
+        path = self.transcripts[member["agent_session"]["value"]]
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        foreign = copy.deepcopy(rows[1:])
+        foreign[0]["payload"]["turn_id"] = "turn-foreign"
+        foreign[1]["payload"]["content"][0]["text"] = "another prompt"
+        foreign[2]["payload"]["turn_id"] = "turn-foreign"
+        complete = {"type": "event_msg", "payload": {"type": "task_complete", "turn_id": "turn-active"}}
+        for label, transcript in (("missing", []), ("newer turn", rows + foreign), ("complete", rows + [complete])):
+            with self.subTest(transcript=label):
+                path.write_text("".join(json.dumps(row) + "\n" for row in transcript))
+                observed = backend.cancel(run_id)
+                self.assertEqual(observed["status"], "indeterminate")
+                self.assertFalse(observed["cancel_attempted"])
+                self.assertEqual(self.fake.agent_states[member["agent_name"]], "working")
+        operations = [self.fake.operation(c) for c in self.fake.calls]
+        self.assertEqual(sum(c[1:3] == ["agent", "prompt"] for c in operations), 1)
+        self.assertFalse(any(c[1:3] == ["agent", "send-keys"] for c in operations))
+
+    def test_uncertain_cancel_refuses_runtime_identity_drift(self) -> None:
+        backend, run_id, _, _ = self.uncertain_submission()
+        agent_info = self.fake.agent_info
+        for field in ("name", "workspace_id", "tab_id", "pane_id", "terminal_id", "agent_session"):
+            with self.subTest(field=field):
+                def changed_identity(name, **kwargs):
+                    receipt = agent_info(name, **kwargs)
+                    receipt[field] = ({**receipt[field], "value": "session-other"}
+                                      if field == "agent_session" else "other")
+                    return receipt
+
+                with mock.patch.object(self.fake, "agent_info", side_effect=changed_identity):
+                    with self.assertRaises(fleet_herdr.HerdrBackendError):
+                        backend.cancel(run_id)
+                observed = backend.state()["submissions"][run_id]
+                self.assertEqual(observed["status"], "indeterminate")
+                self.assertFalse(observed["cancel_attempted"])
+        operations = [self.fake.operation(c) for c in self.fake.calls]
+        self.assertEqual(sum(c[1:3] == ["agent", "prompt"] for c in operations), 1)
+        self.assertFalse(any(c[1:3] == ["agent", "send-keys"] for c in operations))
+
+    def test_uncertain_cancel_uses_existing_quiescence_contract_without_signal(self) -> None:
+        for runtime_state in ("idle", "done", "blocked"):
+            with self.subTest(runtime_state=runtime_state):
+                fixture = HerdrBackendTests()
+                fixture.setUp()
+                try:
+                    backend, run_id, _, member = fixture.uncertain_submission()
+                    fixture.fake.agent_states[member["agent_name"]] = runtime_state
+                    observed = backend.cancel(run_id)
+                    self.assertEqual(observed["status"], "abandoned")
+                    self.assertTrue(observed["cancel_attempted"])
+                    self.assertEqual(fixture.fake.agent_states[member["agent_name"]], runtime_state)
+                    operations = [fixture.fake.operation(c) for c in fixture.fake.calls]
+                    self.assertEqual(sum(c[1:3] == ["agent", "prompt"] for c in operations), 1)
+                    self.assertFalse(any(c[1:3] == ["agent", "send-keys"] for c in operations))
+                finally:
+                    fixture.doCleanups()
 
     def test_wait_timeout_keeps_working_without_resubmit(self) -> None:
         backend = self.booted()
@@ -1023,6 +1147,7 @@ class HerdrBackendTests(unittest.TestCase):
         self.fake.version = "9.9.9"
         self.assertEqual(backend.recover(run_id), blocked)
         self.assertEqual(backend.wait(run_id, timeout_ms=1), blocked)
+        self.assertEqual(backend.cancel(run_id), blocked)
         self.assertEqual(self.fake.calls, [])
 
     def test_cancel_is_sent_once_and_becomes_abandoned(self) -> None:

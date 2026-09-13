@@ -5,6 +5,32 @@ The default canonical workflow is `herdr-implementation`, with the pinned
 All launches request `model_reasoning_effort="high"`. Result collection checks
 the actual Codex turn context in addition to the launch receipt.
 
+The opt-in `herdr-research-implementation` workflow selects the closed
+`astra_sol_research_v1` profile. It has five members and six turns: Plan
+(`lead`) → Research (`research`) → Build (`worker`) → Review (`reviewer`) →
+Verify (`verifier`) → Synthesis (`lead`). Research is Astra/high and read-only;
+Worker remains the only candidate writer. This profile uses only the personal
+Codex lane and rejects OpenCode, capsule and experimental launch options before
+candidate or runtime effects. The profile contract and digest are copied into
+runtime/creation evidence and the immutable `mission_created` payload, then
+rechecked against the compiled snapshot during resume, control, report and
+archive verification.
+
+```sh
+python3 scripts/mission-run.py dry research-sample "Investigate then implement" \
+  --workflow herdr-research-implementation \
+  --target-repo /absolute/path/to/clean/repository --json
+```
+
+New personal CLI runs select `official-cli-personal-v1` and require Herdr **0.9.0**
+and Codex CLI **0.154.0**. Existing **0.153.4** contracts remain readable and retain
+their exact runtime requirements. Both contracts use backend state schema v3 and
+are checked against collected transcript metadata. See [personal operation](personal-autonomy.md)
+for idle fleet preparation and source snapshots.
+Historical schema v2 remains readable without an implicit upgrade. See
+[CLI version contracts](herdr-cli-versions.md) for the compatibility matrix,
+startup delivery guard and server-restart limitations.
+
 ```sh
 python3 scripts/mission-run.py dry sample "Implement the agreed task" \
   --target-repo /absolute/path/to/clean/repository \
@@ -58,8 +84,9 @@ provides a disjoint wall-coverage partition. Missing interval ends stay unknown.
 time includes pauses and is not an execution benchmark. These readers do not
 query live Herdr or CMUX.
 
-The controller advances planning, implementation, review, verification and Lead
-synthesis. Worker receives a private clone. The other roles launch with read-only
+The default controller advances planning, implementation, review, verification
+and Lead synthesis. The Research profile inserts its evidence turn after Plan.
+Worker receives a private clone. The other roles launch with read-only
 sandboxes. No stage creates commits or publishes changes back into the source
 checkout. The candidate and its portable patch remain available for review.
 Dirty source checkouts currently require snapshot support and are rejected before
@@ -100,6 +127,19 @@ pending. A completed incompatible result cannot finalize its admission or advanc
 the next stage, including on recovery. The attestation covers recorded Codex
 configuration, not an independent OS containment test.
 
+Research permission policy v3 adds the `research` reader and requires all six
+turn attestations. Input policy `independent-research-v1` gives Build Plan plus
+Research; gives Review and Verify the same Plan+Research+Build inputs without
+either verdict; and gives Synthesis all prior results. A missing, blocked or
+invalid Research result prevents the first Build admission.
+
+Before Research, CONTROL captures `research-snapshot.json` plus tree and patch
+CAS. The Research task CAS embeds that exact receipt and tree hash. Immediately
+before the first Build admission, the physical candidate must still equal the
+investigated tree. On later recovery the existing Build admission permits its
+legitimate changes, while the original Research task/result/snapshot authority
+is still revalidated without selecting a new snapshot.
+
 The Herdr archive is explicitly versioned separately from historical CMUX
 archives. It retains the Mission ledger, compiled policy, runtime options,
 source objective, backend binding, all CAS artifacts, four mandatory role results,
@@ -138,6 +178,24 @@ new success through this driver, even if ordinary historical verification passes
 it requires separate remediation, not an automatic in-place upgrade. Already
 terminal historical missions return their existing verdict without freezing a
 new policy or rewriting their evidence.
+
+The Research profile always creates archive schema v6, compatible with offline
+reading of true v2–v5 archives but never downgradeable to them. V6 adds the
+investigated receipt/tree/patch and the fifth role result. Research artifact
+citations are checked against the investigated tree; other role citations and
+acceptance remain checked against the final tree. Therefore Build may validly
+change a file cited by Research. SDD and functional evidence remain independent,
+optional additions inside v6. Verification can proceed after the candidate and
+mutable source files disappear because all required bytes are in CAS/archive.
+Completion requires policy v3, six turns, schema v6 and the frozen profile digest.
+
+`scripts/fleet_herdr_opencode_evidence.py` is a separate standard-library,
+offline reader for one explicitly bound native OpenCode export segment. It
+checks strict JSON, cross-references, segment completion, external bindings and
+byte hashes. That is consistency validation, not cryptographic authentication
+of export origin. It always returns `permissions.status=not_attested` and
+`authority=none`; it is not connected to the backend, admissions or closure and
+cannot authorize an OpenCode Research/Worker role.
 
 An acceptance contract uses the existing `text_contains`, `sha256`, and
 `json_equals` predicates against the archived tree. Functional tests are separate

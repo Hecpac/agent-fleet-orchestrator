@@ -1,10 +1,15 @@
 # Referencia complementaria: observar la flota en CMUX
 
+Esta guía aplica únicamente al carril histórico de CMUX cuando el usuario lo
+selecciona explícitamente. Este proyecto utiliza Herdr. Los ejemplos de flotas,
+carreras, notificaciones y teardown requieren autorización para esos efectos;
+una auditoría o tarea compleja no los activa por sí sola.
+
 La guía canónica de selección, ejecución, completion, recuperación, FDP-2/FDP-3,
 WORM y límites de confianza es [`guia-uso-flota.md`](guia-uso-flota.md). Este
 archivo conserva únicamente la referencia visual y los patrones cotidianos de
-CMUX. Para el detalle agéntico consulta `.agents/skills/cmux/SKILL.md`
-(sincronizada con `.claude/skills/cmux/SKILL.md`); para el porqué de cada regla,
+CMUX. Para el detalle agéntico consulta la
+[referencia legacy](cmux-legacy-reference.md); para el porqué de cada regla,
 consulta [`cmux-best-practices.md`](cmux-best-practices.md).
 
 ---

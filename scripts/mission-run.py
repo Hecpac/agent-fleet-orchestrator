@@ -31,9 +31,11 @@ import fleet_control_service
 import fleet_json
 import fleet_herdr
 import fleet_herdr_launch
+import fleet_herdr_profile
 import fleet_herdr_runtime
 import fleet_herdr_archive
 import fleet_herdr_mission
+import fleet_herdr_versions
 import fleet_ledger
 import fleet_manifest
 import fleet_mission
@@ -426,11 +428,12 @@ def render_prompt(
             compiled["resolved"], ensure_ascii=False, indent=2, sort_keys=True
         ),
     }
-    for marker, value in replacements.items():
-        template = template.replace(marker, value)
-    if "{{" in template or "}}" in template:
+    # Validate source syntax only; replacement values remain opaque text.
+    markers = re.compile("|".join(re.escape(marker) for marker in replacements))
+    unresolved = markers.sub(" ", template)
+    if "{{" in unresolved or "}}" in unresolved:
         raise MissionRunError("mission prompt has unresolved template markers")
-    return template
+    return markers.sub(lambda match: replacements[match.group(0)], template)
 
 
 def cmux_signal(
@@ -910,7 +913,7 @@ def request_assurance(
 def drive_mission(runs_dir: Path, mission_id: str) -> dict[str, Any]:
     root = mission_state.mission_root(runs_dir, mission_id)
     compiled, initial = effect_compiled(runs_dir, mission_id)
-    if compiled["resolved"]["preset"] == "astra_sol":
+    if fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
         return fleet_herdr_mission.drive(runs_dir, mission_id)
     options = load_durable_json(
         runs_dir,
@@ -2170,7 +2173,9 @@ def create_and_drive(
     herdr_session: str | None = None,
     herdr_runtime_root: str | None = None,
     herdr_launch_manifest: dict[str, Any] | None = None,
+    herdr_capsule_manifest: dict[str, Any] | None = None,
     functional_contract: dict[str, Any] | None = None,
+    sdd_plan_path: Path | None = None,
 ) -> dict[str, Any]:
     if not FEATURE.fullmatch(feature):
         raise MissionRunError("invalid feature")
@@ -2188,19 +2193,36 @@ def create_and_drive(
     compiled = workflow_config.compile_path(
         workflow_path(workflow_name), router_path=router_path
     )
+    is_herdr = fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"])
+    profile = fleet_herdr_profile.resolve_profile(compiled) if is_herdr else None
+    if sdd_plan_path is not None and not is_herdr:
+        raise MissionRunError("--sdd-plan requires a supported Herdr workflow")
     herdr_runtime_options = {}
     if herdr_runtime_root is not None:
-        if compiled["resolved"]["preset"] != "astra_sol":
-            raise MissionRunError("Herdr runtime layout requires astra_sol")
+        if not is_herdr:
+            raise MissionRunError("Herdr runtime layout requires a supported Herdr profile")
         herdr_runtime_options = {"herdr_layout": {"version": 2, "runtime_root": herdr_runtime_root},
-                                 "herdr_input_policy": "independent-v1"}
+                                 **fleet_herdr_profile.runtime_binding(profile)}
         fleet_herdr_runtime.candidate_path(runs_dir, str(uuid.UUID(int=0)),
                                           herdr_runtime_options, target_repo)
+    if herdr_capsule_manifest is not None:
+        import fleet_mission_capsule
+        if not herdr_runtime_options or herdr_launch_manifest is not None:
+            raise MissionRunError("capsule requires --herdr-runtime-root and excludes legacy launch")
+        if profile is not None and not profile.allow_capsule:
+            raise MissionRunError("Research Herdr profile does not support capsule execution")
+        herdr_runtime_options["herdr_capsule_manifest"] = fleet_mission_capsule.validate_manifest(herdr_capsule_manifest, live=True)
     if herdr_launch_manifest is not None:
         if not herdr_runtime_options:
             raise MissionRunError("observed launch requires --herdr-runtime-root")
+        if profile is not None and not profile.allow_experimental_launch:
+            raise MissionRunError("Research Herdr profile does not support experimental launch")
         herdr_runtime_options["herdr_launch_manifest"] = fleet_herdr_launch.validate_manifest(herdr_launch_manifest)
-    if compiled["resolved"]["preset"] == "astra_sol":
+    if is_herdr:
+        herdr_runtime_options = {**fleet_herdr_profile.runtime_binding(profile), **herdr_runtime_options}
+        if herdr_capsule_manifest is None and herdr_launch_manifest is None:
+            from fleet_herdr_personal import PROFILE
+            herdr_runtime_options["herdr_personal_cli"] = PROFILE
         herdr_session = herdr_session or os.environ.get("HERDR_SESSION")
         if not isinstance(herdr_session, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", herdr_session):
             raise MissionRunError("Herdr requires an explicit --herdr-session or inherited HERDR_SESSION")
@@ -2228,7 +2250,7 @@ def create_and_drive(
         key += ":herdr-runtime:" + mission_state.artifact_id(mission_state.canonical_bytes(herdr_runtime_options))
     if functional_contract is not None:
         fleet_functional.validate(functional_contract)
-        if compiled["resolved"]["preset"] != "astra_sol":
+        if not is_herdr:
             raise MissionRunError("functional v1 requires Herdr")
         key += ":functional:" + fleet_functional.digest(functional_contract)
     if acceptance_contract is not None:
@@ -2260,6 +2282,7 @@ def create_and_drive(
             **({"acceptance_contract": acceptance_contract} if acceptance_contract is not None else {}),
             **({"functional_contract": functional_contract} if functional_contract is not None else {}),
         },
+        sdd_plan_path=sdd_plan_path,
     )
     return drive_mission(runs_dir, mission_id)
 
@@ -2287,8 +2310,8 @@ def dry_run(
     compiled = workflow_config.compile_path(
         workflow_path(workflow_name), router_path=router_path
     )
-    if functional_contract is not None and compiled["resolved"]["preset"] != "astra_sol":
-        raise MissionRunError("functional contracts require the Herdr astra_sol workflow")
+    if functional_contract is not None and not fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
+        raise MissionRunError("functional contracts require a supported Herdr workflow")
     if acceptance_contract is not None:
         fleet_acceptance.validate(acceptance_contract)
         if compiled["workflow"]["archive"]["content_policy"] != "full" or not compiled["workflow"]["archive"]["include_final_tree"]:
@@ -2316,7 +2339,7 @@ def dry_run(
         "effects": [],
         **({"functional": {"schema_version": 1, "spec_sha256": fleet_functional.digest(functional_contract),
                             "check_id": functional_contract["check_id"]}} if functional_contract is not None else {}),
-        "backend": "herdr" if compiled["resolved"]["preset"] == "astra_sol" else "cmux-legacy",
+        "backend": "herdr" if fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]) else "cmux-legacy",
         "acceptance": {"mode": "artifact_contract", "contract_sha256": fleet_acceptance.digest(acceptance_contract)} if acceptance_contract is not None else {"mode": "legacy_not_evaluated"},
     }
 
@@ -2335,6 +2358,7 @@ def _parser() -> argparse.ArgumentParser:
         if name == "run":
             command.add_argument("--herdr-runtime-root", help="existing private physical directory outside runs/source; enables layout v2 and independent role inputs")
             command.add_argument("--herdr-launch-manifest", type=Path, help="pinned local Herdr/Codex images; records launch inputs only, not effective sandbox binding")
+            command.add_argument("--herdr-capsule-manifest", type=Path, help="explicit external Seatbelt executor; no unconstrained Herdr fallback")
         command.add_argument("--target-repo", default=os.getcwd())
         command.add_argument(
             "--risk", default="auto", choices=("auto", *fleet_risk.RISK_ORDER)
@@ -2356,6 +2380,7 @@ def _parser() -> argparse.ArgumentParser:
         if name == "run":
             command.add_argument("--allow-dirty-baseline", action="store_true")
             command.add_argument("--teardown", action="store_true")
+            command.add_argument("--sdd-plan", type=Path, help="freeze an SDD plan snapshot before Mission creation (supported Herdr profiles only)")
 
     resume = commands.add_parser("resume")
     resume.add_argument("--mission-id", required=True)
@@ -2387,7 +2412,7 @@ def _parser() -> argparse.ArgumentParser:
     cancel.add_argument("--json", action="store_true")
     retry = commands.add_parser("retry-start", help="recover an exited, unsubmitted startup in its exact owned pane")
     retry.add_argument("--mission-id", required=True)
-    retry.add_argument("--instance", choices=("lead", "worker", "reviewer", "verifier"), required=True)
+    retry.add_argument("--instance", choices=("lead", "research", "worker", "reviewer", "verifier"), required=True)
     retry.add_argument("--json", action="store_true")
 
     assurance = commands.add_parser("request-assurance")
@@ -2418,7 +2443,7 @@ def mission_status(runs_dir: Path, mission_id: str) -> dict[str, Any]:
     cancelled = current.get("cancelled_runs", {})
     result = {"mission_id": current["mission_id"], "feature": current["feature"],
         **({"control": fleet_herdr_control.view(current)} if "herdr_control" in current else {}),
-        "backend": "herdr" if compiled["resolved"]["preset"] == "astra_sol" else "cmux-legacy",
+        "backend": "herdr" if fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]) else "cmux-legacy",
         "status": current["status"], "terminal": current.get("terminal"), "admissions": admissions,
         "cancellations": [{"run_id": run, "state": "confirmed" if any(
             a["run_id"] == run and a.get("terminal", {}).get("status") == "abandoned"
@@ -2427,11 +2452,13 @@ def mission_status(runs_dir: Path, mission_id: str) -> dict[str, Any]:
     root = Path("missions") / current["mission_id"]
     with fleet_safe_paths.RootedFS(runs_dir) as fs:
         entries = fs.list_directory(root, directory_modes=(0o700, 0o700))
-        if "herdr-backend.json" in entries:
-            backend = fleet_json.loads(fs.read_regular(root / "herdr-backend.json",
-                directory_modes=(0o700, 0o700), file_mode=0o600, max_bytes=16 * 1024 * 1024))
-            if backend.get("mission_id") != current["mission_id"] or backend.get("compiled_digest") != compiled["compiled_digest"]:
-                raise MissionRunError("status backend binding mismatch")
+        backend = fleet_herdr_versions.read_state(fs, root / "herdr-backend.json",
+            mission_id=current["mission_id"], compiled_digest=compiled["compiled_digest"])
+        if backend is not None and backend.get("executor") == "fleet.mission.capsule.v2":
+            result["runtime"] = {"executor": backend["executor"], "session": backend["session"],
+                "generation": backend["generation"], "workspace": backend["workspace"],
+                "visibility": "headless_confined_cli", "status_source": "mission_ledger"}
+        elif backend is not None:
             result["runtime"] = {"phase": backend["phase"], "session": backend["session"],
                 "workspace": backend["workspace"], "members": [{k: m.get(k) for k in (
                     "instance_id", "model", "start_phase", "pane_id", "agent_session")}
@@ -2496,9 +2523,11 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=args.timeout,
                 allow_dirty_baseline=args.allow_dirty_baseline,
                 teardown=args.teardown,
+                sdd_plan_path=Path(args.sdd_plan).expanduser() if args.sdd_plan else None,
                 herdr_session=args.herdr_session,
                 herdr_runtime_root=args.herdr_runtime_root,
                 herdr_launch_manifest=mission_state.loads_strict(args.herdr_launch_manifest.read_bytes()) if args.herdr_launch_manifest else None,
+                herdr_capsule_manifest=mission_state.loads_strict(args.herdr_capsule_manifest.read_bytes()) if args.herdr_capsule_manifest else None,
                 execution_profile=args.execution_profile,
                 acceptance_contract=fleet_acceptance.load(args.acceptance_contract) if args.acceptance_contract else None,
                 functional_contract=fleet_functional.load(args.functional_contract) if args.functional_contract else None,
@@ -2546,6 +2575,8 @@ def main(argv: list[str] | None = None) -> int:
                         raise MissionRunError("driver busy; startup retry was not attempted")
                     driver = fleet_herdr_mission._Driver(runs_dir, mission_id)
                     driver.load()
+                    if driver.sdd_error is not None:
+                        raise MissionRunError("SDD plan binding failed closed: " + driver.sdd_error)
                     if fleet_herdr_control.view(driver.current())["desired"] != "running":
                         raise MissionRunError("control request blocks startup retry; resume the Mission explicitly")
                     if driver.current()["status"] != "booting":

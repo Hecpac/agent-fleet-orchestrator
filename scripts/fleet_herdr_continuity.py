@@ -301,7 +301,11 @@ class Controller:
         return self.store.load(self.policy_sha)
 
     def transition(self, state, phase, **values):
-        state['active'].update(phase=phase, since=self.clock(), **values)
+        since = self.clock()
+        # Late adjudication must not create a fresh window for the next effect.
+        if phase in {'prepared', 'lead_pending'} and since - state['active']['since'] > self.plan['phase_timeout_seconds']:
+            since = state['active']['since']
+        state['active'].update(phase=phase, since=since, **values)
         self.store.save(state)
 
     def send(self, state, phase, member, expected, prompt):
@@ -386,10 +390,15 @@ class Controller:
         op = state['active']; member = self.members[op['member']]; phase = op['phase']
         if phase == 'blocked':
             return
-        if self.clock() - op['since'] > self.plan['phase_timeout_seconds'] and phase != 'prepared':
+        response_binding = {'checkpoint_sent': 'source_binding', 'restore_sent': 'new_binding',
+                            'lead_sent': 'lead_binding'}.get(phase)
+        ns = None
+        if response_binding:
+            recipient = self.members[self.plan['lead_name']] if phase == 'lead_sent' else member
+            ns = self.response(recipient, op[response_binding], op['prompt_sha256'])
+        if self.clock() - op['since'] > self.plan['phase_timeout_seconds'] and phase != 'prepared' and ns is None:
             raise ContinuityError('handoff_timeout_reconcile_without_resending')
         if phase == 'checkpoint_sent':
-            ns = self.response(member, op['source_binding'], op['prompt_sha256'])
             if ns is None:
                 return
             summary = validate_summary(read_json(ns['done']['final']), member)
@@ -456,7 +465,6 @@ class Controller:
             fresh=dict(agent['binding'],session=sid)
             self.restore(state,member,fresh,agent['binding'])
         elif phase == 'restore_sent':
-            ns = self.response(member, op['new_binding'], op['prompt_sha256'])
             if ns is None:
                 return
             created = context.stamp(ns['meta'].get('timestamp'))
@@ -487,7 +495,6 @@ class Controller:
                       'status=BLOCKED. La misión histórica conserva su cierre.\n' + encoded(report).decode())
             self.send(state, 'lead_sent', lead, agent['binding'], prompt)
         elif phase == 'lead_sent':
-            ns = self.response(self.members[self.plan['lead_name']], op['lead_binding'], op['prompt_sha256'])
             if ns is None:
                 return
             if acknowledgement(ns['done']['final']) != op['lead_ack']:

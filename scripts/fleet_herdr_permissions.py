@@ -9,25 +9,38 @@ from pathlib import PurePosixPath
 from typing import Any
 
 VERSION = 1
+RESEARCH_VERSION = 3
 MINIMUM_ARCHIVE_SCHEMA_VERSION = 3
 REQUIRED_TURNS = 5
 MODELS = {"lead": "gpt-6-astra", "worker": "gpt-5.6-sol",
           "reviewer": "gpt-5.6-sol", "verifier": "gpt-5.6-sol"}
+RESEARCH_MODELS = {**MODELS, "research": "gpt-6-astra"}
 
 
 class PermissionError(ValueError):
     pass
 
 
-def finalization_policy(compiled_digest: str) -> dict[str, Any]:
+def finalization_policy(compiled_digest: str, *, capsule: bool = False,
+                        profile=None) -> dict[str, Any]:
     """Controller policy frozen in the Mission ledger, never inferred from an index."""
+    if profile is not None and profile.permissions_policy_version == RESEARCH_VERSION:
+        if capsule:
+            raise PermissionError("Research permission policy does not support capsule execution")
+        return {"compiled_digest": compiled_digest,
+                "minimum_archive_schema_version": profile.minimum_archive_schema_version,
+                "permissions_policy_version": profile.permissions_policy_version,
+                "required_turns": len(profile.stages),
+                "herdr_profile": profile.profile_id,
+                "herdr_profile_sha256": profile.digest}
     return {"compiled_digest": compiled_digest,
             "minimum_archive_schema_version": MINIMUM_ARCHIVE_SCHEMA_VERSION,
-            "permissions_policy_version": VERSION, "required_turns": REQUIRED_TURNS}
+            "permissions_policy_version": 2 if capsule else VERSION, "required_turns": REQUIRED_TURNS}
 
 
 def policy(role: str, cwd: str, *, version: int = VERSION) -> dict[str, Any]:
-    if type(version) is not int or version != VERSION or not isinstance(role, str) or role not in MODELS:
+    models = MODELS if version == VERSION else RESEARCH_MODELS if version == RESEARCH_VERSION else None
+    if type(version) is not int or models is None or not isinstance(role, str) or role not in models:
         raise PermissionError("unsupported Herdr permission policy/role")
     if (not isinstance(cwd, str) or not PurePosixPath(cwd).is_absolute()
             or str(PurePosixPath(cwd)) != cwd or ".." in PurePosixPath(cwd).parts):
@@ -36,12 +49,12 @@ def policy(role: str, cwd: str, *, version: int = VERSION) -> dict[str, Any]:
     if role == "worker":
         sandbox = {"type": "workspace-write", "network_access": False,
                    "exclude_tmpdir_env_var": False, "exclude_slash_tmp": False}
-    return {"version": version, "role": role, "cwd": cwd, "model": MODELS[role],
+    return {"version": version, "role": role, "cwd": cwd, "model": models[role],
             "effort": "high", "approval_policy": "never", "sandbox_policy": sandbox}
 
 
-def launch_flags(role: str, cwd: str) -> list[str]:
-    expected = policy(role, cwd)
+def launch_flags(role: str, cwd: str, *, version: int = VERSION) -> list[str]:
+    expected = policy(role, cwd, version=version)
     flags = ["--sandbox", expected["sandbox_policy"]["type"], "--ask-for-approval", "never"]
     if role == "worker":
         for key in ("network_access", "exclude_tmpdir_env_var", "exclude_slash_tmp"):

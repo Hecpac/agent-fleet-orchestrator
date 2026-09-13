@@ -31,6 +31,86 @@ fleet_approve = importlib.util.module_from_spec(APPROVE_SPEC)
 APPROVE_SPEC.loader.exec_module(fleet_approve)
 
 
+class MissionPromptRenderingTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="mission-render-test-")
+        self.addCleanup(temporary.cleanup)
+        self.template = Path(temporary.name) / "prompt.md"
+        self.arguments = {
+            "mission_id": "fixture-mission", "feature": "fixture-feature", "objective": "plain text",
+            "compiled": {"workflow": {"name": "implementation"}, "workflow_digest": "d" * 64,
+                         "resolved": {"capability": "fixture"}},
+            "risk": "low", "target_repo": Path("/fixture/repo"),
+            "manifest": Path("/fixture/manifest"), "timeout_seconds": 60,
+        }
+        for owner, name in ((mission_run, "run_process"), (subprocess, "run")):
+            patcher = mock.patch.object(owner, name, side_effect=AssertionError("renderer invoked a runtime"))
+            observed = patcher.start()
+            self.addCleanup(patcher.stop)
+            self.addCleanup(observed.assert_not_called)
+
+    def render(self, template, **values):
+        self.template.write_text(template, encoding="utf-8")
+        with mock.patch.object(mission_run, "PROMPT_TEMPLATE", self.template):
+            return mission_run.render_prompt(**{**self.arguments, **values})
+
+    def assert_rendered(self, template, expected, **values):
+        try:
+            actual = self.render(template, **values)
+        except mission_run.MissionRunError as exc:
+            self.fail(f"renderer reinterpreted opaque replacement text: {exc}")
+        self.assertEqual(actual.encode("utf-8"), expected.encode("utf-8"))
+
+    def test_original_placeholders_and_surrounding_text_are_preserved(self):
+        template = "ID={{MISSION_ID}}; feature={{FEATURE}}; workflow={{WORKFLOW}}\n{{WORKFLOW_DIGEST}}\n{{RISK}} {{TARGET_REPO}} {{MANIFEST}} {{TIMEOUT_SECONDS}}\n{{OBJECTIVE}}\n{{CAPABILITY_CATALOG}}\n"
+        expected = 'ID=fixture-mission; feature=fixture-feature; workflow=implementation\n' + 'd' * 64 + '\nlow /fixture/repo /fixture/manifest 60\nplain text\n{\n  "capability": "fixture"\n}\n'
+        self.assert_rendered(template, expected)
+
+    def test_multiple_occurrences_of_original_placeholder(self):
+        self.assert_rendered("{{OBJECTIVE}} / {{OBJECTIVE}}\n", "plain text / plain text\n")
+        self.assert_rendered("{{{OBJECTIVE}}{", "{plain text{")
+        self.assert_rendered("}{{OBJECTIVE}}}", "}plain text}")
+
+    def test_literal_unknown_marker_in_replacement_is_opaque(self):
+        self.assert_rendered("Objective: {{OBJECTIVE}}\n", "Objective: {{customer}}\n", objective="{{customer}}")
+
+    def test_literal_catalog_marker_does_not_collide_with_original_placeholder(self):
+        self.assert_rendered(
+            "Objective: {{OBJECTIVE}}\nCatalog: {{CAPABILITY_CATALOG}}\n",
+            'Objective: {{CAPABILITY_CATALOG}}\nCatalog: {\n  "capability": "fixture"\n}\n',
+            objective="{{CAPABILITY_CATALOG}}",
+        )
+
+    def test_nested_json_and_brace_suffixes_are_opaque(self):
+        for value in ('{"outer":{"inner":"literal"}}', 'suffix }}', '{ordinary}', '{{', '}}'):
+            with self.subTest(value=value):
+                self.assert_rendered("<{{OBJECTIVE}}>\n", "<" + value + ">\n", objective=value)
+
+    def test_several_marker_looking_strings_are_opaque(self):
+        value = "{{customer}} | {{CAPABILITY_CATALOG}} | {{FEATURE}} | {{OBJECTIVE}}"
+        self.assert_rendered("{{OBJECTIVE}}", value, objective=value)
+
+    def test_unicode_newlines_quotes_and_backslashes_are_opaque(self):
+        value = 'Español: ñ, 漢字, 🦊\n"{{customer}}" y {"a":{}}\n\\1 \\g<OBJECTIVE>\n'
+        self.assert_rendered("before\n{{OBJECTIVE}}after\n", "before\n" + value + "after\n", objective=value)
+
+    def test_unresolved_or_incomplete_markers_in_original_template_are_rejected(self):
+        for template in ("{{MISSING}}", "{{customer}}", "{{OBJECTIVE", "orphan }}"):
+            with self.subTest(template=template), self.assertRaisesRegex(
+                    mission_run.MissionRunError, "mission prompt has unresolved template markers"):
+                self.render(template, objective="{{customer}}")
+
+    def test_absent_source_placeholder_and_empty_value_keep_existing_contract(self):
+        self.assert_rendered("Only {{FEATURE}}\n", "Only fixture-feature\n")
+        self.assert_rendered("a{{OBJECTIVE}}b{{OBJECTIVE}}c\n", "abc\n", objective="")
+        self.assert_rendered("", "")
+
+    def test_replacements_do_not_cascade_across_parameters(self):
+        self.assert_rendered("{{FEATURE}}|{{OBJECTIVE}}", "{{OBJECTIVE}}|plain text", feature="{{OBJECTIVE}}")
+        compiled = {**self.arguments["compiled"], "resolved": {"capability": "{{FEATURE}}"}}
+        self.assert_rendered("{{CAPABILITY_CATALOG}}", '{\n  "capability": "{{FEATURE}}"\n}', compiled=compiled)
+
+
 class MissionRunTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -1012,6 +1092,28 @@ class MissionRunTests(unittest.TestCase):
             ),
             result_bytes,
         )
+
+    def test_legacy_mission_dispatch_preserves_opaque_objective_and_prompt_hash(self) -> None:
+        calls, fake = self.fake_runtime()
+        prompts = []
+        objective = 'Implement parser: {"a":{"b":1}}; {{customer}}; {{CAPABILITY_CATALOG}}.'
+
+        def observed(command, *, timeout=None, env=None):
+            if Path(command[0]).name == "fleet-send.sh":
+                prompts.append(command[3])
+            return fake(command, timeout=timeout, env=env)
+
+        with mock.patch.object(mission_run, "run_process", side_effect=observed), mock.patch.object(mission_run, "cmux_signal"):
+            value = mission_run.create_and_drive(self.runs, feature="opaque-objective", objective=objective,
+                workflow_name="implementation", target_repo=self.target.resolve(), risk_override="auto",
+                timeout_seconds=300, allow_dirty_baseline=False, teardown=False)
+        self.assertEqual(value["status"], "succeeded")
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("Exact objective:\n\n```text\n" + objective + "\n```", prompts[0])
+        self.assertLess(calls.index("fleet-up.sh"), calls.index("fleet-send.sh"))
+        current = mission_run.fleet_mission.load_state(self.runs, value["mission_id"])
+        admission = next(a for a in current["admissions"].values() if a["run_id"] == current["lead_run_id"])
+        self.assertEqual(admission["task_sha256"], hashlib.sha256(prompts[0].encode("utf-8")).hexdigest())
 
     def test_live_assurance_request_waits_for_exact_lead_finalization(self) -> None:
         calls, base_runtime = self.fake_runtime()

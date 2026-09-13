@@ -60,6 +60,36 @@ def _append_while_quiesced(arguments: tuple[str, str, str]) -> str:
 
 
 class MissionStateTests(unittest.TestCase):
+    def test_archive_selection_is_bound_unique_and_idempotent(self):
+        from tests.test_fleet_herdr_archive import HerdrSnapshotTests
+        import fleet_herdr_archive as archive
+        helper = HerdrSnapshotTests()
+        helper.setUp()
+        self.addCleanup(helper.doCleanups)
+        mid, roles, backend = helper.archive_fixture()
+        archive.create(helper.runs, mid, helper.repo, roles, backend)
+        events = state.read_events(state.ledger_path(helper.runs, mid))
+        selected = next(e for e in events if e["kind"] == "herdr_archive_selected")
+        same, appended = state.append_event(helper.runs, mid, kind=selected["kind"],
+            actor=selected["actor"], idempotency_key=selected["idempotency_key"], payload=selected["payload"])
+        self.assertFalse(appended)
+        self.assertEqual(same, selected)
+        ledger = state.ledger_path(helper.runs, mid).read_bytes()
+        for payload, key in [
+            ({**selected["payload"], "index_artifact_id": "f" * 64}, selected["idempotency_key"]),
+            (selected["payload"], "second-selection"),
+        ]:
+            with self.subTest(key=key), self.assertRaises(state.MissionConflict):
+                state.append_event(helper.runs, mid, kind=selected["kind"], actor="CONTROL",
+                                   idempotency_key=key, payload=payload)
+            self.assertEqual(state.ledger_path(helper.runs, mid).read_bytes(), ledger)
+        # The current test's Mission is still compiled, so selection has no authority.
+        current = mission.load_state(self.runs, self.mission_id)
+        with self.assertRaises(state.MissionConflict):
+            state.append_event(self.runs, self.mission_id, kind="herdr_archive_selected", actor="CONTROL",
+                idempotency_key="premature-selection", payload={"compiled_digest": current["compiled_digest"],
+                    "ledger_head": current["head_sha256"], "index_artifact_id": "f" * 64})
+
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)

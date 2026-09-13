@@ -1,0 +1,61 @@
+{
+  "schema": "fleet.sdd.plan.v1",
+  "objective": "Ejemplo sintético: rechazar una operación sin capacidad explícita antes de invocar su efecto.",
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "behavior": "Una operación sin capacidad explícita se deniega antes del efecto."
+    }
+  ],
+  "scenarios": [
+    {
+      "id": "SCN-001",
+      "requirement": "REQ-001",
+      "given": "No hay capacidad concedida.",
+      "when": "Se solicita una operación.",
+      "then": "Se devuelve denegación y el contador de efectos permanece en cero."
+    },
+    {
+      "id": "SCN-002",
+      "requirement": "REQ-001",
+      "given": "La capacidad tiene un identificador desconocido.",
+      "when": "Se solicita una operación.",
+      "then": "Se devuelve denegación y el contador de efectos permanece en cero."
+    }
+  ],
+  "design": {
+    "approach": "Validar la capacidad antes de llamar a un callback local instrumentado. Este ejemplo no representa aislamiento del sistema operativo.",
+    "requirements": [
+      "REQ-001"
+    ]
+  },
+  "tasks": [
+    {
+      "id": "TASK-001",
+      "owner": "worker",
+      "scenarios": [
+        "SCN-001",
+        "SCN-002"
+      ],
+      "change": "Implementar el guard y pruebas con un callback contador en una fixture local."
+    }
+  ],
+  "checks": [
+    {
+      "id": "CHK-001",
+      "scenarios": [
+        "SCN-001"
+      ],
+      "procedure": "Invocar sin capacidad; comprobar denegación y cero llamadas al callback.",
+      "status": "NOT_VERIFIED"
+    },
+    {
+      "id": "CHK-002",
+      "scenarios": [
+        "SCN-002"
+      ],
+      "procedure": "Invocar con capacidad desconocida; comprobar denegación y cero llamadas al callback.",
+      "status": "NOT_VERIFIED"
+    }
+  ]
+}

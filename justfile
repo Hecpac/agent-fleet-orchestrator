@@ -1,4 +1,31 @@
 runs_dir := env_var_or_default("FLEET_RUNS_DIR", "orchestration/runs")
+personal_python := env_var_or_default("FLEET_PYTHON", "python3.12")
+
+# Personal CLI path. Diagnostics never start agents or send model prompts.
+personal-check target:
+    {{personal_python}} -B scripts/fleet_personal_preflight.py --target-repo "{{target}}"
+
+personal-snapshot source output *flags:
+    {{personal_python}} -B scripts/fleet_personal_snapshot.py --source "{{source}}" --output "{{output}}" {{flags}}
+
+personal-prepare pool target session:
+    {{personal_python}} -B scripts/fleet_personal_pool.py --state-dir "{{pool}}" prepare --target-repo "{{target}}" --session "{{session}}"
+
+personal-show pool:
+    {{personal_python}} -B scripts/fleet_personal_pool.py --state-dir "{{pool}}" show
+
+personal-close pool:
+    {{personal_python}} -B scripts/fleet_personal_pool.py --state-dir "{{pool}}" close
+
+personal-assign pool feature objective contract:
+    {{personal_python}} -B scripts/fleet_personal_pool.py --state-dir "{{pool}}" assign "{{feature}}" "{{objective}}" --acceptance-contract "{{contract}}" --runs-dir "{{runs_dir}}"
+
+# Explicit names for the retained historical fleet entry points.
+legacy-fleet feature *roles:
+    ./scripts/fleet-up.sh {{feature}} {{roles}}
+
+legacy-fleet-down feature:
+    ./scripts/fleet-down.sh {{feature}}
 
 check:
     ./scripts/check-env.sh
@@ -75,19 +102,19 @@ mission-cancel mission_id run_id reason key *flags:
     python3 scripts/mission-run.py --runs-dir "{{runs_dir}}" cancel --mission-id {{mission_id}} --run-id {{run_id}} --reason "{{reason}}" --idempotency-key {{key}} {{flags}}
 
 mission-approve mission_id scope *flags:
-    python3 scripts/fleet-approve.py --runs-dir orchestration/runs --mission-id {{mission_id}} --scope {{scope}} {{flags}}
+    python3 scripts/fleet-approve.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} --scope {{scope}} {{flags}}
 
 mission-approve-archive mission_id scope *flags:
-    python3 scripts/fleet-approve.py --runs-dir orchestration/runs --mission-id {{mission_id}} --scope {{scope}} --archive {{flags}}
+    python3 scripts/fleet-approve.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} --scope {{scope}} --archive {{flags}}
 
 mission-advisory mission_id instance objective key *flags:
-    python3 scripts/fleet_assured_runner.py --runs-dir orchestration/runs --mission-id {{mission_id}} advisory --instance {{instance}} --objective "{{objective}}" --idempotency-key {{key}} {{flags}}
+    python3 scripts/fleet_assured_runner.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} advisory --instance {{instance}} --objective "{{objective}}" --idempotency-key {{key}} {{flags}}
 
 mission-audit-verify mission_id:
-    python3 scripts/fleet_audit_client.py --runs-dir orchestration/runs --mission-id {{mission_id}} verify
+    python3 scripts/fleet_audit_client.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} verify
 
 mission-archive mission_id manifest *flags:
-    python3 scripts/fleet_archive.py create --runs-dir orchestration/runs --mission-id {{mission_id}} --manifest {{manifest}} {{flags}}
+    python3 scripts/fleet_archive.py create --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} --manifest {{manifest}} {{flags}}
 
 mission-archive-verify archive *flags:
     python3 scripts/fleet_archive.py verify {{archive}} {{flags}}
@@ -110,25 +137,25 @@ mission-trace mission_id *flags:
     python3 scripts/fleet_export_trace.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} {{flags}}
 
 mission-control-start mission_id:
-    python3 scripts/fleet_control_service.py --runs-dir orchestration/runs --mission-id {{mission_id}} start
+    python3 scripts/fleet_control_service.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} start
 
 mission-control-health mission_id:
-    python3 scripts/fleet_control_service.py --runs-dir orchestration/runs --mission-id {{mission_id}} health
+    python3 scripts/fleet_control_service.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} health
 
 mission-control-stop mission_id:
-    python3 scripts/fleet_control_service.py --runs-dir orchestration/runs --mission-id {{mission_id}} stop
+    python3 scripts/fleet_control_service.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} stop
 
 mission-decision-request mission_id brief key:
-    python3 scripts/fleet_control.py --runs-dir orchestration/runs --mission-id {{mission_id}} request-decision --brief-file {{brief}} --idempotency-key {{key}}
+    python3 scripts/fleet_control.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} request-decision --brief-file {{brief}} --idempotency-key {{key}}
 
 mission-decisions mission_id *flags:
-    python3 scripts/fleet-decision.py --runs-dir orchestration/runs --mission-id {{mission_id}} list {{flags}}
+    python3 scripts/fleet-decision.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} list {{flags}}
 
 mission-decision-show mission_id decision_id *flags:
-    python3 scripts/fleet-decision.py --runs-dir orchestration/runs --mission-id {{mission_id}} {{flags}} show --decision-id {{decision_id}}
+    python3 scripts/fleet-decision.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} {{flags}} show --decision-id {{decision_id}}
 
 mission-decision-resolve mission_id decision_id option_id key reason:
-    python3 scripts/fleet-decision.py --runs-dir orchestration/runs --mission-id {{mission_id}} resolve --decision-id {{decision_id}} --option-id {{option_id}} --idempotency-key {{key}} --reason "{{reason}}"
+    python3 scripts/fleet-decision.py --runs-dir "{{runs_dir}}" --mission-id {{mission_id}} resolve --decision-id {{decision_id}} --option-id {{option_id}} --idempotency-key {{key}} --reason "{{reason}}"
 
 manifest-inspect manifest:
     python3 scripts/fleet_manifest.py inspect {{manifest}}

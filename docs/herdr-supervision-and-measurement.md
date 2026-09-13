@@ -28,6 +28,11 @@ close idle role panes; the separately configured selective teardown controls tha
 It never targets the focused pane. Repeated requests cannot reopen a terminal
 Mission or replace the scope of an existing cancellation.
 
+When cancellation selects one run and other admissions are active, the driver
+reconciles the selected run regardless of admission order. It leaves the other
+runs untouched and keeps Mission cancellation pending until they are inactive;
+settling the selected run alone does not establish Mission-wide quiescence.
+
 Supervision v1 records an explicit dispatch intent after admission authorization.
 That ledger event is the boundary between a not-yet-dispatched stage and an
 in-flight attempt. A pause that precedes the intent prevents it. A request after

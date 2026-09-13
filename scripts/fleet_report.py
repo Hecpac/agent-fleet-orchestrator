@@ -85,6 +85,36 @@ def _members(compiled: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _owned_run_events(
+    legacy_events: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    current: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Select runs bound by the validated Mission, including historical lanes."""
+    owned = set(current["run_owners"])
+    # Prelaunch abort releases run_owners but retains the admission's identity.
+    owned.update(item["run_id"] for item in current["admissions"].values())
+    owned.update(
+        event["payload"]["run_id"]
+        for event in events
+        if event["kind"] == "assured_action_completed"
+        and event["payload"]["action"] == "dispatch"
+    )
+    return [
+        event for event in legacy_events
+        if isinstance(event.get("run_id"), str) and event["run_id"] in owned
+    ]
+
+
+def _token_count(event: dict[str, Any], field: str) -> int | None:
+    value = event.get(field)
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise ReportError(f"legacy run {event.get('run_id')}: {field} must be a non-negative integer or null")
+    return value
+
+
 def _run_records(
     legacy_events: list[dict[str, Any]],
     delegations: dict[str, dict[str, Any]],
@@ -138,8 +168,8 @@ def _run_records(
                 "started_at": start,
                 "ended_at": end,
                 "duration_seconds": _seconds(start, end) if end else None,
-                "prompt_tokens": int(latest.get("prompt_tokens", 0) or 0),
-                "completion_tokens": int(latest.get("completion_tokens", 0) or 0),
+                "prompt_tokens": _token_count(latest, "prompt_tokens"),
+                "completion_tokens": _token_count(latest, "completion_tokens"),
             }
         )
     return records
@@ -216,6 +246,9 @@ def _provider_metrics(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ):
         outcomes = Counter(value["status"] for value in values)
         total = len(values)
+        observed = [value for value in values
+                    if value["prompt_tokens"] is not None and value["completion_tokens"] is not None]
+        complete = len(observed) == total
         result.append(
             {
                 "provider": provider,
@@ -224,8 +257,12 @@ def _provider_metrics(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "runs": total,
                 "outcomes": {name: outcomes[name] for name in OUTCOMES},
                 "success_rate": round(outcomes["succeeded"] / total, 6),
-                "prompt_tokens": sum(value["prompt_tokens"] for value in values),
-                "completion_tokens": sum(value["completion_tokens"] for value in values),
+                "prompt_tokens": sum(value["prompt_tokens"] for value in observed) if complete else None,
+                "completion_tokens": sum(value["completion_tokens"] for value in observed) if complete else None,
+                "usage_observed_runs": len(observed),
+                "usage_total_runs": total,
+                "usage_source": "latest_run_ledger_counters" if complete else None,
+                "usage_reason": None if complete else "some_runs_lack_assignable_usage",
                 "cost_usd": None,
                 "cost_reason": "no durable provider cost receipt",
             }
@@ -244,6 +281,7 @@ def derive_report(
         raise ReportError("report requires a mission_created root event")
     mission_id = str(events[0]["mission_id"])
     state = mission_state.derive_state(events)
+    legacy_events = _owned_run_events(legacy_events, events, state)
     started = _timestamp(events[0]["timestamp"], "mission start")
     ended = _timestamp(events[-1]["timestamp"], "mission end")
     delegations = state["delegations"]
@@ -365,6 +403,8 @@ def _archive_report(root: Path) -> dict[str, Any]:
         return {"present": False, "verified": False, "bytes": 0, "entries": 0}
     try:
         verified = fleet_archive.verify_archive(archive)
+        if verified["mission_id"] != root.name:
+            raise ReportError("archive belongs to a different Mission")
         size = sum(
             path.stat().st_size for path in archive.rglob("*")
             if path.is_file() and not path.is_symlink()
@@ -405,21 +445,25 @@ def build_report(runs_dir: Path, mission_id: str) -> dict[str, Any]:
         or compiled["compiled_digest"] != current["compiled_digest"]
     ):
         raise ReportError("compiled workflow evidence is not bound to the mission ledger")
-    if compiled["resolved"]["preset"] == "astra_sol":
+    import fleet_herdr_profile
+    if fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
         import fleet_herdr_report
         return fleet_herdr_report.build_report(runs_dir, current, compiled, events)
     feature = events[0]["payload"]["feature"]
     archive_report = _archive_report(root)
     legacy_path = runs_dir / f"fleet-{feature}.ledger.jsonl"
+    legacy = _owned_run_events(_jsonl(legacy_path), events, current)
     legacy_source = "live"
-    if not legacy_path.exists():
+    # An unrelated live feature ledger cannot displace this Mission's archive.
+    # Own live evidence may legitimately postdate an early archive snapshot.
+    if not legacy:
         archived_legacy = root / "archive" / "ledger.jsonl"
         if archive_report.get("verified") is True and archived_legacy.exists():
             legacy_path = archived_legacy
+            legacy = _jsonl(legacy_path)
             legacy_source = "unified_archive"
         else:
             legacy_source = "none"
-    legacy = _jsonl(legacy_path)
     report = derive_report(events, compiled, legacy, archive=archive_report)
     report["source"].update(
         {
@@ -480,10 +524,14 @@ def human_report(report: dict[str, Any]) -> str:
         ),
     ]
     for provider in report["providers"]:
+        prompt, completion = provider["prompt_tokens"], provider["completion_tokens"]
+        tokens = prompt + completion if prompt is not None and completion is not None else "unknown"
+        coverage = (f" usage={provider['usage_observed_runs']}/{provider['usage_total_runs']} runs"
+                    if "usage_observed_runs" in provider else "")
         lines.append(
             f"Provider {provider['provider']}/{provider['model']}: "
             f"runs={provider['runs']} success_rate={provider['success_rate']} "
-            f"tokens={provider['prompt_tokens'] + provider['completion_tokens']}"
+            f"tokens={tokens}{coverage}"
         )
     return "\n".join(lines)
 

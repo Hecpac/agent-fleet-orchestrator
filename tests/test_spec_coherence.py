@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 from pathlib import Path
 import re
+import shlex
+import shutil
+import subprocess
 import unittest
 
 
@@ -33,10 +37,7 @@ FLEET_GUIDE = ROOT / "docs" / "guia-uso-flota.md"
 FLEET_REVIEWER = ROOT / ".opencode" / "agents" / "fleet-reviewer.md"
 MINIMAX_CHECKER = ROOT / ".opencode" / "agents" / "minimax-checker.md"
 GLM_CHALLENGER = ROOT / ".opencode" / "agents" / "glm-challenger.md"
-SKILL_COPIES = (
-    ROOT / ".agents" / "skills" / "cmux" / "SKILL.md",
-    ROOT / ".claude" / "skills" / "cmux" / "SKILL.md",
-)
+CMUX_LEGACY_REFERENCE = ROOT / "docs" / "cmux-legacy-reference.md"
 
 
 class SpecCoherenceTests(unittest.TestCase):
@@ -48,6 +49,71 @@ class SpecCoherenceTests(unittest.TestCase):
             '"${FLEET_RUNS_DIR:-orchestration/runs}/fleet-{{feature}}.manifest"',
             recipe,
         )
+
+    @unittest.skipUnless(shutil.which("just"), "just is required for recipe dry-runs")
+    def test_mission_recipes_propagate_selected_runs_directory(self) -> None:
+        mission_id = "11111111-1111-4111-8111-111111111111"
+        recipes = (
+            ("mission-status", (mission_id,), ("--json",)),
+            ("mission-approve", (mission_id, "launch"), ("--expires-in", "120")),
+            ("mission-approve-archive", (mission_id, "archive"), ("--expires-in", "120")),
+            ("mission-advisory", (mission_id, "reviewer", "review this", "key"), ("--timeout", "15")),
+            ("mission-audit-verify", (mission_id,), ()),
+            ("mission-archive", (mission_id, "fleet-example.manifest"), ("--output", "/tmp/r04-archive")),
+            ("mission-control-start", (mission_id,), ()),
+            ("mission-control-health", (mission_id,), ()),
+            ("mission-control-stop", (mission_id,), ()),
+            ("mission-decision-request", (mission_id, "brief.json", "key"), ()),
+            ("mission-decisions", (mission_id,), ("--pending",)),
+            ("mission-decision-show", (mission_id, "decision"), ("--json",)),
+            ("mission-decision-resolve", (mission_id, "decision", "option", "key", "reviewed this"), ()),
+        )
+        # An explicit Just value must also win over a conflicting environment.
+        configurations = (
+            (None, None, "orchestration/runs"),
+            ("/tmp/r04-runs", None, "/tmp/r04-runs"),
+            ("/tmp/r04 env runs", None, "/tmp/r04 env runs"),
+            ("/tmp/r04-env-ignored", "/tmp/r04 explicit runs", "/tmp/r04 explicit runs"),
+            ("r04/relative-runs", None, "r04/relative-runs"),
+            ("/tmp/r04-env-ignored", "r04/explicit-runs", "r04/explicit-runs"),
+        )
+        for recipe, arguments, extra_flags in recipes:
+            for flags in ((), extra_flags) if extra_flags else ((),):
+                default_tokens = None
+                for environment_store, explicit_store, expected_store in configurations:
+                    with self.subTest(recipe=recipe, store=expected_store, flags=flags):
+                        env = os.environ.copy()
+                        env.pop("FLEET_RUNS_DIR", None)
+                        if environment_store is not None:
+                            env["FLEET_RUNS_DIR"] = environment_store
+                        overrides = (
+                            ["--set", "runs_dir", explicit_store]
+                            if explicit_store is not None else []
+                        )
+                        result = subprocess.run(
+                            [
+                                "just", "--justfile", str(JUSTFILE), "--dry-run",
+                                *overrides, recipe, *arguments, *flags,
+                            ],
+                            cwd=ROOT, env=env, capture_output=True, text=True,
+                            check=False,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        self.assertEqual(result.stdout, "")
+                        # Inspect shell words only; never execute the emitted command.
+                        tokens = shlex.split(result.stderr)
+                        self.assertEqual(tokens.count("--runs-dir"), 1)
+                        store_index = tokens.index("--runs-dir") + 1
+                        self.assertEqual(tokens[store_index], expected_store)
+                        self.assertEqual(tokens[tokens.index("--mission-id") + 1], mission_id)
+                        if flags:
+                            end = tokens.index("show") if recipe == "mission-decision-show" else len(tokens)
+                            self.assertEqual(tokens[end - len(flags):end], list(flags))
+                        tokens[store_index] = "orchestration/runs"
+                        if default_tokens is None:
+                            default_tokens = tokens
+                        else:
+                            self.assertEqual(tokens, default_tokens)
 
     def test_portable_ci_declares_python_floor_and_pinned_uv(self) -> None:
         gate = CHECK_CI.read_text(encoding="utf-8")
@@ -102,38 +168,28 @@ class SpecCoherenceTests(unittest.TestCase):
                     f"missing referenced test method: {reference}",
                 )
 
-    def test_skill_copies_are_identical(self) -> None:
-        agents_copy, claude_copy = (
-            path.read_text(encoding="utf-8") for path in SKILL_COPIES
-        )
-        self.assertEqual(
-            agents_copy,
-            claude_copy,
-            ".agents and .claude copies of the cmux SKILL have drifted apart",
-        )
-
-    def test_skill_schema_version_matches_router(self) -> None:
+    def test_legacy_reference_schema_version_matches_router(self) -> None:
         router_version = json.loads(ROUTER.read_text(encoding="utf-8"))[
             "schema_version"
         ]
-        for path in SKILL_COPIES:
-            versions = re.findall(
-                r"^schema_version=(\d+)$", path.read_text(encoding="utf-8"), re.M
+        path = CMUX_LEGACY_REFERENCE
+        versions = re.findall(
+            r"^schema_version=(\d+)$", path.read_text(encoding="utf-8"), re.M
+        )
+        self.assertTrue(
+            versions, f"{path} shows no manifest schema_version example"
+        )
+        for version in versions:
+            self.assertEqual(
+                int(version),
+                router_version,
+                f"{path} shows schema_version={version}; router.yaml is {router_version}",
             )
-            self.assertTrue(
-                versions, f"{path} shows no manifest schema_version example"
-            )
-            for version in versions:
-                self.assertEqual(
-                    int(version),
-                    router_version,
-                    f"{path} shows schema_version={version}; router.yaml is {router_version}",
-                )
 
     def test_kimi_model_identity_matches_operational_documentation(self) -> None:
         router = json.loads(ROUTER.read_text(encoding="utf-8"))
         model = router["roles"]["kimi"]["model"]
-        documents = (README, FLEET_GUIDE, *SKILL_COPIES)
+        documents = (README, FLEET_GUIDE, CMUX_LEGACY_REFERENCE)
         for path in documents:
             with self.subTest(path=path):
                 self.assertIn(model, path.read_text(encoding="utf-8"))

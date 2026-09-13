@@ -30,13 +30,17 @@ import fleet_acceptance
 import fleet_admission
 import fleet_artifacts
 import fleet_herdr
+import fleet_herdr_rejection
 import fleet_herdr_evidence
 import fleet_herdr_permissions
+import fleet_herdr_profile
 import fleet_herdr_launch
 import fleet_herdr_runtime
+import fleet_herdr_sdd
 import fleet_herdr_control as control
 import fleet_herdr_metrics as metrics
 import fleet_herdr_instructions
+import fleet_herdr_role_guidance
 import fleet_functional
 import fleet_mission
 import fleet_mission_state as state
@@ -55,6 +59,10 @@ RESULT_STATUS = {"PASS": "succeeded", "BLOCKED": "blocked", "FAIL": "failed"}
 
 class HerdrMissionError(RuntimeError):
     """A durable contract cannot authorize further Mission effects."""
+
+
+class RoleProtocolError(HerdrMissionError):
+    """Attributed role content fails its protocol, independently of execution closure."""
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -87,6 +95,12 @@ class _Driver:
         self.mid = state.normalize_uuid(mission_id, "mission_id")
         self.rel = Path("missions") / self.mid
         self.root = self.runs / self.rel
+        self.protocol_rejection = None
+        self.evidence_rejection = None
+        self.sdd_packet: dict[str, Any] | None = None
+        self.sdd_error: str | None = None
+        self.profile = fleet_herdr_profile.LEGACY
+        self.stages = self.profile.stages
 
     def current(self) -> dict[str, Any]:
         return fleet_mission.load_state(self.runs, self.mid)
@@ -114,6 +128,8 @@ class _Driver:
         return {"mission_id": self.mid, "feature": current["feature"],
                 "status": current["status"], "head_sha256": current["head_sha256"],
                 **({"control": control.view(current)} if "herdr_control" in current else {}),
+                **({"protocol_rejection": self.protocol_rejection} if self.protocol_rejection else {}),
+                **({"evidence_rejection": self.evidence_rejection} if self.evidence_rejection else {}),
                 "backend": "herdr", **extra}
 
     def finish(self, response: dict[str, Any]) -> dict[str, Any]:
@@ -170,6 +186,15 @@ class _Driver:
         if state.artifact_id(objective) != current["objective_sha256"]:
             raise HerdrMissionError("durable objective digest mismatch")
         self.objective = objective.decode("utf-8")
+        # Integrity is recorded, not raised here: an already-authorized exact
+        # cancellation must still reconcile an owned run whose SDD blob was
+        # later corrupted. New admissions/dispatch fail closed in execute/turn.
+        self.sdd_packet = None
+        self.sdd_error = None
+        try:
+            self.sdd_packet = self._sdd_integrity(current)
+        except state.MissionStateError as exc:
+            self.sdd_error = str(exc)
         contract = self.options.get("acceptance_contract")
         fleet_acceptance.check_binding(creation["idempotency_key"], contract)
         functional_spec = self.options.get("functional_contract")
@@ -179,26 +204,64 @@ class _Driver:
             raise HerdrMissionError("functional policy/runtime options binding mismatch")
         if contract is not None:
             fleet_acceptance.validate(contract)
+        try:
+            self.profile = fleet_herdr_profile.validate_profile_binding(
+                self.compiled, self.options, current)
+            fleet_herdr_profile.validate_creation_binding(
+                self.compiled, creation.get("request"))
+        except fleet_herdr_profile.ProfileError as exc:
+            raise HerdrMissionError(str(exc)) from exc
+        self.stages = self.profile.stages
+        if self.compiled["workflow"].get("assurance", {}).get("profile") != "none":
+            raise HerdrMissionError("Herdr driver requires assurance none")
         resolved = self.compiled["resolved"]
         self.members = [resolved["lead"], *resolved["instances"]]
-        actual = [tuple(m.get(k) for k in ("instance_id", "role_type", "model", "phase", "authority"))
-                  for m in self.members]
-        if (resolved["preset"] != "astra_sol" or resolved["mode"] != "autonomous"
-                or actual != list(PROFILE) or self.compiled["workflow"]["assurance"]["profile"] != "none"
-                or any(m.get("provider") != "openai" or m.get("runner") != "interactive"
-                       or m.get("hook_source") != "codex" for m in self.members)):
-            raise HerdrMissionError("driver requires exact astra_sol profile with assurance none")
         self.session = self.options.get("herdr_session")
         if not isinstance(self.session, str) or not self.session.strip():
             raise HerdrMissionError("durable herdr_session is required; no implicit session fallback")
-        if self.options.get("herdr_input_policy") not in {None, "independent-v1"}:
-            raise HerdrMissionError("unsupported Herdr input policy")
         self.candidate = fleet_herdr_runtime.candidate_path(
             self.runs, self.mid, self.options, Path(current["target_repo"]))
+        if self.options.get("herdr_capsule_manifest") is not None:
+            import fleet_mission_capsule
+            fleet_mission_capsule.validate_manifest(self.options["herdr_capsule_manifest"])
+            if self.options.get("herdr_launch_manifest") is not None:
+                raise HerdrMissionError("capsule and legacy launch cannot be combined")
         if self.options.get("herdr_launch_manifest") is not None:
             if self.options.get("herdr_layout") is None:
                 raise HerdrMissionError("observed launch requires Herdr layout v2")
             fleet_herdr_launch.validate_manifest(self.options["herdr_launch_manifest"])
+
+    def _sdd_integrity(self, current: dict[str, Any]) -> dict[str, Any] | None:
+        """Bind the optional creation receipt pin to the ledger and snapshot.
+
+        Presence and absence must agree: a removed creation pin is a mismatch
+        even when the ledger and snapshot still hold a valid digest.
+        """
+        creation = self.read("creation-request.json")
+        request = creation.get("request") if isinstance(creation, dict) else None
+        request_digest = request.get("sdd_plan_sha256") if isinstance(request, dict) else None
+        ledger_digest = current.get("sdd_plan_sha256")
+        if request_digest != ledger_digest:
+            raise state.MissionStateError(
+                "creation-request SDD pin differs from the immutable ledger binding"
+            )
+        return fleet_herdr_sdd.verify(self.runs, current)
+
+    def revalidate_sdd(self) -> bool:
+        """Re-check frozen evidence before any new admission or dispatch.
+
+        Returns ``True`` for a valid or legacy Mission. On failure it stores
+        the error and clears the packet so no stale plan can be used. It never
+        runs during cancellation, pause or result-only observation paths.
+        """
+        try:
+            self.sdd_packet = self._sdd_integrity(self.current())
+            self.sdd_error = None
+            return True
+        except state.MissionStateError as exc:
+            self.sdd_packet = None
+            self.sdd_error = str(exc)
+            return False
 
     def remaining_seconds(self) -> float:
         return (self.deadline - datetime.now(timezone.utc)).total_seconds()
@@ -232,12 +295,15 @@ class _Driver:
         if active and backend is None:
             backend = self.backend()
         if request["action"] == "cancel" and request["generation"] is not None:
-            observed_generation = (backend.state() if backend is not None else self.read("herdr-backend.json")).get("generation")
+            observed_generation = (backend.state().get("generation") if backend is not None
+                else control.backend_generation(self.runs, self.mid))
             if observed_generation != request["generation"]:
                 return self.response(control=view, next_action="cancel requested; owned generation changed, no signal sent")
         for admission in active:
             if request["run_id"] and admission["run_id"] != request["run_id"]:
-                return self.response(control=view, next_action="cancel scope differs from active run; no signal sent")
+                # Reconcile the selected run regardless of admission order,
+                # without extending cancellation to other owned runs.
+                continue
             unsent = admission["phase"] in {"reserved", "committed"} or (
                 admission["phase"] == "authorized" and control.fresh_authorization(current, admission)
                 and admission["run_id"] not in view["dispatches"])
@@ -259,7 +325,7 @@ class _Driver:
                         idempotency_key="herdr:control-unsent:" + admission["run_id"])
                 continue
             stage = admission["request_key"].removeprefix("herdr:")
-            row = next((s for s in STAGES if s[0] == stage), None)
+            row = next((s for s in self.stages if s[0] == stage), None)
             if row is None:
                 raise HerdrMissionError("control found an unsupported owned admission")
             task = state.loads_strict(fleet_artifacts.get_bytes(self.runs, self.mid, admission["task_sha256"]))
@@ -270,6 +336,10 @@ class _Driver:
             if self.current()["status"] in state.TERMINAL_STATUSES:
                 return self.finish(self.response(control=control.view(self.current())))
         current = self.current()
+        if request["run_id"] and any(a["active"] and a["run_id"] != request["run_id"]
+                                     for a in current["admissions"].values()):
+            return self.response(control=control.view(current),
+                next_action="cancel requested; other active runs remain outside cancellation scope")
         attempt = current.get("functional_attempt")
         if attempt and not attempt.get("result"):
             # A prior physical run was lost. run() cleans only its exact attempt
@@ -316,11 +386,11 @@ class _Driver:
         admissions = self.current()["admissions"].values()
         completed = {a["request_key"] for a in admissions if a["phase"] == "finalized"
                      and a.get("result") is not None and a["terminal"]["status"] == "succeeded"}
-        return all(f"herdr:{stage}" in completed for stage, _, _ in STAGES)
+        return all(f"herdr:{stage}" in completed for stage, _, _ in self.stages)
 
     def timed_out(self, backend: Any = None) -> dict[str, Any]:
         """Enforce the durable deadline when driven; no background watchdog is implied."""
-        for stage, instance, capability in STAGES:
+        for stage, instance, capability in self.stages:
             current = self.current()
             admission = next((a for a in current["admissions"].values()
                               if a["request_key"] == f"herdr:{stage}" and a["active"]), None)
@@ -341,7 +411,7 @@ class _Driver:
             # A result may be durable in the backend (or Mission ledger) even
             # when its admission has not been finalized. Consume it before any
             # cancellation intent; never infer failure from the expired clock.
-            if admission["phase"] in {"authorized", "started"}:
+            if admission["phase"] in {"authorized", "started"} and self.result_rejection(backend, admission["run_id"]) is None:
                 try:
                     raw = None if admission.get("result") is not None else self.observe_backend(backend, "collect_result", admission["run_id"])
                     if admission.get("result") is not None or raw is not None:
@@ -358,6 +428,8 @@ class _Driver:
                                 reason=f"Herdr {stage}: {completed['summary']}", idempotency_key=f"herdr:{stage}:terminal")
                             return self.finish(self.response())
                         continue
+                except fleet_herdr.ExecutionEvidenceRejected as exc:
+                    return self.evidence_block(exc.proof)
                 except fleet_herdr.HerdrBackendError as exc:
                     return self.response(next_action=f"deadline expired; reconcile durable result before cancel: {exc}")
             if admission["phase"] in {"reserved", "committed"}:
@@ -470,10 +542,20 @@ class _Driver:
             raise HerdrMissionError("candidate HEAD drift; commits are not authorized")
 
     def backend(self) -> Any:
+        if self.options.get("herdr_capsule_manifest") is not None:
+            from fleet_mission_capsule import CapsuleBackend
+            return CapsuleBackend(self.runs, self.mid, feature=self.current()["feature"],
+                target_repo=self.candidate, compiled=self.compiled, session=self.session,
+                manifest=self.options["herdr_capsule_manifest"])
         signature = inspect.signature(fleet_herdr.HerdrBackend)
         if "session" not in signature.parameters or not callable(getattr(fleet_herdr.HerdrBackend, "collect_result", None)):
             raise HerdrMissionError("backend integration requires explicit session and collect_result(run_id)")
         launch_options = {}
+        if self.options.get("herdr_personal_cli") is not None:
+            from fleet_herdr_personal import PROFILE
+            if self.options["herdr_personal_cli"] != PROFILE:
+                raise HerdrMissionError("unknown personal CLI profile")
+            launch_options["personal_cli"] = True
         if self.options.get("herdr_launch_manifest") is not None:
             home = self.root / "herdr-launch" / "controller"
             launch_options = {"launch_manifest": self.options["herdr_launch_manifest"],
@@ -498,7 +580,68 @@ class _Driver:
         self.write("herdr-freeze.json", value)
         return value
 
+    def research_snapshot(self) -> dict[str, Any]:
+        if self.profile is not fleet_herdr_profile.RESEARCH:
+            raise HerdrMissionError("investigated snapshot is available only to the Research profile")
+        self.check_candidate()
+        archive = _archive()
+        value = archive.freeze_research(self.runs, self.mid, self.candidate,
+                                        profile_digest=self.profile.digest)
+        archive.verify_research_snapshot(self.runs, self.mid, value,
+                                         expected_profile_digest=self.profile.digest)
+        return value
+
+    def verify_research_authority(self, snapshot: dict[str, Any], *, before_first_build: bool) -> None:
+        """Bind the mutable receipt to Research task CAS and, once, to the physical tree."""
+        current = self.current()
+        admissions = [a for a in current["admissions"].values()
+                      if a["request_key"] == "herdr:research"]
+        if len(admissions) != 1:
+            raise HerdrMissionError("Build requires one durable Research admission")
+        admission = admissions[0]
+        if (admission["phase"] != "finalized" or admission["terminal"]["status"] != "succeeded"
+                or not admission.get("result")):
+            raise HerdrMissionError("Build requires successful durable Research evidence")
+        task = state.loads_strict(fleet_artifacts.get_bytes(
+            self.runs, self.mid, admission["task_sha256"]))
+        if (task.get("stage") != "research" or task.get("investigated_snapshot") != snapshot
+                or task.get("frozen_candidate") != snapshot
+                or task.get("result_contract", {}).get("candidate_tree_sha") != snapshot["tree_sha"]):
+            raise HerdrMissionError("Research task CAS does not authorize the investigated snapshot")
+        result = state.loads_strict(fleet_artifacts.get_bytes(
+            self.runs, self.mid, admission["result"]["artifact_id"]))
+        if result.get("candidate_tree_sha") != snapshot["tree_sha"]:
+            raise HerdrMissionError("Research result does not bind the investigated snapshot")
+        if before_first_build:
+            observed_sha, _, _ = _archive().snapshot(
+                self.candidate, expected_base=current["base_sha"])
+            if observed_sha != snapshot["tree_sha"]:
+                raise HerdrMissionError("candidate changed after Research; refusing first Build admission")
+
     def prompt(self, stage: str, instance: str, run_id: str, inputs: list[str], frozen: Any) -> str:
+        research_profile = self.profile is fleet_herdr_profile.RESEARCH
+        synthesis_criteria = (
+            "PASS when you reconcile the Plan, Research, Build, Review and Verify results against "
+            "the frozen candidate and acceptance criteria, including the Research source evidence, "
+            "with supported conclusions and residual risks. Do not wait for the controller's "
+            "subsequent archive or terminal verdict."
+            if research_profile else
+            "PASS when you reconcile the available Worker, Reviewer and Verifier results against "
+            "the frozen candidate and acceptance criteria, with supported conclusions and residual risks. "
+            "Do not wait for the controller's subsequent archive or terminal verdict."
+        )
+        stage_instructions = (
+            "Plan: provide a bounded implementation plan. Research: inspect and report source evidence. "
+            "Build: implement and run focused tests using Plan and Research. "
+            "Review: inspect contracts and diff. Verify: independently validate with temporary outputs, "
+            "without modifying candidate. Synthesis: reconcile Plan, Research, Build, Review and Verify "
+            "results, including Research source evidence, and report residual risks. "
+            if research_profile else
+            "Plan: provide a bounded implementation plan. Build: implement and run focused tests using Plan. "
+            "Review: inspect contracts and diff. Verify: independently validate with temporary outputs, "
+            "without modifying candidate. Synthesis: reconcile all three role results, report evidence "
+            "and residual risks. "
+        )
         stage_success_criteria = {
             "plan": ("PASS when you provide a viable bounded implementation plan and actual baseline evidence "
                 "from existing candidate files. Expected failing baseline tests or an unimplemented acceptance "
@@ -507,14 +650,15 @@ class _Driver:
             "build": ("PASS when you implement the assigned change as the sole writer and run relevant focused "
                 "tests with evidence that the implementation meets the acceptance criteria. Do not wait for "
                 "Review, Verify or Synthesis."),
+            "research": ("PASS when your read-only investigation supplies concrete source evidence relevant to "
+                "the objective against the controller-pinned investigated snapshot. Do not modify candidate files, "
+                "make implementation decisions on behalf of Build, or wait for later stages."),
             "review": ("PASS when your read-only review of the frozen candidate contracts and diff finds no "
                 "blocking defects, with concrete evidence. Report discovered defects as FAIL; do not wait for Verify or Synthesis."),
             "verify": ("PASS when you independently reproduce the required behavior and validate acceptance "
                 "criteria on the frozen candidate, using temporary outputs without changing candidate files. "
                 "Report reproduced failures as FAIL; do not wait for Synthesis."),
-            "synthesis": ("PASS when you reconcile the available Worker, Reviewer and Verifier results against "
-                "the frozen candidate and acceptance criteria, with supported conclusions and residual risks. "
-                "Do not wait for the controller's subsequent archive or terminal verdict."),
+            "synthesis": synthesis_criteria,
         }[stage]
         task = {"schema_version": 1, "mission_id": self.mid, "run_id": run_id, "stage": stage,
             "instance_id": instance, "objective": self.objective, "candidate_repo": str(self.candidate),
@@ -522,13 +666,14 @@ class _Driver:
             "acceptance_contract": self.options.get("acceptance_contract"),
             "stage_success_criteria": stage_success_criteria,
             "project_instructions": fleet_herdr_instructions.packet(self.runs, self.mid, self.candidate, self.current()),
+            "role_guidance": fleet_herdr_role_guidance.packet(self.runs, self.mid, self.current(), instance),
             "frozen_candidate": frozen, "writer": stage == "build",
-            "instructions": ("Only Worker/build may change candidate files. Never commit, push, deploy, "
+            "instructions": ("When role_guidance is present, use its explicit role contract and selected skill content "
+                "under their stated conditions; do not assume global instructions or skills were inherited. "
+                "Only Worker/build may change candidate files. Never commit, push, deploy, "
                 "change global configuration, control other agents, or edit the source checkout. "
-                "Plan: provide a bounded implementation plan. Build: implement and run focused tests. "
-                "Review: inspect contracts and diff. Verify: independently validate with temporary outputs, "
-                "without modifying candidate. Synthesis: reconcile all three role results, report evidence "
-                "and residual risks. Status judges ONLY your assigned stage using stage_success_criteria. "
+                + stage_instructions +
+                "Status judges ONLY your assigned stage using stage_success_criteria. "
                 "PASS requires actual evidence for that stage, not completion of the entire mission. "
                 "Do not wait for future stages or require their results to report PASS. "
                 "BLOCKED means a real inability to complete your own assigned stage; FAIL means evidence "
@@ -546,6 +691,17 @@ class _Driver:
                 "instance_id": instance, "status": "PASS|BLOCKED|FAIL", "summary": "nonempty evidence report",
                 "artifacts": [{"path": "canonical relative candidate file", "sha256": "exact file SHA-256"}],
                 "candidate_tree_sha": frozen["tree_sha"] if frozen else None}}
+        if stage == "research":
+            task["investigated_snapshot"] = frozen
+        if getattr(self, "sdd_packet", None) is not None:
+            task["sdd_plan"] = self.sdd_packet
+        if self.options.get("herdr_capsule_manifest") is not None:
+            from fleet_mission_capsule import candidate_files
+            task["capsule_context"] = {
+                "candidate_files": {n: {"text": b.decode("utf-8"), "sha256": state.artifact_id(b)}
+                    for n, b in candidate_files(self.candidate).items()},
+                "prior_results": [state.loads_strict(fleet_artifacts.get_bytes(self.runs, self.mid, p)) for p in inputs],
+                "execution_limits": "Work in your current directory. Host candidate and artifact_store paths are identity only and inaccessible. Only the installed Codex/code-mode host may execute; shell commands and candidate programs are denied. Use supplied file text for inspection and apply_patch for changes. Report BLOCKED if your stage requires unavailable execution; never claim tests ran."}
         return state.canonical_bytes(task).decode("utf-8")
 
     def validate_result(self, raw: Any, run_id: str, instance: str, frozen: Any, prompt_sha: str) -> dict[str, Any]:
@@ -555,8 +711,6 @@ class _Driver:
                               "instance_id": instance}.items():
             if raw.get(key) != expected or (key == "schema_version" and type(raw[key]) is not int):
                 raise HerdrMissionError(f"role result {key} binding mismatch")
-        if not isinstance(raw.get("status"), str) or raw["status"] not in RESULT_STATUS or not isinstance(raw.get("summary"), str) or not raw["summary"].strip():
-            raise HerdrMissionError("role result requires PASS/BLOCKED/FAIL and evidence summary")
         final_id = raw.get("artifact_id")
         if not isinstance(final_id, str) or not state.SHA256.fullmatch(final_id):
             raise HerdrMissionError("role result requires final text CAS artifact_id")
@@ -578,36 +732,94 @@ class _Driver:
                 raise HerdrMissionError("backend result envelope CAS binding mismatch")
         if frozen and raw.get("candidate_tree_sha") != frozen["tree_sha"]:
             raise HerdrMissionError("role result refers to a different frozen candidate")
+        if not isinstance(raw.get("status"), str) or raw["status"] not in RESULT_STATUS or not isinstance(raw.get("summary"), str) or not raw["summary"].strip():
+            raise RoleProtocolError("role result requires PASS/BLOCKED/FAIL and evidence summary")
         artifacts = raw.get("artifacts")
         if not isinstance(artifacts, list) or not artifacts or len(artifacts) > 100:
-            raise HerdrMissionError("role result requires 1..100 artifact checks")
+            raise RoleProtocolError("role result requires 1..100 artifact checks")
         copied = []
         with fleet_safe_paths.RootedFS(self.candidate) as fs:
             for item in artifacts:
                 if not isinstance(item, dict) or set(item) != {"path", "sha256"}:
-                    raise HerdrMissionError("invalid role artifact contract")
+                    raise RoleProtocolError("invalid role artifact contract")
                 path = item["path"]
-                if (not isinstance(path, str) or not path or PurePosixPath(path).is_absolute()
+                if (not isinstance(path, str) or not path or "\x00" in path or PurePosixPath(path).is_absolute()
                         or any(p in {"", ".", "..", ".git"} for p in path.split("/"))):
-                    raise HerdrMissionError("role artifact must be a safe candidate-relative path")
-                content = fs.read_regular(path, directory_modes=(None,) * (len(path.split("/")) - 1),
-                    file_mode=stat.S_IMODE((self.candidate / path).lstat().st_mode),
-                    max_bytes=fleet_artifacts.MAX_ARTIFACT_BYTES)
+                    raise RoleProtocolError("role artifact must be a safe candidate-relative path")
+                try:
+                    content = fs.read_regular(path, directory_modes=(None,) * (len(path.split("/")) - 1),
+                        file_mode=stat.S_IMODE((self.candidate / path).lstat().st_mode),
+                        max_bytes=fleet_artifacts.MAX_ARTIFACT_BYTES)
+                except (OSError, fleet_safe_paths.SafePathError) as exc:
+                    raise RoleProtocolError(f"role artifact is unavailable or unsafe: {path}") from exc
                 if state.artifact_id(content) != item["sha256"]:
-                    raise HerdrMissionError("role artifact digest mismatch")
+                    raise RoleProtocolError("role artifact digest mismatch")
                 copied.append(fleet_artifacts.put_bytes(self.runs, self.mid, content)["artifact_id"])
         normalized = {k: v for k, v in raw.items() if k != "result_artifact_id"}
         return {**normalized, "backend_result_artifact_id": raw.get("result_artifact_id"),
                 "evidence_artifact_ids": copied}
+
+    def verify_result_evidence(self, raw, instance, prompt_sha):
+        try:
+            fleet_herdr_evidence.verify_result(raw,
+                read_artifact=lambda digest: fleet_artifacts.get_bytes(self.runs, self.mid, digest),
+                role=instance, cwd=str(self.candidate), prompt_sha256=prompt_sha,
+                capsule_manifest=self.options.get("herdr_capsule_manifest"), current=self.current(),
+                permission_version=self.profile.permissions_policy_version)
+        except fleet_herdr_evidence.EvidenceError as exc:
+            raise fleet_herdr.HerdrBackendError(f"role permission evidence: {exc}") from exc
+
+    def evidence_block(self, proof):
+        self.evidence_rejection = proof
+        return self.response(next_action=(
+            "execution evidence rejected; pause cannot be confirmed while the admission remains active; "
+            "exact execution closure requires explicit cancellation; frozen task cannot be replayed or upgraded"),
+            recovery="blocked", deadline_expired=self.remaining_seconds() <= 0)
+
+    def execution_rejection(self, run_id):
+        with fleet_safe_paths.RootedFS(self.runs) as fs:
+            stored = fleet_herdr.versions.read_state(fs, self.rel / "herdr-backend.json",
+                mission_id=self.mid, compiled_digest=self.compiled["compiled_digest"])
+        if stored is None:
+            return None
+        proof = fleet_herdr_rejection.load(self.runs, self.mid, run_id, stored)
+        if proof is not None:
+            admission = next((a for a in self.current()["admissions"].values() if a["run_id"] == run_id), None)
+            submission = stored["submissions"][run_id]
+            if (admission is None or admission["task_sha256"] != submission["prompt_sha256"]
+                    or admission["recipient_instance"] != submission["instance_id"] or admission.get("result") is not None):
+                raise HerdrMissionError("evidence rejection admission binding mismatch")
+            self.evidence_rejection = proof
+        return proof
+
+    def result_rejection(self, backend, run_id):
+        execution = self.execution_rejection(run_id)
+        if execution is not None:
+            return execution
+        proof = fleet_herdr.load_result_rejection(self.runs, self.mid, run_id)
+        if proof is None:
+            return None
+        admission = next(a for a in self.current()["admissions"].values() if a["run_id"] == run_id)
+        if (proof["instance_id"] != admission["recipient_instance"]
+                or proof["prompt_sha256"] != admission["task_sha256"] or admission.get("result") is not None):
+            raise HerdrMissionError("role protocol rejection admission binding mismatch")
+        raw = self.observe_backend(backend, "collect_result", run_id)
+        if raw is None:
+            raise HerdrMissionError("rejected result is no longer available")
+        fleet_herdr.load_result_rejection(self.runs, self.mid, run_id, result=raw)
+        self.verify_result_evidence(raw, admission["recipient_instance"], admission["task_sha256"])
+        self.protocol_rejection = proof
+        return proof
 
     def turn(self, backend: Any, stage: str, instance: str, capability: str,
              inputs: list[str], frozen: Any, *, result_only: bool = False,
              durable_result: dict[str, Any] | None = None, reconcile_only: bool = False) -> dict[str, Any] | None:
         ids = fleet_admission.deterministic_ids(self.mid, request_key=f"herdr:{stage}", run_kind="specialist")
         run_id = str(ids["run_id"])
+        rejection = self.result_rejection(backend, run_id)
         if not result_only and run_id in self.current()["cancelled_runs"]:
             admission = self.current()["admissions"][str(ids["admission_id"])]
-            if admission["phase"] != "finalized":
+            if admission["phase"] != "finalized" and rejection is None:
                 raw = durable_result
                 if admission.get("result") is None and raw is None:
                     raw = self.observe_backend(backend, "collect_result", run_id)
@@ -647,10 +859,17 @@ class _Driver:
                 state.append_terminal(self.runs, self.mid, status="abandoned", reason="Herdr run cancellation confirmed",
                                       idempotency_key="herdr:cancel-terminal")
             return None  # a cancellation receipt is not a successful role result
+        if rejection is not None:
+            self.pending_reason = "role protocol rejected; cancellation requires separate exact execution closure"
+            return None
         existing = self.current()["admissions"].get(str(ids["admission_id"]))
         if existing is None and (reconcile_only or control.view(self.current())["desired"] != "running"):
             self.pending_reason = "control request blocks new stage admission"
             return None
+        if existing is None and not self.revalidate_sdd():
+            raise HerdrMissionError(
+                "SDD plan binding failed closed before new stage admission: " + str(self.sdd_error)
+            )
         prompt = fleet_artifacts.get_bytes(self.runs, self.mid, existing["task_sha256"]).decode() if existing else self.prompt(stage, instance, run_id, inputs, frozen)
         task_sha = fleet_artifacts.put_bytes(self.runs, self.mid, prompt.encode())["artifact_id"]
         member = next(m for m in self.members if m["instance_id"] == instance)
@@ -709,7 +928,20 @@ class _Driver:
                 raw = self.observe_backend(backend, "collect_result", run_id)
             if raw is None:
                 return None
-            result = self.validate_result(raw, run_id, instance, frozen, task_sha)
+            try:
+                result = self.validate_result(raw, run_id, instance, frozen, task_sha)
+            except RoleProtocolError as exc:
+                # Content rejection is durable only after exact completed-result
+                # evidence passes. It cannot stand in for a runtime terminal proof.
+                self.verify_result_evidence(raw, instance, task_sha)
+                observed = fleet_artifacts.put_bytes(self.runs, self.mid, state.canonical_bytes(raw))
+                proof = fleet_artifacts.put_bytes(self.runs, self.mid, state.canonical_bytes({
+                    "schema_version": 1, "kind": "herdr_role_protocol_rejection",
+                    "mission_id": self.mid, "run_id": run_id, "instance_id": instance,
+                    "prompt_sha256": task_sha, "observed_result_artifact_id": observed["artifact_id"],
+                    "reason": str(exc)}))
+                self.write(f"herdr-result-rejection-{run_id}.json", {"artifact_id": proof["artifact_id"]})
+                raise
             stored = fleet_artifacts.put_bytes(self.runs, self.mid, state.canonical_bytes(result))
             metadata = {"run_id": run_id, "artifact_id": stored["artifact_id"], "provider": member["provider"],
                         "model": member["model"], "variant": member.get("variant")}
@@ -726,12 +958,7 @@ class _Driver:
                     "provider": member["provider"], "model": member["model"], "variant": member.get("variant")})
                 self.event("result_recorded", f"{stage}:result", {**metadata, "delegation_id": admission["delegation_id"]})
             admission = self.current()["admissions"][str(ids["admission_id"])]
-        try:
-            fleet_herdr_evidence.verify_result(result,
-                read_artifact=lambda digest: fleet_artifacts.get_bytes(self.runs, self.mid, digest),
-                role=instance, cwd=str(self.candidate), prompt_sha256=task_sha)
-        except fleet_herdr_evidence.EvidenceError as exc:
-            raise fleet_herdr.HerdrBackendError(f"role permission evidence: {exc}") from exc
+        self.verify_result_evidence(result, instance, task_sha)
         if admission["phase"] != "finalized":
             fleet_admission.finalize(self.runs, self.mid, admission_id=admission["admission_id"],
                 recipient_instance=instance, writer=stage == "build", reason=result["summary"],
@@ -748,6 +975,10 @@ class _Driver:
                 and control.fresh_authorization(current, admission) and run_id not in view["dispatches"]):
             if reconcile_only or view["desired"] != "running":
                 return {"status": "blocked", "reason": "control request precedes dispatch"}
+            if not self.revalidate_sdd():
+                # Includes resumed authorized-but-not-dispatched tasks: never
+                # append a dispatch intent or submit under stale evidence.
+                return {"status": "blocked", "reason": "SDD plan binding failed closed before dispatch"}
             try:
                 _, appended = state.append_event(self.runs, self.mid, kind="herdr_dispatch_intent", actor="CONTROL",
                     idempotency_key="herdr:dispatch:" + run_id, payload={"run_id": run_id,
@@ -769,6 +1000,17 @@ class _Driver:
         self.observation_deadline = observation_deadline
         self.load()
         self.freeze_finalization_policy()
+        # Rejected evidence is not a role result or proof of quiescence. Preserve
+        # a pending pause even after expiry; only explicit cancellation may
+        # reconcile this rejected execution. Never replay or upgrade its task.
+        for admission in self.current()["admissions"].values():
+            proof = self.execution_rejection(admission["run_id"])
+            if proof is not None:
+                if control.view(self.current())["desired"] == "cancel_requested":
+                    # Validate the explicit request's generation/run scope before
+                    # any deadline cancellation can touch the rejected execution.
+                    return self.control_stop(self.backend())
+                return self.evidence_block(proof)
         # A durable cancellation acknowledgement already proves quiescence.
         # Recover its terminal append even if the controller died before closure
         # and the deadline has since elapsed.
@@ -784,13 +1026,26 @@ class _Driver:
         stopped = self.control_stop()
         if stopped is not None:
             return stopped
+        # The existing high/unknown risk gate still governs recovery ordering.
         stopped = self.risk_gate()
         if stopped is not None:
             return stopped
+        if (self.current()["status"] in {"completing", "archived"}
+                and self.current().get("herdr_archive_selection")):
+            # Selected durable evidence recovery must not depend on the live SDD
+            # store; the archive verifier enforces SDD from archived bytes.
+            archive = _archive()
+            return self.complete_archive(archive, archive.recover(self.runs, self.mid))
         if self.current()["status"] in {"completing", "archived"} and self.archive_index_exists():
             archive = _archive()
             return self.complete_archive(archive, archive.verify(self.runs, self.mid,
                 require_anchor=False, for_completion=True))
+        if self.sdd_error is not None:
+            # Exact cancellation/pause reconciliation above is already handled.
+            # Any further candidate preparation, admission or dispatch stops here.
+            return self.response(
+                next_action="SDD plan binding failed closed before new effects: " + self.sdd_error
+            )
         if (self.current()["status"] in {"compiled", "booting", "running"} and self.remaining_seconds() <= 0
                 and not self.completed_turns() and not any(a["active"] for a in self.current()["admissions"].values())):
             return self.timed_out()
@@ -802,7 +1057,7 @@ class _Driver:
         backend = self.backend()
         current = self.current()
         if current["status"] == "compiled":
-            self.event("fleet_boot_started", "boot", {"feature": current["feature"], "preset": "astra_sol"})
+            self.event("fleet_boot_started", "boot", {"feature": current["feature"], "preset": self.profile.preset})
         if self.current()["status"] == "booting":
             self.observe_backend(backend, "boot")
             self.event("mission_running", "running", {"manifest": str(self.root / "herdr-backend.json")})
@@ -810,7 +1065,7 @@ class _Driver:
         inputs: list[str] = []
         completed_inputs: dict[str, str] = {}
         frozen = None
-        for stage, instance, capability in STAGES:
+        for stage, instance, capability in self.stages:
             if self.observation_deadline is not None and time.monotonic() >= self.observation_deadline:
                 return self.response(next_action="observation budget exhausted before next stage")
             stopped = self.control_stop(backend)
@@ -821,11 +1076,41 @@ class _Driver:
                 return self.response(next_action="mission authority changed; reconcile before further effects")
             if current["status"] == "running" and self.remaining_seconds() <= 0 and not self.completed_turns():
                 return self.timed_out(backend)
+            if not any(a["request_key"] == f"herdr:{stage}"
+                       for a in current["admissions"].values()):
+                # New stage work (candidate check, freeze, functional check,
+                # admission) must re-verify frozen evidence even if an earlier
+                # stage corrupted it during this same drive. Stages that already
+                # have an admission keep result-only/observation recovery paths.
+                if not self.revalidate_sdd():
+                    return self.response(
+                        next_action="SDD plan binding failed closed before new stage work: "
+                                    + str(self.sdd_error))
             self.check_candidate()
             inputs = fleet_herdr_runtime.role_inputs(
                 stage, completed_inputs, self.options.get("herdr_input_policy"))
-            if stage in {"review", "verify", "synthesis"}:
+            if stage == "research":
+                frozen = self.research_snapshot()
+            elif stage == "build" and self.profile is fleet_herdr_profile.RESEARCH:
+                snapshot = self.read("research-snapshot.json")
+                _archive().verify_research_snapshot(self.runs, self.mid, snapshot,
+                    expected_profile_digest=self.profile.digest)
+                self.verify_research_authority(snapshot,
+                    before_first_build=not any(a["request_key"] == "herdr:build"
+                                               for a in current["admissions"].values()))
+                frozen = None
+            elif stage in {"review", "verify", "synthesis"}:
                 frozen = self.freeze()
+            functional_attempt = current.get("functional_attempt")
+            new_functional = (stage == "synthesis" and current.get("functional_policy")
+                              and not (isinstance(functional_attempt, dict)
+                                       and functional_attempt.get("result")))
+            if new_functional and not self.revalidate_sdd():
+                # Gate a NEW functional check; durable receipt recovery (result
+                # already present) and cancellation are not blocked here.
+                return self.response(
+                    next_action="SDD plan binding failed closed before new functional check: "
+                                + str(self.sdd_error))
             if stage == "synthesis" and current.get("functional_policy"):
                 try:
                     functional = metrics.observe(self.runs, self.mid, "controller_operation" if self.current().get("functional_attempt") else "functional_execution",
@@ -849,6 +1134,8 @@ class _Driver:
             self.pending_reason = None
             try:
                 result = self.turn(backend, stage, instance, capability, inputs, frozen)
+            except fleet_herdr.ExecutionEvidenceRejected as exc:
+                return self.evidence_block(exc.proof)
             except fleet_herdr.HerdrBackendError as exc:
                 # The authorization remains durable. Resuming can only recover it.
                 return self.response(next_action=f"reconcile {stage} without resubmitting: {exc}")
@@ -866,13 +1153,13 @@ class _Driver:
                 state.append_terminal(self.runs, self.mid, status=RESULT_STATUS[result["status"]],
                     reason=f"Herdr {stage}: {result['summary']}", idempotency_key=f"herdr:{stage}:terminal")
                 return self.finish(self.response(role_results=results))
-            if stage == "plan" and not any(a["request_key"] == "herdr:build" for a in self.current()["admissions"].values()):
+            if stage in {"plan", "research"} and not any(a["request_key"] == "herdr:build" for a in self.current()["admissions"].values()):
                 if _git(self.candidate, "status", "--porcelain=v1", "--untracked-files=all", "--ignored"):
-                    raise HerdrMissionError("Lead planning changed the candidate before writer admission")
+                    raise HerdrMissionError(f"{stage.title()} changed the candidate before writer admission")
             if stage in {"review", "verify", "synthesis"}:
                 self.freeze()  # archive rejects any drift, including read-only role writes
-        if set(results) != {"lead", "worker", "reviewer", "verifier"}:
-            raise HerdrMissionError("all four role results are mandatory")
+        if set(results) != self.profile.result_roles:
+            raise HerdrMissionError("all selected Herdr profile role results are mandatory")
         if self.current()["status"] == "running":
             self.event("mission_completing", "completing", {"lead_artifact_id": results["lead"]["artifact_id"]})
         archive = _archive()
@@ -892,8 +1179,13 @@ class _Driver:
 
     def freeze_finalization_policy(self) -> dict[str, Any]:
         current = self.current()
+        options = self.read("runtime-options.json")
+        if self.read("creation-request.json").get("runtime_options") != options:
+            raise HerdrMissionError("finalization options differ from creation")
         self.event("herdr_finalization_policy_frozen", "finalization-policy",
-                   fleet_herdr_permissions.finalization_policy(current["compiled_digest"]))
+                   fleet_herdr_permissions.finalization_policy(current["compiled_digest"],
+                       capsule=options.get("herdr_capsule_manifest") is not None,
+                       profile=self.profile))
         return self.current()["herdr_finalization_policy"]
 
     def completion_receipt_matches_policy(self, receipt: dict[str, Any], policy: dict[str, Any]) -> bool:
@@ -957,7 +1249,12 @@ def drive(runs_dir: Path, mission_id: str, *, observation_deadline=None) -> dict
                                blocking=False) as acquired:
             if not acquired:
                 return driver.response(next_action="another Herdr driver owns this mission")
-            return driver.execute(observation_deadline=observation_deadline)
+            try:
+                return driver.execute(observation_deadline=observation_deadline)
+            except fleet_herdr.ExecutionEvidenceRejected as exc:
+                # collect_result published an immutable rejection; this pass
+                # stops before any downstream admission or resend.
+                return driver.evidence_block(exc.proof)
 
 
 def supervise(runs_dir, mission_id, *, seconds=60, poll_seconds=0.25):
@@ -978,6 +1275,8 @@ def supervise(runs_dir, mission_id, *, seconds=60, poll_seconds=0.25):
                 except fleet_herdr.HerdrBackendError as exc:
                     result = {"mission_id": mission_id, "next_action": "reconcile existing transport: " + str(exc)}
                 iterations += 1
+                if result.get("evidence_rejection"):
+                    return {**result, "supervision": "blocked", "iterations": iterations}
                 current = fleet_mission.load_state(runs_dir, mission_id)
                 if current["status"] in state.TERMINAL_STATUSES or control.view(current)["applied"] == "paused" and control.view(current)["desired"] == "pause_requested":
                     return {**result, "supervision": "settled", "iterations": iterations}
