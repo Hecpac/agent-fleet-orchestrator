@@ -26,6 +26,10 @@ Commands print the refs they create: `OK surface:7 pane:7 workspace:5`.
 
 Set `CMUX_QUIET=1` to silence alias notices.
 
+Durable legacy Missions run through `scripts/fleet_legacy_mission.py`.
+`mission-run.py` dispatches Herdr presets first and hands only the remaining
+legacy workflows to that driver; it is never a fallback for a Herdr Mission.
+
 ## Core verbs
 
 ```bash

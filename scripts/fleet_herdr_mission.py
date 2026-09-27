@@ -878,7 +878,7 @@ class _Driver:
                         or cancellation and cancellation["generation"] is not None and observed.get("generation") != cancellation["generation"]):
                     self.pending_reason = "cancellation has no exact terminal proof; keep admission active"
                     return None
-                # Like mission-run.terminal_evidence, this binds an external terminal
+                # Like fleet_legacy_mission.terminal_evidence, this binds an external terminal
                 # receipt, not a role PASS. Keep its exact bytes in CAS for replay.
                 external = {"mission_id": self.mid, "run_id": run_id,
                     "task_sha256": admission["task_sha256"], "status": "abandoned", "backend_receipt": observed}

@@ -37,7 +37,7 @@ no se alteran sus planes, pins, deadlines, autorizaciones ni evidencia.
 | S0 | Base física y corpus histórico | Completado; procedencia y aceptación originales desconocidas quedan explícitas |
 | S1 | Intérprete y disponibilidad de workflows | Verificado localmente |
 | S2 | Lectores, contratos y operaciones puras | Completado: dos carriles históricos explícitos, lectores puros extraídos y un rechazo explicado |
-| S3 | Composición moderna y compatibilidad | Pendiente |
+| S3 | Composición moderna y compatibilidad | Completado: raíz moderna, soporte neutral y driver legacy explícito, sin cambio de comportamiento |
 | S4 | Catálogo de perfiles e identidad | Pendiente |
 | S5 | Telemetría separada de autoridad | Pendiente |
 | S6 | Scope y aceptación independientes del perfil | Pendiente |
@@ -71,6 +71,16 @@ La primera ronda pasó 92 de 93 tests. El caso de archive firmado falló porque
 el OpenSSL seleccionado por el entorno no soportaba ED25519. El mismo caso
 pasó con el OpenSSL 3 ya instalado. La ronda conjunta utiliza ese binario
 mediante un `PATH` limitado al proceso de tests, sin instalación ni cambio global.
+
+### D3 — Alcance de S3
+
+El informe que definió los slices no se conserva en el repositorio ni en las
+transcripciones locales. S3 se interpreta a partir de su nombre, del objetivo de
+esta refactorización y de la regla de carriles de `AGENTS.md`: `mission-run.py`
+queda como raíz de composición moderna (entrada, despacho, `create_and_drive`,
+`dry_run`, `status` y `main`). El driver de Missions CMUX y sus primitivas de
+efecto pasan a un módulo de compatibilidad explícito, y los helpers neutrales
+compartidos a un módulo de soporte. No se introduce fallback entre carriles.
 
 ## Entrega inicial: S0, S1 y extracción inicial de S2
 
@@ -156,7 +166,45 @@ Los tests unitarios cubren la selección, el enlace estricto y el rechazo de
 mezclas; la verificación completa de los carriles solo la ejercita el replay
 local del corpus ignorado, no el CI hospedado.
 
-Sigue S3. Quedan fuera de S2 `fleet_herdr_archive.verify` y la dependencia de la
+Quedan fuera de S2 `fleet_herdr_archive.verify` y la dependencia de la
 validación del router archivado respecto a `.opencode/agents` del checkout
-actual. El pipeline predeterminado, las políticas de reparación y la telemetría
-todavía no se han refactorizado.
+actual.
+
+## Entrega S3: raíz moderna y carril legacy explícito (2026-09-27)
+
+Interpretación en D3. Evidencia en `outputs/refactor-20260927-s3/`.
+
+- `fleet_mission_run_support.py`: `MissionRunError`, lectores de manifest y de
+  archivos durables, lecturas Git exactas, `enforce_audit_trust`,
+  `effect_compiled` y la carga de `fleet-risk.py`. No elige carril ni runtime.
+- `fleet_legacy_mission.py`: primitivas de proceso y CMUX, admisión y cierre del
+  Lead, handoff de assurance y `drive_legacy_mission`, cuyo cuerpo es el texto
+  exacto (1.239 líneas) que seguía al despacho Herdr en `drive_mission`.
+- `mission-run.py` pasa de 2.716 a 652 líneas: entrada, despacho,
+  `create_and_drive`, `dry_run`, `status` y `main`. `drive_mission` resuelve el
+  plan y despacha los presets Herdr a `fleet_herdr_mission.drive` y el resto a
+  `fleet_legacy_mission.drive_legacy_mission`. El CLI no cambia.
+- Cada nombre que los tests parchean tiene un solo hogar: las primitivas de
+  efecto y `PROMPT_TEMPLATE` solo existen en el módulo legacy y
+  `enforce_audit_trust` en el de soporte, con llamadas cualificadas. `git_value`
+  usa `fleet_legacy_mission.require_success` para conservar la interceptación
+  anterior; reubicar esa primitiva corresponde a S9.
+- 32 definiciones movidas son AST-equivalentes y el cuerpo del driver es
+  verbatim (`s3a-ast.json`, `s3b-ast.json`).
+
+Verificación: `LegacyRuntimeGuard`, permanente en los tests, rechaza
+`fleet-up.sh`, `fleet-down.sh`, `fleet-send.sh` y `cmux` reales; no se disparó.
+Los 23 módulos que referencian `mission-run` ejecutan 561 tests con el mismo
+conjunto de fallos antes, tras S3a y tras S3b, todos bloqueos conocidos del
+sandbox (`failset-*.txt`). Un parche en forma de tupla sin reubicar falló con
+`AttributeError`, como estaba previsto, y se corrigió.
+`ModernCompositionRootTests` fija que las primitivas legacy no existen en la
+raíz, que un preset Herdr nunca llega al driver legacy y que uno legacy se
+delega con el plan resuelto. `surface_check.sh` reproduce byte a byte `dry` de
+`herdr-implementation` e `implementation` y `status` de dos Missions legacy; el
+replay del corpus coincide con la entrega S2. `mission-run.py` conserva imports
+sin uso propio porque los tests acceden a esos módulos a través de él; también
+pasan los tests de `fleet_personal_pool`, que lo carga por ruta.
+
+Sigue S4. El pipeline predeterminado, las políticas de reparación y la
+telemetría todavía no se han refactorizado.

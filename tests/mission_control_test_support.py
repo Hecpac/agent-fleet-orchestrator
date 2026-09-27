@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
+import subprocess
 import sys
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +17,43 @@ import fleet_manifest  # noqa: E402
 import fleet_mission_state as mission_state  # noqa: E402
 import workflow_config  # noqa: E402
 import fleet_admission  # noqa: E402
+
+
+LEGACY_RUNTIME_BINARIES = frozenset({"fleet-up.sh", "fleet-down.sh", "fleet-send.sh", "cmux"})
+
+
+class LegacyRuntimeGuard:
+    """Refuse real CMUX fleet effects in tests that mock the legacy driver.
+
+    A patch that targets the wrong module leaves the real primitive in place; the
+    guard turns that miss into a refused process and a module-level failure.
+    """
+
+    def __init__(self) -> None:
+        self.attempts: list[list[str]] = []
+        self._patch = None
+
+    def start(self) -> None:
+        original = subprocess.Popen.__init__
+        attempts = self.attempts
+
+        def refuse(popen, args, *rest, **kwargs):
+            argv = [args] if isinstance(args, (str, bytes, os.PathLike)) else list(args)
+            names = {os.path.basename(os.fsdecode(item)) for item in argv[:2]}
+            if names & LEGACY_RUNTIME_BINARIES:
+                attempts.append([os.fsdecode(item) for item in argv[:3]])
+                raise PermissionError("test refused a real legacy runtime effect")
+            return original(popen, args, *rest, **kwargs)
+
+        self._patch = mock.patch.object(subprocess.Popen, "__init__", refuse)
+        self._patch.start()
+
+    def stop(self) -> None:
+        if self._patch is not None:
+            self._patch.stop()
+            self._patch = None
+        if self.attempts:
+            raise AssertionError(f"real legacy runtime effects attempted: {self.attempts}")
 
 
 def legacy_v1_compiled(compiled: dict) -> dict:

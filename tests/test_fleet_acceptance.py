@@ -37,6 +37,20 @@ def tree(content=b'{"count":3}', *, link=False, duplicate=False):
     return output.getvalue()
 
 
+from tests.mission_control_test_support import LegacyRuntimeGuard  # noqa: E402
+
+
+_LEGACY_GUARD = LegacyRuntimeGuard()
+
+
+def setUpModule() -> None:
+    _LEGACY_GUARD.start()
+
+
+def tearDownModule() -> None:
+    _LEGACY_GUARD.stop()
+
+
 class AcceptanceTests(unittest.TestCase):
     def test_binding_prevents_downgrade_and_changed_contract(self):
         spec = contract()
@@ -145,7 +159,7 @@ class AcceptanceTests(unittest.TestCase):
                     calls, runtime = fixture.fake_runtime()
                     spec = {"schema_version": 1, "requirements": [{"id": "R1", "description": "README requirement",
                         "checks": [{"kind": "text_contains", "path": "README.md", "expected": expected}]}]}
-                    with mock.patch.object(mission_run, "run_process", side_effect=runtime), mock.patch.object(mission_run, "cmux_signal"):
+                    with mock.patch.object(mission_run.fleet_legacy_mission, "run_process", side_effect=runtime), mock.patch.object(mission_run.fleet_legacy_mission, "cmux_signal"):
                         result = mission_run.create_and_drive(fixture.runs, feature="verified",
                             objective="inspect the parser", workflow_name="implementation",
                             target_repo=fixture.target.resolve(), risk_override="auto",

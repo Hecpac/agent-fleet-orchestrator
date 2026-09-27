@@ -13,7 +13,7 @@ import unittest
 import uuid
 from unittest import mock
 
-from tests.mission_control_test_support import legacy_v1_compiled, write_compiled
+from tests.mission_control_test_support import LegacyRuntimeGuard, legacy_v1_compiled, write_compiled
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,12 +23,24 @@ SPEC = importlib.util.spec_from_file_location("mission_run", SCRIPT)
 assert SPEC and SPEC.loader
 mission_run = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(mission_run)
+legacy_driver = mission_run.fleet_legacy_mission
 APPROVE_SPEC = importlib.util.spec_from_file_location(
     "fleet_approve_for_mission_test", ROOT / "scripts" / "fleet-approve.py"
 )
 assert APPROVE_SPEC and APPROVE_SPEC.loader
 fleet_approve = importlib.util.module_from_spec(APPROVE_SPEC)
 APPROVE_SPEC.loader.exec_module(fleet_approve)
+
+
+_LEGACY_GUARD = LegacyRuntimeGuard()
+
+
+def setUpModule() -> None:
+    _LEGACY_GUARD.start()
+
+
+def tearDownModule() -> None:
+    _LEGACY_GUARD.stop()
 
 
 class MissionPromptRenderingTests(unittest.TestCase):
@@ -43,7 +55,7 @@ class MissionPromptRenderingTests(unittest.TestCase):
             "risk": "low", "target_repo": Path("/fixture/repo"),
             "manifest": Path("/fixture/manifest"), "timeout_seconds": 60,
         }
-        for owner, name in ((mission_run, "run_process"), (subprocess, "run")):
+        for owner, name in ((legacy_driver, "run_process"), (subprocess, "run")):
             patcher = mock.patch.object(owner, name, side_effect=AssertionError("renderer invoked a runtime"))
             observed = patcher.start()
             self.addCleanup(patcher.stop)
@@ -51,7 +63,7 @@ class MissionPromptRenderingTests(unittest.TestCase):
 
     def render(self, template, **values):
         self.template.write_text(template, encoding="utf-8")
-        with mock.patch.object(mission_run, "PROMPT_TEMPLATE", self.template):
+        with mock.patch.object(legacy_driver, "PROMPT_TEMPLATE", self.template):
             return mission_run.render_prompt(**{**self.arguments, **values})
 
     def assert_rendered(self, template, expected, **values):
@@ -109,6 +121,46 @@ class MissionPromptRenderingTests(unittest.TestCase):
         self.assert_rendered("{{FEATURE}}|{{OBJECTIVE}}", "{{OBJECTIVE}}|plain text", feature="{{OBJECTIVE}}")
         compiled = {**self.arguments["compiled"], "resolved": {"capability": "{{FEATURE}}"}}
         self.assert_rendered("{{CAPABILITY_CATALOG}}", '{\n  "capability": "{{FEATURE}}"\n}', compiled=compiled)
+
+
+class ModernCompositionRootTests(unittest.TestCase):
+    """mission-run composes the lanes; legacy effects live only in their module."""
+
+    def test_legacy_effects_live_only_in_the_compatibility_module(self) -> None:
+        for name in ("run_process", "require_success", "cmux_signal", "PROMPT_TEMPLATE",
+                     "enforce_audit_trust", "_terminate_process_group"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(mission_run, name))
+        self.assertIs(mission_run.MissionRunError, legacy_driver.MissionRunError)
+        self.assertIs(mission_run.fleet_risk, legacy_driver.fleet_risk)
+
+    def dispatch(self, preset: str, *, herdr, legacy):
+        compiled, initial = {"resolved": {"preset": preset}}, {"target_repo": "/target"}
+        with (
+            mock.patch.object(mission_run.mission_state, "mission_root", return_value=Path("/root")),
+            mock.patch.object(mission_run, "effect_compiled", return_value=(compiled, initial)),
+            mock.patch.object(mission_run.fleet_herdr_mission, "drive", **herdr) as herdr_drive,
+            mock.patch.object(legacy_driver, "drive_legacy_mission", **legacy) as legacy_drive,
+        ):
+            result = mission_run.drive_mission(Path("/runs"), "mission")
+        return result, compiled, initial, herdr_drive, legacy_drive
+
+    def test_herdr_presets_never_reach_the_legacy_driver(self) -> None:
+        result, _, _, herdr_drive, legacy_drive = self.dispatch(
+            "sol_minimal_v1", herdr={"return_value": {"lane": "herdr"}},
+            legacy={"side_effect": AssertionError("legacy fallback")})
+        self.assertEqual(result, {"lane": "herdr"})
+        herdr_drive.assert_called_once_with(Path("/runs"), "mission")
+        legacy_drive.assert_not_called()
+
+    def test_legacy_presets_delegate_with_the_resolved_plan(self) -> None:
+        result, compiled, initial, herdr_drive, legacy_drive = self.dispatch(
+            "dan", herdr={"side_effect": AssertionError("herdr handled a legacy preset")},
+            legacy={"return_value": {"lane": "legacy"}})
+        self.assertEqual(result, {"lane": "legacy"})
+        herdr_drive.assert_not_called()
+        legacy_drive.assert_called_once_with(
+            Path("/runs"), "mission", root=Path("/root"), compiled=compiled, initial=initial)
 
 
 class MissionRunTests(unittest.TestCase):
@@ -244,7 +296,7 @@ class MissionRunTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(mission_run.MissionRunError, "timed out"):
-            mission_run.run_process([sys.executable, str(program)], timeout=1)
+            legacy_driver.run_process([sys.executable, str(program)], timeout=1)
 
         pid = int(child_pid.read_text(encoding="utf-8"))
         alive = True
@@ -275,8 +327,8 @@ class MissionRunTests(unittest.TestCase):
         root = self.runs / "missions" / mission_id
         write_compiled(root / "compiled-workflow.json", legacy_v1_compiled(compiled))
         with (
-            mock.patch.object(mission_run, "require_success") as shell_effect,
-            mock.patch.object(mission_run, "run_process") as dispatch_effect,
+            mock.patch.object(legacy_driver, "require_success") as shell_effect,
+            mock.patch.object(legacy_driver, "run_process") as dispatch_effect,
             self.assertRaisesRegex(
                 mission_run.MissionRunError, "historical read-only.*require v2"
             ),
@@ -316,7 +368,7 @@ class MissionRunTests(unittest.TestCase):
                 options.write_bytes(poisoned)
                 options.chmod(0o600)
                 with (
-                    mock.patch.object(mission_run, "run_process") as effects,
+                    mock.patch.object(legacy_driver, "run_process") as effects,
                     self.assertRaisesRegex(
                         mission_run.MissionRunError,
                         "durable JSON|not canonical",
@@ -338,7 +390,7 @@ class MissionRunTests(unittest.TestCase):
                 os.link(outside, options)
             with (
                 self.subTest(scenario=scenario),
-                mock.patch.object(mission_run, "run_process") as effects,
+                mock.patch.object(legacy_driver, "run_process") as effects,
                 self.assertRaisesRegex(
                     mission_run.MissionRunError,
                     "cannot load durable JSON",
@@ -825,7 +877,7 @@ class MissionRunTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, self.base_sha + "\n", "")
             return subprocess.CompletedProcess(command, 0, ".git\n", "")
 
-        with mock.patch.object(mission_run, "run_process", side_effect=git_only):
+        with mock.patch.object(legacy_driver, "run_process", side_effect=git_only):
             paused = mission_run.create_and_drive(
                 self.runs,
                 feature="expired-approval",
@@ -855,8 +907,8 @@ class MissionRunTests(unittest.TestCase):
 
         calls.clear()
         with (
-            mock.patch.object(mission_run, "run_process", side_effect=git_only),
-            mock.patch.object(mission_run, "datetime", ExpiredClock),
+            mock.patch.object(legacy_driver, "run_process", side_effect=git_only),
+            mock.patch.object(legacy_driver, "datetime", ExpiredClock),
             mock.patch.object(
                 mission_run.fleet_audit_client, "AuditLifecycle"
             ) as audit,
@@ -1036,8 +1088,8 @@ class MissionRunTests(unittest.TestCase):
     def complete_autonomous(self, feature: str) -> dict[str, object]:
         _, fake = self.fake_runtime()
         with (
-            mock.patch.object(mission_run, "run_process", side_effect=fake),
-            mock.patch.object(mission_run, "cmux_signal"),
+            mock.patch.object(legacy_driver, "run_process", side_effect=fake),
+            mock.patch.object(legacy_driver, "cmux_signal"),
         ):
             return mission_run.create_and_drive(
                 self.runs,
@@ -1054,8 +1106,8 @@ class MissionRunTests(unittest.TestCase):
     def test_autonomous_mission_completes_with_durable_result_and_archive(self) -> None:
         calls, fake = self.fake_runtime()
         with (
-            mock.patch.object(mission_run, "run_process", side_effect=fake),
-            mock.patch.object(mission_run, "cmux_signal"),
+            mock.patch.object(legacy_driver, "run_process", side_effect=fake),
+            mock.patch.object(legacy_driver, "cmux_signal"),
         ):
             value = mission_run.create_and_drive(
                 self.runs,
@@ -1103,7 +1155,7 @@ class MissionRunTests(unittest.TestCase):
                 prompts.append(command[3])
             return fake(command, timeout=timeout, env=env)
 
-        with mock.patch.object(mission_run, "run_process", side_effect=observed), mock.patch.object(mission_run, "cmux_signal"):
+        with mock.patch.object(legacy_driver, "run_process", side_effect=observed), mock.patch.object(legacy_driver, "cmux_signal"):
             value = mission_run.create_and_drive(self.runs, feature="opaque-objective", objective=objective,
                 workflow_name="implementation", target_repo=self.target.resolve(), risk_override="auto",
                 timeout_seconds=300, allow_dirty_baseline=False, teardown=False)
@@ -1137,8 +1189,8 @@ class MissionRunTests(unittest.TestCase):
             return base_runtime(command, timeout=timeout, env=env)
 
         with (
-            mock.patch.object(mission_run, "run_process", side_effect=live_escalation),
-            mock.patch.object(mission_run, "cmux_signal"),
+            mock.patch.object(legacy_driver, "run_process", side_effect=live_escalation),
+            mock.patch.object(legacy_driver, "cmux_signal"),
         ):
             value = mission_run.create_and_drive(
                 self.runs,
@@ -1326,8 +1378,8 @@ class MissionRunTests(unittest.TestCase):
             return base_runtime(command, timeout=timeout, env=env)
 
         with (
-            mock.patch.object(mission_run, "run_process", side_effect=assured_runtime),
-            mock.patch.object(mission_run, "cmux_signal"),
+            mock.patch.object(legacy_driver, "run_process", side_effect=assured_runtime),
+            mock.patch.object(legacy_driver, "cmux_signal"),
             mock.patch.object(
                 mission_run.fleet_assured_runner,
                 "AssuredRunner",
@@ -1393,7 +1445,7 @@ class MissionRunTests(unittest.TestCase):
         before = outside.read_bytes()
         result_path.unlink()
         result_path.symlink_to(outside)
-        with mock.patch.object(mission_run, "require_success") as effects:
+        with mock.patch.object(legacy_driver, "require_success") as effects:
             with self.assertRaisesRegex(
                 mission_run.MissionRunError, "unsafe terminal Lead result"
             ):
@@ -1459,9 +1511,9 @@ class MissionRunTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                mission_run, "run_process", side_effect=symlink_result_store
+                legacy_driver, "run_process", side_effect=symlink_result_store
             ),
-            mock.patch.object(mission_run, "cmux_signal"),
+            mock.patch.object(legacy_driver, "cmux_signal"),
         ):
             with self.assertRaisesRegex(
                 mission_run.MissionRunError, "unsafe lead result store"
@@ -1491,8 +1543,8 @@ class MissionRunTests(unittest.TestCase):
             return runtime(command, timeout=timeout, env=env)
 
         with (
-            mock.patch.object(mission_run, "run_process", side_effect=fail_wait),
-            mock.patch.object(mission_run, "cmux_signal"),
+            mock.patch.object(legacy_driver, "run_process", side_effect=fail_wait),
+            mock.patch.object(legacy_driver, "cmux_signal"),
         ):
             with self.assertRaisesRegex(
                 mission_run.MissionRunError,
@@ -1597,7 +1649,7 @@ class MissionRunTests(unittest.TestCase):
             mock.patch.object(
                 mission_run.fleet_audit_client, "AuditLifecycle", FakeAuditLifecycle
             ),
-            mock.patch.object(mission_run, "require_success", side_effect=fake_require),
+            mock.patch.object(legacy_driver, "require_success", side_effect=fake_require),
         ):
             result = mission_run.drive_mission(self.runs, mission_id)
         self.assertEqual(result["status"], "failed")
@@ -1666,8 +1718,8 @@ class MissionRunTests(unittest.TestCase):
             mock.patch.object(
                 mission_run.fleet_control_service, "ControlLifecycle", ReconciledControl
             ),
-            mock.patch.object(mission_run, "enforce_audit_trust"),
-            mock.patch.object(mission_run, "require_success", side_effect=fail_boot),
+            mock.patch.object(mission_run.mission_support, "enforce_audit_trust"),
+            mock.patch.object(legacy_driver, "require_success", side_effect=fail_boot),
         ):
             for _ in range(2):
                 with self.assertRaisesRegex(
@@ -1717,7 +1769,7 @@ class MissionRunTests(unittest.TestCase):
             ],
             check=True,
         )
-        with mock.patch.object(mission_run, "require_success") as effects:
+        with mock.patch.object(legacy_driver, "require_success") as effects:
             with self.assertRaisesRegex(mission_run.MissionRunError, "frozen base_sha"):
                 mission_run.drive_mission(self.runs, mission_id)
         effects.assert_not_called()
@@ -1737,8 +1789,8 @@ class MissionRunTests(unittest.TestCase):
             return original_append(*args, **kwargs)
 
         with (
-            mock.patch.object(mission_run, "run_process", side_effect=fake),
-            mock.patch.object(mission_run, "cmux_signal"),
+            mock.patch.object(legacy_driver, "run_process", side_effect=fake),
+            mock.patch.object(legacy_driver, "cmux_signal"),
             mock.patch.object(
                 mission_run.mission_state, "append_event", side_effect=crash_once
             ),
@@ -1763,8 +1815,8 @@ class MissionRunTests(unittest.TestCase):
         ]
         self.assertEqual(len(mission_dirs), 1)
         with (
-            mock.patch.object(mission_run, "run_process", side_effect=fake),
-            mock.patch.object(mission_run, "cmux_signal"),
+            mock.patch.object(legacy_driver, "run_process", side_effect=fake),
+            mock.patch.object(legacy_driver, "cmux_signal"),
         ):
             value = mission_run.drive_mission(self.runs, mission_dirs[0].name)
         self.assertEqual(value["status"], "succeeded")
@@ -1783,7 +1835,7 @@ class MissionRunTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, self.base_sha + "\n", "")
             return subprocess.CompletedProcess(command, 0, ".git\n", "")
 
-        with mock.patch.object(mission_run, "run_process", side_effect=git_only):
+        with mock.patch.object(legacy_driver, "run_process", side_effect=git_only):
             paused = mission_run.create_and_drive(
                 self.runs,
                 feature="assured",
@@ -2006,8 +2058,8 @@ class MissionRunTests(unittest.TestCase):
                 return {"valid": True}
 
         with (
-            mock.patch.object(mission_run, "run_process", side_effect=assured_runtime),
-            mock.patch.object(mission_run, "cmux_signal"),
+            mock.patch.object(legacy_driver, "run_process", side_effect=assured_runtime),
+            mock.patch.object(legacy_driver, "cmux_signal"),
             mock.patch.object(
                 mission_run.fleet_assured_runner, "AssuredRunner", FakeAssuredRunner
             ),
@@ -2104,7 +2156,7 @@ class MissionRunTests(unittest.TestCase):
                 mission_run.fleet_audit_client, "AuditLifecycle", FailingAuditLifecycle
             ),
             mock.patch.object(
-                mission_run,
+                legacy_driver,
                 "run_process",
                 side_effect=AssertionError("fleet must not boot"),
             ),
