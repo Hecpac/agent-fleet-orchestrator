@@ -5,6 +5,7 @@ import copy
 import json
 import os
 import shutil
+import traceback
 import uuid
 from unittest import mock
 
@@ -298,15 +299,21 @@ class OwnerCycleTests(CycleFixture):
                         owner.tick(backend, now=1001)
                     pid = os.fork()
                     if pid == 0:
-                        original_write = owner._write
-                        def write(relative, value):
-                            if relative.startswith("events/") and value["kind"] == kind:
-                                with mock.patch.object(safe, "_atomic_write_checkpoint", side_effect=lambda name: os._exit(73) if name == boundary else None):
-                                    return original_write(relative, value)
-                            return original_write(relative, value)
-                        with mock.patch.object(owner, "_write", side_effect=write):
-                            owner.tick(backend, now=1002)
-                        os._exit(74)
+                        try:
+                            original_write = owner._write
+                            def write(relative, value):
+                                if relative.startswith("events/") and value["kind"] == kind:
+                                    with mock.patch.object(safe, "_atomic_write_checkpoint", side_effect=lambda name: os._exit(73) if name == boundary else None):
+                                        return original_write(relative, value)
+                                return original_write(relative, value)
+                            with mock.patch.object(owner, "_write", side_effect=write):
+                                owner.tick(backend, now=1002)
+                            os._exit(74)
+                        except BaseException:
+                            traceback.print_exc()
+                        finally:
+                            # A failed child must never return into the parent's test runner.
+                            os._exit(75)
                     _, result = os.waitpid(pid, 0)
                     self.assertEqual(os.waitstatus_to_exitcode(result), 73)
                     # Reconciliation must recover complete CAS bytes even when

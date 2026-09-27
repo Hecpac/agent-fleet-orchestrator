@@ -9,6 +9,7 @@ import shutil
 import sys
 import tempfile
 import time
+import traceback
 import unittest
 from unittest import mock
 
@@ -145,7 +146,11 @@ class ControlTests(unittest.TestCase):
     def test_dead_first_generation_recovers_without_release_directory(self):
         child=os.fork()
         if child==0:
-            with self.lease():os._exit(91)
+            # A failed child must never return into the parent's test runner.
+            try:
+                with self.lease():os._exit(91)
+            except BaseException:traceback.print_exc()
+            finally:os._exit(92)
         _,status=os.waitpid(child,0);self.assertEqual(os.waitstatus_to_exitcode(status),91)
         self.assertFalse((self.root/"control-releases").exists())
         with self.lease() as recovered:
@@ -157,13 +162,16 @@ class ControlTests(unittest.TestCase):
             lease._bound={"generation_sha256":control.pin(lease.generation)}
             child=os.fork()
             if child==0:
-                original=control.sandbox.publish
-                def crash(root,name,value):
-                    if name=="control-cancel.json":os._exit(91)
-                    return original(root,name,value)
-                control.sandbox.publish=crash
-                control.cancel(self.root,self.pin,"cancel before path")
-                os._exit(92)
+                try:
+                    original=control.sandbox.publish
+                    def crash(root,name,value):
+                        if name=="control-cancel.json":os._exit(91)
+                        return original(root,name,value)
+                    control.sandbox.publish=crash
+                    control.cancel(self.root,self.pin,"cancel before path")
+                    os._exit(92)
+                except BaseException:traceback.print_exc()
+                finally:os._exit(93)
             _,status=os.waitpid(child,0);self.assertEqual(os.waitstatus_to_exitcode(status),91)
             self.assertFalse((self.root/"control-cancel.json").exists())
             with self.assertRaisesRegex(control.AuthorityError,"cancellation committed"):lease.assert_effect()

@@ -1,6 +1,7 @@
 """Functional journal conformance. All container observations are synthetic."""
 import copy
 import os
+import traceback
 import uuid
 from unittest import mock
 
@@ -283,15 +284,21 @@ class OwnerFunctionalTests(CycleFixture):
                         owner.tick(backend, now=1002)
                     pid = os.fork()
                     if pid == 0:
-                        original = owner._write
-                        def write(path, value):
-                            if path.startswith("events/") and value["kind"] == kind:
-                                with mock.patch.object(safe, "_atomic_write_checkpoint", side_effect=lambda name: os._exit(73) if name == boundary else None):
-                                    return original(path, value)
-                            return original(path, value)
-                        with mock.patch.object(owner, "_write", side_effect=write):
-                            owner.tick(backend, now=1003)
-                        os._exit(74)
+                        try:
+                            original = owner._write
+                            def write(path, value):
+                                if path.startswith("events/") and value["kind"] == kind:
+                                    with mock.patch.object(safe, "_atomic_write_checkpoint", side_effect=lambda name: os._exit(73) if name == boundary else None):
+                                        return original(path, value)
+                                return original(path, value)
+                            with mock.patch.object(owner, "_write", side_effect=write):
+                                owner.tick(backend, now=1003)
+                            os._exit(74)
+                        except BaseException:
+                            traceback.print_exc()
+                        finally:
+                            # A failed child must never return into the parent's test runner.
+                            os._exit(75)
                     _, code = os.waitpid(pid, 0)
                     self.assertEqual(os.waitstatus_to_exitcode(code), 73)
                     owner.recover()

@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import os
 import shutil
+import traceback
 import uuid
 from unittest import mock
 
@@ -418,15 +419,21 @@ class ObservedTransportTests(CycleFixture):
                         owner.control("cancel", request_id=str(uuid.uuid4()), target=runtime.resource(admission), reason="fixture", now=1002)
                     pid = os.fork()
                     if pid == 0:
-                        original_write = owner._write
-                        def interrupted(relative, value):
-                            if relative.startswith("events/") and value["kind"] == kind:
-                                with mock.patch.object(safe, "_atomic_write_checkpoint", side_effect=lambda name: os._exit(73) if name == boundary else None):
-                                    return original_write(relative, value)
-                            return original_write(relative, value)
-                        with mock.patch.object(owner, "_write", side_effect=interrupted):
-                            owner.tick(backend, now=1003)
-                        os._exit(74)
+                        try:
+                            original_write = owner._write
+                            def interrupted(relative, value):
+                                if relative.startswith("events/") and value["kind"] == kind:
+                                    with mock.patch.object(safe, "_atomic_write_checkpoint", side_effect=lambda name: os._exit(73) if name == boundary else None):
+                                        return original_write(relative, value)
+                                return original_write(relative, value)
+                            with mock.patch.object(owner, "_write", side_effect=interrupted):
+                                owner.tick(backend, now=1003)
+                            os._exit(74)
+                        except BaseException:
+                            traceback.print_exc()
+                        finally:
+                            # A failed child must never return into the parent's test runner.
+                            os._exit(75)
                     _, status = os.waitpid(pid, 0)
                     self.assertEqual(os.waitstatus_to_exitcode(status), 73)
                     owner.recover()
