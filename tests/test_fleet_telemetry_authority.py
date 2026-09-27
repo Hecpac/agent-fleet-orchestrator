@@ -128,6 +128,46 @@ class IntervalLedgerReducerTests(unittest.TestCase):
             self.append("herdr_interval_finished", {"interval_id": identifier, "elapsed_ns": 2, "outcome": "returned"})
 
 
+class UsageTotalityTests(unittest.TestCase):
+    """Archive, Owner Cycle and report verdicts call usage() on validated rows.
+
+    Those validators check rows and payloads but not token_count contents, so a
+    counter snapshot must degrade to unknown usage instead of raising into them.
+    """
+
+    JSON_VALUES = (None, True, False, 0, 5, -1, 1.5, "", "x", [], [1], {}, {"input_tokens": "1"},
+                   {"input_tokens": 1, "output_tokens": 1, "cached_input_tokens": 2},
+                   {"input_tokens": 3, "output_tokens": 1, "cached_input_tokens": 2})
+
+    @staticmethod
+    def event(kind: str, **payload) -> dict:
+        return {"type": "event_msg", "payload": {"type": kind, **payload}}
+
+    def turn(self, *counters: dict) -> list[dict]:
+        return [self.event("task_started", turn_id="t"), *counters, self.event("task_complete", turn_id="t")]
+
+    def test_non_object_counter_snapshot_is_invalid_usage(self) -> None:
+        import fleet_herdr_metrics
+        for info in (None, {}, 0, "", [], [1], "x", 5, True, [{}]):
+            with self.subTest(info=info):
+                usage = fleet_herdr_metrics.usage(self.turn(self.event("token_count", info=info)), "t")
+                self.assertEqual(usage["usage_reason"], "invalid_usage_counter_snapshot")
+                self.assertIsNone(usage["prompt_tokens"])
+
+    def test_usage_is_total_over_validated_rows(self) -> None:
+        import fleet_herdr_metrics
+        valid = {"input_tokens": 3, "output_tokens": 1, "cached_input_tokens": 2}
+        for value in self.JSON_VALUES:
+            infos = (value, {"total_token_usage": value, "last_token_usage": value},
+                     {"total_token_usage": valid, "last_token_usage": value})
+            for info in infos:
+                for prefix in ([], [self.event("token_count", info={"total_token_usage": valid})]):
+                    with self.subTest(info=info, prefix=bool(prefix)):
+                        rows = [*prefix, *self.turn(self.event("token_count", info=info))]
+                        usage = fleet_herdr_metrics.usage(rows, "t")
+                        self.assertIn("usage_reason", usage)
+
+
 class TelemetryDirectionTests(unittest.TestCase):
     def test_ledger_never_imports_measurement(self) -> None:
         self.assertFalse(imported_modules(module_tree("fleet_mission_state")) & set(MEASUREMENT_MODULES))

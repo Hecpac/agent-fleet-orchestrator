@@ -163,7 +163,7 @@ def usage(rows, turn_id, baseline=None, *, baseline_frontier=None):
     for index,row in enumerate(rows[:last]):
         p = row.get("payload", {})
         if row.get("type") == "event_msg" and p.get("type") == "token_count":
-            info = p.get("info") or {}
+            info = p.get("info") if isinstance(p.get("info"), dict) else {}
             total = counts(info.get("total_token_usage"))
             if total is not None:
                 snapshots.append((index,total,counts(info.get("last_token_usage"))))

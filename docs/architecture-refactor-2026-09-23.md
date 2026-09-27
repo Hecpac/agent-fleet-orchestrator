@@ -100,8 +100,10 @@ medición documentada («observational rather than Mission authority»): la
 telemetría observa la autoridad y nunca la define. El ledger es dueño del esquema
 de todo evento que guarda; los módulos de medición e informe leen la autoridad y
 no escriben el ledger, salvo `fleet_herdr_metrics.observe`, único instrumentador
-declarado de intervalos. Verificadores, formatos archivados y resultados de
-`verify` no cambian. Quedan fuera los otros módulos en los que el
+declarado de intervalos, y un fallo al medir no puede decidir un veredicto.
+Verificadores, formatos archivados y resultados de `verify` no cambian;
+`usage()` pasa a cumplir su contrato documentado para una forma de snapshot que
+antes lanzaba (ver la entrega). Quedan fuera los otros módulos en los que el
 ledger delega esquema (`fleet_herdr_inference`, `fleet_herdr_control`), que son
 autoridad y no medición, y la semántica de escritura de `observe`.
 
@@ -281,7 +283,29 @@ Interpretación en D5. Evidencia en `outputs/refactor-20260927-s5/`.
   sin cambios) y la dirección: el ledger no importa módulos de medición ni de
   informe; `fleet_trace`, `fleet_export_trace`, `fleet_report` y
   `fleet_herdr_report` no llaman escritores del ledger; en `fleet_herdr_metrics`
-  solo `observe` escribe, y solo eventos de intervalo.
+  solo `observe` escribe, y solo eventos de intervalo. También fija que `usage()`
+  es total sobre filas ya validadas (ver la corrección).
+
+Corrección: medir el uso no puede abortar un veredicto.
+
+- `fleet_herdr_archive.attest_admissions` (creación y verificación, también
+  `for_completion`), las respuestas `owner-cycle-admission-v2` de
+  `fleet_herdr_owner_cycle` y `fleet_herdr_report` llaman a
+  `fleet_herdr_metrics.usage()` después de validar la transcripción: JSONL,
+  filas y payloads objeto, identidad y turno. Ninguno valida el contenido de
+  `token_count`. Con un `info` no vacío que no es objeto, `usage()` lanzaba
+  `AttributeError`: el archive no se creaba ni verificaba, la excepción salía del
+  driver sin cerrar la Mission (ni el driver ni el CLI la capturan), el Owner
+  Cycle invalidaba la respuesta completa y el informe marcaba el archive como
+  corrupto.
+- `usage()` trata ahora ese `info` como snapshot inválido
+  (`invalid_usage_counter_snapshot`), igual que ya hacía con `null` y `{}`, como
+  exige la semántica de medición. Toda entrada que antes no lanzaba sigue el
+  mismo camino. Validarlo en el lector de transcripciones habría hecho que la
+  autoridad rechazara evidencia por un campo de medición.
+- Alcance real: los 180 `token_count` de los archives Herdr del corpus traen
+  `info` objeto; hace falta una transcripción ligada fabricada o corrupta. Se
+  reprodujo solo con datos sintéticos (`usage-pin-before-fix.log`).
 
 Revisado y conservado a propósito:
 
@@ -302,13 +326,14 @@ cambia la semántica del ledger («un fin ausente es desconocido») y exige una
 decisión propia.
 
 Verificación: la suite completa conserva el mismo conjunto de fallos (solo
-bloqueos del sandbox) antes (2.183 tests) y tras el traslado (2.191), con los
-tests nuevos en verde. El replay del corpus coincide con S4: los ledgers de los
-tres archives Herdr llevan 2.950 eventos de intervalo por el validador y el
-reductor trasladados. `surface_check.sh` reproduce `dry` y `status` byte a byte y
-los módulos afectados importan en frío sin ciclos. El ajuste final del anclaje de
-dirección (también llamadas por nombre importado) y las precisiones de este texto
-se verificaron con los tests afectados.
+bloqueos del sandbox) antes (2.183 tests), tras el traslado (2.191) y tras la
+corrección (2.193), con los tests nuevos en verde. El replay del corpus coincide
+con S4 en ambos puntos: los ledgers de los tres archives Herdr llevan 2.950
+eventos de intervalo por el validador y el reductor trasladados, y sus 180
+`token_count` por la línea corregida. `surface_check.sh` reproduce `dry` y
+`status` byte a byte y los módulos afectados importan en frío sin ciclos. El
+ajuste final del anclaje de dirección (también llamadas por nombre importado) y
+las precisiones de este texto se verificaron con los tests afectados.
 
 Sigue S6. El pipeline predeterminado y las políticas de reparación todavía no se
 han refactorizado.
