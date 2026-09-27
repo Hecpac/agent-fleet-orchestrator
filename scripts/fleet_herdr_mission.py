@@ -51,10 +51,7 @@ ROOT = Path(__file__).resolve().parents[1]
 STAGES = (("plan", "lead", "recon"), ("build", "worker", "build"),
           ("review", "reviewer", "challenge"), ("verify", "verifier", "verify"),
           ("synthesis", "lead", "synthesis"))
-PROFILE = (("lead", "astra_lead", "gpt-6-astra", "CONTROL", "control"),
-           ("worker", "sol_worker", "gpt-5.6-sol", "BUILD", "write"),
-           ("reviewer", "sol_reviewer", "gpt-5.6-sol", "CHALLENGE", "advisory"),
-           ("verifier", "sol_verifier", "gpt-5.6-sol", "VERIFY", "verification"))
+PROFILE = fleet_herdr_profile.LEGACY.members  # historical alias of the catalog roster
 RESULT_STATUS = {"PASS": "succeeded", "BLOCKED": "blocked", "FAIL": "failed"}
 
 

@@ -12,6 +12,12 @@ from typing import Any, Iterable
 import fleet_json
 
 
+# Work owner per preset, pinned to the Herdr profile catalog by test (the first
+# stage's instance); other presets keep the Lead as owner.
+WORK_OWNER_BY_PRESET = {"sol_minimal_v1": "worker"}
+DEFAULT_WORK_OWNER = "lead"
+
+
 IDENTIFIER = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 RISK_LEVELS = {"low", "medium", "high", "unknown"}
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2, "unknown": 3}
@@ -147,7 +153,7 @@ def validate_workflow(value: Any) -> None:
         {"owner", "allow_parallel", "allow_subdelegation", "max_delegation_depth"},
         "workflow.autonomy",
     )
-    expected_owner = "worker" if workflow["preset"] == "sol_minimal_v1" else "lead"
+    expected_owner = WORK_OWNER_BY_PRESET.get(workflow["preset"], DEFAULT_WORK_OWNER)
     if autonomy["owner"] != expected_owner:
         raise WorkflowError(f"workflow.autonomy.owner must be {expected_owner}")
     _boolean(autonomy["allow_parallel"], "workflow.autonomy.allow_parallel")

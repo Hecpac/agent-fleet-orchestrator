@@ -8,15 +8,17 @@ from __future__ import annotations
 from pathlib import PurePosixPath
 from typing import Any
 
-VERSION = 1
-RESEARCH_VERSION = 3
-MINIMAL_VERSION = 4
-MINIMUM_ARCHIVE_SCHEMA_VERSION = 3
-REQUIRED_TURNS = 5
-MODELS = {"lead": "gpt-6-astra", "worker": "gpt-5.6-sol",
-          "reviewer": "gpt-5.6-sol", "verifier": "gpt-5.6-sol"}
-RESEARCH_MODELS = {**MODELS, "research": "gpt-6-astra"}
-MINIMAL_MODELS = {"worker": "gpt-5.6-sol"}
+import fleet_herdr_profile as profiles
+
+# Versions, roster models and turn counts come from the closed profile catalog.
+VERSION = profiles.LEGACY.permissions_policy_version
+RESEARCH_VERSION = profiles.RESEARCH.permissions_policy_version
+MINIMAL_VERSION = profiles.MINIMAL.permissions_policy_version
+MINIMUM_ARCHIVE_SCHEMA_VERSION = profiles.LEGACY.minimum_archive_schema_version
+REQUIRED_TURNS = len(profiles.LEGACY.stages)
+MODELS = profiles.role_models(profiles.LEGACY)
+RESEARCH_MODELS = profiles.role_models(profiles.RESEARCH)
+MINIMAL_MODELS = profiles.role_models(profiles.MINIMAL)
 
 
 class PermissionError(ValueError):

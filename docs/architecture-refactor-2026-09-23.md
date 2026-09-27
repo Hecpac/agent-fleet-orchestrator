@@ -38,7 +38,7 @@ no se alteran sus planes, pins, deadlines, autorizaciones ni evidencia.
 | S1 | Intérprete y disponibilidad de workflows | Verificado localmente |
 | S2 | Lectores, contratos y operaciones puras | Completado: dos carriles históricos explícitos, lectores puros extraídos y un rechazo explicado |
 | S3 | Composición moderna y compatibilidad | Completado: raíz moderna, soporte neutral y driver legacy explícito, sin cambio de comportamiento |
-| S4 | Catálogo de perfiles e identidad | Pendiente |
+| S4 | Catálogo de perfiles e identidad | Completado: catálogo como fuente única, identidades fijadas y copias ancladas por test |
 | S5 | Telemetría separada de autoridad | Pendiente |
 | S6 | Scope y aceptación independientes del perfil | Pendiente |
 | S7 | Mecanismos comunes de Owner Cycle | Pendiente |
@@ -81,6 +81,17 @@ queda como raíz de composición moderna (entrada, despacho, `create_and_drive`,
 `dry_run`, `status` y `main`). El driver de Missions CMUX y sus primitivas de
 efecto pasan a un módulo de compatibilidad explícito, y los helpers neutrales
 compartidos a un módulo de soporte. No se introduce fallback entre carriles.
+
+### D4 — Alcance de S4
+
+Como en D3, S4 se interpreta a partir de su nombre: una sola fuente de hechos por
+perfil Herdr y de su identidad. Los consumidores del carril Herdr derivan
+versiones, modelos y restricciones de `fleet_herdr_profile`. El validador del
+ledger y los contratos puros conservan literales propios, anclados al catálogo
+por test, sin ampliar sus dependencias. `HerdrProfile.contract()` no cambia: su
+digest está fijado en ledgers existentes. Quedan fuera `fleet_herdr_roster`
+(identidades del roster FLEET-01), `fleet_herdr_owner_runtime` (S7) y el
+controlador de diálogo legacy.
 
 ## Entrega inicial: S0, S1 y extracción inicial de S2
 
@@ -206,5 +217,39 @@ replay del corpus coincide con la entrega S2. `mission-run.py` conserva imports
 sin uso propio porque los tests acceden a esos módulos a través de él; también
 pasan los tests de `fleet_personal_pool`, que lo carga por ruta.
 
-Sigue S4. El pipeline predeterminado, las políticas de reparación y la
+## Entrega S4: catálogo de perfiles e identidad (2026-09-27)
+
+Interpretación en D4. Evidencia en `outputs/refactor-20260927-s4/`.
+
+- `fleet_herdr_profile` añade `BY_PROFILE_ID`, `VERSIONED`,
+  `PHYSICAL_SCOPE_PROFILE` y `role_models()` fuera de `HerdrProfile.contract()`;
+  los tres digests no cambian.
+- Derivan del catálogo: las versiones, modelos, turnos y esquema mínimo de
+  `fleet_herdr_permissions`; la versión de permisos de `fleet_herdr_rejection`
+  (antes dos mapas); `fleet_herdr_mission.PROFILE`, alias sin consumidores; y la
+  restricción de alcance físico en `fleet_herdr_scope`, `fleet_mission` y
+  `mission-run`. Un binding desconocido conserva su versión 1 histórica porque el
+  estado del backend no valida ese campo.
+- `fleet_mission_state` y `fleet_workflow_contract` no importan el catálogo:
+  sus literales pasan a constantes con nombre (`VERSIONED_FINALIZATION_CONTRACTS`,
+  `LEGACY_FINALIZATION_CONTRACT`, `PHYSICAL_SCOPE_PROFILE_ID`,
+  `WORK_OWNER_BY_PRESET`, …).
+- `tests/test_fleet_herdr_profile_catalog.py` fija los tres digests completos,
+  ancla cada copia a la derivación del catálogo y valida los contratos de
+  finalización por comportamiento. Pasó sobre el árbol sin cambios antes de
+  derivar nada, sin divergencias.
+
+- Residuo anclado, no derivado: `fleet_herdr_archive.verify` elige el perfil por
+  esquema (6 → Research, si no Minimal) y admite versiones de permisos
+  `{1, 2, 3, 4}`. El test los fija contra el catálogo; derivarlos corresponde al
+  trabajo pendiente del lector de archives Herdr.
+
+Verificación: suite completa antes y después con el mismo conjunto de fallos
+(solo bloqueos del sandbox; 2.179 → 2.182 tests por los anclajes nuevos). El
+replay del corpus coincide con S3, incluida la ruta de permisos de los tres
+archives Herdr, y `surface_check.sh` reproduce la superficie real. La conversión
+final del segundo chequeo de alcance de `mission-run`, su texto de ayuda y el
+ancla del lector se verificaron con los tests afectados, no con otra suite completa.
+
+Sigue S5. El pipeline predeterminado, las políticas de reparación y la
 telemetría todavía no se han refactorizado.

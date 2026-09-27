@@ -143,8 +143,9 @@ def create_and_drive(
     profile = fleet_herdr_profile.resolve_profile(compiled) if is_herdr else None
     if scope_contract is not None:
         fleet_herdr_scope.validate(scope_contract)
-        if profile is not fleet_herdr_profile.MINIMAL:
-            raise MissionRunError("--scope-contract requires sol_minimal_v1")
+        scope_profile = fleet_herdr_profile.PHYSICAL_SCOPE_PROFILE
+        if profile is not scope_profile:
+            raise MissionRunError(f"--scope-contract requires {scope_profile.preset}")
     if sdd_plan_path is not None and not is_herdr:
         raise MissionRunError("--sdd-plan requires a supported Herdr workflow")
     herdr_runtime_options = {}
@@ -284,8 +285,9 @@ def dry_run(
         raise MissionRunError("functional contracts require a supported Herdr workflow")
     if scope_contract is not None:
         fleet_herdr_scope.validate(scope_contract)
-        if compiled["resolved"]["preset"] != "sol_minimal_v1":
-            raise MissionRunError("--scope-contract requires sol_minimal_v1")
+        scope_preset = fleet_herdr_profile.PHYSICAL_SCOPE_PROFILE.preset
+        if compiled["resolved"]["preset"] != scope_preset:
+            raise MissionRunError(f"--scope-contract requires {scope_preset}")
     if acceptance_contract is not None:
         fleet_acceptance.validate(acceptance_contract)
         if compiled["workflow"]["archive"]["content_policy"] != "full" or not compiled["workflow"]["archive"]["include_final_tree"]:
@@ -362,7 +364,7 @@ def _parser() -> argparse.ArgumentParser:
         )
         command.add_argument("--acceptance-contract", type=Path)
         command.add_argument("--functional-contract", type=Path, help="versioned required functional check frozen before launch")
-        command.add_argument("--scope-contract", type=Path, help="opt-in physical candidate acceptance (sol_minimal_v1 only)")
+        command.add_argument("--scope-contract", type=Path, help=f"opt-in physical candidate acceptance ({fleet_herdr_profile.PHYSICAL_SCOPE_PROFILE.preset} only)")
         if name == "dry":
             command.add_argument("--work-packet", action="store_true", help="preview owner-work-v1; owner cycle and dispatch remain disabled")
             command.add_argument("--work-context", type=Path, help="initial context, requirements, preferences and decisions for the work packet")

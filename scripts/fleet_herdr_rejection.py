@@ -38,8 +38,9 @@ def delivery_problem(final_bytes, *, expected, candidate_tree_sha):
 
 
 def _permission_version(backend):
-    return {fleet_herdr_profile.RESEARCH.profile_id: 3,
-            fleet_herdr_profile.MINIMAL.profile_id: 4}.get(backend.get('herdr_profile'), 1)
+    # An unvalidated unknown binding keeps its historical version-1 default.
+    return fleet_herdr_profile.BY_PROFILE_ID.get(
+        backend.get('herdr_profile'), fleet_herdr_profile.LEGACY).permissions_policy_version
 
 
 def execution_status(envelope, *, read, role, cwd, prompt_sha256, agent_session, permission_version):
@@ -167,9 +168,7 @@ def load(runs, mid, run, backend):
         fleet_herdr_evidence.verify_result(result, read_artifact=read,
             role=member['instance_id'], cwd=backend['target_repo'],
             prompt_sha256=submission['prompt_sha256'], agent_session=member['agent_session']['value'],
-            permission_version=({fleet_herdr_profile.RESEARCH.profile_id: 3,
-                                 fleet_herdr_profile.MINIMAL.profile_id: 4}.get(
-                                     backend.get('herdr_profile'), 1)))
+            permission_version=_permission_version(backend))
     except fleet_herdr_evidence.EvidenceError as exc:
         if str(exc) != proof['reason']:
             raise ValueError('evidence rejection reason no longer reproduces') from exc

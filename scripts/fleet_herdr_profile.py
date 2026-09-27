@@ -132,6 +132,15 @@ MINIMAL = HerdrProfile(
 )
 
 BY_PRESET = {profile.preset: profile for profile in (LEGACY, RESEARCH, MINIMAL)}
+BY_PROFILE_ID = {profile.profile_id: profile for profile in (LEGACY, RESEARCH, MINIMAL)}
+VERSIONED = (RESEARCH, MINIMAL)
+# Physical scope v1 is admitted only for the single-writer minimal profile.
+PHYSICAL_SCOPE_PROFILE = MINIMAL
+
+
+def role_models(profile: HerdrProfile) -> dict[str, str]:
+    """Requested model per role instance; observed identity comes from transcripts."""
+    return {instance: model for instance, _, model, _, _ in profile.members}
 
 
 class ProfileError(ValueError):

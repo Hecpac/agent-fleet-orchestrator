@@ -86,6 +86,20 @@ SAFE_FEATURE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SAFE_DECISION_OPTION = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_OID = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+# Herdr profile facts the ledger validator pins without importing the catalog;
+# tests/test_fleet_herdr_profile_catalog.py keeps them equal to fleet_herdr_profile.
+VERSIONED_HERDR_PROFILE_IDS = frozenset({"astra_sol_research_v1", "sol_minimal_v1"})
+PHYSICAL_SCOPE_PROFILE_ID = "sol_minimal_v1"
+# profile_id -> (minimum_archive_schema_version, permissions_policy_version, required_turns)
+VERSIONED_FINALIZATION_CONTRACTS = {
+    "astra_sol_research_v1": (6, 3, 6),
+    "sol_minimal_v1": (7, 4, 1),
+}
+LEGACY_FINALIZATION_CONTRACT = {
+    "minimum_archive_schema_version": frozenset({3}),
+    "permissions_policy_version": frozenset({1, 2}),  # 2: legacy capsule execution
+    "required_turns": frozenset({5}),
+}
 MISSION_LEDGER_TEMP = re.compile(
     r"^\.mission\.jsonl\.(?:[0-9a-f]{32}|[0-9a-f]{64})\.tmp$"
 )
@@ -645,12 +659,12 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
             _require_sha(payload["sdd_plan_sha256"], "sdd_plan_sha256")
         if "scope_contract_sha256" in payload:
             _require_sha(payload["scope_contract_sha256"], "scope_contract_sha256")
-            if payload.get("herdr_profile") != "sol_minimal_v1":
-                raise MissionStateError("physical scope v1 requires sol_minimal_v1")
+            if payload.get("herdr_profile") != PHYSICAL_SCOPE_PROFILE_ID:
+                raise MissionStateError(f"physical scope v1 requires {PHYSICAL_SCOPE_PROFILE_ID}")
         if ("herdr_profile" in payload) is not ("herdr_profile_sha256" in payload):
             raise MissionStateError("Herdr profile creation binding is incomplete")
         if "herdr_profile" in payload:
-            if payload["herdr_profile"] not in {"astra_sol_research_v1", "sol_minimal_v1"}:
+            if payload["herdr_profile"] not in VERSIONED_HERDR_PROFILE_IDS:
                 raise MissionStateError("unsupported Herdr profile creation binding")
             _require_sha(payload["herdr_profile_sha256"], "herdr_profile_sha256")
         validate_target_repo(payload["target_repo"])
@@ -870,20 +884,14 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
             raise MissionStateError("Herdr finalization policy fields are invalid")
         _require_sha(payload["compiled_digest"], "Herdr finalization compiled_digest")
         if fields == versioned:
-            contracts = {
-                "astra_sol_research_v1": (6, 3, 6),
-                "sol_minimal_v1": (7, 4, 1),
-            }
-            expected = contracts.get(payload["herdr_profile"])
+            expected = VERSIONED_FINALIZATION_CONTRACTS.get(payload["herdr_profile"])
             if (expected is None or any(type(payload[field]) is not int or payload[field] != value
                     for field, value in zip(("minimum_archive_schema_version",
                                              "permissions_policy_version", "required_turns"), expected))):
                 raise MissionStateError("unsupported versioned Herdr finalization policy")
             _require_sha(payload["herdr_profile_sha256"], "Herdr profile digest")
         else:
-            for field, expected in (("minimum_archive_schema_version", 3),
-                                    ("permissions_policy_version", 1), ("required_turns", 5)):
-                allowed = {1, 2} if field == "permissions_policy_version" else {expected}
+            for field, allowed in LEGACY_FINALIZATION_CONTRACT.items():
                 if type(payload[field]) is not int or payload[field] not in allowed:
                     raise MissionStateError("unsupported Herdr finalization policy")
     elif kind == "herdr_archive_selected":

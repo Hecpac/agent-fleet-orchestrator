@@ -250,8 +250,9 @@ def create_mission(
     scope_pin = None
     if options.get("scope_contract") is not None:
         import fleet_herdr_scope
-        if compiled["resolved"]["preset"] != "sol_minimal_v1":
-            raise MissionError("physical scope v1 requires sol_minimal_v1")
+        scope_preset = fleet_herdr_profile.PHYSICAL_SCOPE_PROFILE.preset
+        if compiled["resolved"]["preset"] != scope_preset:
+            raise MissionError(f"physical scope v1 requires {scope_preset}")
         scope_pin = fleet_herdr_scope.digest(fleet_herdr_scope.validate(options["scope_contract"]))
     if not runs_dir.exists():
         state.ensure_private_directory(runs_dir)
