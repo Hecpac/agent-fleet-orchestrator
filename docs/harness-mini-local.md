@@ -1,7 +1,9 @@
 # Mini: conformidad local y preparación de piloto
 
-El perfil opt-in `harness_mini_local_v2` usa el owner-cycle v3. Su transporte
-admitido es local y sintético. El gate de transporte real Herdr permanece cerrado.
+El perfil opt-in `harness_mini_local_v2` usa el owner-cycle v3 local y sintético.
+`harness_mini_herdr_v1` añade owner-cycle v4 y un proceso CONTROL exclusivo
+lanzado por Herdr. El transporte nativo v2 por pane conserva su gate: Herdr
+no ofrece el envío/cancelación condicional que ese contrato requiere.
 La configuración solicitada del modelo y su identidad observada son campos
 distintos; las pruebas sintéticas no acreditan identidad, calidad ni facturación.
 
@@ -17,6 +19,9 @@ FLEET_HARNESS_LOCAL_TESTS=1 python3 -B -m unittest \
   tests.test_fleet_harness_recovery tests.test_fleet_harness_mini \
   tests.test_fleet_harness_executor tests.test_fleet_harness_cycle \
   tests.test_fleet_harness_campaign tests.test_fleet_harness_https
+FLEET_HARNESS_LOCAL_TESTS=1 python3 -B -m unittest \
+  tests.test_fleet_harness_control tests.test_fleet_harness_live_budget \
+  tests.test_fleet_harness_live_cycle tests.test_fleet_harness_live_campaign
 ```
 
 Las pruebas crean repositorios Git desechables como fixtures; no crean commits
@@ -85,6 +90,14 @@ Cada final conserva el original Mini, su extracción y vínculos con admisión,
 tarea, herramientas, revisión y solicitudes/respuestas HTTP. El replay exige
 conservar las reservas de los intentos anteriores, incluidos los inválidos.
 El owner journal mantiene la autoridad de admisión, revisión y cierre.
+Los nuevos deliveries fallidos pueden incluir `mini-public-failure-v1`: distingue
+una respuesta `length` vacía y sin acciones del límite de solicitudes agotado.
+El diagnóstico deriva esperado/observado de los originales verificados y fija
+admisión, revisión previa (o `null`) y presupuesto. No copia razonamiento ni texto
+del proveedor. `response_sha256` identifica el objeto JSON canónico; el hash del
+presupuesto vincula los bytes HTTP originales. La reparación recibe ese
+diagnóstico, sin renovar límites ni convertir un fallo en una entrega válida.
+Los deliveries históricos sin suplemento conservan su clasificación original.
 En el perfil v2, un evento `input_snapshot` conserva el inventario de entrada de
 cada admisión antes del envío. Recuperar no vuelve a capturarlo. La primera
 herramienta debe coincidir con esos hashes y tamaños; las publicaciones enlazan
@@ -143,10 +156,120 @@ resolver separado sin credenciales, identidad del hijo, terminación y originale
 una IP fijada, sin fallback; TLS con hostname/SAN verificados; `exchange()`
 conserva el socket también durante la lectura del cuerpo. El reloj monotónico
 limita DNS y HTTP además del deadline civil. La vigencia de cinco minutos es una
-política local, no un TTL observado. La preparación incompleta no se reintenta
-en el mismo directorio. Todavía falta vincular este transporte al contrato live
-admitido por CONTROL y a su archivo de autorización: el ledger v1 rechaza toda
-solicitud live, incluso si recibe una credencial o un diccionario de aprobación.
+política local, no un TTL observado. La preparación DNS incompleta no se reintenta
+en el mismo directorio. El ledger v1 sigue rechazando solicitudes live. El ledger
+v2 usa v1 exclusivamente como subledger financiero; vincula el HTTPS propio a la
+admisión, payload completo, generación, lanzamiento Herdr, reloj original y
+aprobación externa fijada.
+
+## Supervisor CONTROL v4
+
+```sh
+python3 -B scripts/fleet_harness_live_campaign.py prepare /RUTA/NUEVA/piloto \
+  --mode synthetic_tls
+python3 -B scripts/fleet_harness_live_campaign.py validate /RUTA/NUEVA/piloto \
+  --plan-sha256 HASH_DEVUELTO
+```
+
+Esta preparación genera `owned-control-plugin.toml`. Con autorización de registro,
+se enlaza ese manifiesto al plugin propio `fleet.harness-control-e4` y se abre su
+entrypoint `supervisor` en un tab propio, con `--no-focus`. El supervisor comprueba
+los originales Herdr del proceso exacto, argv, cwd y terminal antes de enviar.
+El `flock` continuo de CONTROL, su identidad de proceso y la raíz física sostienen
+la exclusividad; la observación Herdr es procedencia del lanzamiento. Una copia
+de un recibo, de la raíz, o un guard heredado por fork no confieren autoridad.
+
+Las reservas, envíos, originales TLS y generaciones son inmutables. Una caída
+tras reservar/enviar sin respuesta reconciliable mantiene consumo desconocido y
+bloquea el reenvío. Una respuesta completa retenida se verifica antes de usarla.
+Los mensajes derivados conservan `reasoning_content`; no se alteran los originales
+del proveedor. El deadline monotónico está ligado al boot original: reiniciar
+el proceso no lo renueva; un cambio de boot requiere una dependencia explícita.
+
+La proyección `deepseek-mini-wire-v3` admite el campo opcional `index` observado
+en llamadas de herramientas de la API: exige enteros exactos consecutivos en el
+orden recibido y lo retira únicamente de la copia derivada. No reordena acciones,
+no cambia IDs ni argumentos y no elimina campos desconocidos. El contrato de
+presupuesto fija la versión; las evidencias v2 conservan su interpretación y
+rechazo originales. Cambiar el adaptador requiere una preparación nueva; no
+reabre un intento agotado ni renueva autorización, presupuesto o deadline.
+
+El transporte conserva 30 segundos para conexión, handshake y envío. Una vez
+enviado el request, esperar headers y cuerpo utiliza el tiempo restante del
+deadline original y de la vigencia DNS, con límite monotónico y cancelación del
+socket exacto. No impone 30 segundos de silencio a una inferencia en curso ni
+renueva tiempo por bloque. Una respuesta incompleta sigue reteniendo su reserva
+y bloqueando reenvíos; esta corrección no recupera respuestas ya perdidas.
+El guardian interrumpe el socket; el hilo de la operación cierra los buffers HTTP
+para evitar cierres concurrentes. El ejecutor de comandos requiere EOF y salida
+del hijo antes de informar terminación normal. Reserva dentro del mismo deadline
+tiempo para reap y respuesta RPC; truncación y timeout son observaciones distintas.
+
+La preparación live usa `--mode live --pricing-evidence ARCHIVO`. No admite gasto
+ni lee la clave. `--credential-source file` declara alternativamente el archivo
+privado `provider-key` en la raíz CONTROL, con modo 0600, propietario actual y un
+solo link; rechaza symlinks. El contenido no entra en argv, manifiestos, candidatos
+ni evidencia. Esta opción permite cargar la clave sin cambiar el entorno global
+de Herdr. El operador crea ese archivo mediante entrada oculta, fuera del chat.
+Una autorización humana concreta permite posteriormente el
+ingreso `authorize --human-authorization-reference REFERENCIA`, ligado al hash
+exacto y a los límites preparados. Por defecto son dos tareas, 12 solicitudes,
+20 minutos y USD 1,20 de reservas estimadas. `prepare --requests-per-task 12`
+prepara 24 solicitudes y USD 2,40, repartidos por igual entre D1/D2. Admite de
+1 a 30 solicitudes por tarea, dentro del límite existente de tokens; cada una
+reserva USD 0,10. El presupuesto y los límites de tiempo y reparaciones siguen
+compartidos por todos los intentos. Esta opción sólo configura una preparación
+nueva: no altera ejecuciones previas ni reutiliza su aprobación. El ingreso
+revalida cada presupuesto de tarea, los agregados y la identidad de la campaña.
+La opción opt-in `--output-profile thinking-32k-v1` fija `max_tokens=32768`
+mediante `deepseek-mini-wire-v4`, conservando thinking/max. Reserva 131072 tokens
+y USD 0,20 por solicitud: con 12 solicitudes por tarea prepara 24 solicitudes y
+USD 4,80 en total. Permite hasta 15 solicitudes por tarea para conservar el tope
+original de dos millones de tokens. Un request debe caber completo (bytes JSON,
+1024 de margen y salida máxima) dentro de su reserva; el exceso se rechaza antes
+del envío. La reserva anterior de 65536 no basta para 32K de salida y algunos
+prompts observados. No cambia el deadline, los intentos ni las reglas de aceptación.
+
+El perfil anterior `legacy-8k` y los lectores wire-v2/v3 conservan 8192 de salida;
+el nuevo perfil requiere CONTROL, nunca el supervisor local histórico. Su
+preparación y aprobación incluyen el perfil, reservas y coste nuevos. Un pago
+anterior no lo autoriza. Los tests sintéticos demuestran configuración, rechazo
+de excesos, entrega y recuperación; no demuestran que 32K basten para DeepSeek.
+La [API oficial](https://api-docs.deepseek.com/api/create-chat-completion/)
+permite salidas mayores; este límite opt-in es una decisión experimental acotada,
+no el máximo ni el default del proveedor. El presupuesto de salida puede seguir
+agotándose y los deadlines originales siguen aplicándose.
+
+La referencia segura (`env:DEEPSEEK_API_KEY` o el archivo exacto) sólo se resuelve
+en CONTROL y después de comprobar la autorización.
+Los casos privados no se montan ni se entregan a Mini. Los controles sintéticos
+restauran código conocido; su éxito no acredita calidad de DeepSeek.
+
+```sh
+python3 -B scripts/fleet_harness_live_campaign.py cancel /RUTA/piloto \
+  --plan-sha256 HASH
+python3 -B scripts/fleet_harness_live_campaign.py reconcile /RUTA/piloto \
+  --plan-sha256 HASH
+python3 -B scripts/fleet_harness_live_campaign.py source-review /RUTA/piloto \
+  --plan-sha256 HASH --task D1 --binding-sha256 CHECK_ACTUAL --review REVISION.json
+python3 -B scripts/fleet_harness_live_campaign.py verify /RUTA/piloto \
+  --plan-sha256 HASH
+```
+
+La cancelación detiene toda la campaña serial. `reconcile` no carga credenciales,
+no envía solicitudes y sólo limpia recursos ligados a admisiones/checks del
+journal, rutas de creación y CIDs propios. Continúa con la otra tarea si un
+registro falla; el resultado conserva la dependencia. No contar un error de
+observación como ausencia. `source-review` admite un suplemento independiente
+de los bytes congelados actuales; no ejecuta el candidato ni concede aceptación.
+La reanudación desde el mismo plugin conserva presupuesto y reloj, incluido el
+tiempo usado en revisión. Un timeout sigue siendo agotamiento.
+
+`control-completed.json` requiere archivos aceptados de ambas tareas, servicios
+locales drenados y release de la generación exacta. La recuperación puede completar
+un release faltante sólo tras verificar los archivos y la muerte del proceso
+anterior. Una señal en memoria aún no persistida puede perderse con el proceso;
+la solicitud durable es la frontera de cancelación confirmada.
 
 La comparación posterior de 12 tareas × 3 repeticiones por configuración debe
 cubrir las familias del playbook y fijar rúbricas para tareas generales. Estas

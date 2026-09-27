@@ -31,6 +31,7 @@ TOOLS = [{"type":"function", "function":{"name":"bash", "description":"Run a com
 
 class LocalHarnessBackend:
     supports_functional = True
+    delivery_version = delivery.VERSION
 
     def __init__(self, cycle, *, endpoint, dependencies, source_admissions=(), fault=None):
         self.cycle = cycle
@@ -63,6 +64,18 @@ class LocalHarnessBackend:
 
     def _fault(self, name):
         if self.fault: self.fault(name)
+
+    def _payload(self,trajectory):
+        return {"model":"deepseek-flash", "max_tokens":8192, "stream":False,
+            "messages":[{k:v for k,v in m.items() if k in {"role","content","tool_calls","tool_call_id"}}
+                        for m in trajectory["messages"]], "tools":TOOLS,
+            "thinking":{"type":"enabled"}, "reasoning_effort":"max"}
+
+    def _request(self,logical,admission,payload):
+        return self.ledger.request(logical,work.digest(admission),payload,endpoint=self.endpoint,synthetic=True,fault=self.fault)
+
+    def _response(self,retained):
+        return fleet_json.loads(base64.b64decode(retained["body_b64"],validate=True))
 
     def _stopped(self):
         return time.time() >= self.contract["deadline_at"] or (self.ledger.root / "revoked.json").exists()
@@ -158,18 +171,14 @@ class LocalHarnessBackend:
                 logical = work.digest(admission) + "/query/" + str(index)
                 response = self._read(step, "response.json", optional=True)
                 if response is None:
-                    payload = {"model":"deepseek-flash", "max_tokens":8192, "stream":False,
-                        "messages":[{k:v for k,v in m.items() if k in {"role","content","tool_calls","tool_call_id"}}
-                                    for m in control.trajectory["messages"]], "tools":TOOLS,
-                        "thinking":{"type":"enabled"}, "reasoning_effort":"max"}
+                    payload = self._payload(control.trajectory)
                     reconciled = self.ledger.reconcile(logical)
                     if reconciled["status"] == "response_retained":
                         retained = reconciled["response"]
                     else:
-                        retained = self.ledger.request(logical, work.digest(admission), payload,
-                            endpoint=self.endpoint, synthetic=True, fault=self.fault)
+                        retained = self._request(logical,admission,payload)
                     if retained["http_status"] != 200: raise budget.BudgetError("provider rejected request")
-                    response = fleet_json.loads(base64.b64decode(retained["body_b64"], validate=True))
+                    response = self._response(retained)
                     sandbox.publish(step, "response.json", response)
                 if control.trajectory["messages"][-1]["role"] != "assistant":
                     actions = control.query(response)
@@ -202,7 +211,7 @@ class LocalHarnessBackend:
             terminal = control.terminal()
             controls = self._cleanup(root, admission)
             tools = [item for step in sorted((root / "steps").iterdir()) for item in (self._read(step, "tools.json", optional=True) or [])]
-            value = {"version":delivery.VERSION, "admission":admission, "task":intent["task"], "error":None,
+            value = {"version":self.delivery_version, "admission":admission, "task":intent["task"], "error":None,
                 "terminal":terminal, "native_terminal_b64":base64.b64encode((control.root / f"native/{control.ordinal:04d}.json").read_bytes()).decode(),
                 "controls":controls, "tools":tools, "budget":self.ledger.summary(),"budget_originals":self.ledger.originals()}
             sandbox.publish(root, "delivery.json", value)
@@ -216,9 +225,12 @@ class LocalHarnessBackend:
             sandbox.publish(root, "dependency.json", {"reason":"provider_send_indeterminate; retained reservation; no resend"})
         except (ValueError, OSError, RuntimeError) as exc:
             controls = self._cleanup(root, admission)
-            value = {"version":delivery.VERSION, "admission":admission, "task":intent["task"],
+            value = {"version":self.delivery_version, "admission":admission, "task":intent["task"],
                 "error":type(exc).__name__+":"+str(exc)[:500], "controls":controls, "terminal":None,
                 "budget":self.ledger.summary(),"budget_originals":self.ledger.originals()}
+            report = delivery.public_failure(value, contract=self.contract, admission=admission)
+            if report is not None:
+                value["public_failure"] = report
             sandbox.publish(root, "delivery.json", value)
 
     def _restore_tools(self,step,admission,response,outputs,*,expected_before):
@@ -253,8 +265,11 @@ class LocalHarnessBackend:
             if not (resource / "resource.json").exists(): continue
             record = self._read(resource, "resource.json")
             sandbox.Sandbox(resource, owner=record["owner"]).cleanup()
+        if not self._transport_quiescent():raise RuntimeError("owned provider transport cleanup remains unconfirmed")
         sandbox.publish(root,"quiescence.json",{"resource":runtime.resource(admission),"inactive":True,"resources_clean":True})
         return receipts
+
+    def _transport_quiescent(self):return True
 
     def poll(self, admission):
         root = self._attempt(admission)

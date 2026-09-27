@@ -13,21 +13,37 @@ import fleet_harness_read_scope as read_scope
 import fleet_harness_acceptance as checker
 
 VERSION = "owner-mini-delivery-v1"
+CONTROL_VERSION = "owner-mini-delivery-v2"
+FAILURE_VERSION = "mini-public-failure-v1"
+
+
+def _budget(originals,limits,contract_sha256=None):
+    if limits.get("version")=="harness-budget-v2":
+        from fleet_harness_live_budget import verify_originals
+        return verify_originals(originals,limits,contract_sha256=contract_sha256)
+    return budget.verify_originals(originals,limits)
+
+
+def _budget_files(originals,limits):
+    if limits.get("version")=="harness-budget-v2":
+        return {directory+"/"+name:value for directory in ("financial","control") for name,value in originals[directory].items()}
+    return originals
 
 
 def verify_continuity(raw, predecessors, *, limits, admission):
     """Invalid protocol attempts consume the same immutable reservation history."""
     current=fleet_json.loads(raw)["budget_originals"]
-    _,rows=budget.verify_originals(current,limits)
+    _,rows=_budget(current,limits,admission["contract_sha256"])
+    current_files=_budget_files(current,limits)
     allowed={work.digest(admission)};old_calls=set()
     for previous,previous_admission in predecessors:
         previous_value=fleet_json.loads(previous)
         if work.digest(previous_value["admission"])!=work.digest(previous_admission):raise ValueError("foreign predecessor admission")
         earlier=previous_value["budget_originals"]
-        _,earlier_rows=budget.verify_originals(earlier,limits)
+        _,earlier_rows=_budget(earlier,limits,admission["contract_sha256"])
         allowed.add(work.digest(previous_admission))
         old_calls.update(r["reservation"]["id"] for r in earlier_rows)
-        if any(current.get(name)!=value for name,value in earlier.items()):
+        if any(current_files.get(name)!=value for name,value in _budget_files(earlier,limits).items()):
             raise ValueError("request budget dropped or changed an earlier attempt")
     for row in rows:
         record=row["reservation"];pin=record["admission"];logical=record["logical_id"]
@@ -38,19 +54,85 @@ def verify_continuity(raw, predecessors, *, limits, admission):
             raise ValueError("request lacks registered admission/query provenance")
 
 
+def public_failure(value, *, contract, admission):
+    """Derive bounded repair facts, never provider text or acceptance authority.
+
+    Only new failed deliveries opt in. Historical deliveries without this
+    supplement retain their original classification and archive semantics.
+    """
+    error = value.get("error")
+    if error not in {"InvalidTerminal:bounded native action batch required",
+                     "BudgetError:shared request budget exhausted"}:
+        return None
+    limits = contract["request_budget"]
+    measured, rows = _budget(value["budget_originals"], limits, work.digest(contract))
+    if work.digest(measured) != work.digest(value["budget"]):
+        raise ValueError("budget summary differs from originals")
+    report = {"version": FAILURE_VERSION, "admission_sha256": work.digest(admission),
+              "revision_sha256": admission["parent_revision"],
+              "budget_sha256": work.digest(value["budget_originals"])}
+    if error == "BudgetError:shared request budget exhausted":
+        financial_limits = limits["financial"] if limits.get("version") == "harness-budget-v2" else limits
+        if measured["admitted_requests"] != financial_limits["max_requests"]:
+            return None
+        return {**report, "category": "request_limit_exhausted",
+                "expected": {"requests_before_next_send_less_than": financial_limits["max_requests"]},
+                "observed": {"admitted_requests": measured["admitted_requests"],
+                             "new_send_permitted": False}}
+    current = []
+    prefix = work.digest(admission) + "/query/"
+    for row in rows:
+        reservation = row["reservation"]
+        if reservation["admission"] != work.digest(admission):
+            continue
+        suffix = reservation["logical_id"].removeprefix(prefix)
+        if (not suffix.isascii() or not suffix.isdecimal() or not 1 <= int(suffix) <= 32
+                or reservation["logical_id"] != prefix + str(int(suffix))):
+            raise ValueError("failure response lacks exact query provenance")
+        current.append((int(suffix), row))
+    if not current:
+        return None
+    _, last = max(current, key=lambda item: item[0])
+    response = last["response"]
+    if (not isinstance(response, dict) or not isinstance(response.get("choices"), list)
+            or len(response["choices"]) != 1 or not isinstance(response["choices"][0], dict)):
+        return None
+    choice = response["choices"][0]; message = choice.get("message")
+    if (choice.get("finish_reason") != "length" or not isinstance(message, dict)
+            or message.get("role") != "assistant" or message.get("content") != ""
+            or message.get("tool_calls") not in (None, [])):
+        return None
+    return {**report, "category": "output_truncated_without_action",
+            "call_id": last["reservation"]["id"], "response_sha256": work.digest(response),
+            "expected": {"native_bash_calls_min": 1, "native_bash_calls_max": 16},
+            "observed": {"finish_reason": "length", "content_empty": True, "tool_calls": 0,
+                         "max_output_tokens": last["payload"]["max_tokens"]}}
+
+
 def verify_terminal(raw, final, *, contract, admission):
     value = fleet_json.loads(raw)
-    if (not isinstance(value, dict) or value.get("version") != VERSION
+    controlled=contract["version"]=="owner-cycle-contract-v4"
+    version=CONTROL_VERSION if controlled else VERSION
+    if (not isinstance(value, dict) or value.get("version") != version
             or work.digest(value.get("admission")) != work.digest(admission)
-            or work.digest(value.get("task")) != admission["prompt_sha256"]
-            or value.get("error") is not None):
+            or work.digest(value.get("task")) != admission["prompt_sha256"]):
         raise ValueError("invalid or foreign Mini delivery")
+    if value.get("error") is not None:
+        if "public_failure" in value:
+            derived = public_failure(value, contract=contract, admission=admission)
+            if (derived is None or work.digest(derived) != work.digest(value["public_failure"])
+                    or final != b"" or value.get("terminal") is not None):
+                raise ValueError("invalid public Mini failure report")
+            raise ValueError(fleet_json.canonical_bytes(derived).decode())
+        raise ValueError("invalid or foreign Mini delivery")
+    if "public_failure" in value:
+        raise ValueError("failure report cannot accompany a successful delivery")
     terminal = value["terminal"]
     task = fleet_json.canonical_bytes(value["task"]).decode()
     derived = mini.recover_mini(terminal["trajectory"], terminal["runner"], task=task,
         expected_template_sha256=mini.digest(mini.TEMPLATE.encode()))
     messages = terminal["trajectory"]["messages"]
-    measured,requests=budget.verify_originals(value["budget_originals"],contract["request_budget"])
+    measured,requests=_budget(value["budget_originals"],contract["request_budget"],work.digest(contract))
     if work.digest(measured)!=work.digest(value["budget"]): raise ValueError("budget summary differs from originals")
     current={r["reservation"]["logical_id"]:r for r in requests if r["reservation"]["admission"]==work.digest(admission)}
     index=0
@@ -59,8 +141,15 @@ def verify_terminal(raw, final, *, contract, admission):
         index+=1; logical=work.digest(admission)+"/query/"+str(index)
         request=current.pop(logical,None)
         prefix=[{k:v for k,v in m.items() if k in {"role","content","tool_calls","tool_call_id"}} for m in messages[:offset]]
+        if controlled:
+            from fleet_harness_provider_protocol import messages as wire_messages, normalize, payload as wire_payload
+            from fleet_harness_backend import TOOLS
+            wire_version=contract["request_budget"]["wire_version"]
+            prefix=wire_messages(messages[:offset],version=wire_version)
+            if request is not None and work.digest(request["payload"])!=work.digest(wire_payload(messages[:offset],TOOLS,version=wire_version)):
+                raise ValueError("provider payload differs from pinned tools/thinking/effort protocol")
         if (request is None or request["http_status"]!=200
-                or work.digest(request["response"])!=work.digest(message["extra"]["response"])
+                or work.digest(normalize(request["response"],version=wire_version) if controlled else request["response"])!=work.digest(message["extra"]["response"])
                 or work.digest(prefix)!=work.digest(request["payload"]["messages"])):
             raise ValueError("native query differs from reserved provider exchange")
     if current or not index:raise ValueError("unaccounted provider request")
@@ -180,10 +269,12 @@ def verify_terminal(raw, final, *, contract, admission):
                     or matching[0]["extra"]["returncode"] != output["returncode"]):
                 raise ValueError("native tool observation differs from executor")
     requested = copy.deepcopy(contract["runtime"])
-    result={"version":VERSION, "requested":requested, "observed":{"cli":"mini-swe-agent", "cli_version":"2.4.6",
+    result={"version":version, "requested":requested, "observed":{"cli":"mini-swe-agent", "cli_version":"2.4.6",
         "provider_model":"NOT_VERIFIED", "effort":"NOT_VERIFIED"},
         "identity_provenance":"CONTROL admission; native Mini originals; synthetic provider has no model identity",
         "transcript_sha256":mini.digest(raw), "usage":value["budget"], "authority":"none"}
+    if controlled:
+        result["identity_provenance"]="Owned Herdr CONTROL and native Mini originals; provider response metadata is not independent model identity"
     if "public_read" in contract["prepared"]["sources"]:
         if first_files is None or last_files is None:raise ValueError("delivery has no completed executor effects")
         result["effects"]={"before":first_files,"after":last_files}

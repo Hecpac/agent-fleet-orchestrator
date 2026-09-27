@@ -1,6 +1,7 @@
 """Offline transport preparation only; no DNS service or model calls."""
 import copy
 import json
+import os
 from pathlib import Path
 import socket
 import ssl
@@ -23,6 +24,87 @@ class HTTPSTests(unittest.TestCase):
         return {"version":https.VERSION,"endpoint":https.ENDPOINT,"method":"POST","hostname":https.HOST,"port":443,
             "family":int(socket.AF_INET),"address":"1.1.1.1","resolved_at":now-1,"expires_at":now+30,
             "owner":str(uuid.uuid4()),"resolution_sha256":"a"*64,"tls":"CERT_REQUIRED+check_hostname"}
+
+    def delayed_response(self,phase,delay,*,seconds,stopped=lambda:False,dns_seconds=50):
+        client,peer=socket.socketpair();client.settimeout(50);peer.settimeout(2)
+        policy=self.policy();policy["expires_at"]=time.time()+dns_seconds
+        connection=https.NumericHTTPS(policy,deadline_at=time.time()+seconds,stopped=stopped)
+        release=threading.Event();received=[];errors=[]
+        def connect():connection.sock=client;connection.active_socket=client
+        def serve():
+            try:
+                raw=b""
+                while b"\r\n\r\n" not in raw:raw+=peer.recv(4096)
+                while len(raw.partition(b"\r\n\r\n")[2])<2:raw+=peer.recv(4096)
+                received.append(raw)
+                header=b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: "+(b"keep-alive" if phase=="keepalive-body" else b"close")+b"\r\n\r\n"
+                if phase=="headers":release.wait(delay);peer.sendall(header+b"{}")
+                else:peer.sendall(header);release.wait(delay);peer.sendall(b"{}")
+            except OSError as exc:errors.append(type(exc).__name__)
+            finally:peer.close()
+        thread=threading.Thread(target=serve);thread.start()
+        return connection,connect,thread,release,received,errors
+
+    @unittest.skipUnless(os.environ.get("FLEET_HARNESS_LOCAL_TESTS")=="1","explicit local slow HTTP regression")
+    def test_response_silence_over_30_seconds_keeps_one_original_request(self):
+        # Real wall time reproduces the provider failure; all three socket
+        # ownership paths run concurrently and never contact a provider.
+        results={}
+        def probe(phase):
+            connection,connect,thread,release,received,errors=self.delayed_response(phase,31,seconds=45)
+            start=time.monotonic();original=(connection.deadline_at,connection.monotonic_deadline)
+            try:
+                with mock.patch.object(connection,"connect",connect):result=connection.exchange(b"{}")
+                results[phase]={"result":result,"outcome":connection.retained_outcome(),"requests":len(received),
+                    "elapsed":time.monotonic()-start,"same_deadlines":original==(connection.deadline_at,connection.monotonic_deadline),"errors":errors}
+            except BaseException as exc:results[phase]={"failure":repr(exc)}
+            finally:release.set();connection.abort();thread.join(2)
+        workers=[threading.Thread(target=probe,args=(phase,)) for phase in ("headers","close-body","keepalive-body")]
+        for worker in workers:worker.start()
+        for worker in workers:worker.join(50)
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(set(results),{"headers","close-body","keepalive-body"})
+        for phase,value in results.items():
+            with self.subTest(phase=phase):
+                self.assertNotIn("failure",value)
+                self.assertEqual(value["result"],{"http_status":200,"body":b"{}"})
+                self.assertTrue(value["outcome"]["response_complete"] and value["outcome"]["transport_closed"])
+                self.assertTrue(value["same_deadlines"]);self.assertEqual(value["requests"],1)
+                self.assertGreaterEqual(value["elapsed"],30);self.assertLess(value["elapsed"],45)
+                self.assertEqual(value["errors"],[])
+
+    def test_revocation_interrupts_silent_headers_and_transferred_body(self):
+        for phase in ("headers","close-body","keepalive-body"):
+            with self.subTest(phase=phase):
+                revoked=threading.Event()
+                connection,connect,thread,release,received,_=self.delayed_response(phase,1,seconds=10,stopped=revoked.is_set)
+                timer=threading.Timer(.15,revoked.set);timer.start();start=time.monotonic()
+                close_threads=[];original_close=connection.close
+                def close():close_threads.append(threading.get_ident());original_close()
+                try:
+                    with mock.patch.object(connection,"connect",connect),mock.patch.object(connection,"close",side_effect=close):
+                        with self.assertRaises((TimeoutError,OSError,https.http.client.HTTPException)):connection.exchange(b"{}")
+                    self.assertLess(time.monotonic()-start,.8)
+                    self.assertEqual(set(close_threads),{threading.get_ident()})
+                    observed=connection.retained_outcome()
+                    self.assertFalse(observed["response_complete"]);self.assertTrue(observed["transport_closed"])
+                    self.assertEqual(len(received),1)
+                    with self.assertRaisesRegex(ValueError,"cannot be repeated"):connection.exchange(b"{}")
+                finally:timer.cancel();release.set();connection.abort();thread.join(2)
+
+    def test_dns_expiry_bounds_silent_headers_and_body_before_task_deadline(self):
+        for phase in ("headers","close-body"):
+            with self.subTest(phase=phase):
+                connection,connect,thread,release,received,_=self.delayed_response(phase,1,seconds=10,dns_seconds=.15)
+                start=time.monotonic()
+                try:
+                    with mock.patch.object(connection,"connect",connect):
+                        with self.assertRaises((TimeoutError,ValueError,OSError,https.http.client.HTTPException)):connection.exchange(b"{}")
+                    self.assertLess(time.monotonic()-start,.8)
+                    observed=connection.retained_outcome()
+                    self.assertFalse(observed["response_complete"]);self.assertTrue(observed["transport_closed"])
+                    self.assertEqual(len(received),1)
+                finally:release.set();connection.abort();thread.join(2)
 
     def test_endpoint_numeric_identity_and_freshness_are_fixed(self):
         for key,value in (("port",8443),("method","GET"),("hostname","localhost"),("address","127.0.0.1"),("address","api.deepseek.com"),("family",True),("tls","insecure"),("expires_at",0),("resolution_sha256","z"*64)):
@@ -132,6 +214,15 @@ class HTTPSTests(unittest.TestCase):
                 with self.assertRaises((TimeoutError,OSError,https.http.client.HTTPException)):
                     connection.exchange(b"{}")
             self.assertLess(time.monotonic()-start,.25)
+            retained=connection.retained_outcome()
+            self.assertEqual(retained["http_status"],200)
+            self.assertGreater(len(retained["body"]),0)
+            self.assertLess(len(retained["body"]),8)
+            self.assertFalse(retained["response_complete"])
+            self.assertTrue(retained["transport_closed"])
+            retained["body"]=b"forged"
+            self.assertNotEqual(connection.retained_outcome()["body"],b"forged")
+            with self.assertRaisesRegex(ValueError,"cannot be repeated"):connection.exchange(b"{}")
         finally:connection.abort();thread.join(2)
 
     def test_civil_clock_rollback_cannot_extend_dns_or_http(self):
@@ -177,6 +268,44 @@ class HTTPSTests(unittest.TestCase):
         with mock.patch.object(https.socket,"socket",return_value=raw):
             with self.assertRaisesRegex(RuntimeError,"guardian failed"):connection.exchange(b"{}")
         wrapped.do_handshake.assert_not_called();self.assertFalse(connection.http_started)
+
+    def test_partial_timeout_and_cleanup_failure_keep_both_causes(self):
+        connection=https.NumericHTTPS(self.policy(),deadline_at=time.time()+2,stopped=lambda:False)
+        response=mock.Mock(status=200,length=100)
+        response.read1.side_effect=[b"prefix",TimeoutError("read failed")]
+        with mock.patch.object(connection,"connect"),mock.patch.object(connection,"request"),mock.patch.object(connection,"getresponse",return_value=response),mock.patch.object(connection,"abort",side_effect=OSError("close failed")):
+            with self.assertRaises(OSError):connection.exchange(b"{}")
+        observed=connection.retained_outcome()
+        self.assertEqual(observed["body"],b"prefix")
+        self.assertEqual(observed["transport_error"],"TimeoutError")
+        self.assertEqual(observed["cleanup_errors"],["OSError"])
+        self.assertEqual(observed["guardian_errors"],[])
+        self.assertFalse(observed["transport_closed"])
+        self.assertFalse(observed["response_complete"])
+        self.assertEqual(observed["observed_body_bytes"],6)
+        self.assertFalse(observed["body_truncated"])
+
+    def test_connect_and_early_close_failures_are_retained(self):
+        connection=https.NumericHTTPS(self.policy(),deadline_at=time.time()+2,stopped=lambda:False)
+        raw=mock.Mock();raw.connect.side_effect=TimeoutError("connect")
+        with mock.patch.object(https.socket,"socket",return_value=raw),mock.patch.object(connection,"close",side_effect=[OSError("early cleanup"),None]):
+            with self.assertRaises(OSError):connection.exchange(b"{}")
+        observed=connection.retained_outcome()
+        self.assertEqual(observed["transport_error"],"TimeoutError")
+        self.assertEqual(observed["cleanup_errors"],["OSError"])
+        self.assertFalse(observed["transport_closed"])
+
+    def test_interrupted_join_still_closes_response_and_retains_failure(self):
+        connection=https.NumericHTTPS(self.policy(),deadline_at=time.time()+2,stopped=lambda:False)
+        response=mock.Mock(status=200,length=0);response.read1.return_value=b""
+        watcher=mock.Mock();watcher.join.side_effect=KeyboardInterrupt()
+        with mock.patch.object(https.threading,"Thread",return_value=watcher),mock.patch.object(connection,"connect"),mock.patch.object(connection,"request"),mock.patch.object(connection,"getresponse",return_value=response):
+            with self.assertRaises(KeyboardInterrupt):connection.exchange(b"{}")
+        response.close.assert_called_once()
+        observed=connection.retained_outcome()
+        self.assertEqual(observed["cleanup_errors"],["KeyboardInterrupt"])
+        self.assertFalse(observed["transport_closed"])
+        self.assertFalse(observed["response_complete"])
 
 
 if __name__=="__main__":unittest.main()

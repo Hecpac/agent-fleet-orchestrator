@@ -270,6 +270,9 @@ def prepare(*, objective, candidate_repo, base_sha, compiled, acceptance_contrac
 
 def verify(prepared):
     """Check retained preparation without rereading mutable files or upgrading it."""
+    if isinstance(prepared, dict) and prepared.get("execution_envelope", {}).get("contract_version") == "owner-harness-envelope-v2":
+        from fleet_harness_live_contract import verify_prepared
+        return verify_prepared(prepared)
     if isinstance(prepared, dict) and prepared.get("execution_envelope", {}).get("contract_version") == "owner-harness-envelope-v1":
         from fleet_harness_contract import verify_prepared
         return verify_prepared(prepared)

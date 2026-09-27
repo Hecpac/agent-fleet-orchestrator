@@ -29,10 +29,68 @@ import fleet_safe_paths as safe
 import fleet_json
 import fleet_artifacts
 import fleet_harness_read_scope as read_scope
+import fleet_harness_provider_protocol as wire
 
 REPO=Path(__file__).resolve().parents[1]
 FIXTURES=REPO/"tests/fixtures/harness_v1"
 VERSION="harness-pilot-preparation-v2"
+REQUEST_RESERVE_NANO_USD=100_000_000
+
+
+def output_profile(name="legacy-8k"):
+    if name=="legacy-8k":
+        return {"max_output_tokens":8192,"reserve_tokens":65536,"reserve_nano_usd":REQUEST_RESERVE_NANO_USD,
+                "wire_version":wire.INDEXED_VERSION}
+    if name=="thinking-32k-v1":
+        return {"max_output_tokens":32768,"reserve_tokens":131072,"reserve_nano_usd":200_000_000,
+                "wire_version":wire.THINKING_32K_VERSION}
+    raise ValueError("unknown output profile")
+
+
+def request_count(value,*,profile="legacy-8k"):
+    # No profile increases the original two-million-token task authority.
+    maximum=2_000_000//output_profile(profile)["reserve_tokens"]
+    if type(value) is not int or not 1<=value<=maximum:
+        raise ValueError("requests_per_task must be an exact integer from 1 to "+str(maximum))
+    return value
+
+
+def financial_limits(*,cycle_id,deadline_at,requests,request_policy=None,profile="legacy-8k"):
+    selected=output_profile(profile);count=request_count(requests,profile=profile)
+    policy=dict(request_policy) if request_policy is not None else budget.contract(cycle_id=cycle_id,deadline_at=deadline_at)["request_policy"]
+    if request_policy is not None and (type(policy["max_output_tokens"]) is not int
+            or policy["max_output_tokens"]!=selected["max_output_tokens"]):
+        raise ValueError("request policy differs from output profile")
+    policy["max_output_tokens"]=selected["max_output_tokens"]
+    return budget.contract(cycle_id=cycle_id,deadline_at=deadline_at,max_requests=count,
+        estimated_cap_nano_usd=count*selected["reserve_nano_usd"],reserve_tokens_per_request=selected["reserve_tokens"],
+        reserve_nano_usd_per_request=selected["reserve_nano_usd"],request_policy=policy)
+
+
+def validate_budget_plan(plan):
+    tasks=plan.get("tasks")
+    if (not isinstance(tasks,list) or len(tasks)!=2 or any(not isinstance(t,dict) for t in tasks)
+            or [t.get("id") for t in tasks]!=["D1","D2"]):
+        raise ValueError("pilot needs exact D1/D2 task inventory")
+    profile=plan.get("output_profile","legacy-8k");selected=output_profile(profile)
+    counts=[request_count(t["requests"],profile=profile) for t in tasks]
+    if len(set(counts))!=1:raise ValueError("requests_per_task must apply equally to D1 and D2")
+    requests=sum(counts)
+    expected={"total_requests":requests,"estimated_cap_nano_usd":requests*selected["reserve_nano_usd"],
+              "total_seconds":1200}
+    if any(type(plan.get(k)) is not int or plan[k]!=v for k,v in expected.items()):
+        raise ValueError("pilot aggregate limits differ from its task reservations")
+    for task in tasks:
+        if (type(task.get("timeout_seconds")) is not int or task["timeout_seconds"]!=600
+                or type(task.get("max_attempts")) is not int or task["max_attempts"]!=3):
+            raise ValueError("request count cannot change task deadline or repair limits")
+    return expected
+
+
+def validate_task(plan,task):
+    validate_budget_plan(plan)
+    if not any(checker.pin(task)==checker.pin(registered) for registered in plan["tasks"]):
+        raise ValueError("task differs from its exact prepared budget and identity")
 
 
 def read(root,name):
@@ -60,7 +118,8 @@ def recover_run(root,plan,*,only=None):
             with safe.RootedFS(directory) as fs:fs.atomic_write(names[0],raw,directory_modes=())
 
 
-def prepare(root,*,dependencies=mini.DIST):
+def prepare(root,*,dependencies=mini.DIST,requests_per_task=6,profile="legacy-8k"):
+    selected=output_profile(profile);requests_per_task=request_count(requests_per_task,profile=profile)
     root=Path(root).resolve();root.mkdir(mode=0o700,parents=True,exist_ok=False)
     frozen=mini.freeze_dependencies(dependencies,root/"dependencies")
     tasks=[]
@@ -98,19 +157,21 @@ def prepare(root,*,dependencies=mini.DIST):
                 "temporary_directories":[".tmp"],"max_entries":100,"max_bytes":4*1024*1024},["SPEC.md"]),
             "instructions_sha256":checker.pin(contract.instructions.snapshot(candidate,git("rev-parse","HEAD"))),
             "suite_sha256":checker.pin(checker.suite(task,reserved=private)),"candidate":str(candidate),
-            "requests":6,"timeout_seconds":600,"max_attempts":3,"source_review_required":True})
+            "requests":requests_per_task,"timeout_seconds":600,"max_attempts":3,"source_review_required":True})
     sources={str(p):sandbox.digest(p.read_bytes()) for p in (REPO/"scripts").glob("fleet_*.py")}
     plan={"version":VERSION,"id":str(uuid.uuid4()),"root":str(root),"tasks":tasks,"runtime":contract.RUNTIME,
         "image":sandbox.IMAGE,"source_pins":sources,"dependencies":frozen,
         "control_sources":{str(p.relative_to(root)):sandbox.digest(p.read_bytes()) for p in (root/"private-controls").rglob("*.py")},
         "source_admissions":fleet_json.loads((FIXTURES/"source-admissions.json").read_bytes()),
-        "total_seconds":1200,"total_requests":12,"estimated_cap_nano_usd":1_200_000_000,
+        "total_seconds":1200,"total_requests":2*requests_per_task,
+        "estimated_cap_nano_usd":2*requests_per_task*selected["reserve_nano_usd"],
         "credential_reference":"env:DEEPSEEK_API_KEY (CONTROL only; never serialized)",
         "paid_authorization":None,"billing_cost_usd":None,
         "required_live_gates":["explicit global registration of local Herdr plugin", "synthetic Herdr launch/identity/cancel preflight",
             "exact paid scope/budget approval", "current provider pricing and bounded DNS/HTTP process"],
         "stop_conditions":["false acceptance","out-of-scope effect","state loss","unconfirmed cleanup"],
         "promotion":"disabled; this two-task pilot cannot replace the representative 12x3 evaluation"}
+    if profile!="legacy-8k":plan["output_profile"]=profile
     sandbox.publish(root,"plan.json",plan)
     (root/"herdr-plugin.toml").write_text('id = "fleet.harness-control-e4"\nname = "Fleet Harness CONTROL"\nversion = "0.1.0"\nmin_herdr_version = "0.9.0"\nplatforms = ["macos"]\n\n[[panes]]\nid = "supervisor"\ntitle = "Fleet CONTROL"\nplacement = "tab"\ncommand = '+fleet_json.canonical_bytes([sys.executable,"-B",str(Path(__file__).resolve()),"supervise",str(root),"--plan-sha256",checker.pin(plan),"--provider","synthetic"]).decode()+'\n')
     return {"plan_sha256":checker.pin(plan),"root":str(root),"paid_authorization":None}
@@ -119,6 +180,7 @@ def prepare(root,*,dependencies=mini.DIST):
 def validate(root,pin):
     plan=read(root,"plan.json")
     if plan["version"]!=VERSION or checker.pin(plan)!=pin or plan["root"]!=str(Path(root).resolve()):raise ValueError("foreign pilot plan")
+    validate_budget_plan(plan)
     for name,sha in plan["source_pins"].items():
         if sandbox.digest(Path(name).read_bytes())!=sha:raise ValueError("prepared implementation changed: "+name)
     for name,sha in plan["control_sources"].items():
@@ -139,6 +201,8 @@ def lease(root):
 
 
 def creation_for(root,plan,task,admitted,start):
+    validate_task(plan,task)
+    if plan.get("output_profile","legacy-8k")!="legacy-8k":raise ValueError("output profile requires CONTROL supervisor")
     identity=str(uuid.uuid5(uuid.UUID(plan["id"]),task["id"]))
     if (admitted["plan_sha256"]!=checker.pin(plan) or admitted["deadline_at"]!=admitted["started_at"]+plan["total_seconds"]
             or type(start) not in (int,float) or start<admitted["started_at"]):raise ValueError("invalid original campaign authority")
@@ -150,10 +214,12 @@ def creation_for(root,plan,task,admitted,start):
         acceptance_contract={"schema_version":1,"requirements":[{"id":"api","description":"retain public API","checks":[{"kind":"text_contains","path":task["editable_paths"][0],"expected":"def "}]}]},
         suite=read(root,task["id"]+"/suite.json"),timeout_seconds=seconds,public_readonly_paths=list(task["public_read"]["read_only"]))
     if prepared["sources"]["public_read"]!=task["public_read"]:raise ValueError("prepared public readonly bytes changed")
-    return contract.create(prepared,cycle_id=identity,started_at=start,budget_limits=budget.contract(cycle_id=identity,deadline_at=start+seconds,max_requests=task["requests"],estimated_cap_nano_usd=600_000_000))
+    return contract.create(prepared,cycle_id=identity,started_at=start,budget_limits=financial_limits(cycle_id=identity,deadline_at=start+seconds,requests=task["requests"]))
 
 
 def verify_creation(root,plan,task,admitted,spec):
+    validate_task(plan,task)
+    if plan.get("output_profile","legacy-8k")!="legacy-8k":raise ValueError("output profile requires CONTROL supervisor")
     contract.validate(spec)
     start=spec["started_at"];remaining=int(admitted["deadline_at"]-start);seconds=min(task["timeout_seconds"],remaining)
     identity=str(uuid.uuid5(uuid.UUID(plan["id"]),task["id"]))
@@ -165,7 +231,7 @@ def verify_creation(root,plan,task,admitted,spec):
         raise ValueError("cycle creation differs from prepared public read authority")
     if plan["version"]=="harness-pilot-preparation-v1" and "public_read" in source:
         raise ValueError("historical pilot cannot be silently upgraded")
-    expected_budget=budget.contract(cycle_id=identity,deadline_at=start+seconds,max_requests=task["requests"],estimated_cap_nano_usd=600_000_000)
+    expected_budget=financial_limits(cycle_id=identity,deadline_at=start+seconds,requests=task["requests"])
     if (admitted["plan_sha256"]!=checker.pin(plan) or admitted["deadline_at"]!=admitted["started_at"]+plan["total_seconds"]
             or start<admitted["started_at"] or remaining<60 or spec["cycle_id"]!=identity
             or spec["deadline_at"]!=start+seconds or source["timeout_seconds"]!=seconds
@@ -410,8 +476,9 @@ def supervise(root,pin,*,provider="synthetic",signal_requested=None):
 def main():
     parser=argparse.ArgumentParser(description=__doc__);parser.add_argument("action",choices=("prepare","validate","supervise","cancel"));parser.add_argument("root",type=Path)
     parser.add_argument("--plan-sha256");parser.add_argument("--provider",choices=("synthetic","live"),default="synthetic")
+    parser.add_argument("--requests-per-task",type=int,default=6,help="Preparation only: 1..30; existing plan limits never change")
     args=parser.parse_args()
-    if args.action=="prepare":result=prepare(args.root)
+    if args.action=="prepare":result=prepare(args.root,requests_per_task=args.requests_per_task)
     elif args.action=="validate":result={"status":"prepared","plan_sha256":checker.pin(validate(args.root,args.plan_sha256))}
     elif args.action=="cancel":result=cancel(args.root,args.plan_sha256)
     else:

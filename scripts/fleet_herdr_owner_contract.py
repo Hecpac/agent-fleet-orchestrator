@@ -67,7 +67,7 @@ def surface(value):
 def create(prepared, *, cycle_id, started_at, budget, runtime=None, surfaces=None):
     import fleet_herdr_owner_runtime as adapters
     work.verify(prepared)
-    if prepared["execution_envelope"]["contract_version"] == "owner-harness-envelope-v1":
+    if prepared["execution_envelope"]["contract_version"] in {"owner-harness-envelope-v1", "owner-harness-envelope-v2"}:
         raise ContractError("harness preparation requires its v3 creation contract; no legacy downgrade")
     budget = limits(budget)
     if budget["deadline_seconds"] > prepared["sources"]["timeout_seconds"]:
@@ -94,6 +94,9 @@ def create(prepared, *, cycle_id, started_at, budget, runtime=None, surfaces=Non
 
 
 def validate(value):
+    if isinstance(value, dict) and value.get("version") == "owner-cycle-contract-v4":
+        from fleet_harness_live_contract import validate as validate_control
+        return validate_control(value)
     if isinstance(value, dict) and value.get("version") == "owner-cycle-contract-v3":
         from fleet_harness_contract import validate as validate_harness
         return validate_harness(value)
@@ -131,7 +134,7 @@ def task(contract, *, attempt, feedback, decisions):
                         "max_attempts": contract["limits"]["max_attempts"],
                         "deadline_at": contract["deadline_at"],
                         "runtime_lane": PROFILE["lane"]}
-    if contract["version"] == "owner-cycle-contract-v3":
+    if contract["version"] in {"owner-cycle-contract-v3", "owner-cycle-contract-v4"}:
         packet["contract_version"] = "owner-cycle-task-v2"
         packet["limits"]["runtime_lane"] = contract["profile"]["lane"]
     packet["continuation"] = {"attempt": attempt, "feedback": copy.deepcopy(feedback),
@@ -167,8 +170,8 @@ def admission(contract, *, ordinal, run_id, admission_id, generation,
             "deadline_at": contract["deadline_at"]}
     if observed:
         result.update(version="owner-cycle-admission-v2", surface=copy.deepcopy(contract["surfaces"][ordinal-1]))
-    elif contract["version"] == "owner-cycle-contract-v3":
-        result["version"] = "owner-cycle-admission-v3"
+    elif contract["version"] in {"owner-cycle-contract-v3", "owner-cycle-contract-v4"}:
+        result["version"] = "owner-cycle-admission-v4" if contract["version"] == "owner-cycle-contract-v4" else "owner-cycle-admission-v3"
     return result
 
 

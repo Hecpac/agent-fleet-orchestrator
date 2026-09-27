@@ -7,6 +7,8 @@ import unittest
 from unittest import mock
 import copy
 import subprocess
+import shutil
+import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import fleet_harness_executor as executor
@@ -182,6 +184,46 @@ e.execute(sys.argv[2],spec,{'command':'true','tool_call_id':'t'},sys.argv[3],bin
 
 @unittest.skipUnless(os.environ.get("FLEET_HARNESS_LOCAL_TESTS") == "1", "explicit owned local test lane")
 class ExecutorTests(unittest.TestCase):
+    def guest_probe(self,command,seconds):
+        with tempfile.TemporaryDirectory(prefix="fleet-executor-exit-") as temporary:
+            root=Path(temporary);candidate=root/"candidate";candidate.mkdir();bridge=root/"bridge";bridge.mkdir()
+            shutil.copyfile(executor.GUEST,bridge/executor.GUEST.name)
+            resource=sandbox.Sandbox(root/"resource",owner=str(uuid.uuid4()))
+            try:
+                resource.create(candidate=candidate,guest=bridge,
+                    argv=["/usr/local/bin/python3","-I","-S","-B","/bridge/"+executor.GUEST.name],processes=32)
+                resource.start()
+                result=resource.rpc({"id":"exit-probe","command":command,"seconds":seconds},timeout=seconds+2)
+                self.assertIsNone(result["error"])
+                return result["value"]
+            finally:self.assertTrue(resource.cleanup()["resources_clean"])
+
+    def test_eof_before_child_exit_waits_inside_original_deadline(self):
+        result=self.guest_probe("exec 1>&- 2>&-; sleep .15; exit 0",.8)
+        self.assertEqual(result,{"output":"","returncode":0,"timed_out":False,"truncated":False})
+
+    def test_deadline_requires_child_exit_and_stream_eof(self):
+        for command in ("sleep 10","exec 1>&- 2>&-; sleep 10","sleep 10 & exit 0"):
+            with self.subTest(command=command):
+                result=self.guest_probe(command,.15)
+                self.assertTrue(result["timed_out"]);self.assertFalse(result["truncated"])
+                if command.endswith("exit 0"):self.assertEqual(result["returncode"],0)
+
+    def test_output_limit_is_not_a_premature_timeout(self):
+        result=self.guest_probe("python3 -B -c 'import sys,time;sys.stdout.write(\"x\"*32769);sys.stdout.flush();time.sleep(10)'",1)
+        self.assertTrue(result["truncated"]);self.assertFalse(result["timed_out"])
+        self.assertEqual(len(result["output"]),32768)
+
+    def test_timeout_report_fits_inside_same_task_deadline(self):
+        with tempfile.TemporaryDirectory(prefix="fleet-executor-budget-") as temporary:
+            root=Path(temporary);candidate=root/"candidate";candidate.mkdir();(candidate/"report.py").write_text("value = 1\n")
+            spec={"schema_version":1,"editable_paths":["report.py"],"temporary_directories":[".tmp"],"max_entries":100,"max_bytes":1024*1024}
+            deadline=time.time()+6
+            result=executor.execute(candidate,spec,{"tool_call_id":"bounded-timeout","command":"sleep 10"},root/"command",binding={"admission":"a"},deadline_at=deadline)
+            self.assertTrue(result["timed_out"]);self.assertFalse(result["truncated"])
+            self.assertLess(time.time(),deadline)
+            self.assertEqual((candidate/"report.py").read_text(),"value = 1\n")
+
     def test_scope_credentials_network_cache_and_idempotent_publication(self):
         with tempfile.TemporaryDirectory(prefix="fleet-executor-") as temporary:
             root = Path(temporary); candidate = root / "candidate"; candidate.mkdir()

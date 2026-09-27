@@ -225,7 +225,7 @@ class Cycle:
         response = attempt["response"]
         raw, final = self.get(response["transcript"]), self.get(response["final"])
         try:
-            if attempt["admission"]["version"]=="owner-cycle-admission-v3":
+            if attempt["admission"]["version"] in {"owner-cycle-admission-v3", "owner-cycle-admission-v4"}:
                 from fleet_harness_delivery import verify_continuity
                 prior=[]
                 for earlier in current["attempts"]:
@@ -446,7 +446,7 @@ class Cycle:
             a["cancel_signal"] = p
         elif kind == "response":
             contracts.exact(p, {"admission_sha256", "transcript", "final"}, "response")
-            if (a is None or a["admission"]["version"] not in {"owner-cycle-admission-v1", "owner-cycle-admission-v3"} or not a["intent"]
+            if (a is None or a["admission"]["version"] not in {"owner-cycle-admission-v1", "owner-cycle-admission-v3", "owner-cycle-admission-v4"} or not a["intent"]
                     or a["response"] is not None or p["admission_sha256"] != work.digest(a["admission"])):
                 raise CycleError("response is not for the pending admission")
             self.get(p["transcript"]); self.get(p["final"])
@@ -469,7 +469,7 @@ class Cycle:
             work.text(p["detail"], "observation error")
             a["observation_errors"].append(p)
         elif kind == "quiescent":
-            if a is None or a["admission"]["version"] not in {"owner-cycle-admission-v1", "owner-cycle-admission-v3"} or not a["intent"] or a["quiescent"]:
+            if a is None or a["admission"]["version"] not in {"owner-cycle-admission-v1", "owner-cycle-admission-v3", "owner-cycle-admission-v4"} or not a["intent"] or a["quiescent"]:
                 raise CycleError("unexpected quiescence")
             runtime.verify_quiescence(p, a["admission"])
             a["quiescent"] = True
@@ -649,6 +649,19 @@ class Cycle:
                     or (check and (check["conflicts"] or any(e["kind"] == "retention" for e in check["errors"]))))
 
     def control(self, action, *, request_id, target, reason, now=None):
+        contract=self.json(self.pin)
+        if action=="cancel" and contract["version"]=="owner-cycle-contract-v4":
+            from fleet_harness_control import cancel_under_barrier, pin
+            plan=contract["request_budget"]["control_plan"]
+            # Owner cancellation commits at the journal pathname. Before that,
+            # an orphan CAS event is not an acknowledged request. New sends use
+            # this same barrier; the watchdog observes the journal without locks.
+            with safe.RootedFS(plan["root"],root_mode=0o700) as fs:
+                with fs.exclusive_lock(".control-send.lock",directory_modes=()):
+                    current=self._append("control_requested",{"request_id":request_id,"action":action,"target":target,"reason":reason},
+                        now=time.time if now is None else now)
+                    cancel_under_barrier(fs,pin(plan),"cycle_cancel_requested")
+                    return current
         current = self._append("control_requested", {"request_id": request_id, "action": action,
             "target": target, "reason": reason}, now=time.time if now is None else now)
         if action == "cancel" and current["contract"]["version"] == "owner-cycle-contract-v3":
@@ -813,7 +826,12 @@ class Cycle:
 
     def tick(self, backend, *, now=None):
         contract = self.json(self.pin)
-        if contract["version"] == "owner-cycle-contract-v3":
+        if contract["version"] == "owner-cycle-contract-v4":
+            from fleet_harness_live_backend import ControlHarnessBackend
+            if type(backend) is not ControlHarnessBackend or backend.cycle.pin != self.pin:
+                raise CycleError("CONTROL profile requires its exact owned backend")
+            backend.guard.assert_owned()
+        elif contract["version"] == "owner-cycle-contract-v3":
             from fleet_harness_backend import LocalHarnessBackend
             if not isinstance(backend, LocalHarnessBackend) or backend.cycle.pin != self.pin:
                 raise CycleError("harness local profile requires its exact bound backend")

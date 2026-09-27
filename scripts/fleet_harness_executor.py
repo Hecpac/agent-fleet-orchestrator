@@ -140,9 +140,12 @@ def _run(candidate,store,intent,public_checks=None):
             writable=scope_contract["editable_paths"], temporary=scope_contract["temporary_directories"], processes=32)
         if time.time() >= deadline_at: raise ValueError("deadline exhausted during executor setup")
         sandbox.start()
-        seconds = min(30., deadline_at - time.time())
-        if seconds <= 0: raise ValueError("deadline exhausted before command")
-        response = sandbox.rpc({"id": action["tool_call_id"], "command": action["command"], "seconds": seconds}, timeout=seconds)
+        rpc_seconds = min(32., deadline_at - time.time())
+        if rpc_seconds <= 0: raise ValueError("deadline exhausted before command")
+        # The command must finish before its containing RPC, including a
+        # timeout report and reap. Both share the original task deadline.
+        seconds = min(30., rpc_seconds - min(2.,rpc_seconds/2))
+        response = sandbox.rpc({"id": action["tool_call_id"], "command": action["command"], "seconds": seconds}, timeout=rpc_seconds)
         _persist(store,owner,"response.json",response)
     except (ValueError, OSError, RuntimeError) as exc:
         error = type(exc).__name__ + ":" + str(exc)

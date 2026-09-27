@@ -110,6 +110,10 @@ class NumericHTTPS(http.client.HTTPSConnection):
     def __init__(self,policy,*,deadline_at,stopped):
         self.policy=validate(policy);self.deadline_at=deadline_at;self.stopped=stopped;self.connect_started=False;self.http_started=False
         self.active_socket=None
+        self._reading_response=False
+        self._outcome=None
+        self._connect_error=None
+        self._connect_cleanup_errors=[]
         self.transport_interrupted=threading.Event()
         self.policy_sha256=sandbox.digest(fleet_json.canonical_bytes(self.policy))
         if type(deadline_at) not in (int,float) or not time.time()<deadline_at<float("inf"):raise ValueError("invalid original HTTPS deadline")
@@ -123,9 +127,13 @@ class NumericHTTPS(http.client.HTTPSConnection):
         if self.transport_interrupted.is_set():raise TimeoutError("transport guardian interrupted execution")
         if sandbox.digest(fleet_json.canonical_bytes(self.policy))!=self.policy_sha256:raise ValueError("prepared HTTPS policy changed")
         validate(self.policy)
+        stopped=self.stopped()
         remaining=min(self.deadline_at-time.time(),self.monotonic_deadline-time.monotonic())
-        if self.stopped() or remaining<=0:raise TimeoutError("original transport authority expired/revoked")
-        if self.sock is not None:self.sock.settimeout(min(30,remaining))
+        if stopped or remaining<=0:raise TimeoutError("original transport authority expired/revoked")
+        # Inference may legitimately leave both headers and body silent beyond
+        # the connection timeout. Use the existing absolute bound for response
+        # reads; never renew it per block or reconnect after an incomplete read.
+        if self.sock is not None:self.sock.settimeout(remaining if self._reading_response else min(30,remaining))
 
     def connect(self):
         if self.connect_started:raise ValueError("second connection attempt forbidden")
@@ -136,7 +144,7 @@ class NumericHTTPS(http.client.HTTPSConnection):
             self.sock=socket.socket(self.policy["family"],socket.SOCK_STREAM)
             self.active_socket=self.sock
             self.boundary()
-            address=(self.policy["address"],443) if self.policy["family"]==socket.AF_INET else (self.policy["address"],443,0,0)
+            address=self._tcp_address()
             self.sock.connect(address)
             self.boundary()
             self.sock=self._context.wrap_socket(self.sock,server_hostname=HOST,do_handshake_on_connect=False)
@@ -144,8 +152,16 @@ class NumericHTTPS(http.client.HTTPSConnection):
             self.boundary()
             self.sock.do_handshake()
             self.boundary()
-        except BaseException:
-            self.close();raise
+        except BaseException as exc:
+            self._connect_error=type(exc).__name__
+            try:self.close()
+            except BaseException as cleanup:
+                self._connect_cleanup_errors.append(type(cleanup).__name__)
+                raise
+            raise
+
+    def _tcp_address(self):
+        return (self.policy["address"],443) if self.policy["family"]==socket.AF_INET else (self.policy["address"],443,0,0)
 
     def request(self,method,url,body=None,headers=None,*,encode_chunked=False):
         self.boundary()
@@ -156,27 +172,55 @@ class NumericHTTPS(http.client.HTTPSConnection):
         self.http_started=True
         return super().request(method,url,body,headers,encode_chunked=False)
 
-    def abort(self):
+    def _interrupt_socket(self):
         # HTTPResponse can retain a makefile after HTTPConnection sets sock=None.
-        # Keep the exact underlying socket across that transfer for shutdown.
-        if self.active_socket is not None:
-            try:self.active_socket.shutdown(socket.SHUT_RDWR)
+        # The guardian touches only this socket, never HTTPResponse's buffer.
+        # exchange() owns closing HTTPConnection/HTTPResponse on its own thread.
+        active=self.active_socket
+        if active is not None:
+            # SSLSocket.shutdown() clears TLS state before the syscall. The
+            # base operation interrupts I/O without enabling a raw-send path.
+            try:socket.socket.shutdown(active,socket.SHUT_RDWR)
             except OSError:pass
-        self.close()
+            active.close()
+
+    def abort(self):
+        try:self._interrupt_socket()
+        finally:self.close()
+
+    def retained_outcome(self):
+        """Observed bytes, including incomplete exchanges; never usage or billing.
+
+        The original exception still propagates. CONTROL can persist this
+        bounded observation without inventing a complete provider response.
+        """
+        return copy.deepcopy(self._outcome)
 
     def exchange(self,body,headers=None):
-        finished=threading.Event();interrupted=self.transport_interrupted;guard_errors=[]
+        if self._outcome is not None:raise ValueError("an observed exchange cannot be repeated")
+        finished=threading.Event();interrupted=self.transport_interrupted;guard_errors=[];cleanup_errors=[]
+        def close_transport(*,interrupt_only=False):
+            try:
+                if interrupt_only:self._interrupt_socket()
+                else:self.abort()
+            except BaseException as exc:
+                cleanup_errors.append(type(exc).__name__)
+                raise
         def guard():
             try:
                 while not finished.wait(.01):
-                    if self.stopped() or time.time()>=min(self.deadline_at,self.policy["expires_at"]) or time.monotonic()>=self.monotonic_deadline:
-                        interrupted.set();self.abort();return
+                    if time.time()>=min(self.deadline_at,self.policy["expires_at"]) or time.monotonic()>=self.monotonic_deadline or self.stopped():
+                        interrupted.set();close_transport(interrupt_only=True);return
             except BaseException as exc:
-                guard_errors.append(exc);interrupted.set();self.abort()
+                guard_errors.append(exc);interrupted.set()
+                try:close_transport(interrupt_only=True)
+                except BaseException:pass  # retained separately; never an unobserved thread failure
         watcher=threading.Thread(target=guard,daemon=True);watcher.start()
-        response=None;data=b""
+        response=None;data=b"";completed=False;error=None;drained=False
         try:
             self.connect();self.request("POST","/chat/completions",body,headers)
+            self._reading_response=True
+            self.boundary()
             response=self.getresponse()
             while True:
                 self.boundary()
@@ -189,8 +233,62 @@ class NumericHTTPS(http.client.HTTPSConnection):
                 if not block:
                     if response.length not in (None,0):raise http.client.IncompleteRead(data,response.length)
                     break
+            completed=True
             return {"http_status":response.status,"body":data}
+        except BaseException as exc:
+            error=self._connect_error or type(exc).__name__
+            raise
         finally:
-            finished.set();self.abort();watcher.join()
-            if response is not None:response.close()
+            finished.set()
+            try:
+                try:close_transport()
+                finally:
+                    try:watcher.join()
+                    except BaseException as exc:
+                        cleanup_errors.append(type(exc).__name__)
+                        raise
+                    finally:
+                        if response is not None:
+                            try:response.close()
+                            except BaseException as exc:
+                                cleanup_errors.append(type(exc).__name__)
+                                raise
+                drained=not cleanup_errors and not self._connect_cleanup_errors
+            finally:
+                self._outcome={"http_status":response.status if response is not None else None,
+                    "body":data[:1024*1024],"response_complete":completed and not guard_errors and drained,
+                    "transport_closed":drained,"error":"guardian_failed" if guard_errors else error if drained else "cleanup_failed",
+                    "transport_error":error,"cleanup_errors":self._connect_cleanup_errors+cleanup_errors,
+                    "guardian_errors":[type(exc).__name__ for exc in guard_errors],
+                    "observed_body_bytes":len(data),"body_truncated":len(data)>1024*1024}
             if guard_errors:raise RuntimeError("transport guardian failed") from guard_errors[0]
+
+
+def synthetic_endpoint(value):
+    if (not isinstance(value,dict) or set(value)!={"version","host","port","certificate_pem"}
+            or value["version"]!="synthetic-loopback-tls-v1" or value["host"]!="127.0.0.1"
+            or type(value["port"]) is not int or not 0<value["port"]<65536
+            or not isinstance(value["certificate_pem"],str) or not 0<len(value["certificate_pem"])<65536):
+        raise ValueError("synthetic transport requires fixed loopback TLS endpoint")
+    return copy.deepcopy(value)
+
+
+class SyntheticTLS(NumericHTTPS):
+    """Same bounded HTTP implementation, structurally unable to use provider TCP.
+
+    The public policy supplies protocol/deadline constraints only in this mode;
+    the archived synthetic endpoint is the actual TCP destination. No bearer
+    credential is accepted, even if accidentally supplied by CONTROL.
+    """
+    def __init__(self,policy,*,endpoint,deadline_at,stopped):
+        self.endpoint=synthetic_endpoint(endpoint)
+        if policy["family"]!=int(socket.AF_INET):raise ValueError("synthetic endpoint requires IPv4 loopback")
+        super().__init__(policy,deadline_at=deadline_at,stopped=stopped)
+        self._context=ssl.create_default_context(cadata=self.endpoint["certificate_pem"])
+
+    def _tcp_address(self):return ("127.0.0.1",self.endpoint["port"])
+
+    def exchange(self,body,headers=None):
+        if any(k.lower()=="authorization" for k in (headers or {})):
+            raise ValueError("synthetic transport cannot receive credentials")
+        return super().exchange(body,headers)

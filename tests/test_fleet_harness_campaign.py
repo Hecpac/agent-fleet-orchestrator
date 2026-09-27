@@ -25,6 +25,65 @@ class CampaignTests(unittest.TestCase):
         self.prepared=campaign.prepare(self.root);self.plan=campaign.read(self.root,"plan.json");self.pin=self.prepared["plan_sha256"]
     def tearDown(self):self.temp.cleanup()
 
+    def test_expanded_budget_is_consistent_and_original_default_unchanged(self):
+        target=self.root.parent/"expanded"
+        prepared=campaign.prepare(target,requests_per_task=12)
+        plan=campaign.validate(target,prepared["plan_sha256"])
+        self.assertEqual([t["requests"] for t in plan["tasks"]],[12,12])
+        self.assertEqual(plan["total_requests"],24)
+        self.assertEqual(plan["estimated_cap_nano_usd"],2_400_000_000)
+        self.assertEqual(self.plan["total_requests"],12)
+        start=time.time();admitted={"plan_sha256":prepared["plan_sha256"],"started_at":start,"deadline_at":start+1200}
+        for task in plan["tasks"]:
+            spec=campaign.creation_for(target,plan,task,admitted,start)
+            limits=spec["request_budget"]
+            self.assertEqual(limits["max_requests"],12)
+            self.assertEqual(limits["estimated_cap_nano_usd"],1_200_000_000)
+            self.assertEqual(limits["token_cap"],2_000_000)
+            self.assertEqual(campaign.verify_creation(target,plan,task,admitted,spec),spec)
+            changed=copy.deepcopy(task);changed["requests"]=6
+            with self.assertRaisesRegex(ValueError,"task differs"):
+                campaign.creation_for(target,plan,changed,admitted,start)
+
+    def test_thinking_profile_preserves_token_cap_and_requires_control(self):
+        target=self.root.parent/"thinking"
+        for count in (16,30,True,12.0):
+            with self.assertRaises(ValueError):campaign.prepare(target,requests_per_task=count,profile="thinking-32k-v1")
+            self.assertFalse(target.exists())
+        prepared=campaign.prepare(target,requests_per_task=12,profile="thinking-32k-v1")
+        plan=campaign.validate(target,prepared["plan_sha256"])
+        self.assertEqual(plan["total_requests"],24);self.assertEqual(plan["estimated_cap_nano_usd"],4_800_000_000)
+        limits=campaign.financial_limits(cycle_id=str(uuid.uuid4()),deadline_at=time.time()+60,requests=12,profile="thinking-32k-v1")
+        self.assertEqual(limits["reserve_tokens_per_request"],131072)
+        self.assertEqual(limits["reserve_nano_usd_per_request"],200_000_000)
+        self.assertEqual(limits["token_cap"],2_000_000)
+        for profile in ("legacy-8k",None,"unknown"):
+            forged=copy.deepcopy(plan);forged["output_profile"]=profile
+            with self.assertRaises(ValueError):campaign.validate_budget_plan(forged)
+        with self.assertRaisesRegex(ValueError,"requires CONTROL"):
+            campaign.creation_for(target,plan,plan["tasks"][0],{},time.time())
+
+    def test_output_policy_rejects_inexact_types_without_normalization(self):
+        for profile,cap in (("legacy-8k",8192),("thinking-32k-v1",32768)):
+            policy=campaign.budget.contract(cycle_id=str(uuid.uuid4()),deadline_at=time.time()+60)["request_policy"]
+            for value in (float(cap),True,str(cap),None):
+                policy["max_output_tokens"]=value
+                with self.subTest(profile=profile,value=value),self.assertRaises(ValueError):
+                    campaign.financial_limits(cycle_id=str(uuid.uuid4()),deadline_at=time.time()+60,requests=3,request_policy=policy,profile=profile)
+                self.assertEqual(policy["max_output_tokens"],value)
+
+    def test_invalid_request_counts_and_partial_budget_changes_are_rejected(self):
+        target=self.root.parent/"must-not-exist"
+        for count in (True,False,12.0,"12",None,0,-1,31):
+            with self.subTest(count=count),self.assertRaises(ValueError):campaign.prepare(target,requests_per_task=count)
+            self.assertFalse(target.exists())
+        for key,value in (("total_requests",12.0),("estimated_cap_nano_usd",1_200_000_000.0),("total_seconds",1200.0)):
+            changed=copy.deepcopy(self.plan);changed[key]=value
+            with self.subTest(key=key),self.assertRaises(ValueError):campaign.validate_budget_plan(changed)
+        changed=copy.deepcopy(self.plan);changed["tasks"][0]["requests"]=12
+        changed.update(total_requests=18,estimated_cap_nano_usd=1_800_000_000)
+        with self.assertRaisesRegex(ValueError,"equally"):campaign.validate_budget_plan(changed)
+
     def test_creation_bound_to_plan_and_replay_without_candidate(self):
         start=time.time();admitted={"plan_sha256":self.pin,"started_at":start,"deadline_at":start+self.plan["total_seconds"]}
         task=self.plan["tasks"][0];spec=campaign.creation_for(self.root,self.plan,task,admitted,start)

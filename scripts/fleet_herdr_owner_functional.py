@@ -16,7 +16,7 @@ import fleet_json
 
 
 def binding(contract, revision_pin, revision):
-    if contract["version"] == "owner-cycle-contract-v3":
+    if contract["version"] in {"owner-cycle-contract-v3", "owner-cycle-contract-v4"}:
         from fleet_harness_functional import binding as harness_binding
         return harness_binding(contract, revision_pin, revision)
     spec = contract["prepared"]["sources"]["functional"]

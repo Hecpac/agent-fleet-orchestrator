@@ -179,6 +179,58 @@ class HarnessCycleTests(unittest.TestCase):
         self.assertEqual(result["attempts"],2);self.assertEqual(len(self.requests),2)
         self.assertEqual(backend.ledger.summary()["admitted_requests"],2)
 
+    def test_truncated_output_feedback_survives_interruption_and_rejects_foreign_reports(self):
+        from fleet_harness_delivery import verify_terminal, FAILURE_VERSION
+        self.responses=[{"choices":[{"finish_reason":"length", "message":{
+            "role":"assistant", "content":"", "reasoning_content":"provider-private-text-canary"}}]},
+            self.submit("valid-after-truncation")]
+        owner,backend=self.make()
+        class Interrupted(BaseException):pass
+        append=owner._append
+        def interrupt(kind,payload,**kwargs):
+            result=append(kind,payload,**kwargs)
+            if kind=="classified":raise Interrupted()
+            return result
+        with mock.patch.object(owner,"_append",side_effect=interrupt),self.assertRaises(Interrupted):
+            for _ in range(4):owner.tick(backend)
+        original=owner.load()["attempts"][0]
+        self.assertEqual(len(self.requests),1)
+        report=fleet_json.loads(original["classified"]["error"])
+        self.assertEqual(report["version"],FAILURE_VERSION)
+        self.assertEqual(report["category"],"output_truncated_without_action")
+        self.assertEqual(report["admission_sha256"],work.digest(original["admission"]))
+        self.assertIsNone(report["revision_sha256"])
+        self.assertEqual(report["observed"],{"finish_reason":"length","content_empty":True,
+            "tool_calls":0,"max_output_tokens":8192})
+        self.assertNotIn("provider-private-text-canary",original["classified"]["error"])
+        value=owner.json(original["response"]["transcript"])
+        legacy=copy.deepcopy(value);del legacy["public_failure"]
+        with self.assertRaisesRegex(ValueError,"^invalid or foreign Mini delivery$"):
+            verify_terminal(fleet_json.canonical_bytes(legacy),b"",contract=backend.contract,admission=original["admission"])
+        for mutation in ("revision","task","admission","observation","error_cleared","final","terminal"):
+            forged=copy.deepcopy(value);final=b""
+            if mutation=="revision":forged["public_failure"]["revision_sha256"]="a"*64
+            elif mutation=="task":forged["task"]["objective"]="foreign task"
+            elif mutation=="admission":forged["admission"]["run_id"]=str(uuid.uuid4())
+            elif mutation=="observation":forged["public_failure"]["observed"]["tool_calls"]=False
+            elif mutation=="error_cleared":forged["error"]=None
+            elif mutation=="final":final=b'{"type":"submit_candidate"}'
+            else:forged["terminal"]={}
+            with self.subTest(mutation=mutation),self.assertRaises(ValueError) as failure:
+                verify_terminal(fleet_json.canonical_bytes(forged),final,contract=backend.contract,admission=original["admission"])
+            self.assertNotIn('"category"',str(failure.exception))
+        owner=cycle.Cycle(owner.runs,owner.cycle_id,contract_sha256=owner.pin)
+        backend.cycle=owner
+        result=self.drive(owner,backend)
+        self.assertEqual(result["status"],"accepted_contract",result)
+        self.assertEqual(len(self.requests),2)
+        attempts=owner.load()["attempts"]
+        self.assertEqual(attempts[0]["response"],original["response"])
+        feedback=owner.json(attempts[1]["task"])["continuation"]["feedback"]
+        self.assertEqual(fleet_json.loads(feedback["detail"]),report)
+        self.assertEqual(result["revisions"],1)
+        self.assertEqual(owner.verify(),result)
+
     def test_real_process_loss_reserve_send_freeze_and_retained_check(self):
         script='''import os,sys
 sys.path.insert(0,sys.argv[1])
@@ -258,6 +310,13 @@ os._exit(92)
         self.assertEqual(len(self.requests),1);self.assertEqual(backend.ledger.summary()["admitted_requests"],1)
         self.assertLessEqual(len(owner.load()["attempts"]),3)
         self.assertEqual(len({a["admission"]["deadline_at"] for a in owner.load()["attempts"]}),1)
+        for attempt in owner.load()["attempts"][1:]:
+            report=fleet_json.loads(attempt["classified"]["error"])
+            self.assertEqual(report["category"],"request_limit_exhausted")
+            self.assertEqual(report["observed"],{"admitted_requests":1,"new_send_permitted":False})
+            self.assertEqual(report["expected"],{"requests_before_next_send_less_than":1})
+            self.assertEqual(report["admission_sha256"],work.digest(attempt["admission"]))
+        self.assertEqual(owner.verify(),result)
 
     def test_counterexample_in_rpc_survives_crash_before_derived_observation(self):
         good=(FIXTURES/"d2/report.py").read_text()
@@ -383,6 +442,34 @@ os._exit(92)
         self.assertTrue(next(r for r in result_original["results"] if r["id"]=="held-1")["passed"])
         suite=fleet_json.loads(owner.get(check["evidence"]["suite.json"]))
         self.assertFalse(suite["custody"]["blind_to_maintainer"])
+
+    def test_malformed_inventory_delivery_cannot_block_durable_cancellation(self):
+        class Interrupted(BaseException):
+            pass
+        self.responses=[self.submit("final")]
+        owner,backend=self.make()
+        def interrupt(name):
+            if name=="after_delivery":raise Interrupted()
+        backend.fault=interrupt
+        with self.assertRaises(Interrupted):owner.tick(backend)
+        backend.fault=None
+        admission=owner.load()["attempts"][0]["admission"]
+        path=backend._attempt(admission)/"delivery.json"
+        value=fleet_json.loads(path.read_bytes())
+        originals=value["tools"][0]["originals"]
+        publication=fleet_json.loads(base64.b64decode(originals["publication.json"]))
+        publication["projection_after"]["inventory"]["entries"]["report.py"]["bytes"]=True
+        originals["publication.json"]=base64.b64encode(fleet_json.canonical_bytes(publication)).decode()
+        path.write_bytes(fleet_json.canonical_bytes(value))
+        owner.control("cancel",request_id=str(uuid.uuid4()),target=backend_module.runtime.resource(admission),reason="cancel malformed delivery")
+        result=self.drive(owner,backend)
+        self.assertEqual(result["status"],"cancelled",result)
+        state=owner.load()
+        self.assertEqual(len(state["attempts"]),1)
+        self.assertFalse(state["attempts"][0]["classified"]["valid"])
+        self.assertEqual(owner.verify(),result)
+        self.assertEqual(owner.tick(backend),result)
+        self.assertEqual(len(self.requests),1)
 
     def test_wrong_revision_late_and_duplicate_finals_do_not_reopen_acceptance(self):
         self.responses=[response("true",identifier="inspection"),self.submit("final")]

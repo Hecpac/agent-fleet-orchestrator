@@ -27,7 +27,12 @@ def main():
                         exceeded = True
                         break
             if exceeded: break
-    timed_out = process.poll() is None
+        # EOF and child exit are separate observations. A child may close its
+        # streams before finishing, or exit while a descendant retains them.
+        timed_out = bool(selector.get_map()) and not exceeded
+    if not timed_out and not exceeded:
+        try:process.wait(timeout=max(0,deadline-time.monotonic()))
+        except subprocess.TimeoutExpired:timed_out=True
     if timed_out or exceeded:
         # Local process group is a convenience only. CONTROL removes the whole
         # exact container before admitting another command or observing writes.
