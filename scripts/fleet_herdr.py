@@ -1276,6 +1276,9 @@ class HerdrBackend:
             raise HerdrBackendError("Herdr prompt must be canonical Driver JSON") from exc
         if not isinstance(value, dict):
             raise HerdrBackendError("Herdr prompt must be a Driver object")
+        if value.get("contract_version") == "owner-work-v1":
+            raise HerdrBackendError(
+                "owner-work-v1 dispatch is disabled; owner revisions and decision lifecycle are not implemented")
         expected = {
             "schema_version": 1,
             "mission_id": self.mission_id,

@@ -25,6 +25,18 @@ artifact acceptance and performs offline archive verification. A Worker `PASS`
 therefore cannot close a failed predicate. Its isolated permission policy v4 and
 archive schema v7 do not migrate or reinterpret either historical profile.
 
+The optional `--scope-contract` adds physical candidate acceptance to this
+minimal profile and selects archive v8. It inventories ignored files against a
+pre-admission baseline, permits declared temporary directories without exporting
+them, and rejects incomplete captures. It does not add a repair loop. See
+[physical scope acceptance](herdr-physical-scope.md) for the contract and limits.
+
+Unit B adds a local `dry --work-packet` preview and a staged owner response
+protocol. Functional requirements, scope and limits travel without requiring the
+model to copy execution identities or hashes. Live dispatch remains disabled;
+existing Missions retain their stage protocol. See [owner WorkPacket and
+interaction](herdr-owner-work-packet.md) for the exact boundary and verification.
+
 ```sh
 python3 scripts/mission-run.py dry research-sample "Investigate then implement" \
   --workflow herdr-research-implementation \
@@ -213,8 +225,9 @@ change a file cited by Research. SDD and functional evidence remain independent,
 optional additions inside v6. Verification can proceed after the candidate and
 mutable source files disappear because all required bytes are in CAS/archive.
 Completion requires policy v3, six turns, schema v6 and the frozen profile digest.
-The minimal counterpart requires policy v4, one turn, schema v7 and its own
-frozen digest. Reviewer and Verifier remain independent under profiles that
+The minimal counterpart requires policy v4, one turn, schema v7 (v8 when physical
+scope is explicitly selected) and its own frozen digest. Reviewer and Verifier
+remain independent under profiles that
 select them; running them in parallel is a deferred scheduler optimization, not
 part of these role contracts.
 

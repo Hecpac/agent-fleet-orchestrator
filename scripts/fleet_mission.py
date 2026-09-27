@@ -174,6 +174,7 @@ def _created_request(
     compiled: dict[str, Any],
     sdd_plan_sha256: str | None = None,
     profile_binding: dict[str, Any] | None = None,
+    scope_contract_sha256: str | None = None,
 ) -> dict[str, Any]:
     request = {
         "feature": feature,
@@ -186,6 +187,8 @@ def _created_request(
     if sdd_plan_sha256 is not None:
         request["sdd_plan_sha256"] = sdd_plan_sha256
     request.update(profile_binding or {})
+    if scope_contract_sha256 is not None:
+        request["scope_contract_sha256"] = scope_contract_sha256
     return request
 
 
@@ -244,6 +247,12 @@ def create_mission(
         fleet_functional.validate(options["functional_contract"])
         if not fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
             raise MissionError("functional v1 requires a supported Herdr profile")
+    scope_pin = None
+    if options.get("scope_contract") is not None:
+        import fleet_herdr_scope
+        if compiled["resolved"]["preset"] != "sol_minimal_v1":
+            raise MissionError("physical scope v1 requires sol_minimal_v1")
+        scope_pin = fleet_herdr_scope.digest(fleet_herdr_scope.validate(options["scope_contract"]))
     if not runs_dir.exists():
         state.ensure_private_directory(runs_dir)
     mission_relative = Path("missions") / mission_id
@@ -341,6 +350,7 @@ def create_mission(
                     compiled=compiled,
                     sdd_plan_sha256=sdd_plan_sha256,
                     profile_binding=profile_binding,
+                    scope_contract_sha256=scope_pin,
                 )
                 creation = state.canonical_bytes(
                     {

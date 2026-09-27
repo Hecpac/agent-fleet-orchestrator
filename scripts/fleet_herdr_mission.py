@@ -37,6 +37,7 @@ import fleet_herdr_profile
 import fleet_herdr_launch
 import fleet_herdr_runtime
 import fleet_herdr_sdd
+import fleet_herdr_scope
 import fleet_herdr_control as control
 import fleet_herdr_metrics as metrics
 import fleet_herdr_instructions
@@ -195,6 +196,11 @@ class _Driver:
             self.sdd_packet = self._sdd_integrity(current)
         except state.MissionStateError as exc:
             self.sdd_error = str(exc)
+        self.scope_error = None
+        try:
+            fleet_herdr_scope.validate_binding(current, self.options)
+        except fleet_herdr_scope.ScopeError as exc:
+            self.scope_error = str(exc)
         contract = self.options.get("acceptance_contract")
         fleet_acceptance.check_binding(creation["idempotency_key"], contract)
         functional_spec = self.options.get("functional_contract")
@@ -717,6 +723,8 @@ class _Driver:
                 raise HerdrMissionError(str(exc)) from exc
         if getattr(self, "sdd_packet", None) is not None:
             task["sdd_plan"] = self.sdd_packet
+        if self.options.get("scope_contract") is not None:
+            task["physical_scope"] = self.options["scope_contract"]
         if self.options.get("herdr_capsule_manifest") is not None:
             from fleet_mission_capsule import candidate_files
             task["capsule_context"] = {
@@ -1068,12 +1076,22 @@ class _Driver:
             return self.response(
                 next_action="SDD plan binding failed closed before new effects: " + self.sdd_error
             )
+        if self.scope_error is not None:
+            return self.response(next_action="physical scope binding failed before new effects: " + self.scope_error,
+                                 scope_rejection={"status": "rejected", "reason": self.scope_error})
         if (self.current()["status"] in {"compiled", "booting", "running"} and self.remaining_seconds() <= 0
                 and not self.completed_turns() and not any(a["active"] for a in self.current()["admissions"].values())):
             return self.timed_out()
         _archive()  # Fail before clone/boot when integration is unavailable.
         control.enable(self.runs, self.mid)
         self.prepare_candidate()
+        scope_contract = self.options.get("scope_contract")
+        if scope_contract is not None:
+            if not self.current().get("herdr_scope_baseline") and _git(
+                    self.candidate, "status", "--porcelain=v1", "--untracked-files=all", "--ignored"):
+                raise HerdrMissionError("scope baseline changed before initial capture")
+            fleet_herdr_scope.establish(self.runs, self.current(), self.candidate, scope_contract,
+                [p for p in _git(self.candidate, "ls-files", "-z").split("\0") if p])
         # Validate bounded target instructions before booting any role process.
         fleet_herdr_instructions.packet(self.runs, self.mid, self.candidate, self.current())
         backend = self.backend()
@@ -1317,6 +1335,9 @@ def drive(runs_dir: Path, mission_id: str, *, observation_deadline=None) -> dict
                 # collect_result published an immutable rejection; this pass
                 # stops before any downstream admission or resend.
                 return driver.evidence_block(exc.proof)
+            except fleet_herdr_scope.ScopeRejected as exc:
+                return driver.response(scope_rejection=exc.receipt,
+                    next_action="physical scope not accepted; inspect receipt before explicit recovery")
 
 
 def supervise(runs_dir, mission_id, *, seconds=60, poll_seconds=0.25):
@@ -1337,7 +1358,7 @@ def supervise(runs_dir, mission_id, *, seconds=60, poll_seconds=0.25):
                 except fleet_herdr.HerdrBackendError as exc:
                     result = {"mission_id": mission_id, "next_action": "reconcile existing transport: " + str(exc)}
                 iterations += 1
-                if result.get("evidence_rejection"):
+                if result.get("evidence_rejection") or result.get("scope_rejection"):
                     return {**result, "supervision": "blocked", "iterations": iterations}
                 current = fleet_mission.load_state(runs_dir, mission_id)
                 if current["status"] in state.TERMINAL_STATUSES or control.view(current)["applied"] == "paused" and control.view(current)["desired"] == "pause_requested":

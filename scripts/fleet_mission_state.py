@@ -632,7 +632,7 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
             "initial_risk",
         }
         if not required <= set(payload) or not set(payload) <= required | {
-            "sdd_plan_sha256", "herdr_profile", "herdr_profile_sha256"
+            "sdd_plan_sha256", "herdr_profile", "herdr_profile_sha256", "scope_contract_sha256"
         }:
             raise MissionStateError("mission_created payload fields do not match schema")
         if not isinstance(payload["feature"], str) or not SAFE_FEATURE.fullmatch(
@@ -643,6 +643,10 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         _require_sha(payload["workflow_digest"], "workflow_digest")
         if "sdd_plan_sha256" in payload:
             _require_sha(payload["sdd_plan_sha256"], "sdd_plan_sha256")
+        if "scope_contract_sha256" in payload:
+            _require_sha(payload["scope_contract_sha256"], "scope_contract_sha256")
+            if payload.get("herdr_profile") != "sol_minimal_v1":
+                raise MissionStateError("physical scope v1 requires sol_minimal_v1")
         if ("herdr_profile" in payload) is not ("herdr_profile_sha256" in payload):
             raise MissionStateError("Herdr profile creation binding is incomplete")
         if "herdr_profile" in payload:
@@ -836,6 +840,10 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
     elif kind in {"herdr_supervision_enabled", "herdr_control_requested", "herdr_control_applied", "herdr_dispatch_intent"}:
         import fleet_herdr_control
         fleet_herdr_control.validate_payload(kind, payload)
+    elif kind == "herdr_scope_baseline_captured":
+        _require_fields(kind, payload, {"compiled_digest", "contract_sha256", "baseline_artifact_id"})
+        for field in payload:
+            _require_sha(payload[field], "physical scope " + field)
     elif kind == "functional_policy_frozen":
         _require_fields(kind, payload, {"compiled_digest", "spec_artifact_id", "tests_sha256"})
         for field in payload:
@@ -1914,6 +1922,8 @@ def _reserve_admissions(
 ) -> None:
     lane_actor = _require_admission_lane(result, event)
     _require_admission_deadline(result, event)
+    if result.get("scope_contract_sha256") and not result.get("herdr_scope_baseline"):
+        raise MissionConflict("physical scope requires baseline before admission")
     admissions = payload["admissions"]
     if payload["batch_sha256"] != sha256(admissions):
         raise MissionStateError("admission batch digest mismatch")
@@ -2161,6 +2171,8 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if "sdd_plan_sha256" in created:
         result["sdd_plan_sha256"] = created["sdd_plan_sha256"]
+    if "scope_contract_sha256" in created:
+        result["scope_contract_sha256"] = created["scope_contract_sha256"]
     if "herdr_profile" in created:
         result["herdr_profile"] = created["herdr_profile"]
         result["herdr_profile_sha256"] = created["herdr_profile_sha256"]
@@ -2652,6 +2664,13 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                 result["herdr_legacy_authorizations"] = [a["run_id"] for a in result["admissions"].values()
                     if a["phase"] in {"authorized", "started", "finalized"}]
             fleet_herdr_control.reduce(result, event)
+        elif kind == "herdr_scope_baseline_captured":
+            if (event["actor"] != "CONTROL" or result["status"] != "compiled"
+                    or result["admissions"] or result.get("herdr_scope_baseline")
+                    or payload["compiled_digest"] != result["compiled_digest"]
+                    or payload["contract_sha256"] != result.get("scope_contract_sha256")):
+                raise MissionConflict("scope baseline must be captured once before boot/admission")
+            result["herdr_scope_baseline"] = {**payload, "event_sha256": event["event_sha256"]}
         elif kind == "functional_policy_frozen":
             if (event["actor"] != "CONTROL" or result["status"] != "compiled"
                     or payload["compiled_digest"] != result["compiled_digest"] or result.get("functional_policy")):

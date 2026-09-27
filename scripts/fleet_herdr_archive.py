@@ -1,4 +1,4 @@
-"""Herdr archives v2-v5 (historical), v6 Research and v7 minimal evidence.
+"""Herdr archives v2-v7 and opt-in v8 minimal physical-scope evidence.
 
 The existing CMUX archive format remains unchanged. This format records a Git
 tree (including uncommitted candidate changes) without creating a commit.
@@ -25,6 +25,7 @@ import fleet_herdr_permissions
 import fleet_herdr_profile
 import fleet_herdr_metrics
 import fleet_herdr_sdd
+import fleet_herdr_scope
 import fleet_functional
 import fleet_mission
 import fleet_mission_state as state
@@ -70,7 +71,8 @@ def _git(repo: Path, *args: str, environment: dict[str, str] | None = None, inpu
     return result.stdout
 
 
-def snapshot(candidate_repo: Path, *, expected_base: str | None = None) -> tuple[str, bytes, bytes]:
+def snapshot(candidate_repo: Path, *, expected_base: str | None = None,
+             selected_paths: list[str] | None = None) -> tuple[str, bytes, bytes]:
     """Use a private index; never stage into the candidate's real index."""
     repo = candidate_repo.resolve(strict=True)
     if Path(_git(repo, "rev-parse", "--show-toplevel").decode().strip()).resolve() != repo:
@@ -81,7 +83,14 @@ def snapshot(candidate_repo: Path, *, expected_base: str | None = None) -> tuple
     with tempfile.TemporaryDirectory(prefix="fleet-herdr-index-") as temporary:
         environment = {**fleet_archive._git_environment(), "GIT_INDEX_FILE": str(Path(temporary) / "index")}
         _git(repo, "read-tree", base, environment=environment)
-        _git(repo, "add", "--all", "--", ".", environment=environment)
+        if selected_paths is None:
+            _git(repo, "add", "--all", "--", ".", environment=environment)
+        elif selected_paths:
+            for name in selected_paths:
+                fleet_herdr_scope.path(name)
+            environment["GIT_LITERAL_PATHSPECS"] = "1"
+            _git(repo, "add", "--all", "--force", "--pathspec-from-file=-", "--pathspec-file-nul",
+                 environment=environment, input_bytes=b"\0".join(p.encode() for p in selected_paths) + b"\0")
         tree_sha = _git(repo, "write-tree", environment=environment).decode().strip()
         patch = _git(repo, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", base, tree_sha)
         _git(repo, "read-tree", base, environment=environment)
@@ -104,7 +113,16 @@ def freeze(runs_dir: Path, mission_id: str, candidate_repo: Path) -> dict[str, A
     root = Path("missions") / mission_id
     if _git(candidate_repo, "rev-parse", "HEAD").decode().strip() != current["base_sha"]:
         raise HerdrArchiveError("candidate HEAD differs from mission baseline")
-    tree_sha, tree, patch = snapshot(candidate_repo, expected_base=current["base_sha"])
+    with fleet_safe_paths.RootedFS(runs_dir) as store:
+        options = fleet_json.loads(_read(store, root / "runtime-options.json"))
+    scope_contract = fleet_herdr_scope.validate_binding(current, options)
+    selected = None
+    if scope_contract is not None:
+        baseline, observed = fleet_herdr_scope.inspect(runs_dir, current, candidate_repo, scope_contract)
+        selected = sorted(set(baseline["tracked_paths"]) | set(observed["delivery_paths"]))
+    tree_sha, tree, patch = snapshot(candidate_repo, expected_base=current["base_sha"], selected_paths=selected)
+    if scope_contract is not None:
+        fleet_herdr_scope.inspect(runs_dir, current, candidate_repo, scope_contract, tree_sha=tree_sha, tree=tree)
     frozen = {
         "schema_version": 1, "mission_id": mission_id,
         "compiled_digest": compiled["compiled_digest"], "base_sha": current["base_sha"],
@@ -118,6 +136,9 @@ def freeze(runs_dir: Path, mission_id: str, candidate_repo: Path) -> dict[str, A
         raise HerdrArchiveError(f"candidate freeze SDD binding: {exc}") from exc
     if sdd is not None:
         frozen["sdd_plan_sha256"] = sdd["plan_sha256"]
+    if scope_contract is not None:
+        frozen.update(scope_contract_sha256=current[fleet_herdr_scope.FIELD],
+                      scope_baseline_artifact_id=current["herdr_scope_baseline"]["baseline_artifact_id"])
     with fleet_safe_paths.RootedFS(runs_dir) as store:
         _write(store, root / "candidate-freeze.json", _bytes(frozen))
     return frozen
@@ -327,6 +348,12 @@ def _capture_contents(runs_dir, mission_id, role_results, backend_state, compile
         if fleet_json.loads(contents["artifacts/" + recorded["artifact_id"]]) != {k: v for k, v in result.items() if k != "result_artifact_id"}:
             raise HerdrArchiveError("archive role envelope differs from ledger CAS")
     options = fleet_json.loads(contents["runtime-options.json"])
+    scope_contract = fleet_herdr_scope.validate_binding(current, options)
+    if scope_contract is not None:
+        baseline, receipt = fleet_herdr_scope.inspect(runs_dir, current, Path(frozen["candidate_repo"]),
+            scope_contract, tree_sha=frozen["tree_sha"], tree=contents["writer/final-tree.tar"])
+        contents["scope/baseline.json"] = fleet_json.canonical_bytes(baseline)
+        contents["scope/result.json"] = _bytes(receipt)
     try:
         fleet_herdr_inference.require_settled(current)
         fleet_herdr_inference.verify_evidence(current, lambda pin: contents["artifacts/" + pin])
@@ -352,6 +379,8 @@ def _capture_contents(runs_dir, mission_id, role_results, backend_state, compile
     attest_admissions(contents, current, frozen["candidate_repo"], profile=profile)
     versioned = profile is not fleet_herdr_profile.LEGACY
     schema_version = profile.archive_schema_version if versioned else (5 if sdd is not None else (4 if functional is not None else 3))
+    if scope_contract is not None:
+        schema_version = fleet_herdr_scope.ARCHIVE_VERSION
     index = {"schema_version": schema_version, "permissions_policy_version": profile.permissions_policy_version if versioned else (2 if options.get("herdr_capsule_manifest") else 1), "backend": "herdr", "mission_id": mission_id,
         "compiled_digest": compiled["compiled_digest"], "ledger_head": current["head_sha256"],
         "base_sha": current["base_sha"], "final_tree_sha": frozen["tree_sha"],
@@ -477,7 +506,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
     with fleet_safe_paths.RootedFS(runs_dir) as store:
         raw = _read(store, archive / "archive-index.json")
         index = fleet_json.loads(raw)
-        if not isinstance(index, dict) or raw != _bytes(index) or (type(index.get("schema_version")) is not int or index["schema_version"] not in {2, 3, 4, 5, 6, 7}) or index.get("backend") != "herdr" or index.get("mission_id") != mission_id:
+        if not isinstance(index, dict) or raw != _bytes(index) or (type(index.get("schema_version")) is not int or index["schema_version"] not in {2, 3, 4, 5, 6, 7, 8}) or index.get("backend") != "herdr" or index.get("mission_id") != mission_id:
             raise HerdrArchiveError("invalid Herdr archive index")
         if index["schema_version"] >= 3 and (type(index.get("permissions_policy_version")) is not int
                 or index["permissions_policy_version"] not in {1, 2, 3, 4}):
@@ -497,7 +526,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
             profile = fleet_herdr_profile.resolve_profile(compiled)
         except fleet_herdr_profile.ProfileError as exc:
             raise HerdrArchiveError(str(exc)) from exc
-        if index["schema_version"] in {6, 7}:
+        if index["schema_version"] in {6, 7, 8}:
             expected_profile = (fleet_herdr_profile.RESEARCH if index["schema_version"] == 6
                                 else fleet_herdr_profile.MINIMAL)
             if (profile is not expected_profile
@@ -518,6 +547,11 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
         if archived_state.get("functional_policy") is not None:
             required.add("functional-result.json")
         ledger_sdd = archived_state.get("sdd_plan_sha256")
+        scope_required = archived_state.get(fleet_herdr_scope.FIELD) is not None
+        if scope_required != (index["schema_version"] == fleet_herdr_scope.ARCHIVE_VERSION):
+            raise HerdrArchiveError("scope archive version/creation binding mismatch")
+        if scope_required:
+            required.update({"scope/baseline.json", "scope/result.json"})
         if index["schema_version"] == 5 and ledger_sdd is None:
             raise HerdrArchiveError("archive schema v5 lacks its ledger SDD plan pin")
         if ledger_sdd is not None:
@@ -719,6 +753,19 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
                 or _sha(contents["objective.txt"]) != archived_state["objective_sha256"]
                 or creation.get("request", {}).get("sdd_plan_sha256") != ledger_sdd):
             raise HerdrArchiveError("archive runtime/objective binding mismatch")
+        scope_receipt = None
+        try:
+            fleet_herdr_scope.validate_binding(archived_state, options)
+            if creation.get("request", {}).get(fleet_herdr_scope.FIELD) != archived_state.get(fleet_herdr_scope.FIELD):
+                raise fleet_herdr_scope.ScopeError("scope creation request mismatch")
+            if scope_required:
+                scope_receipt = fleet_herdr_scope.verify_archived(archived_state, options, frozen,
+                    fleet_json.loads(contents["scope/baseline.json"]),
+                    fleet_json.loads(contents["scope/result.json"]), tree)
+            elif fleet_herdr_scope.FIELD in frozen or "scope_baseline_artifact_id" in frozen:
+                raise fleet_herdr_scope.ScopeError("unbound scope freeze")
+        except (fleet_herdr_scope.ScopeError, KeyError, TypeError, ValueError) as exc:
+            raise HerdrArchiveError("archive physical scope evidence invalid: " + str(exc)) from exc
         try:
             fleet_herdr_profile.validate_profile_binding(compiled, options, archived_state)
             fleet_herdr_profile.validate_creation_binding(
@@ -737,7 +784,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
         if bool(functional_spec) != bool(archived_state.get("functional_policy")):
             raise HerdrArchiveError("archive functional options/policy mismatch")
         if functional_spec is not None:
-            if (index["schema_version"] not in {4, 5, 6, 7} or fleet_functional.digest(fleet_functional.validate(functional_spec))
+            if (index["schema_version"] not in {4, 5, 6, 7, 8} or fleet_functional.digest(fleet_functional.validate(functional_spec))
                     != archived_state["functional_policy"]["spec_artifact_id"]):
                 raise HerdrArchiveError("archive functional contract/schema mismatch")
             try:
@@ -765,6 +812,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
             raise HerdrArchiveError("archive completion permission attestation is incompatible")
         store.assert_root_binding()
     return {"archive_schema_version": index["schema_version"], "permissions": permission_proof,
+        **({"physical_scope": scope_receipt} if scope_receipt is not None else {}),
         **({"inference_broker": inference_evidence} if archived_state.get("inference_policies") else {}),
         **({"functional": functional, "functional_verification_scope": "offline_integrity_and_controller_provenance_not_reexecution"} if functional is not None else {}),
         **({"finalization_policy_event_sha256": finalization_policy["event_sha256"]} if for_completion else {}),

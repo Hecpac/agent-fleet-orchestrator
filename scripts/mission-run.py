@@ -21,6 +21,8 @@ import uuid
 import fleet_admission
 import fleet_acceptance
 import fleet_functional
+import fleet_herdr_scope
+import fleet_herdr_work_packet
 import fleet_herdr_control
 import fleet_artifacts
 import fleet_archive
@@ -2176,6 +2178,7 @@ def create_and_drive(
     herdr_capsule_manifest: dict[str, Any] | None = None,
     functional_contract: dict[str, Any] | None = None,
     sdd_plan_path: Path | None = None,
+    scope_contract: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not FEATURE.fullmatch(feature):
         raise MissionRunError("invalid feature")
@@ -2199,6 +2202,10 @@ def create_and_drive(
         raise MissionRunError("minimal Herdr profile requires --acceptance-contract")
     is_herdr = fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"])
     profile = fleet_herdr_profile.resolve_profile(compiled) if is_herdr else None
+    if scope_contract is not None:
+        fleet_herdr_scope.validate(scope_contract)
+        if profile is not fleet_herdr_profile.MINIMAL:
+            raise MissionRunError("--scope-contract requires sol_minimal_v1")
     if sdd_plan_path is not None and not is_herdr:
         raise MissionRunError("--sdd-plan requires a supported Herdr workflow")
     herdr_runtime_options = {}
@@ -2255,6 +2262,8 @@ def create_and_drive(
     )
     manifest_path = runs_dir / f"fleet-{feature}.manifest"
     if herdr_runtime_options:
+        if scope_contract is not None:
+            herdr_runtime_options["scope_contract"] = scope_contract
         key += ":herdr-runtime:" + mission_state.artifact_id(mission_state.canonical_bytes(herdr_runtime_options))
     if functional_contract is not None:
         fleet_functional.validate(functional_contract)
@@ -2307,7 +2316,12 @@ def dry_run(
     acceptance_contract: dict[str, Any] | None = None,
     router_path: Path | None = None,
     functional_contract: dict[str, Any] | None = None,
+    scope_contract: dict[str, Any] | None = None,
+    work_packet: bool = False,
+    work_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if work_context is not None and not work_packet:
+        raise MissionRunError("--work-context requires --work-packet")
     target_repo = exact_git_toplevel(target_repo)
     if functional_contract is not None:
         fleet_functional.validate(functional_contract)
@@ -2324,6 +2338,10 @@ def dry_run(
         raise MissionRunError("minimal Herdr profile requires --acceptance-contract")
     if functional_contract is not None and not fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
         raise MissionRunError("functional contracts require a supported Herdr workflow")
+    if scope_contract is not None:
+        fleet_herdr_scope.validate(scope_contract)
+        if compiled["resolved"]["preset"] != "sol_minimal_v1":
+            raise MissionRunError("--scope-contract requires sol_minimal_v1")
     if acceptance_contract is not None:
         fleet_acceptance.validate(acceptance_contract)
         if compiled["workflow"]["archive"]["content_policy"] != "full" or not compiled["workflow"]["archive"]["include_final_tree"]:
@@ -2337,6 +2355,19 @@ def dry_run(
     )
     enforce_audit_trust(compiled, list(assessment["categories"]), execution_profile)
     timeout = timeout_seconds or int(compiled["workflow"]["limits"]["deadline_seconds"])
+    preview = {}
+    if work_packet:
+        if scope_contract is None:
+            raise MissionRunError("--work-packet requires an explicit --scope-contract")
+        prepared = fleet_herdr_work_packet.prepare(objective=objective,
+            candidate_repo=target_repo, base_sha=git_read(target_repo, "rev-parse", "HEAD"),
+            compiled=compiled, acceptance_contract=acceptance_contract, scope_contract=scope_contract,
+            functional_contract=functional_contract, work_context=work_context,
+            timeout_seconds=timeout_seconds)
+        preview = {"owner_work_packet": prepared["work_packet"],
+            "owner_protocol": {"mode": "preview_only", "dispatch_enabled": False,
+                "instruction_source": "tracked HEAD, including on a dirty checkout",
+                "note": "No Mission, admission, session or candidate is created. B stages information and interaction; repair, decisions lifecycle and amendments remain disabled."}}
     return {
         "feature": feature,
         "objective_sha256": mission_state.artifact_id(objective),
@@ -2349,6 +2380,9 @@ def dry_run(
         "timeout_seconds": timeout,
         "execution_profile": execution_profile,
         "effects": [],
+        **preview,
+        **({"physical_scope": {"contract_sha256": fleet_herdr_scope.digest(scope_contract),
+                               "archive_schema_version": 8}} if scope_contract is not None else {}),
         **({"functional": {"schema_version": 1, "spec_sha256": fleet_functional.digest(functional_contract),
                             "check_id": functional_contract["check_id"]}} if functional_contract is not None else {}),
         "backend": "herdr" if fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]) else "cmux-legacy",
@@ -2384,6 +2418,10 @@ def _parser() -> argparse.ArgumentParser:
         )
         command.add_argument("--acceptance-contract", type=Path)
         command.add_argument("--functional-contract", type=Path, help="versioned required functional check frozen before launch")
+        command.add_argument("--scope-contract", type=Path, help="opt-in physical candidate acceptance (sol_minimal_v1 only)")
+        if name == "dry":
+            command.add_argument("--work-packet", action="store_true", help="preview owner-work-v1; owner cycle and dispatch remain disabled")
+            command.add_argument("--work-context", type=Path, help="initial context, requirements, preferences and decisions for the work packet")
         command.add_argument(
             "--execution-profile",
             default="native",
@@ -2520,6 +2558,9 @@ def main(argv: list[str] | None = None) -> int:
                 execution_profile=args.execution_profile,
                 acceptance_contract=fleet_acceptance.load(args.acceptance_contract) if args.acceptance_contract else None,
                 functional_contract=fleet_functional.load(args.functional_contract) if args.functional_contract else None,
+                scope_contract=fleet_herdr_scope.load(args.scope_contract) if args.scope_contract else None,
+                work_packet=args.work_packet,
+                work_context=fleet_herdr_work_packet.load_context(args.work_context) if args.work_context else None,
                 router_path=args.router,
             )
             emit(value, json_mode=args.json)
@@ -2543,6 +2584,7 @@ def main(argv: list[str] | None = None) -> int:
                 execution_profile=args.execution_profile,
                 acceptance_contract=fleet_acceptance.load(args.acceptance_contract) if args.acceptance_contract else None,
                 functional_contract=fleet_functional.load(args.functional_contract) if args.functional_contract else None,
+                scope_contract=fleet_herdr_scope.load(args.scope_contract) if args.scope_contract else None,
                 router_path=args.router,
             )
             emit(value, json_mode=args.json)
@@ -2623,6 +2665,7 @@ def main(argv: list[str] | None = None) -> int:
         fleet_safe_paths.SafePathError,
         fleet_acceptance.AcceptanceError,
         fleet_functional.FunctionalError,
+        fleet_herdr_work_packet.WorkPacketError,
         fleet_json.FleetJSONError,
         OSError,
         MissionRunError,
