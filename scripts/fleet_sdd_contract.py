@@ -3,6 +3,11 @@ import argparse
 import json
 import re
 
+try:  # imported as ``scripts.fleet_sdd_contract``
+    from . import fleet_json
+except ImportError:  # executed directly or imported from scripts/
+    import fleet_json
+
 
 def _object(value, fields, where):
     if not isinstance(value, dict) or set(value) != set(fields):
@@ -84,22 +89,13 @@ def validate(document):
     return {'contract': 'VALID', 'functional_status': 'NOT_VERIFIED', 'matrix': matrix}
 
 
-def _unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f'duplicate JSON key: {key}')
-        result[key] = value
-    return result
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('plan')
     args = parser.parse_args()
     try:
-        with open(args.plan, encoding='utf-8') as source:
-            result = validate(json.load(source, object_pairs_hook=_unique_object))
+        with open(args.plan, 'rb') as source:
+            result = validate(fleet_json.loads(source.read()))
     except (OSError, ValueError) as error:
         parser.exit(2, f'INVALID: {error}\n')
     print(json.dumps(result, indent=2))

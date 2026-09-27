@@ -9,7 +9,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import http.client
-import json
 import os
 from pathlib import Path
 import re
@@ -103,7 +102,7 @@ def _private_file(path):
 def _claims(token):
     try:
         part = token.split('.')[1]
-        return json.loads(base64.urlsafe_b64decode(part + '=' * (-len(part) % 4)))
+        return fleet_json.loads(base64.urlsafe_b64decode(part + '=' * (-len(part) % 4)))
     except (IndexError, ValueError, UnicodeError):
         return {}
 

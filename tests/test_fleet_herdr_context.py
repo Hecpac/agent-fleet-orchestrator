@@ -2,9 +2,11 @@ import copy
 import importlib.util
 import json
 from pathlib import Path
+import sys
 import tempfile
 import unittest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 spec = importlib.util.spec_from_file_location("context", Path(__file__).resolve().parents[1]/"scripts/fleet_herdr_context.py")
 ctx = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ctx)

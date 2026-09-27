@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts/fleet_sdd_contract.py'
+sys.path.insert(0, str(ROOT / 'scripts'))
 SPEC = importlib.util.spec_from_file_location('sdd_contract', SCRIPT)
 sdd = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(sdd)
@@ -48,8 +50,13 @@ class ContractTests(unittest.TestCase):
                 sdd.validate(value)
 
     def test_duplicate_json_key_rejected(self):
-        with self.assertRaises(ValueError):
-            json.loads('{"schema":1,"schema":2}', object_pairs_hook=sdd._unique_object)
+        with tempfile.TemporaryDirectory() as temp:
+            plan = Path(temp) / 'plan.json'
+            plan.write_bytes(b'{"schema":1,"schema":2}')
+            run = subprocess.run([sys.executable, '-B', str(SCRIPT), str(plan)],
+                                 capture_output=True, text=True, check=False)
+        self.assertEqual(run.returncode, 2)
+        self.assertIn('duplicate JSON object key: schema', run.stderr)
 
     def test_cli_outputs_matrix_without_running_procedures(self):
         run = subprocess.run([sys.executable, '-B', str(SCRIPT),

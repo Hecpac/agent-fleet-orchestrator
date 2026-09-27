@@ -5,7 +5,6 @@ import copy
 import ast
 import hashlib
 import io
-import json
 import os
 import platform
 from pathlib import Path, PurePosixPath
@@ -57,7 +56,7 @@ class Docker:
         p = subprocess.run([self.binary, "context", "inspect", "--format", "{{json .Endpoints.docker.Host}}"],
                            capture_output=True, timeout=10, shell=False)
         try:
-            self.endpoint = json.loads(p.stdout)
+            self.endpoint = fleet_json.loads(p.stdout)
         except (ValueError, TypeError) as exc:
             raise RunnerBlocked("docker_context_unavailable") from exc
         if p.returncode or not isinstance(self.endpoint, str) or not self.endpoint.startswith("unix:///"):
@@ -71,13 +70,13 @@ class Docker:
         return p.stdout
 
     def inspect(self, name):
-        return json.loads(self.call(["container", "inspect", name]))[0]
+        return fleet_json.loads(self.call(["container", "inspect", name]))[0]
 
     def runtime(self, image):
-        info = json.loads(self.call(["info", "--format", '{{json .}}']))
+        info = fleet_json.loads(self.call(["info", "--format", '{{json .}}']))
         if info.get("CgroupVersion") != "2" or info.get("OSType") != "linux":
             raise RunnerBlocked("linux_cgroup_v2_required")
-        value = json.loads(self.call(["image", "inspect", image]))[0]
+        value = fleet_json.loads(self.call(["image", "inspect", image]))[0]
         if value.get("Os") != "linux" or value.get("Architecture") != "arm64":
             raise RunnerBlocked("runtime_architecture_incompatible")
         variables = dict(v.split("=", 1) for v in value.get("Config", {}).get("Env", []))

@@ -15,6 +15,7 @@ import fleet_herdr_owner_contract as contracts
 import fleet_herdr_owner_cycle as cycle
 import fleet_herdr_owner_runtime as runtime
 import fleet_herdr_work_packet as work
+import fleet_json
 import workflow_config
 from scripts.fleet_herdr_campaign import git
 from tests.test_fleet_herdr_owner_cycle import Backend
@@ -147,7 +148,7 @@ def run(output):
 
 
 def verify_report(path):
-    report = json.loads(Path(path).read_text())
+    report = fleet_json.loads(Path(path).read_bytes())
     for record in report["cases"]:
         owner = cycle.Cycle(record["runs"], record["cycle_id"], contract_sha256=record["contract_sha256"])
         if owner.verify() != record["result"]:

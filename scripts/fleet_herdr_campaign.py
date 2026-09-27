@@ -23,6 +23,7 @@ import fleet_functional
 import fleet_herdr_archive
 import fleet_herdr_control as control
 import fleet_herdr_mission as driver
+import fleet_json
 import fleet_mission
 import fleet_mission_state as state
 import fleet_report
@@ -60,7 +61,7 @@ class CampaignBackend(FakeBackend):
             if run_id in self.results:
                 result = self.results[run_id]
                 raw = fleet_artifacts.get_bytes(self.runs, self.mid, result["evidence"]["transcript_artifact_id"])
-                rows = [json.loads(line) for line in raw.splitlines()]
+                rows = [fleet_json.loads(line) for line in raw.splitlines()]
                 ended = stamp()
                 for row in rows:
                     row["timestamp"] = ended if row.get("payload", {}).get("type") == "task_complete" else started

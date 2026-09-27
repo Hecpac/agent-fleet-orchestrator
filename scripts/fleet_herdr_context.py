@@ -17,6 +17,8 @@ import sys
 import time
 import uuid
 
+import fleet_json
+
 MAX_BYTES = 64 * 1024 * 1024
 SOURCE = "fleet-context"
 TOKEN_KEYS = ("fleet_role", "fleet_context", "fleet_context_detail")
@@ -115,7 +117,7 @@ class Reader:
                     raw = handle.read(MAX_BYTES + 1)
                 if len(raw) > MAX_BYTES or not raw.endswith(b"\n"):
                     return unknown("transcript_incomplete_or_oversized")
-                rows = [json.loads(line) for line in raw.splitlines() if line.strip()]
+                rows = [fleet_json.loads(line) for line in raw.splitlines() if line.strip()]
                 if any(not isinstance(r, dict) for r in rows):
                     return unknown("invalid_transcript_row")
                 # Keep one version per path, never an old counter after a rewrite.
@@ -135,7 +137,7 @@ def command(config, args):
     # through pane.get below; an empty read response is still an error.
     if not result.stdout.strip() and args[:2] == ["pane", "report-metadata"]:
         return {}
-    payload = json.loads(result.stdout)
+    payload = fleet_json.loads(result.stdout)
     return payload["result"]
 
 
@@ -206,13 +208,13 @@ def publish(config, item, *, run=command, ttl_ms=15000):
 
 
 def load_inputs(config_path, roster_path):
-    config = json.loads(Path(config_path).read_text())
+    config = fleet_json.loads(Path(config_path).read_bytes())
     cmd = config.get("command")
     if (not isinstance(cmd, list) or len(cmd) != 3 or cmd[1] != "--session"
             or not all(isinstance(v, str) and v for v in cmd)
             or not Path(cmd[0]).is_absolute() or not isinstance(config.get("environment"), dict)):
         raise ValueError("explicit herdr executable/session/environment required")
-    roster = json.loads(Path(roster_path).read_text())
+    roster = fleet_json.loads(Path(roster_path).read_bytes())
     if roster.get("schema_version") != 1 or not isinstance(roster.get("members"), list) or not 1 <= len(roster["members"]) <= 16:
         raise ValueError("roster requires 1 to 16 members")
     members = roster["members"]
@@ -265,7 +267,7 @@ def attach_continuity(items, directory):
         head = root/'head.json'
         if head.is_symlink() or head.stat().st_size > 1024:
             raise ValueError('head')
-        sha = json.loads(head.read_bytes())['sha256']
+        sha = fleet_json.loads(head.read_bytes())['sha256']
         if not isinstance(sha,str) or len(sha)!=64 or any(c not in '0123456789abcdef' for c in sha):
             raise ValueError('digest')
         path = root/'objects'/sha
@@ -274,7 +276,7 @@ def attach_continuity(items, directory):
         raw=path.read_bytes()
         if hashlib.sha256(raw).hexdigest()!=sha:
             raise ValueError('modified')
-        state=json.loads(raw)
+        state=fleet_json.loads(raw)
         phases={'checkpoint_sent':'guardando resumen', 'prepared':'resumen listo',
                 'new_sent':'abriendo sesión', 'status_sent':'comprobando sesión', 'restore_sent':'recuperando memoria',
                 'lead_pending':'esperando al Lead', 'lead_sent':'informando al Lead', 'blocked':'requiere atención'}

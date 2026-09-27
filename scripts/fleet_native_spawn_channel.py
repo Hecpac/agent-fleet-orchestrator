@@ -16,6 +16,8 @@ import socket
 import struct
 import time
 
+import fleet_json
+
 LIMIT = 1024 * 1024
 REQUEST = b"native-spawn/request/v1\0"
 ACK = b"native-spawn/ack/v1\0"
@@ -72,7 +74,7 @@ def read_frame(sock, deadline):
             if not block:
                 raise EOFError("channel closed")
             body.extend(block)
-    value = json.loads(body)
+    value = fleet_json.loads(body)
     if canonical(value) != body:
         raise ValueError("noncanonical channel frame")
     return value

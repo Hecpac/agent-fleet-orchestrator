@@ -21,9 +21,11 @@ import uuid
 try:  # imported as ``scripts.fleet_sdd_snapshot``
     from . import fleet_sdd_contract as _contract
     from . import fleet_safe_paths as _safe_paths
+    from . import fleet_json
 except ImportError:  # executed directly as ``python3 scripts/fleet_sdd_snapshot.py``
     import fleet_sdd_contract as _contract
     import fleet_safe_paths as _safe_paths
+    import fleet_json
 
 
 SCHEMA = "fleet.sdd.snapshot.v1"
@@ -56,31 +58,14 @@ def _canonical_sha256(value: object) -> str:
     return value
 
 
-def _reject_constant(token: str) -> object:
-    raise SnapshotError(f"non-JSON constant rejected: {token}")
-
-
-def _unique_object(pairs):
-    result = {}
-    for key, value in pairs:
-        if key in result:
-            raise SnapshotError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-
 def _parse_json(raw: bytes, where: str) -> object:
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise SnapshotError(f"{where} is not valid UTF-8") from exc
     try:
-        return json.loads(
-            text, object_pairs_hook=_unique_object, parse_constant=_reject_constant
-        )
-    except SnapshotError:
-        raise
-    except ValueError as exc:
+        return fleet_json.loads(text)
+    except fleet_json.FleetJSONError as exc:
         raise SnapshotError(f"{where} is not valid JSON: {exc}") from exc
 
 

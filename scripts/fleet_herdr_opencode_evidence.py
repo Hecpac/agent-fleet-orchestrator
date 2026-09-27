@@ -14,8 +14,9 @@ acceptance, even when the final text contains such claims.
 from __future__ import annotations
 
 import hashlib
-import json
 import math
+
+import fleet_json
 
 __all__ = ["EvidenceError", "verify_export", "MAX_RAW_BYTES", "MAX_JSON_DEPTH"]
 
@@ -26,19 +27,6 @@ MAX_JSON_DEPTH = 200
 
 class EvidenceError(ValueError):
     """Raised when the export does not satisfy the text-only evidence contract."""
-
-
-def _reject_constant(name):
-    raise EvidenceError("non-finite JSON constant is not allowed: %s" % name)
-
-
-def _no_duplicate_keys(pairs):
-    obj = {}
-    for key, value in pairs:
-        if key in obj:
-            raise EvidenceError("duplicate JSON key is not allowed: %r" % key)
-        obj[key] = value
-    return obj
 
 
 def _require_str(value, name):
@@ -85,16 +73,10 @@ def _load_json(raw):
     if len(raw) > MAX_RAW_BYTES:
         raise EvidenceError("raw export exceeds the %d byte limit" % MAX_RAW_BYTES)
     try:
-        document = json.loads(
-            raw,
-            object_pairs_hook=_no_duplicate_keys,
-            parse_constant=_reject_constant,
-        )
-    except EvidenceError:
-        raise
-    except RecursionError as exc:
-        raise EvidenceError("JSON nesting is too deep") from exc
-    except ValueError as exc:
+        document = fleet_json.loads(raw)
+    except fleet_json.FleetJSONError as exc:
+        if isinstance(exc.__cause__, RecursionError):
+            raise EvidenceError("JSON nesting is too deep") from exc
         raise EvidenceError("raw export is not strict JSON: %s" % exc) from exc
     _check_depth(document)
     return document

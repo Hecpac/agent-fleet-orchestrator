@@ -26,6 +26,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import fleet_json
+
 SCHEMA_VERSION = "herdr.fleet.roster.v1"
 MODE = "supervised-maintenance"
 INPUT_POLICY = "independent-v1"
@@ -128,30 +130,11 @@ CANONICAL_ROLES = (
 EXPECTED_BY_ID = {row["id"]: row for row in CANONICAL_ROLES}
 
 
-def _reject_constant(name: str) -> Any:
-    raise ValueError(f"non-finite JSON constant is not allowed: {name}")
-
-
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError(f"duplicate JSON key: {key}")
-        result[key] = value
-    return result
-
-
 def loads_strict(raw: str | bytes) -> Any:
     """Parse JSON rejecting duplicate keys and ``NaN``/``Infinity`` values."""
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
     try:
-        return json.loads(
-            raw,
-            object_pairs_hook=_unique_object,
-            parse_constant=_reject_constant,
-        )
-    except json.JSONDecodeError as exc:
+        return fleet_json.loads(raw)
+    except fleet_json.FleetJSONError as exc:
         raise ValueError(f"invalid JSON: {exc}") from exc
 
 
