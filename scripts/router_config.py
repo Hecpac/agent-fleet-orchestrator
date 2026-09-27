@@ -321,14 +321,20 @@ def _validate_identity_groups(
     return normalized
 
 
-def validate_router(config: dict[str, Any]) -> None:
+def validate_router(config: dict[str, Any], *, provider_contract: bool = True) -> None:
+    """Validate a router; ``provider_contract=False`` is the archive-only pre-3b8d894 shape.
+
+    That historical shape predates ``router.providers`` and per-role ``transport`` /
+    ``num_predict`` without a schema bump. It must omit all three and is only for
+    reading retained archives; compilation and effects always use the current contract.
+    """
     config = _expect_mapping(config, "router")
     _expect_keys(
         config,
         required={
             "schema_version",
             "defaults",
-            "providers",
+            *(("providers",) if provider_contract else ()),
             "limits",
             "lead",
             "roles",
@@ -344,8 +350,9 @@ def validate_router(config: dict[str, Any]) -> None:
     _expect_identifier(defaults["preset"], "router.defaults.preset", allow_reserved=True)
     race_roles = _expect_string_list(defaults["race_roles"], "router.defaults.race_roles", nonempty=True)
 
-    providers = _expect_mapping(config["providers"], "router.providers")
-    if not providers:
+    providers = (_expect_mapping(config["providers"], "router.providers")
+                 if provider_contract else {})
+    if provider_contract and not providers:
         raise RouterError("router.providers must not be empty")
     for provider_hook, raw_entry in providers.items():
         provider_where = f"router.providers.{provider_hook}"
@@ -413,8 +420,7 @@ def validate_router(config: dict[str, Any]) -> None:
         "variant",
         "instructions",
         "hook_source",
-        "transport",
-        "num_predict",
+        *(("transport", "num_predict") if provider_contract else ()),
     }
     used_hook_sources: set[str] = set()
     for role_type, raw_role in roles.items():
@@ -526,11 +532,11 @@ def validate_router(config: dict[str, Any]) -> None:
                 raise RouterError(
                     f"router.roles.{role_type}.hook_source is not supported: {hook_source}"
                 )
-            if role.get("transport") not in TRANSPORTS:
+            if provider_contract and role.get("transport") not in TRANSPORTS:
                 raise RouterError(
                     f"router.roles.{role_type}.transport must be one of {sorted(TRANSPORTS)}"
                 )
-            if hook_source not in providers:
+            if provider_contract and hook_source not in providers:
                 raise RouterError(
                     f"router.roles.{role_type}.hook_source has no router.providers entry: {hook_source}"
                 )

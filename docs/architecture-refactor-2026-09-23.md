@@ -36,7 +36,7 @@ no se alteran sus planes, pins, deadlines, autorizaciones ni evidencia.
 | --- | --- | --- |
 | S0 | Base física y corpus histórico | Completado; procedencia y aceptación originales desconocidas quedan explícitas |
 | S1 | Intérprete y disponibilidad de workflows | Verificado localmente |
-| S2 | Lectores, contratos y operaciones puras | Extracción inicial verificada; decoders históricos y resto de readers pendientes |
+| S2 | Lectores, contratos y operaciones puras | Completado: dos carriles históricos explícitos, lectores puros extraídos y un rechazo explicado |
 | S3 | Composición moderna y compatibilidad | Pendiente |
 | S4 | Catálogo de perfiles e identidad | Pendiente |
 | S5 | Telemetría separada de autoridad | Pendiente |
@@ -115,8 +115,48 @@ Verificación local en `outputs/refactor-20260923/`:
 - `own-changes.patch`: delta de esta intervención respecto de la base física,
   separado del trabajo que ya existía antes de la autorización.
 
-S2 continúa con decoders históricos explícitos y la separación de los readers
-restantes. Su criterio es conservar o explicar los resultados según la versión
-original; no convertir los 13 rechazos en aceptación relajando validaciones.
-Después sigue S3. El pipeline predeterminado, las políticas de reparación y
-la telemetría todavía no se han refactorizado.
+## Entrega S2: carriles históricos y lectores puros (2026-09-27)
+
+Criterio: conservar o explicar cada resultado según la versión original, sin
+relajar las validaciones actuales. Evidencia en `outputs/refactor-20260927-s2/`.
+
+- Resultado original: `original_readers.py` ejecuta el árbol versionado de cada
+  fecha sobre copias temporales (`original-reader-outcomes.json`). Los 9 archives
+  del 14-07 verifican con `67a7734` y se rechazan desde `c1e0f2c`/`1bcdec2`. Los 4
+  del 20-07 verifican con `b259e18` y `85261cf` y se rechazan desde `3b8d894`. La
+  revisión exacta del controlador sigue `NOT_VERIFIED`; los commits son el proxy.
+- `manifest-contract-v2`: solo con `manifest_contract_version=2` y sin `base_sha`
+  global. Enlaza la base mediante un único escritor, exige su `final_sha` de
+  arranque igual a la base y rechaza cualquier campo de publicación v3. El final
+  lo acredita la evidencia Git archivada. No acredita aislamiento del escritor,
+  publicación tras quiescencia ni enlace del final en el manifest.
+- `router-pre-provider-contract`: `3b8d894` añadió `router.providers`, `transport`
+  y `num_predict` sin cambiar `schema_version`. El carril exige que el router
+  archivado omita los tres y que el manifest no tenga registros `provider.*`; una
+  mezcla se rechaza. `validate_router(provider_contract=False)` solo lo usa la
+  lectura de archives; compilación, validación y modo `effect` conservan el
+  contrato actual.
+- El resultado incluye `historical_lanes` y `not_attested`; `verify_acceptance`
+  lo rechaza y `fleet_report` lo muestra. Los 7 archives del lector actual
+  conservan resultados idénticos.
+- `d0d20dda` sigue rechazado: su recibo de auditoría es anterior a `27c728d`
+  (sin `trust_scope` ni `anchor_receipts_sha256`). Un carril propio duplicaría la
+  verificación de firma, anclas y trust scope para una Mission de prueba.
+- `fleet_archive_contract.py` recibe 11 funciones y 9 constantes sin IO, Git ni
+  procesos, AST-equivalentes (`extraction-ast.json`); `fleet_archive` conserva
+  aliases.
+
+Verificación: `replay_corpus.py` reproduce exactamente S0 antes del cambio
+(20 archives, 10 workflows, sello owner-cycle y 0 efectos). Después: 7 idénticos,
+12 verificados por carril, 1 rechazo explicado, workflows y sello sin cambios
+(`replay-before.json`, `replay-after.json`, `corpus-classification.json`). Pasan
+`test_fleet_archive_historical_lanes` y las suites de archive, router, compilados,
+informes y Mission; el único error es el bind de socket Unix del sandbox.
+Los tests unitarios cubren la selección, el enlace estricto y el rechazo de
+mezclas; la verificación completa de los carriles solo la ejercita el replay
+local del corpus ignorado, no el CI hospedado.
+
+Sigue S3. Quedan fuera de S2 `fleet_herdr_archive.verify` y la dependencia de la
+validación del router archivado respecto a `.opencode/agents` del checkout
+actual. El pipeline predeterminado, las políticas de reparación y la telemetría
+todavía no se han refactorizado.

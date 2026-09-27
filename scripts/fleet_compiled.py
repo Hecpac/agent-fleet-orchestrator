@@ -361,7 +361,7 @@ def _validate_v1(value: dict[str, Any]) -> None:
         )
 
 
-def _validate_v2(value: dict[str, Any], *, effectful: bool) -> None:
+def _validate_v2(value: dict[str, Any], *, effectful: bool, provider_contract: bool = True) -> None:
     # Snapshot validation must not import the compiler or Mission runtime.
     import router_config
 
@@ -375,7 +375,7 @@ def _validate_v2(value: dict[str, Any], *, effectful: bool) -> None:
     if router_digest != value["router_digest"]:
         raise CompiledError("compiled router_snapshot digest mismatch")
     try:
-        router_config.validate_router(router)
+        router_config.validate_router(router, provider_contract=provider_contract)
     except router_config.RouterError as exc:
         raise CompiledError(f"compiled.router_snapshot is invalid: {exc}") from exc
 
@@ -532,10 +532,18 @@ def _mode(value: str) -> LoadMode:
     raise CompiledError("compiled load mode must be 'read' or 'effect'")
 
 
-def validate(value: Any, *, mode: LoadMode = "read") -> dict[str, Any]:
-    """Validate one parsed compiled workflow for historical or effectful use."""
+def validate(
+    value: Any, *, mode: LoadMode = "read", provider_contract: bool = True
+) -> dict[str, Any]:
+    """Validate one parsed compiled workflow for historical or effectful use.
+
+    ``provider_contract=False`` reads a retained pre-provider router snapshot and is
+    never valid for effects.
+    """
 
     selected_mode = _mode(mode)
+    if not provider_contract and selected_mode == "effect":
+        raise CompiledError("pre-provider router snapshots are historical read-only")
     compiled = _object(value, "compiled")
     version = compiled.get("schema_version")
     if type(version) is not int or version not in {1, 2}:
@@ -567,12 +575,19 @@ def validate(value: Any, *, mode: LoadMode = "read") -> dict[str, Any]:
                 "compiled schema_version=1 is historical read-only; effects require v2"
             )
     else:
-        _validate_v2(compiled, effectful=selected_mode == "effect")
+        _validate_v2(
+            compiled,
+            effectful=selected_mode == "effect",
+            provider_contract=provider_contract,
+        )
     return compiled
 
 
 def loads(
-    raw: bytes | bytearray | memoryview | str, *, mode: LoadMode = "read"
+    raw: bytes | bytearray | memoryview | str,
+    *,
+    mode: LoadMode = "read",
+    provider_contract: bool = True,
 ) -> dict[str, Any]:
     """Strictly parse and validate one compiled workflow JSON value."""
 
@@ -581,7 +596,7 @@ def loads(
         value = fleet_json.loads(raw)
     except fleet_json.FleetJSONError as exc:
         raise CompiledError(f"cannot parse compiled workflow: {exc}") from exc
-    return validate(value, mode=selected_mode)
+    return validate(value, mode=selected_mode, provider_contract=provider_contract)
 
 
 def load(path: str | Path, *, mode: LoadMode = "read") -> dict[str, Any]:

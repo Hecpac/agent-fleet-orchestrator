@@ -416,6 +416,9 @@ def _archive_report(root: Path) -> dict[str, Any]:
             "entries": verified["entries"],
             "content_policy": verified["content_policy"],
             "content_root_sha256": verified["content_root_sha256"],
+            **({"historical_lanes": verified["historical_lanes"],
+                "not_attested": verified["not_attested"]}
+               if verified.get("historical_lanes") else {}),
         }
     except (RuntimeError, OSError, json.JSONDecodeError) as exc:
         return {
