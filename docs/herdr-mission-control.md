@@ -126,6 +126,14 @@ workspace, tab, pane, terminal, agent session and generation. On ambiguous deliv
 recovery observes the same run; it does not automatically resend the prompt.
 This is a single physical attempt with durable reconciliation, not an unconditional
 exactly-once delivery guarantee.
+The task travels as one `herdr agent prompt` argument, so a new admission whose
+prompt exceeds 512 KiB is refused before any admission or dispatch intent exists.
+If the Herdr process never starts (for example `E2BIG`), the submission is
+`not_sent` rather than `indeterminate`: no prompt left the controller. The
+supervisor observation budget does not interrupt a send once its dispatch intent
+is durable; each command keeps its own timeout. The driver reports `transport_rejection`, supervision stops, and
+exact cancellation closes that run without a runtime signal. A timeout after the
+process started remains ambiguous. A corrected attempt needs a new Mission.
 
 The minimal profile follows this identical backend route: official personal
 environment, exact argv/version/trust checks, context preview, delivery-surface
@@ -246,7 +254,11 @@ No contract means `not_evaluated`, so the driver cannot claim accepted completio
 
 `run` and `resume` return `3` when further action is needed or the result is
 `blocked`; `failed`, `indeterminate`, and `abandoned` return `1`; successful terminal
-completion returns `0`. A durable terminal can be read without a live Herdr UI.
+completion returns `0`. A controller error while the durable Mission is still
+non-terminal returns `4` with a JSON envelope (`mission_id`, `status`,
+`controller_error`, `next_action`); it is not a verdict. Errors before any Mission
+exists, or with an already terminal Mission, keep `1`. A durable terminal can be
+read without a live Herdr UI.
 When requested, teardown is tracked separately; a cleanup problem does not rewrite
 an already durable semantic verdict.
 Use `--teardown` at creation to close only the mission-owned workspace after all

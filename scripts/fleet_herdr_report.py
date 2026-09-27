@@ -131,11 +131,14 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
             try:
                 proof = fleet_herdr_rejection.load(runs, mid, run, backend)
                 if proof is None:
+                    proof = fleet_herdr_rejection.load_delivery(runs, mid, run, backend)
+                if proof is None:
                     proof = fleet_herdr.load_result_rejection(runs, mid, run)
                 if proof is not None:
                     result_pin = proof["observed_result_artifact_id"]
-                    disposition = ("rejected_execution_evidence" if proof["kind"] ==
-                                   "herdr_execution_evidence_rejection" else "rejected_role_protocol")
+                    disposition = {"herdr_execution_evidence_rejection": "rejected_execution_evidence",
+                                   fleet_herdr_rejection.DELIVERY_KIND: "rejected_delivery"}.get(
+                                       proof["kind"], "rejected_role_protocol")
             except (ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
                 record["observation_reason"] = f"invalid_rejection_evidence: {exc}"
         if disposition is not None:
@@ -168,7 +171,7 @@ def build_report(runs: Path, current: dict[str, Any], compiled: dict[str, Any],
                         cwd=fleet_json.loads(read(evidence["capsule_launch_artifact_id"]))["candidate"]["realpath"],
                         prompt_sha256=admission["task_sha256"], capsule_manifest=capsule_manifest, current=current)
                 inspect_transcript = (fleet_herdr_evidence.observe_rejected_transcript
-                    if disposition == "rejected_execution_evidence"
+                    if disposition in {"rejected_execution_evidence", "rejected_delivery"}
                     else fleet_herdr_evidence.verify_transcript)
                 inspect_transcript(transcript, agent_session=session,
                     model=observed_model, turn_id=result["turn_id"],

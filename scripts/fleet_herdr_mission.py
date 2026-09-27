@@ -98,6 +98,7 @@ class _Driver:
         self.root = self.runs / self.rel
         self.protocol_rejection = None
         self.evidence_rejection = None
+        self.transport_rejection = None
         self.sdd_packet: dict[str, Any] | None = None
         self.sdd_error: str | None = None
         self.profile = fleet_herdr_profile.LEGACY
@@ -131,6 +132,7 @@ class _Driver:
                 **({"control": control.view(current)} if "herdr_control" in current else {}),
                 **({"protocol_rejection": self.protocol_rejection} if self.protocol_rejection else {}),
                 **({"evidence_rejection": self.evidence_rejection} if self.evidence_rejection else {}),
+                **({"transport_rejection": self.transport_rejection} if self.transport_rejection else {}),
                 "backend": "herdr", **extra}
 
     def finish(self, response: dict[str, Any]) -> dict[str, Any]:
@@ -801,8 +803,10 @@ class _Driver:
 
     def evidence_block(self, proof):
         self.evidence_rejection = proof
+        rejected = ("unbound final delivery rejected" if proof.get("kind") == fleet_herdr_rejection.DELIVERY_KIND
+                    else "execution evidence rejected")
         return self.response(next_action=(
-            "execution evidence rejected; pause cannot be confirmed while the admission remains active; "
+            rejected + "; pause cannot be confirmed while the admission remains active; "
             "exact execution closure requires explicit cancellation; frozen task cannot be replayed or upgraded"),
             recovery="blocked", deadline_expired=self.remaining_seconds() <= 0)
 
@@ -813,6 +817,9 @@ class _Driver:
         if stored is None:
             return None
         proof = fleet_herdr_rejection.load(self.runs, self.mid, run_id, stored)
+        if proof is None:
+            # An unbound final follows the same no-verdict, exact-cancel path.
+            proof = fleet_herdr_rejection.load_delivery(self.runs, self.mid, run_id, stored)
         if proof is not None:
             admission = next((a for a in self.current()["admissions"].values() if a["run_id"] == run_id), None)
             submission = stored["submissions"][run_id]
@@ -901,6 +908,11 @@ class _Driver:
                 "SDD plan binding failed closed before new stage admission: " + str(self.sdd_error)
             )
         prompt = fleet_artifacts.get_bytes(self.runs, self.mid, existing["task_sha256"]).decode() if existing else self.prompt(stage, instance, run_id, inputs, frozen)
+        limit = getattr(backend, "max_prompt_bytes", None)
+        if existing is None and limit is not None and len(prompt.encode()) > limit:
+            # Refuse before any admission or dispatch intent can make the send durable.
+            raise HerdrMissionError(f"{stage} prompt is {len(prompt.encode())} bytes and exceeds {limit} bytes; "
+                                    "reduce the objective or inputs before admission")
         task_sha = fleet_artifacts.put_bytes(self.runs, self.mid, prompt.encode())["artifact_id"]
         member = next(m for m in self.members if m["instance_id"] == instance)
         effect = state.sha256({"backend": "herdr", "session": self.session, "candidate_repo": str(self.candidate),
@@ -944,7 +956,11 @@ class _Driver:
         else:
             if raw is None:
                 raw = self.observe_backend(backend, "collect_result", run_id)
-            if raw is None and (not isinstance(observation, dict) or observation.get("status") in {"indeterminate", "failed", "abandoned", "blocked"}):
+            if raw is None and (not isinstance(observation, dict) or observation.get("status") in {"indeterminate", "failed", "abandoned", "blocked", "not_sent"}):
+                if isinstance(observation, dict) and observation.get("status") == "not_sent":
+                    self.transport_rejection = {"run_id": run_id, "status": "not_sent", "reason": observation.get("reason")}
+                    self.pending_reason = ("prompt command never started (not_sent); no prompt reached Herdr; "
+                                           "exact cancellation closes this run; a corrected attempt needs a new Mission")
                 return None
             if admission["phase"] == "authorized":
                 fleet_admission.mark_started(self.runs, self.mid, **binding,
@@ -1358,7 +1374,7 @@ def supervise(runs_dir, mission_id, *, seconds=60, poll_seconds=0.25):
                 except fleet_herdr.HerdrBackendError as exc:
                     result = {"mission_id": mission_id, "next_action": "reconcile existing transport: " + str(exc)}
                 iterations += 1
-                if result.get("evidence_rejection") or result.get("scope_rejection"):
+                if result.get("evidence_rejection") or result.get("scope_rejection") or result.get("transport_rejection"):
                     return {**result, "supervision": "blocked", "iterations": iterations}
                 current = fleet_mission.load_state(runs_dir, mission_id)
                 if current["status"] in state.TERMINAL_STATUSES or control.view(current)["applied"] == "paused" and control.view(current)["desired"] == "pause_requested":

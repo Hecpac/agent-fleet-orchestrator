@@ -34,7 +34,10 @@ HERDR_VERSION = versions.HERDR_VERSION
 AGENT_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 SESSION_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-TERMINAL = {"succeeded", "failed", "blocked", "abandoned", "indeterminate"}
+TERMINAL = {"succeeded", "failed", "blocked", "abandoned", "indeterminate", "not_sent"}
+# The whole task travels as one argv element; the controller refuses larger
+# prompts before admission instead of discovering the limit at exec time.
+MAX_PROMPT_BYTES = 512 * 1024
 QUIESCENT = {"idle", "done", "blocked"}
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 TranscriptResolver = Callable[[str], Optional[Path]]
@@ -44,10 +47,22 @@ class HerdrBackendError(RuntimeError):
     """The Herdr backend cannot safely reconcile its owned lifecycle."""
 
 
+class HerdrCommandNotStarted(HerdrBackendError):
+    """The Herdr process was never started, so the command had no runtime effect."""
+
+
 class ExecutionEvidenceRejected(HerdrBackendError):
     def __init__(self, proof):
         self.proof = proof
         super().__init__("completed result permission evidence: " + proof["reason"])
+
+
+class DeliveryRejected(ExecutionEvidenceRejected):
+    """A completed prompt-bound final that cannot be a role result; never a verdict."""
+
+    def __init__(self, proof):
+        self.proof = proof
+        HerdrBackendError.__init__(self, "completed result delivery: " + proof["reason"])
 
 
 def load_result_rejection(runs_dir: Path, mission_id: str, run_id: str,
@@ -195,6 +210,8 @@ def _message_text(content: Any, *, kind: str) -> str:
 
 class HerdrBackend:
     """Own one Herdr workspace and exactly-once prompt intents for one Mission."""
+
+    max_prompt_bytes = MAX_PROMPT_BYTES
 
     def __init__(
         self,
@@ -347,7 +364,7 @@ class HerdrBackend:
         if observation_deadline is not None:
             remaining = observation_deadline - time.monotonic()
             if remaining <= 0:
-                raise HerdrBackendError("supervisor observation budget exhausted before command")
+                raise HerdrCommandNotStarted("supervisor observation budget exhausted before command")
             timeout = min(timeout, remaining)
         try:
             return self.run_command(
@@ -356,7 +373,10 @@ class HerdrBackend:
                 env=self.environment,
                 timeout=timeout,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except OSError as exc:
+            # Spawn failed (for example E2BIG or ENOENT): no Herdr process ran.
+            raise HerdrCommandNotStarted(f"Herdr command failed to run: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
             raise HerdrBackendError(f"Herdr command failed to run: {exc}") from exc
 
     def _compiled_members(self) -> list[dict[str, Any]]:
@@ -1312,6 +1332,19 @@ class HerdrBackend:
     def submit(
         self, run_id: str, prompt: str, *, instance_id: str = "lead"
     ) -> dict[str, Any]:
+        # The supervisor budget bounds observation, not a send already under a
+        # durable dispatch intent: stopping midway would strand that intent.
+        # Each command keeps its own timeout, so the send stays bounded.
+        budget = getattr(self, "observation_deadline", None)
+        self.observation_deadline = None
+        try:
+            return self._submit(run_id, prompt, instance_id=instance_id)
+        finally:
+            self.observation_deadline = budget
+
+    def _submit(
+        self, run_id: str, prompt: str, *, instance_id: str
+    ) -> dict[str, Any]:
         normalized_run = mission_state.normalize_uuid(run_id, "run_id")
         if not isinstance(prompt, str) or not prompt:
             raise HerdrBackendError("Herdr prompt must be non-empty")
@@ -1400,15 +1433,27 @@ class HerdrBackend:
                         submission["launch_run_link_artifact_id"] = fleet_herdr_launch.link_run(
                             self.runs_dir, self.mission_id, member, normalized_run, prompt_sha256)
                     self._save(rooted, state, exists=True)
-                    result = self._command(
-                        [
-                            "herdr",
-                            "agent",
-                            "prompt",
-                            member["agent_name"],
-                            prompt,
-                        ]
-                    )
+                    try:
+                        result = self._command(
+                            [
+                                "herdr",
+                                "agent",
+                                "prompt",
+                                member["agent_name"],
+                                prompt,
+                            ]
+                        )
+                    except HerdrCommandNotStarted as exc:
+                        # Known not delivered, unlike a timeout after the process ran.
+                        submission.update(
+                            {
+                                "phase": "terminal",
+                                "status": "not_sent",
+                                "reason": f"prompt command did not start: {exc}",
+                            }
+                        )
+                        self._save(rooted, state, exists=True)
+                        return _copy(submission)
                     if result.returncode == 0:
                         receipt = self._verify_agent_receipt(
                             _result_payload(result, "agent prompt"),
@@ -1828,7 +1873,7 @@ class HerdrBackend:
         self,
         submission: Mapping[str, Any],
         member: Mapping[str, Any],
-    ) -> tuple[dict[str, Any], bytes, str, str, bytes, str, dict[str, Any]] | None:
+    ) -> tuple[Any, bytes, str, str, bytes, str, dict[str, Any]] | None:
         agent_session = member["agent_session"]["value"]
         rows, row_bytes, transcript_path, _ = self._transcript_rows(agent_session)
         if not rows:
@@ -1940,13 +1985,13 @@ class HerdrBackend:
             selected.insert(0, metadata[0][0])
         transcript_segment = b"".join(row_bytes[index] for index in selected)
         transcript_sha256 = hashlib.sha256(transcript_segment).hexdigest()
+        # Content is classified by collect_result, after the turn is bound, so an
+        # unbound final is retained as a delivery rejection instead of spinning.
         final_bytes = final_text.encode("utf-8")
         try:
             raw_result = fleet_json.loads(final_bytes)
-        except fleet_json.FleetJSONError as exc:
-            raise HerdrBackendError("Codex final result is not JSON") from exc
-        if not isinstance(raw_result, dict):
-            raise HerdrBackendError("Codex final result must be an object")
+        except fleet_json.FleetJSONError:
+            raw_result = None
         return (
             raw_result,
             final_bytes,
@@ -1989,11 +2034,15 @@ class HerdrBackend:
                     rejected = fleet_herdr_rejection.load(self.runs_dir, self.mission_id, normalized_run, state)
                     if rejected is not None:
                         raise ExecutionEvidenceRejected(rejected)
+                    delivered = fleet_herdr_rejection.load_delivery(
+                        self.runs_dir, self.mission_id, normalized_run, state)
+                    if delivered is not None:
+                        raise DeliveryRejected(delivered)
                     observed = self._transcript_result(submission, member)
                     if observed is None:
                         return None
                     (
-                        raw_result,
+                        _,
                         final_bytes,
                         turn_id,
                         transcript_path,
@@ -2007,19 +2056,11 @@ class HerdrBackend:
                         "run_id": normalized_run,
                         "instance_id": submission["instance_id"],
                     }
-                    if any(raw_result.get(key) != value for key, value in expected.items()):
-                        raise HerdrBackendError("Codex final result binding mismatch")
                     # Cache attributed execution bytes even when their role protocol
                     # is invalid. The driver durably adjudicates that separate fact.
-                    if raw_result.get("candidate_tree_sha") != submission.get(
-                        "candidate_tree_sha"
-                    ):
-                        raise HerdrBackendError("Codex final candidate_tree_sha drift")
-                    for reserved in ("artifact_id", "result_artifact_id", "turn_id", "evidence"):
-                        if reserved in raw_result:
-                            raise HerdrBackendError(
-                                f"Codex final result cannot supply reserved field {reserved}"
-                            )
+                    problem = fleet_herdr_rejection.delivery_problem(
+                        final_bytes, expected=expected,
+                        candidate_tree_sha=submission.get("candidate_tree_sha"))
                     final_artifact = fleet_artifacts.put_bytes(
                         self.runs_dir, self.mission_id, final_bytes
                     )
@@ -2037,28 +2078,50 @@ class HerdrBackend:
                                 or baseline.get("generation") != state["generation"]
                                 or baseline.get("agent_session") not in (None, member["agent_session"])):
                             raise HerdrBackendError("usage baseline CAS binding mismatch")
+                    evidence = {
+                        **({"runtime_contract": _copy(state["runtime_contract"])} if state.get("runtime_contract") else {}),
+                        **({"context_artifact_id": state["context_artifact_id"]} if state.get("context_artifact_id") else {}),
+                        "herdr_session": self.session,
+                        "generation": state["generation"],
+                        "workspace_id": member["workspace_id"],
+                        "tab_id": member["tab_id"],
+                        "pane_id": member["pane_id"],
+                        "terminal_id": member["terminal_id"],
+                        "agent_session": _copy(member["agent_session"]),
+                        "prompt_sha256": submission["prompt_sha256"],
+                        "transcript_path": transcript_path,
+                        "transcript_sha256": transcript_sha256,
+                        "transcript_artifact_id": transcript_artifact["artifact_id"],
+                        **({"usage_baseline_artifact_id": baseline_id}
+                           if baseline_id is not None else {}),
+                        "usage_baseline_frontier": usage_frontier,
+                    }
+                    if problem is not None:
+                        # Controller-derived identity only; no model-authored field.
+                        envelope = {
+                            "mission_id": self.mission_id,
+                            "run_id": normalized_run,
+                            "instance_id": submission["instance_id"],
+                            "candidate_tree_sha": submission.get("candidate_tree_sha"),
+                            "delivery": "unbound_final",
+                            "artifact_id": final_artifact["artifact_id"],
+                            "turn_id": turn_id,
+                            "evidence": evidence,
+                        }
+                        execution = fleet_herdr_rejection.execution_status(envelope,
+                            read=lambda digest: fleet_artifacts.get_bytes(self.runs_dir, self.mission_id, digest),
+                            role=member["instance_id"], cwd=str(self.target_repo),
+                            prompt_sha256=submission["prompt_sha256"],
+                            agent_session=member["agent_session"]["value"],
+                            permission_version=self.profile.permissions_policy_version)
+                        proof = fleet_herdr_rejection.retain_delivery(self.runs_dir, self.mission_id,
+                            normalized_run, envelope, problem, execution, rooted)
+                        raise DeliveryRejected(proof)
                     result = {
-                        **raw_result,
+                        **fleet_json.loads(final_bytes),
                         "artifact_id": final_artifact["artifact_id"],
                         "turn_id": turn_id,
-                        "evidence": {
-                            **({"runtime_contract": _copy(state["runtime_contract"])} if state.get("runtime_contract") else {}),
-                            **({"context_artifact_id": state["context_artifact_id"]} if state.get("context_artifact_id") else {}),
-                            "herdr_session": self.session,
-                            "generation": state["generation"],
-                            "workspace_id": member["workspace_id"],
-                            "tab_id": member["tab_id"],
-                            "pane_id": member["pane_id"],
-                            "terminal_id": member["terminal_id"],
-                            "agent_session": _copy(member["agent_session"]),
-                            "prompt_sha256": submission["prompt_sha256"],
-                            "transcript_path": transcript_path,
-                            "transcript_sha256": transcript_sha256,
-                            "transcript_artifact_id": transcript_artifact["artifact_id"],
-                            **({"usage_baseline_artifact_id": baseline_id}
-                               if baseline_id is not None else {}),
-                            "usage_baseline_frontier": usage_frontier,
-                        },
+                        "evidence": evidence,
                     }
                     try:
                         result["evidence"]["permissions"] = fleet_herdr_evidence.verify_result(result,
@@ -2194,6 +2257,17 @@ class HerdrBackend:
                     submission = state["submissions"].get(normalized_run)
                     if not isinstance(submission, dict):
                         raise HerdrBackendError("Herdr submission is missing")
+                    if submission["status"] == "not_sent":
+                        # No prompt reached Herdr, so this run has no runtime to signal.
+                        submission.update(
+                            {
+                                "status": "abandoned",
+                                "cancel_attempted": True,
+                                "reason": "cancelled before delivery; prompt command never started",
+                            }
+                        )
+                        self._save(rooted, state, exists=True)
+                        return _copy(submission)
                     # An uncertain transport outcome is not proof of quiescence;
                     # an explicit cancellation must reconcile the exact resource.
                     if submission["status"] in TERMINAL and submission["status"] != "indeterminate":

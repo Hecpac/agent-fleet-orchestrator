@@ -160,6 +160,17 @@ runtime anchor, Mission/run/admission/session/task bindings and reproduces the
 rejection offline. It does not read a replacement live transcript or resend the
 task. Research and Build cannot follow a rejected Plan.
 
+A completed prompt-bound turn whose final cannot be a role result (not JSON,
+not an object, copied identities or `candidate_tree_sha` that differ, or a
+backend-reserved field) is retained as `herdr_delivery_rejection` through
+`herdr-delivery-rejection-<run>.json`. The observed envelope carries only
+controller-derived identity plus the exact final and transcript CAS; the
+receipt also records whether the turn's execution evidence verified. Recovery
+reproduces both the content reason and that execution outcome offline. It never
+becomes a verdict and follows the same block and exact-cancel rules below; the
+driver reports `unbound final delivery rejected`. Previously such a final left
+the run unresolved, and neither cancellation nor the deadline could close it.
+
 A rejection is not evidence of quiescence. If the admission is still active,
 recovery reports an explicit pause block while retaining `pause_requested` and
 its unapplied request. It does not report `paused`, cancel implicitly on expiry,
@@ -169,7 +180,8 @@ task cannot be changed or replayed in place. Continuing the feature after such
 an incident requires authorized closure of that execution and a separately
 authorized corrected Mission; historical evidence remains readable.
 
-Provider-free regression: `python3 -B -m unittest tests.test_fleet_herdr_skill_context`.
+Provider-free regression: `python3 -B -m unittest tests.test_fleet_herdr_skill_context
+tests.test_fleet_herdr_delivery_rejection`.
 This exercises authorized inline delivery, nine-message rejection, scope/content
 mutation, CAS recovery, pause/deadline/cancel boundaries and the six-stage archive
 using synthetic CLI output. Local preview evidence is distinct from a live model

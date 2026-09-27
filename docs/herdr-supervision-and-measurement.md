@@ -57,7 +57,9 @@ recovery-only path. This is durable reconciliation, not exactly-once delivery.
 `--seconds` is a bounded observation budget (0–3600 seconds, exclusive of zero),
 not a replacement Mission deadline or a guaranteed process-kill deadline. Runtime
 waits use at most one-second slices; Herdr command timeouts are capped to the
-remaining observation budget. Local Git operations retain their own timeouts;
+remaining observation budget, except the prompt send sequence, which keeps its
+own command timeouts so a durable dispatch intent is never left without a
+submission. Local Git operations retain their own timeouts;
 synchronous snapshot/archive processing has file/count limits rather than a
 preemptive wall timeout. An already-started functional check may finish
 within its contract's wall limit. Thus a final bounded operation can outlast the

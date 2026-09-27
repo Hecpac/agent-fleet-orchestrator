@@ -2301,7 +2301,12 @@ def create_and_drive(
         },
         sdd_plan_path=sdd_plan_path,
     )
-    return drive_mission(runs_dir, mission_id)
+    try:
+        return drive_mission(runs_dir, mission_id)
+    except Exception as exc:
+        # The Mission is already durable; let main report its live state.
+        exc.fleet_mission_id = mission_id
+        raise
 
 
 def dry_run(
@@ -2535,6 +2540,20 @@ def emit(value: dict[str, Any], *, json_mode: bool) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True))
 
 
+CONTROLLER_ERROR_EXIT = 4
+
+
+def live_mission_status(runs_dir: Path, mission_id: Any) -> str | None:
+    """Non-terminal durable status after a controller error, or None when unknown/terminal."""
+    if not isinstance(mission_id, str):
+        return None
+    try:
+        current = fleet_mission.load_state(runs_dir, mission_state.normalize_uuid(mission_id, "mission_id"))
+    except (mission_state.MissionStateError, fleet_safe_paths.SafePathError, OSError, ValueError):
+        return None
+    return None if current["status"] in mission_state.TERMINAL_STATUSES else current["status"]
+
+
 def response_exit_code(value: Mapping[str, Any]) -> int:
     if "next_action" in value or value.get("status") == "blocked":
         return 3
@@ -2680,7 +2699,16 @@ def main(argv: list[str] | None = None) -> int:
         fleet_control_service.ControlServiceError,
     ) as exc:
         print(f"mission-run: {exc}", file=sys.stderr)
-        return 1
+        mission_id = getattr(exc, "fleet_mission_id", None) or getattr(args, "mission_id", None)
+        status = live_mission_status(runs_dir, mission_id)
+        if status is None:
+            return 1
+        # Exit 1 means a terminal verdict; this Mission is still live and owned.
+        emit({"mission_id": mission_state.normalize_uuid(mission_id, "mission_id"), "status": status,
+              "controller_error": str(exc),
+              "next_action": f"controller error; durable Mission remains {status}; resolve the error, then resume "
+                             "or cancel the exact run"}, json_mode=getattr(args, "json", False))
+        return CONTROLLER_ERROR_EXIT
 
 
 if __name__ == "__main__":
