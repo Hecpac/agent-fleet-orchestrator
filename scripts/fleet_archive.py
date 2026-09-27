@@ -11,16 +11,26 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import selectors
 import shutil
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
-import time
 from typing import Any
 import uuid
+
+# Compatibility aliases keep historical callers and exception identity stable.
+from fleet_archive_tree import (
+    ArchiveError, MAX_FILE_BYTES, OBJECT_FORMATS, GIT_MODE_PAX, GIT_OID_PAX,
+    _object_format, _git_oid, _hash_git_object, _git_name, _is_structural_empty_tar,
+    safe_relative as _safe_relative, tree_hash_from_tar as _tree_hash_from_tar,
+)
+from fleet_git_snapshot import (
+    _run, _run_bounded, _git_command, _git_run, _git_run_bounded, _git,
+    _raw_tree_records, _batch_blob_header, _raw_tree_layout, _raw_blob_data, _tar_info,
+    git_environment as _git_environment, raw_tree_tar as _raw_tree_tar,
+)
 
 import fleet_audit_client
 import fleet_compiled
@@ -34,7 +44,6 @@ import fleet_state
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MAX_FILE_BYTES = 32 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 SECRET_AUDIT_FILES = {
     "control-hmac.key",
@@ -48,12 +57,6 @@ SENSITIVE_PARTS = {
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 GIT_SHA = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
-OBJECT_FORMATS = {
-    "sha1": (hashlib.sha1, 40),
-    "sha256": (hashlib.sha256, 64),
-}
-GIT_MODE_PAX = "FLEET.git.mode"
-GIT_OID_PAX = "FLEET.git.oid"
 ARCHIVE_RECEIPT_FIELDS_LEGACY = {
     "schema_version", "mission_id", "index_sha256", "content_root_sha256",
     "entry_count", "created_at",
@@ -69,23 +72,12 @@ WRITER_FIELDS_CURRENT = WRITER_FIELDS_LEGACY | {"object_format"}
 WRITER_COMMIT_FIELDS = {"sha", "parents", "tree", "subject"}
 
 
-class ArchiveError(RuntimeError):
-    """Mission archive content or verification is unsafe or inconsistent."""
-
-
 def _sha256(path: Path) -> str:
     hasher = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             hasher.update(chunk)
     return hasher.hexdigest()
-
-
-def _safe_relative(value: str) -> PurePosixPath:
-    path = PurePosixPath(value)
-    if not value or path.is_absolute() or ".." in path.parts or any(not part for part in path.parts):
-        raise ArchiveError(f"unsafe archive path: {value}")
-    return path
 
 
 def _parse_manifest(content: bytes) -> dict[str, str]:
@@ -248,109 +240,6 @@ def _archive_manifest_binding(
     ):
         raise ArchiveError("writer published SHA metadata is invalid")
     return writer, branch, final_sha
-
-
-def _run(
-    command: list[str],
-    *,
-    cwd: Path = ROOT,
-    input_bytes: bytes | None = None,
-    env: dict[str, str] | None = None,
-) -> bytes:
-    try:
-        result = subprocess.run(
-            command,
-            cwd=cwd,
-            input=input_bytes,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=120,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ArchiveError(f"cannot run {Path(command[0]).name}: {exc}") from exc
-    if result.returncode != 0:
-        raise ArchiveError(
-            f"{Path(command[0]).name} failed: {result.stderr.decode('utf-8', 'replace').strip()}"
-        )
-    return result.stdout
-
-
-def _run_bounded(
-    command: list[str],
-    *,
-    cwd: Path = ROOT,
-    env: dict[str, str] | None = None,
-    max_stdout_bytes: int,
-    max_stderr_bytes: int = 1024 * 1024,
-    timeout_seconds: float = 120,
-) -> bytes:
-    """Capture a command incrementally and kill it before output can exceed bounds."""
-
-    try:
-        process = subprocess.Popen(
-            command,
-            cwd=cwd,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except OSError as exc:
-        raise ArchiveError(f"cannot run {Path(command[0]).name}: {exc}") from exc
-    assert process.stdout is not None and process.stderr is not None
-    selector = selectors.DefaultSelector()
-    selector.register(process.stdout, selectors.EVENT_READ, "stdout")
-    selector.register(process.stderr, selectors.EVENT_READ, "stderr")
-    stdout = bytearray()
-    stderr = bytearray()
-    deadline = time.monotonic() + timeout_seconds
-    try:
-        while selector.get_map():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ArchiveError(f"{Path(command[0]).name} timed out")
-            events = selector.select(remaining)
-            if not events:
-                raise ArchiveError(f"{Path(command[0]).name} timed out")
-            for key, _ in events:
-                chunk = os.read(key.fd, 64 * 1024)
-                if not chunk:
-                    selector.unregister(key.fileobj)
-                    continue
-                target = stdout if key.data == "stdout" else stderr
-                limit = max_stdout_bytes if key.data == "stdout" else max_stderr_bytes
-                if len(target) + len(chunk) > limit:
-                    stream = "output" if key.data == "stdout" else "error output"
-                    raise ArchiveError(
-                        f"{Path(command[0]).name} {stream} exceeds limit"
-                    )
-                target.extend(chunk)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            raise ArchiveError(f"{Path(command[0]).name} timed out")
-        try:
-            returncode = process.wait(timeout=remaining)
-        except subprocess.TimeoutExpired as exc:
-            raise ArchiveError(f"{Path(command[0]).name} timed out") from exc
-        if returncode != 0:
-            raise ArchiveError(
-                f"{Path(command[0]).name} failed: "
-                + bytes(stderr).decode("utf-8", "replace").strip()
-            )
-        return bytes(stdout)
-    finally:
-        selector.close()
-        process.stdout.close()
-        process.stderr.close()
-        if process.poll() is None:
-            process.kill()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
 
 
 def _write(path: Path, content: bytes, *, mode: int = 0o600) -> None:
@@ -544,417 +433,6 @@ def _iter_regular_tree(root: Path) -> list[tuple[PurePosixPath, Path]]:
 
 def _sensitive(logical: PurePosixPath) -> bool:
     return any(part in SENSITIVE_PARTS for part in logical.parts)
-
-
-def _git_environment() -> dict[str, str]:
-    env = {
-        key: value for key, value in os.environ.items() if not key.startswith("GIT_")
-    }
-    env.update(
-        {
-            "GIT_CONFIG_NOSYSTEM": "1",
-            "GIT_CONFIG_GLOBAL": os.devnull,
-            "GIT_GRAFT_FILE": os.devnull,
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_OPTIONAL_LOCKS": "0",
-            "GIT_PAGER": "cat",
-            "GIT_TERMINAL_PROMPT": "0",
-            "PAGER": "cat",
-        }
-    )
-    return env
-
-
-def _git_command(repo: Path, *args: str) -> list[str]:
-    return [
-        "git",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        f"core.hooksPath={os.devnull}",
-        "-c",
-        "submodule.recurse=false",
-        "-C",
-        str(repo),
-        *args,
-    ]
-
-
-def _git_run(
-    repo: Path, *args: str, input_bytes: bytes | None = None
-) -> bytes:
-    return _run(
-        _git_command(repo, *args),
-        input_bytes=input_bytes,
-        env=_git_environment(),
-    )
-
-
-def _git_run_bounded(
-    repo: Path, *args: str, max_bytes: int = MAX_FILE_BYTES
-) -> bytes:
-    return _run_bounded(
-        _git_command(repo, *args),
-        env=_git_environment(),
-        max_stdout_bytes=max_bytes,
-    )
-
-
-def _git(repo: Path, *args: str) -> str:
-    return _git_run(repo, *args).decode("utf-8").strip()
-
-
-def _object_format(value: str) -> tuple[Any, int]:
-    try:
-        return OBJECT_FORMATS[value]
-    except KeyError as exc:
-        raise ArchiveError(f"unsupported Git object format: {value}") from exc
-
-
-def _git_oid(value: str, object_format: str, *, where: str) -> str:
-    _, width = _object_format(object_format)
-    if not re.fullmatch(rf"[0-9a-f]{{{width}}}", value):
-        raise ArchiveError(f"{where} is not a {object_format} object id")
-    return value
-
-
-def _hash_git_object(kind: str, content: bytes, object_format: str) -> bytes:
-    hasher, _ = _object_format(object_format)
-    return hasher(f"{kind} {len(content)}\0".encode("ascii") + content).digest()
-
-
-def _git_name(value: str) -> bytes:
-    try:
-        return value.encode("utf-8", "surrogateescape")
-    except UnicodeEncodeError as exc:
-        raise ArchiveError("final tree contains an unencodable Git path") from exc
-
-
-def _is_structural_empty_tar(content: bytes) -> bool:
-    if not content or len(content) % 512 != 0:
-        return False
-    if content == b"\0" * len(content):
-        return True
-    header = content[:512]
-    if header[:100].rstrip(b"\0") != b"pax_global_header" or header[156:157] != b"g":
-        return False
-    try:
-        size = int(header[124:136].rstrip(b"\0 ") or b"0", 8)
-        stored_checksum = int(header[148:156].rstrip(b"\0 ") or b"0", 8)
-    except ValueError:
-        return False
-    checksum_header = bytearray(header)
-    checksum_header[148:156] = b" " * 8
-    if sum(checksum_header) != stored_checksum:
-        return False
-    end = 512 + ((size + 511) // 512) * 512
-    return end <= len(content) and content[end:] == b"\0" * (len(content) - end)
-
-
-def _tree_hash_from_tar(content: bytes, object_format: str = "sha1") -> str:
-    # git archive represents an empty tree as a standards-compliant sequence of
-    # zero blocks. Python 3.14's tarfile rejects that representation before it
-    # can expose an empty member list, so recognize only the exact structural
-    # empty-tar case and reproduce Git's canonical empty-tree object ID.
-    if _is_structural_empty_tar(content):
-        return _hash_git_object("tree", b"", object_format).hex()
-    nodes: dict[tuple[str, ...], list[tuple[str, str, bytes]]] = {(): []}
-    seen: set[tuple[str, ...]] = set()
-    try:
-        archive = tarfile.open(fileobj=io.BytesIO(content), mode="r:")
-    except tarfile.TarError as exc:
-        raise ArchiveError("final-tree.tar is invalid") from exc
-    with archive:
-        for member in archive.getmembers():
-            path = _safe_relative(member.name.rstrip("/"))
-            parts = tuple(path.parts)
-            if parts in seen:
-                raise ArchiveError("final tree contains duplicate paths")
-            seen.add(parts)
-            for index in range(1, len(parts)):
-                nodes.setdefault(parts[:index], [])
-            git_mode = member.pax_headers.get(GIT_MODE_PAX)
-            git_oid = member.pax_headers.get(GIT_OID_PAX)
-            if (git_mode is None) != (git_oid is None):
-                raise ArchiveError("final tree contains an incomplete raw Git binding")
-            if git_mode == "160000":
-                if not member.isdir():
-                    raise ArchiveError("final tree gitlink is not a directory marker")
-                oid = bytes.fromhex(
-                    _git_oid(str(git_oid), object_format, where="gitlink oid")
-                )
-                parent, name = parts[:-1], parts[-1]
-                nodes.setdefault(parent, []).append((name, git_mode, oid))
-                continue
-            if member.isdir():
-                if git_mode is not None:
-                    raise ArchiveError("final tree directory has a leaf Git binding")
-                nodes.setdefault(parts, [])
-                continue
-            parent, name = parts[:-1], parts[-1]
-            if member.isreg():
-                extracted = archive.extractfile(member)
-                if extracted is None:
-                    raise ArchiveError("final tree regular file has no content")
-                data = extracted.read(MAX_FILE_BYTES + 1)
-                if len(data) > MAX_FILE_BYTES:
-                    raise ArchiveError("final tree file exceeds limit")
-                mode = "100755" if member.mode & 0o111 else "100644"
-            elif member.issym():
-                data = _git_name(member.linkname)
-                mode = "120000"
-            else:
-                raise ArchiveError("final tree contains an unsupported special entry")
-            oid = _hash_git_object("blob", data, object_format)
-            if git_mode is not None:
-                if git_mode != mode:
-                    raise ArchiveError("final tree raw Git mode does not match tar entry")
-                if _git_oid(str(git_oid), object_format, where="blob oid") != oid.hex():
-                    raise ArchiveError("final tree raw Git oid does not match tar content")
-            nodes.setdefault(parent, []).append((name, mode, oid))
-
-    hashes: dict[tuple[str, ...], bytes] = {}
-    for directory in sorted(nodes, key=len, reverse=True):
-        entries = list(nodes[directory])
-        children = {
-            key[len(directory)]
-            for key in nodes
-            if len(key) == len(directory) + 1 and key[:-1] == directory
-        }
-        for name in children:
-            entries.append((name, "40000", hashes[directory + (name,)]))
-        names: set[bytes] = set()
-        for name, _, _ in entries:
-            encoded = _git_name(name)
-            if encoded in names:
-                raise ArchiveError("final tree contains duplicate entry names")
-            names.add(encoded)
-        entries.sort(
-            key=lambda item: _git_name(item[0])
-            + (b"/" if item[1] == "40000" else b"")
-        )
-        body = b"".join(
-            mode.encode("ascii") + b" " + _git_name(name) + b"\0" + object_id
-            for name, mode, object_id in entries
-        )
-        hashes[directory] = _hash_git_object("tree", body, object_format)
-    return hashes[()].hex()
-
-
-def _raw_tree_records(repo: Path, commit: str, object_format: str) -> list[tuple[str, str, str, str]]:
-    content = _git_run_bounded(repo, "ls-tree", "-rz", "--full-tree", commit)
-    records: list[tuple[str, str, str, str]] = []
-    seen: set[str] = set()
-    for raw in content.split(b"\0"):
-        if not raw:
-            continue
-        try:
-            metadata, raw_path = raw.split(b"\t", 1)
-            raw_mode, raw_type, raw_oid = metadata.split(b" ", 2)
-            mode = raw_mode.decode("ascii")
-            kind = raw_type.decode("ascii")
-            oid = raw_oid.decode("ascii")
-            path = raw_path.decode("utf-8", "surrogateescape")
-        except (UnicodeDecodeError, ValueError) as exc:
-            raise ArchiveError("Git returned a malformed raw tree record") from exc
-        _safe_relative(path)
-        if path in seen:
-            raise ArchiveError("Git returned a duplicate raw tree path")
-        seen.add(path)
-        if (mode, kind) not in {
-            ("100644", "blob"),
-            ("100755", "blob"),
-            ("120000", "blob"),
-            ("160000", "commit"),
-        }:
-            raise ArchiveError(f"unsupported raw Git tree entry: {mode} {kind}")
-        records.append((path, mode, kind, _git_oid(oid, object_format, where="tree oid")))
-    return records
-
-
-def _batch_blob_header(
-    raw: bytes, object_format: str, *, where: str
-) -> tuple[str, int]:
-    if not raw.endswith(b"\n") or len(raw) > 256:
-        raise ArchiveError(f"{where} returned a malformed blob header")
-    fields = raw[:-1].split(b" ")
-    if len(fields) != 3:
-        raise ArchiveError(f"{where} returned a malformed blob header")
-    try:
-        oid = fields[0].decode("ascii")
-        kind = fields[1].decode("ascii")
-        size_text = fields[2].decode("ascii")
-    except UnicodeDecodeError as exc:
-        raise ArchiveError(f"{where} returned a malformed blob header") from exc
-    if kind != "blob" or not size_text.isdecimal():
-        raise ArchiveError(f"{where} did not return a Git blob")
-    return _git_oid(oid, object_format, where=f"{where} oid"), int(size_text)
-
-
-def _raw_tree_layout(
-    records: list[tuple[str, str, str, str]],
-) -> tuple[list[str], int]:
-    directories: set[str] = set()
-    # tarfile pads every archive to a record. Account for leaf and implicit
-    # directory metadata before blob materialization so deep paths and
-    # gitlink-only trees cannot allocate past the final-tree entry limit.
-    estimated_size = tarfile.RECORDSIZE
-    for path, _, _, _ in records:
-        path_size = len(_git_name(path))
-        estimated_size += 1536
-        if path_size > 100:
-            estimated_size += ((path_size - 100 + 511) // 512) * 512
-        if estimated_size > MAX_FILE_BYTES:
-            raise ArchiveError("generated final tree exceeds per-file limit")
-        prefix = ""
-        for part in PurePosixPath(path).parts[:-1]:
-            prefix = part if not prefix else f"{prefix}/{part}"
-            if prefix in directories:
-                continue
-            directories.add(prefix)
-            prefix_size = len(_git_name(prefix))
-            estimated_size += 512
-            if prefix_size > 100:
-                estimated_size += 1024
-                estimated_size += ((prefix_size - 100 + 511) // 512) * 512
-            if estimated_size > MAX_FILE_BYTES:
-                raise ArchiveError("generated final tree exceeds per-file limit")
-    return (
-        sorted(
-            directories,
-            key=lambda value: (len(PurePosixPath(value).parts), _git_name(value)),
-        ),
-        estimated_size,
-    )
-
-
-def _raw_blob_data(
-    repo: Path,
-    records: list[tuple[str, str, str, str]],
-    object_format: str,
-    *,
-    estimated_size: int | None = None,
-) -> dict[str, bytes]:
-    if estimated_size is None:
-        _, estimated_size = _raw_tree_layout(records)
-    oids = list(dict.fromkeys(oid for _, mode, _, oid in records if mode != "160000"))
-    if not oids:
-        return {}
-    request = b"".join(oid.encode("ascii") + b"\n" for oid in oids)
-    checked = _git_run(
-        repo,
-        "cat-file",
-        "--batch-check=%(objectname) %(objecttype) %(objectsize)",
-        input_bytes=request,
-    ).splitlines(keepends=True)
-    if len(checked) != len(oids):
-        raise ArchiveError("Git batch-check returned an incomplete blob set")
-    sizes: dict[str, int] = {}
-    for expected_oid, header in zip(oids, checked, strict=True):
-        oid, size = _batch_blob_header(header, object_format, where="Git batch-check")
-        if oid != expected_oid:
-            raise ArchiveError("Git batch-check returned blobs out of order")
-        if size > MAX_FILE_BYTES:
-            raise ArchiveError("raw Git blob exceeds per-file limit")
-        sizes[oid] = size
-    for _, mode, _, oid in records:
-        # Count symlink target bytes conservatively too: long targets become a
-        # PAX linkpath and must not bypass the aggregate preflight merely
-        # because tar stores them as metadata.
-        if mode in {"100644", "100755", "120000"}:
-            estimated_size += ((sizes[oid] + 511) // 512) * 512
-            if estimated_size > MAX_FILE_BYTES:
-                raise ArchiveError("generated final tree exceeds per-file limit")
-
-    with tempfile.TemporaryFile() as spool:
-        try:
-            result = subprocess.run(
-                _git_command(repo, "cat-file", "--batch"),
-                input=request,
-                env=_git_environment(),
-                stdout=spool,
-                stderr=subprocess.PIPE,
-                timeout=120,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ArchiveError(f"cannot read raw Git blobs: {exc}") from exc
-        if result.returncode != 0:
-            raise ArchiveError(
-                "git failed: "
-                + result.stderr.decode("utf-8", "replace").strip()
-            )
-        spool.seek(0)
-        blobs: dict[str, bytes] = {}
-        for expected_oid in oids:
-            oid, size = _batch_blob_header(
-                spool.readline(257), object_format, where="Git batch"
-            )
-            if oid != expected_oid or size != sizes[expected_oid]:
-                raise ArchiveError("Git batch blob differs from its size preflight")
-            data = spool.read(size)
-            if len(data) != size or spool.read(1) != b"\n":
-                raise ArchiveError("Git batch returned truncated blob content")
-            if _hash_git_object("blob", data, object_format).hex() != oid:
-                raise ArchiveError("raw Git blob content does not match its object id")
-            blobs[oid] = data
-        if spool.read(1):
-            raise ArchiveError("Git batch returned unexpected trailing content")
-    return blobs
-
-
-def _tar_info(name: str, *, mode: int, entry_type: bytes) -> tarfile.TarInfo:
-    info = tarfile.TarInfo(name)
-    info.type = entry_type
-    info.mode = mode
-    info.uid = 0
-    info.gid = 0
-    info.uname = ""
-    info.gname = ""
-    info.mtime = 0
-    return info
-
-
-def _raw_tree_tar(repo: Path, commit: str, object_format: str) -> bytes:
-    records = _raw_tree_records(repo, commit, object_format)
-    directories, estimated_size = _raw_tree_layout(records)
-    blobs = _raw_blob_data(
-        repo,
-        records,
-        object_format,
-        estimated_size=estimated_size,
-    )
-    output = io.BytesIO()
-    with tarfile.open(fileobj=output, mode="w", format=tarfile.PAX_FORMAT) as archive:
-        for directory in directories:
-            archive.addfile(
-                _tar_info(directory + "/", mode=0o755, entry_type=tarfile.DIRTYPE)
-            )
-        for path, mode, kind, oid in records:
-            if mode == "160000":
-                info = _tar_info(path + "/", mode=0o755, entry_type=tarfile.DIRTYPE)
-                info.pax_headers = {GIT_MODE_PAX: mode, GIT_OID_PAX: oid}
-                archive.addfile(info)
-                continue
-            data = blobs[oid]
-            entry_type = tarfile.SYMTYPE if mode == "120000" else tarfile.REGTYPE
-            info = _tar_info(
-                path,
-                mode=0o755 if mode == "100755" else 0o644,
-                entry_type=entry_type,
-            )
-            info.pax_headers = {GIT_MODE_PAX: mode, GIT_OID_PAX: oid}
-            if mode == "120000":
-                if b"\0" in data:
-                    raise ArchiveError("raw Git symlink target contains NUL")
-                info.linkname = data.decode("utf-8", "surrogateescape")
-            else:
-                info.size = len(data)
-            archive.addfile(info, None if mode == "120000" else io.BytesIO(data))
-    content = output.getvalue()
-    if len(content) > MAX_FILE_BYTES:
-        raise ArchiveError("generated final tree exceeds per-file limit")
-    return content
 
 
 class ArchiveBuilder:

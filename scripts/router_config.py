@@ -25,12 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 import fleet_providers  # noqa: E402
-import fleet_compiled  # noqa: E402
 import fleet_json  # noqa: E402
 import fleet_manifest  # noqa: E402
-import fleet_mission  # noqa: E402
-import fleet_mission_state  # noqa: E402
-import fleet_safe_paths  # noqa: E402
 
 DEFAULT_ROUTER = ROOT / "orchestration" / "router.yaml"
 IDENTIFIER_RE = re.compile(r"^[a-z][a-z0-9_-]{0,47}$")
@@ -142,6 +138,13 @@ def _compiled_runtime_config(
         return load_router(args.router), None
     if args.router:
         raise RouterError("--router cannot be combined with compiled router authority")
+    # Runtime authority is needed only for compiled effect admission. Schema
+    # inspection and planning do not load the Mission controller.
+    import fleet_compiled
+    import fleet_mission
+    import fleet_mission_state
+    import fleet_safe_paths
+
     try:
         if mission_id:
             normalized_mission_id = fleet_mission_state.normalize_uuid(

@@ -43,6 +43,35 @@ CMUX_LEGACY_REFERENCE = ROOT / "docs" / "cmux-legacy-reference.md"
 class SpecCoherenceTests(unittest.TestCase):
     """The router is the single source of truth; prose must not drift from it."""
 
+    @unittest.skipUnless(shutil.which("just"), "just is required for recipe dry-runs")
+    def test_personal_and_mission_recipes_use_the_same_selected_interpreter(self) -> None:
+        selected = "/runtime with spaces/python3.12"
+        env = {**os.environ, "FLEET_PYTHON": selected}
+        for arguments in (
+            ["personal-check", "/tmp/target"],
+            ["mission-status", "11111111-1111-4111-8111-111111111111"],
+            ["workflow-catalog"],
+            ["mission-herdr-archive-verify", "11111111-1111-4111-8111-111111111111"],
+        ):
+            with self.subTest(recipe=arguments[0]):
+                result = subprocess.run(
+                    ["just", "--justfile", str(JUSTFILE), "--dry-run", *arguments],
+                    cwd=ROOT, env=env, text=True, capture_output=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                tokens = shlex.split(result.stderr)
+                self.assertEqual(tokens[:2], [selected, "-B"])
+
+    def test_ci_rejects_missing_selected_interpreter_before_running_checks(self) -> None:
+        result = subprocess.run(
+            ["bash", str(CHECK_CI)], cwd=ROOT,
+            env={**os.environ, "FLEET_PYTHON": "/nonexistent/fleet-python"},
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("dependency is unavailable: /nonexistent/fleet-python", result.stderr)
+        self.assertEqual(result.stdout, "")
+
     def test_local_canary_advance_honors_isolated_runs_directory(self) -> None:
         recipe = JUSTFILE.read_text(encoding="utf-8")
         self.assertIn(

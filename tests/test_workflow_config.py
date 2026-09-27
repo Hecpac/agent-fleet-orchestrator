@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -24,6 +25,37 @@ class WorkflowConfigTests(unittest.TestCase):
             ROOT / "workflows" / "implementation.yaml"
         )
         self.router = workflow_config.router_config.load_router()
+
+    def test_catalog_distinguishes_schema_compilation_and_runtime_without_effects(self) -> None:
+        with mock.patch.object(subprocess, "Popen", side_effect=AssertionError("no process")):
+            value = workflow_config.catalog()
+        self.assertFalse(value["runtime_checked"])
+        entries = {row["name"]: row for row in value["workflows"]}
+        self.assertEqual(entries["herdr-implementation"]["effect_compilation"], "available")
+        self.assertTrue(entries["regulated"]["schema_valid"])
+        self.assertEqual(entries["regulated"]["effect_compilation"], "blocked")
+        self.assertIn("hard token_budget must be positive", entries["regulated"]["reason"])
+        self.assertNotIn("compiled_digest", entries["regulated"])
+        self.assertEqual(len(entries), len(list((ROOT / "workflows").glob("*.yaml"))))
+
+    def test_catalog_does_not_hide_invalid_or_missing_workflows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with self.assertRaisesRegex(workflow_config.WorkflowError, "no workflows"):
+                workflow_config.catalog(directory)
+            (directory / "broken.yaml").write_text('{"schema_version":1}')
+            with self.assertRaisesRegex(workflow_config.WorkflowError, "missing fields"):
+                workflow_config.catalog(directory)
+
+    def test_catalog_cli_reports_unavailable_policy_without_launching(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-B", str(SCRIPTS / "workflow_config.py"), "catalog"],
+            cwd=ROOT, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        value = json.loads(result.stdout)
+        self.assertFalse(value["runtime_checked"])
+        self.assertTrue(any(row["effect_compilation"] == "blocked" for row in value["workflows"]))
 
     def test_repository_workflows_compile_against_router(self) -> None:
         expected = {
@@ -316,7 +348,7 @@ class WorkflowConfigTests(unittest.TestCase):
         workflow = ROOT / "workflows" / "implementation.yaml"
         for command in ("validate", "show", "compile"):
             result = subprocess.run(
-                ["python3", str(script), command, str(workflow)],
+                [sys.executable, "-B", str(script), command, str(workflow)],
                 cwd=ROOT,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -327,7 +359,7 @@ class WorkflowConfigTests(unittest.TestCase):
             self.assertTrue(result.stdout.strip())
         compiled = json.loads(
             subprocess.run(
-                ["python3", str(script), "compile", str(workflow)],
+                [sys.executable, "-B", str(script), "compile", str(workflow)],
                 cwd=ROOT,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -341,7 +373,7 @@ class WorkflowConfigTests(unittest.TestCase):
         script = SCRIPTS / "workflow_config.py"
         regulated = ROOT / "workflows" / "regulated.yaml"
         validated = subprocess.run(
-            ["python3", str(script), "validate", str(regulated)],
+            [sys.executable, "-B", str(script), "validate", str(regulated)],
             cwd=ROOT,
             text=True,
             capture_output=True,
@@ -349,7 +381,7 @@ class WorkflowConfigTests(unittest.TestCase):
         )
         self.assertEqual(validated.returncode, 0, validated.stderr)
         compiled = subprocess.run(
-            ["python3", str(script), "compile", str(regulated)],
+            [sys.executable, "-B", str(script), "compile", str(regulated)],
             cwd=ROOT,
             text=True,
             capture_output=True,

@@ -8,6 +8,7 @@ import re
 from typing import Any, Iterable, Literal
 
 import fleet_json
+import fleet_workflow_contract as workflow_contract
 import fleet_providers
 
 
@@ -361,8 +362,8 @@ def _validate_v1(value: dict[str, Any]) -> None:
 
 
 def _validate_v2(value: dict[str, Any], *, effectful: bool) -> None:
-    # Import lazily so workflow_config can use this validator on its own output.
-    import workflow_config
+    # Snapshot validation must not import the compiler or Mission runtime.
+    import router_config
 
     router = _object(value["router_snapshot"], "compiled.router_snapshot")
     try:
@@ -374,8 +375,8 @@ def _validate_v2(value: dict[str, Any], *, effectful: bool) -> None:
     if router_digest != value["router_digest"]:
         raise CompiledError("compiled router_snapshot digest mismatch")
     try:
-        workflow_config.router_config.validate_router(router)
-    except workflow_config.router_config.RouterError as exc:
+        router_config.validate_router(router)
+    except router_config.RouterError as exc:
         raise CompiledError(f"compiled.router_snapshot is invalid: {exc}") from exc
 
     raw_workflow = value["workflow"]
@@ -388,8 +389,8 @@ def _validate_v2(value: dict[str, Any], *, effectful: bool) -> None:
     }:
         raise CompiledError("compiled.workflow.risk.minimum is invalid")
     try:
-        workflow_config.validate_workflow(raw_workflow)
-    except workflow_config.WorkflowError as exc:
+        workflow_contract.validate_workflow(raw_workflow)
+    except workflow_contract.WorkflowError as exc:
         raise CompiledError(f"compiled.workflow is invalid: {exc}") from exc
     workflow = raw_workflow
     resolved = _object(value["resolved"], "compiled.resolved")
@@ -466,6 +467,9 @@ def _validate_v2(value: dict[str, Any], *, effectful: bool) -> None:
     if not effectful:
         return
 
+    import fleet_manifest
+    import fleet_usage
+
     # Checksums alone cannot prove that the published rosters and launch
     # digests were actually derived from the embedded router. Re-resolve both
     # plans from fresh detached copies so a mutable resolver can never leak
@@ -475,17 +479,17 @@ def _validate_v2(value: dict[str, Any], *, effectful: bool) -> None:
         for selected_preset in (preset, assurance_preset):
             plan_router = fleet_json.loads(router_bytes)
             binding_router = fleet_json.loads(router_bytes)
-            plan = workflow_config.router_config.build_plan(
+            plan = router_config.build_plan(
                 plan_router,
                 preset_name=selected_preset,
                 run_healthcheck=False,
                 check_runtime_availability=False,
             )
-            workflow_config.fleet_manifest.bind_plan(binding_router, plan, value)
+            fleet_manifest.bind_plan(binding_router, plan, value)
     except (
         fleet_json.FleetJSONError,
-        workflow_config.router_config.RouterError,
-        workflow_config.fleet_manifest.ManifestError,
+        router_config.RouterError,
+        fleet_manifest.ManifestError,
     ) as exc:
         raise CompiledError(
             f"compiled router snapshot plan binding failed: {exc}"
@@ -506,14 +510,14 @@ def _validate_v2(value: dict[str, Any], *, effectful: bool) -> None:
         }
     )
     try:
-        workflow_config.fleet_usage.validate_policy(
+        fleet_usage.validate_policy(
             {
                 "budget_mode": workflow["limits"]["budget_mode"],
                 "token_budget": workflow["limits"]["token_budget"],
             },
             providers=providers,
         )
-    except workflow_config.fleet_usage.UsageError as exc:
+    except fleet_usage.UsageError as exc:
         raise CompiledError(
             f"compiled workflow token budget is not enforceable: {exc}"
         ) from exc

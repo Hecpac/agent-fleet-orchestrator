@@ -264,9 +264,9 @@ class Cycle:
         tree = self.get(revision["tree"])
         self.get(revision["patch"])
         # Verify tree identity independently of the mutable Git repository.
-        import fleet_archive
+        import fleet_archive_tree
         object_format = "sha1" if len(revision["tree_sha"]) == 40 else "sha256"
-        if fleet_archive._tree_hash_from_tar(tree, object_format) != revision["tree_sha"]:
+        if fleet_archive_tree.tree_hash_from_tar(tree, object_format) != revision["tree_sha"]:
             raise CycleError("revision tree identity mismatch")
         physical = scope.evaluate(current["baseline"], revision["inventory"], spec["scope"],
                                   tree_sha=revision["tree_sha"], tree=tree)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import importlib
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -60,6 +61,27 @@ class FleetCompiledTests(unittest.TestCase):
     def _write(self, value: dict) -> Path:
         self.path.write_bytes(fleet_json.canonical_bytes(value) + b"\n")
         return self.path
+
+    def test_reading_current_snapshot_does_not_import_compiler_or_mission_runtime(self) -> None:
+        path = self._write(self.v2)
+        code = '''
+import sys
+sys.path.insert(0, sys.argv[1])
+class RejectRuntimeImports:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname in {"workflow_config", "fleet_mission", "fleet_mission_state",
+                        "fleet_herdr", "fleet_herdr_mission", "fleet_archive"}:
+            raise AssertionError("snapshot reader imported runtime: " + fullname)
+sys.meta_path.insert(0, RejectRuntimeImports())
+import fleet_compiled
+value = fleet_compiled.load(sys.argv[2], mode="read")
+assert value["schema_version"] == 2
+'''
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", "-c", code, str(SCRIPTS), str(path)],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_v2_is_accepted_for_read_and_effect_with_canonical_digests(self) -> None:
         path = self._write(self.v2)

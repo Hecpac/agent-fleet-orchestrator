@@ -158,10 +158,10 @@ def run(runs, mid, frozen, *, interrupt=None):
     current, spec = load_policy(runs, mid)
     if spec is None:
         raise FunctionalError("functional policy is required before execution")
-    import fleet_archive
+    import fleet_archive_tree
     tree = fleet_artifacts.get_bytes(runs, mid, frozen["tree_artifact_id"])
     if (frozen.get("mission_id") != mid or frozen.get("compiled_digest") != current["compiled_digest"]
-            or fleet_archive._tree_hash_from_tar(tree, "sha1" if len(frozen["tree_sha"]) == 40 else "sha256") != frozen["tree_sha"]):
+            or fleet_archive_tree.tree_hash_from_tar(tree, "sha1" if len(frozen["tree_sha"]) == 40 else "sha256") != frozen["tree_sha"]):
         raise FunctionalError("functional frozen tree binding mismatch")
     contract = contract_for(mid, frozen, spec)
     identifier = digest(contract)

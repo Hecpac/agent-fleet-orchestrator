@@ -26,6 +26,24 @@ pueda admitir efectos: el compilador de ejecución exige `hard_total` en todos
 los proveedores resolubles y el run regulado exige WORM externo, dependencias
 que el S0 local no declara disponibles.
 
+`just workflow-catalog` muestra por separado la validez del esquema y la
+disponibilidad de compilación con el router actual. Es diagnóstico estático:
+`runtime_checked=false` no acredita binarios, credenciales, WORM ni permisos de
+ejecución. Las políticas bloqueadas permanecen visibles con el error del
+compilador. `just workflow-validate` conserva su significado de validación de
+esquemas, incluido `regulated.yaml`.
+
+Las recetas Python de `just` y el gate portátil usan `FLEET_PYTHON`, con
+`python3.12` como valor por defecto. Para seleccionar otro Python compatible:
+
+```bash
+FLEET_PYTHON=/ruta/a/python3.12 just workflow-catalog
+FLEET_PYTHON=/ruta/a/python3.12 just ci
+```
+
+Las invocaciones directas de scripts deben utilizar ese mismo intérprete; el
+proyecto no modifica el Python global ni el `PATH` del usuario.
+
 El mismo contrato se puede ejecutar localmente con:
 
 ```bash

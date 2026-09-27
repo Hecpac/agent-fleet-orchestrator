@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import fleet_archive
+import fleet_git_snapshot
 import fleet_audit_client
 import fleet_manifest
 import fleet_mission
@@ -750,7 +751,7 @@ class FleetArchiveTests(unittest.TestCase):
     def test_raw_tree_preflights_blob_and_pax_size_limits(self) -> None:
         oid = "a" * 40
         oversized = f"{oid} blob {fleet_archive.MAX_FILE_BYTES + 1}\n".encode("ascii")
-        with mock.patch.object(fleet_archive, "_git_run", return_value=oversized):
+        with mock.patch.object(fleet_git_snapshot, "_git_run", return_value=oversized):
             with self.assertRaisesRegex(fleet_archive.ArchiveError, "blob exceeds"):
                 fleet_archive._raw_blob_data(
                     self.repo,
@@ -763,7 +764,7 @@ class FleetArchiveTests(unittest.TestCase):
             for index in range(fleet_archive.MAX_FILE_BYTES // 1536 + 1)
         ]
         empty = f"{oid} blob 0\n".encode("ascii")
-        with mock.patch.object(fleet_archive, "_git_run", return_value=empty):
+        with mock.patch.object(fleet_git_snapshot, "_git_run", return_value=empty):
             with self.assertRaisesRegex(
                 fleet_archive.ArchiveError, "generated final tree exceeds"
             ):
@@ -775,7 +776,7 @@ class FleetArchiveTests(unittest.TestCase):
             (f"link-{index}", "120000", "blob", oid) for index in range(3)
         ]
         with (
-            mock.patch.object(fleet_archive, "_git_run", return_value=long_target),
+            mock.patch.object(fleet_git_snapshot, "_git_run", return_value=long_target),
             mock.patch.object(fleet_archive.subprocess, "run") as batch_run,
         ):
             with self.assertRaisesRegex(
@@ -791,7 +792,7 @@ class FleetArchiveTests(unittest.TestCase):
             oid,
         )
         with (
-            mock.patch.object(fleet_archive, "MAX_FILE_BYTES", 8192),
+            mock.patch.object(fleet_git_snapshot, "MAX_FILE_BYTES", 8192),
             mock.patch.object(fleet_archive.subprocess, "run") as batch_run,
         ):
             with self.assertRaisesRegex(

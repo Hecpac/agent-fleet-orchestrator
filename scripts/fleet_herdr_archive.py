@@ -15,7 +15,8 @@ import tempfile
 from typing import Any
 
 import fleet_acceptance
-import fleet_archive
+import fleet_archive_tree
+import fleet_git_snapshot
 import fleet_artifacts
 import fleet_herdr_inference
 import fleet_compiled
@@ -62,7 +63,7 @@ def _write(store: fleet_safe_paths.RootedFS, relative: Path, content: bytes) -> 
 
 def _git(repo: Path, *args: str, environment: dict[str, str] | None = None, input_bytes: bytes | None = None) -> bytes:
     result = subprocess.run(["git", "-c", "core.hooksPath=/dev/null", "-C", str(repo), *args],
-        env=environment or fleet_archive._git_environment(), stdout=subprocess.PIPE,
+        env=environment or fleet_git_snapshot.git_environment(), stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, input=input_bytes, timeout=60, check=False)
     if result.returncode:
         raise HerdrArchiveError(result.stderr.decode(errors="replace")[:2000])
@@ -81,7 +82,7 @@ def snapshot(candidate_repo: Path, *, expected_base: str | None = None,
     if expected_base is not None and base != expected_base:
         raise HerdrArchiveError("candidate HEAD differs from mission baseline")
     with tempfile.TemporaryDirectory(prefix="fleet-herdr-index-") as temporary:
-        environment = {**fleet_archive._git_environment(), "GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        environment = {**fleet_git_snapshot.git_environment(), "GIT_INDEX_FILE": str(Path(temporary) / "index")}
         _git(repo, "read-tree", base, environment=environment)
         if selected_paths is None:
             _git(repo, "add", "--all", "--", ".", environment=environment)
@@ -99,8 +100,8 @@ def snapshot(candidate_repo: Path, *, expected_base: str | None = None,
         if _git(repo, "write-tree", environment=environment).decode().strip() != tree_sha:
             raise HerdrArchiveError("patch does not reproduce frozen tree from baseline")
     object_format = _git(repo, "rev-parse", "--show-object-format").decode().strip()
-    tree = fleet_archive._raw_tree_tar(repo, tree_sha, object_format)
-    if fleet_archive._tree_hash_from_tar(tree, object_format) != tree_sha:
+    tree = fleet_git_snapshot.raw_tree_tar(repo, tree_sha, object_format)
+    if fleet_archive_tree.tree_hash_from_tar(tree, object_format) != tree_sha:
         raise HerdrArchiveError("snapshot Git tree proof failed")
     if _git(repo, "rev-parse", "HEAD").decode().strip() != base:
         raise HerdrArchiveError("candidate HEAD changed during snapshot")
@@ -207,7 +208,7 @@ def verify_research_snapshot(runs_dir: Path, mission_id: str, receipt: Any,
         tree = fleet_artifacts.get_bytes(runs_dir, mission_id, stored["tree_artifact_id"])
         fleet_artifacts.get_bytes(runs_dir, mission_id, stored["patch_artifact_id"])
         object_format = "sha1" if len(stored["tree_sha"]) == 40 else "sha256"
-        if fleet_archive._tree_hash_from_tar(tree, object_format) != stored["tree_sha"]:
+        if fleet_archive_tree.tree_hash_from_tar(tree, object_format) != stored["tree_sha"]:
             raise HerdrArchiveError("investigated snapshot tree CAS is invalid")
         return stored
     except (fleet_herdr_profile.ProfileError, fleet_json.FleetJSONError,
@@ -410,7 +411,7 @@ def _selected_contents(runs_dir: Path, mission_id: str) -> tuple[bytes, dict[str
         raise HerdrArchiveError("archive snapshot selection binding mismatch")
     contents = {}
     for name, proof in index["entries"].items():
-        fleet_archive._safe_relative(name)
+        fleet_archive_tree.safe_relative(name)
         content = fleet_artifacts.get_bytes(runs_dir, mission_id, proof["sha256"])
         if proof != {"sha256": _sha(content), "bytes": len(content)}:
             raise HerdrArchiveError("archive selected content differs")
@@ -516,7 +517,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
         if not isinstance(entries, dict) or len(entries) > 1000:
             raise HerdrArchiveError("invalid archive entry map")
         for name, proof in entries.items():
-            fleet_archive._safe_relative(name)
+            fleet_archive_tree.safe_relative(name)
             content = _read(store, archive / name)
             if proof != {"sha256": _sha(content), "bytes": len(content)}:
                 raise HerdrArchiveError(f"archive content changed: {name}")
@@ -629,7 +630,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
             raise HerdrArchiveError("archive backend/freeze identity mismatch")
         tree = contents["writer/final-tree.tar"]
         object_format = "sha1" if len(index["final_tree_sha"]) == 40 else "sha256"
-        if (fleet_archive._tree_hash_from_tar(tree, object_format) != index["final_tree_sha"]
+        if (fleet_archive_tree.tree_hash_from_tar(tree, object_format) != index["final_tree_sha"]
                 or frozen["tree_sha"] != index["final_tree_sha"] or frozen["tree_artifact_id"] != _sha(tree)
                 or frozen["patch_artifact_id"] != _sha(contents["writer/change.patch"])):
             raise HerdrArchiveError("archive candidate tree binding mismatch")
@@ -649,7 +650,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
                 raise HerdrArchiveError("archived investigated snapshot binding mismatch")
             research_tree = contents["research/investigated-tree.tar"]
             research_format = "sha1" if len(research["tree_sha"]) == 40 else "sha256"
-            if fleet_archive._tree_hash_from_tar(research_tree, research_format) != research["tree_sha"]:
+            if fleet_archive_tree.tree_hash_from_tar(research_tree, research_format) != research["tree_sha"]:
                 raise HerdrArchiveError("archived investigated tree proof failed")
         roles = fleet_json.loads(contents["role-results.json"])
         if set(roles) != profile.result_roles or any(roles[role].get("artifact_id") != _sha(contents[f"results/{role}.txt"]) for role in profile.result_roles):
@@ -835,7 +836,7 @@ def main() -> int:
         result = verify(args.runs_dir.resolve(strict=True), args.mission_id, attest_permissions=args.attest_permissions)
     except (HerdrArchiveError, fleet_safe_paths.SafePathError, state.MissionStateError,
             fleet_json.FleetJSONError, fleet_compiled.CompiledError,
-            fleet_acceptance.AcceptanceError, fleet_archive.ArchiveError, OSError) as exc:
+            fleet_acceptance.AcceptanceError, fleet_archive_tree.ArchiveError, OSError) as exc:
         print(f"herdr-archive: {exc}", file=sys.stderr)
         return 1
     print(json.dumps(result, sort_keys=True))
