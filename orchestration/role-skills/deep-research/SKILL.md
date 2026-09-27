@@ -1,6 +1,6 @@
 ---
 name: deep-research
-description: Research a topic thoroughly by exploring the codebase, reading docs, and summarizing findings. Use for understanding how something works, investigating bugs, or analyzing architecture.
+description: Investigate a codebase, trace behavior and dependencies, and summarize architecture or bug findings with file references. Use for repository research; general web or literature research belongs to other workflows.
 context: fork
 agent: Explore
 ---
@@ -11,13 +11,12 @@ Research `$ARGUMENTS` thoroughly.
 
 ## Methodology
 
-1. **Search broadly first**
-   - Use Glob to find relevant files by name patterns
-   - Use Grep to find references, imports, and usage patterns
-   - Cast a wide net before narrowing down
+1. **Start from the question and known references**
+   - Find the relevant entry points, files and usage patterns
+   - Expand the search when evidence is missing or reveals another relevant boundary
 
 2. **Read and analyze**
-   - Read key files completely (don't skim)
+   - Read the complete contracts or code blocks needed to evaluate the conclusion; read entire files when their surrounding context matters
    - Trace the flow from entry points to implementation
    - Note patterns, dependencies, and architectural decisions
 

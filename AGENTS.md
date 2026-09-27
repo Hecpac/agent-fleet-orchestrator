@@ -31,7 +31,7 @@ An ad hoc CLI session is not a registered Mission role without its admission.
 
 ## Stages and acceptance
 
-Herdr stages are Plan, Build, Review, Verify and Synthesis. Judge only the
+Herdr stages depend on the profile bound to the task. Judge only the
 assigned stage's supplied criteria: a failing baseline can support Plan PASS.
 Do not wait for future stages to report the current stage's result.
 

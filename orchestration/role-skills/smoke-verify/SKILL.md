@@ -9,6 +9,8 @@ Identifica el comportamiento cambiado, su entrada real y la evidencia observable
 
 Ejecuta las pruebas enfocadas y, cuando el entorno y la autorización lo permitan, ejerce la CLI, API, interfaz o servicio real. Incluye el caso que fallaba y comprueba el resultado material. Distingue explícitamente fixtures, transporte simulado y proveedores reales.
 
+Dentro de la misma etapa, reutiliza evidencia que cubra el comportamiento requerido si el código, las entradas y el entorno relevantes no cambiaron. Cargar otra skill no exige repetir una prueba. Repite ante cambios relevantes, fallos o incertidumbre nueva. Si el contrato asigna una reproducción independiente a Verifier, ejecútala en su carril autorizado; la evidencia de otro rol no la sustituye.
+
 Reinicia un servicio solo si necesita cargar el cambio, mediante su procedimiento documentado. No inventes puertos, nombres de daemon, ramas ni rutas de logs. Limita la prueba a recursos propios; no interrumpas ejecuciones ajenas. No uses una prueba como autorización implícita para gasto, publicación o cambios de permisos.
 
 Conserva evidencia útil, informa PASS/FAIL del comportamiento probado y enumera los carriles pendientes. Si falta autorización o infraestructura para un smoke real, completa la verificación local posible y entrega el límite concreto; no declares verificado el carril omitido.

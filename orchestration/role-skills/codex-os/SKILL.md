@@ -1,51 +1,46 @@
 ---
 name: codex-os
-description: Route substantial engineering and product work through the smallest useful sequence of discovery, decisions, implementation, verification, review, and handoff. Use automatically for new projects, websites, web pages, applications, product design, redesigns, multi-step changes, builds, fixes, or operational work; skip simple answers and one-step edits.
+description: Plan or synthesize an assigned Herdr Lead stage when coordinating scope, decisions and evidence adds value. Use with the supplied stage contract and selected skills.
 ---
 
 # Codex OS
 
-Deliver the requested outcome with evidence while loading only the workflow guidance the task actually needs.
+Complete the assigned Plan or Synthesis stage using its supplied criteria. Implementation, specialized design and verification needs belong in the bounded plan or synthesis; they do not authorize Lead to execute other roles' work or load unselected skills.
 
 ## Shape the work
 
-1. Read the applicable `AGENTS.md` instructions and inspect relevant state before proposing changes.
+1. Use the supplied project instructions and inspect relevant state before proposing changes.
 2. Establish the objective, verified current state, constraints, success criteria, and allowed side effects.
-3. Choose the smallest workflow below. Do not run every phase by default.
+3. Use only selected skill content when its condition applies. Keep future-stage requirements in the plan, without making them prerequisites for the current result.
 
 | Need | Route |
 | --- | --- |
-| Repository state, ownership, or risk is unclear | Use `$fase-0-recon` before implementation. |
-| A missing product, architecture, or scope decision would materially change the result | Use `$entrevista-pre-slice` for material user decisions that investigation and existing instructions cannot resolve. Pause dependent work only; continue authorized independent work. |
-| The main goal is design exploration, UX research or audit, faithful visual recreation, redesign direction, or prototype QA | Use `$product-design:index` to select the focused design workflow before implementation. |
-| A website, landing page, redesign, or visual-polish task needs warmth, personality, editorial detail, brand specificity, or rescue from generic AI aesthetics | Apply `$human-web-art-direction` as the art-direction and anti-generic gate before visual concepting or implementation. When Product Design also applies, preserve its source-selection, approval, and fidelity workflow. |
-| Implementation spans multiple meaningful slices | Maintain `$impl-notes` during execution and apply `$slice-gate` before advancing. |
-| Behavior can be exercised after a change | Use `$smoke-verify` and preserve the evidence it requires. |
-| The user requests a commit | Use `$commit` only after verification and review. |
-| The user requests deployment | Use `$deploy`; obtain the confirmation it requires immediately before production. |
+| A missing product, architecture, or scope decision would materially change the result | Use selected `entrevista-pre-slice` guidance for material user decisions that investigation and existing instructions cannot resolve. Pause dependent work only; continue authorized independent work. |
+| The assigned stage is Synthesis | Use selected `slice-gate` guidance to reconcile completed stages against the supplied acceptance criteria. |
 
-Handle ordinary inspection, a narrow reversible edit, or a focused test directly when loading another skill would add no decision value.
+Handle ordinary inspection directly within the supplied read-only lane.
 
-## Execute by verified slices
+## Plan and synthesize within the role
 
-- Prefer one agent. Use parallel agents only when workstreams are independent, have clear ownership, and can be verified separately.
-- Keep interactive discovery and decision-making in the current conversation. Start a fresh execution context for an independent work order when accumulated context would distract from it; transfer the objective, decisions, constraints, relevant paths, and definition of done.
-- Make the smallest coherent reversible change, then run the most relevant available check before expanding scope.
+- In Plan, identify the smallest coherent change, relevant boundaries and observable checks for later stages. A failing baseline may support a viable plan.
+- In Synthesis, reconcile supplied results, discrepancies and residual risks against the frozen candidate. Do not wait for the controller's archive or terminal verdict.
 - Keep unresolved facts unresolved. Do not convert a partial screenshot, process exit, green CI status, deployment state, or agent report into semantic success without the evidence the task requires.
-- Use `$impl-notes` for material deviations. Record them before dependent work when they change a decision, constraint, or verification plan. Otherwise, a concise delivery note is sufficient. Documentation does not itself create an approval checkpoint.
+- Include material deviations and their impact on scope, decisions or evidence in the stage result; notes do not create an approval checkpoint.
 
 ## Close the evidence loop
 
-For substantial changes, seek three forms of proof when applicable:
+Assess the evidence required by the assigned stage:
 
 1. Automated evidence: targeted tests, type checks, lint, build, or an equivalent machine check.
 2. Functional evidence: browser, simulator, logs, API behavior, rendered artifact, or a minimal smoke test.
 3. Review evidence: inspect the complete relevant diff or result from a fresh defect-focused perspective.
 
+Within the same stage, reuse evidence that covers the required behavior when the relevant code, inputs and environment have not changed. Repeat checks only for relevant changes, failures or new uncertainty, within the supplied lane. Preserve independently assigned Reviewer and Verifier work; Lead does not replace it or make future stages a prerequisite for Plan PASS.
+
 Do not manufacture a gate that the project does not support. If a check cannot be run, state why, preserve the unverified status, and identify the smallest next check.
 
 ## Preserve authorization
 
-This workflow never grants permission beyond the user's request. Follow the active `AGENTS.md` approval boundaries, including existing authorization and any explicit final-stage approval requirement. Pause only at the action whose required approval remains outstanding.
+The supplied task governs the sole-writer rule, permissions, delegation, controller closure authority and result protocol. This skill grants no additional authority. Reuse existing authorization and pause only work whose required decision or approval remains outstanding.
 
-Finish with the outcome, supporting evidence, remaining risks or unknowns, and the recommended next step. Do not claim completion while required verification or an authorized deliverable remains unfinished.
+Finish when the assigned stage's criteria are met. Return its outcome, supporting evidence, remaining risks or unknowns and recommendation in the supplied result protocol, including raw JSON when required. Do not claim Mission closure.
