@@ -30,11 +30,12 @@ def verify_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: st
                       prompt_sha256: str, final_bytes: bytes,
                       permission_policy: dict[str, Any] | None = None,
                       runtime_contract: dict[str, Any] | None = None,
-                      expected_provider: str = "openai") -> dict[str, Any]:
+                      expected_provider: str = "openai", expected_effort: str = "high") -> dict[str, Any]:
     """Accept only a uniquely bound completed turn; no live filesystem/UI reads."""
     return _inspect_transcript(raw, agent_session=agent_session, model=model, turn_id=turn_id,
         prompt_sha256=prompt_sha256, final_bytes=final_bytes, permission_policy=permission_policy,
-        runtime_contract=runtime_contract, expected_provider=expected_provider)
+        runtime_contract=runtime_contract, expected_provider=expected_provider,
+        expected_effort=expected_effort)
 
 
 def observe_rejected_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: str,
@@ -57,7 +58,7 @@ def _inspect_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: 
                       permission_policy: dict[str, Any] | None = None,
                       runtime_contract: dict[str, Any] | None = None,
                       expected_provider: str = "openai",
-                      observation_only: bool = False) -> dict[str, Any]:
+                      observation_only: bool = False, expected_effort: str = "high") -> dict[str, Any]:
     """Accept only a uniquely bound completed turn; no live filesystem/UI reads."""
     if not raw or len(raw) > 32 * 1024 * 1024 or not raw.endswith(b"\n"):
         raise EvidenceError("transcript must be bounded complete JSONL")
@@ -120,7 +121,7 @@ def _inspect_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: 
                          or "<skill>" in _text(payload, "input_text"))):
                 raise EvidenceError("skill input outside frozen task")
     contexts = [r["payload"] for r in rows[start:end] if r.get("type") == "turn_context"]
-    if not contexts or any(p.get("turn_id") != turn_id or p.get("model") != model or p.get("effort") != "high" for p in contexts):
+    if not contexts or any(p.get("turn_id") != turn_id or p.get("model") != model or p.get("effort") != expected_effort for p in contexts):
         raise EvidenceError("model/effort/turn context mismatch")
     finals = []
     completions = []
