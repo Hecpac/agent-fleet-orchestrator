@@ -1,0 +1,24 @@
+{
+  "synthetic": true,
+  "description": "Respuestas inventadas para ejercitar el consumidor. No proceden de TypeSafe ni miden calidad del modelo. confidence también es un valor de prueba.",
+  "answers_by_case": {
+    "syn-01": {"intent": {"type": "choice", "choice": "research", "confidence": 0.95, "probabilities": {"research": 0.95, "plan": 0.01, "build": 0.01, "review": 0.01, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-02": {"intent": {"type": "choice", "choice": "research", "confidence": 0.95, "probabilities": {"research": 0.95, "plan": 0.01, "build": 0.01, "review": 0.01, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-03": {"intent": {"type": "choice", "choice": "plan", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.95, "build": 0.01, "review": 0.01, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-04": {"intent": {"type": "choice", "choice": "plan", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.95, "build": 0.01, "review": 0.01, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-05": {"intent": {"type": "choice", "choice": "build", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.95, "review": 0.01, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-06": {"intent": {"type": "choice", "choice": "build", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.95, "review": 0.01, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-07": {"intent": {"type": "choice", "choice": "review", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.01, "review": 0.95, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-08": {"intent": {"type": "choice", "choice": "review", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.01, "review": 0.95, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-09": {"intent": {"type": "choice", "choice": "verify", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.01, "review": 0.01, "verify": 0.95, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-10": {"intent": {"type": "choice", "choice": "verify", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.01, "review": 0.01, "verify": 0.95, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-11": {"intent": {"type": "choice", "choice": "no_match", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.01, "review": 0.01, "verify": 0.01, "no_match": 0.95}}, "single_intent": {"type": "noul", "noul": 0.05}},
+    "syn-12": {"intent": {"type": "choice", "choice": "plan", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.95, "build": 0.01, "review": 0.01, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.10}},
+    "syn-13": {"intent": {"type": "choice", "choice": "no_match", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.01, "review": 0.01, "verify": 0.01, "no_match": 0.95}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-14": {"intent": {"type": "choice", "choice": "no_match", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.01, "review": 0.01, "verify": 0.01, "no_match": 0.95}}, "single_intent": {"type": "noul", "noul": 0.01}},
+    "syn-15": {"intent": {"type": "choice", "choice": "review", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.01, "review": 0.95, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-16": {"intent": {"type": "choice", "choice": "plan", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.95, "build": 0.01, "review": 0.01, "verify": 0.01, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.98}},
+    "syn-17": {"intent": {"type": "choice", "choice": "review", "confidence": 0.30, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.01, "review": 0.48, "verify": 0.48, "no_match": 0.01}}, "single_intent": {"type": "noul", "noul": 0.50}},
+    "syn-18": {"intent": {"type": "choice", "choice": "no_match", "confidence": 0.95, "probabilities": {"research": 0.01, "plan": 0.01, "build": 0.01, "review": 0.01, "verify": 0.01, "no_match": 0.95}}, "single_intent": {"type": "noul", "noul": 0.98}}
+  }
+}
