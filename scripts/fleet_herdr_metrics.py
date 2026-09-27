@@ -1,4 +1,8 @@
-"""Observed controller intervals and conservative Codex usage normalization."""
+"""Observed controller intervals and conservative Codex usage normalization.
+
+Measurement only: the Mission ledger owns the interval event schema, `observe`
+is the one writer of those events, and nothing here decides Mission authority.
+"""
 from __future__ import annotations
 
 from datetime import datetime
@@ -8,40 +12,7 @@ import uuid
 import fleet_mission
 import fleet_mission_state as state
 
-KINDS = {"controller_operation", "controller_wait", "functional_execution", "supervisor_idle"}
-
-
-def validate_payload(kind, payload):
-    if kind == "herdr_interval_started":
-        state._require_fields(kind, payload, {"interval_id", "kind", "run_id"})
-        if payload["kind"] not in KINDS:
-            raise state.MissionStateError("unsupported controller interval")
-        if payload["run_id"] is not None:
-            state._require_uuid(payload["run_id"], "observed run")
-    else:
-        state._require_fields(kind, payload, {"interval_id", "elapsed_ns", "outcome"})
-        state._require_uint(payload["elapsed_ns"], "monotonic duration")
-        if payload["outcome"] not in {"returned", "raised"}:
-            raise state.MissionStateError("invalid interval outcome")
-    state._require_uuid(payload["interval_id"], "interval identity")
-
-
-def reduce(current, event):
-    if event["actor"] != "CONTROL":
-        raise state.MissionConflict("controller interval requires CONTROL")
-    intervals = current.setdefault("herdr_intervals", {})
-    payload = event["payload"]
-    identifier = payload["interval_id"]
-    if event["kind"] == "herdr_interval_started":
-        if identifier in intervals:
-            raise state.MissionConflict("interval identity cannot be reused")
-        intervals[identifier] = {**payload, "started_at": event["timestamp"], "ended_at": None,
-                                "elapsed_ns": None, "outcome": None}
-    else:
-        interval = intervals.get(identifier)
-        if not interval or interval["ended_at"] is not None:
-            raise state.MissionConflict("interval completion lacks its unique start")
-        interval.update(ended_at=event["timestamp"], elapsed_ns=payload["elapsed_ns"], outcome=payload["outcome"])
+KINDS = state.HERDR_INTERVAL_KINDS
 
 
 def observe(runs, mid, kind, callback, run_id=None):

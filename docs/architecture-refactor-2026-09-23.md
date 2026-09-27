@@ -39,7 +39,7 @@ no se alteran sus planes, pins, deadlines, autorizaciones ni evidencia.
 | S2 | Lectores, contratos y operaciones puras | Completado: dos carriles históricos explícitos, lectores puros extraídos y un rechazo explicado |
 | S3 | Composición moderna y compatibilidad | Completado: raíz moderna, soporte neutral y driver legacy explícito, sin cambio de comportamiento |
 | S4 | Catálogo de perfiles e identidad | Completado: catálogo como fuente única, identidades fijadas y copias ancladas por test |
-| S5 | Telemetría separada de autoridad | Pendiente |
+| S5 | Telemetría separada de autoridad | Completado: el ledger es dueño del esquema de intervalos y la dirección medición → autoridad queda fijada por test |
 | S6 | Scope y aceptación independientes del perfil | Pendiente |
 | S7 | Mecanismos comunes de Owner Cycle | Pendiente |
 | S8 | Política opt-in de reparación | Pendiente; calidad live requiere autorización propia |
@@ -92,6 +92,18 @@ por test, sin ampliar sus dependencias. `HerdrProfile.contract()` no cambia: su
 digest está fijado en ledgers existentes. Quedan fuera `fleet_herdr_roster`
 (identidades del roster FLEET-01), `fleet_herdr_owner_runtime` (S7) y el
 controlador de diálogo legacy.
+
+### D5 — Alcance de S5
+
+Como en D3 y D4, S5 se interpreta a partir de su nombre y de la semántica de
+medición documentada («observational rather than Mission authority»): la
+telemetría observa la autoridad y nunca la define. El ledger es dueño del esquema
+de todo evento que guarda; los módulos de medición e informe leen la autoridad y
+no escriben el ledger, salvo `fleet_herdr_metrics.observe`, único instrumentador
+declarado de intervalos. Verificadores, formatos archivados y resultados de
+`verify` no cambian. Quedan fuera los otros módulos en los que el
+ledger delega esquema (`fleet_herdr_inference`, `fleet_herdr_control`), que son
+autoridad y no medición, y la semántica de escritura de `observe`.
 
 ## Entrega inicial: S0, S1 y extracción inicial de S2
 
@@ -251,5 +263,52 @@ archives Herdr, y `surface_check.sh` reproduce la superficie real. La conversió
 final del segundo chequeo de alcance de `mission-run`, su texto de ayuda y el
 ancla del lector se verificaron con los tests afectados, no con otra suite completa.
 
-Sigue S5. El pipeline predeterminado, las políticas de reparación y la
-telemetría todavía no se han refactorizado.
+## Entrega S5: telemetría separada de autoridad (2026-09-27)
+
+Interpretación en D5. Evidencia en `outputs/refactor-20260927-s5/`.
+
+- `fleet_mission_state` define `HERDR_INTERVAL_KINDS`, `_validate_herdr_interval`
+  y `_reduce_herdr_interval`, y su validador y su reductor dejan de importar
+  `fleet_herdr_metrics`. Las dos funciones son AST-equivalentes a las anteriores
+  salvo el prefijo `state.`, el nombre y las anotaciones añadidas
+  (`move-ast.json`); mensajes y proyección `herdr_intervals` no cambian. La rama
+  de intervalos del ledger ya no importa el módulo de métricas.
+- `fleet_herdr_metrics` conserva `observe`, `timing` y `usage`; su `KINDS` es la
+  misma constante del ledger, ahora `frozenset`, con el mismo orden de iteración
+  del que `timing()` construye su resultado (comprobado con varias semillas de hash).
+- `tests/test_fleet_telemetry_authority.py` fija el esquema, los mensajes, la
+  proyección y los conflictos de los eventos de intervalo (pasó sobre el árbol
+  sin cambios) y la dirección: el ledger no importa módulos de medición ni de
+  informe; `fleet_trace`, `fleet_export_trace`, `fleet_report` y
+  `fleet_herdr_report` no llaman escritores del ledger; en `fleet_herdr_metrics`
+  solo `observe` escribe, y solo eventos de intervalo.
+
+Revisado y conservado a propósito:
+
+- `permissions.usage_by_run` sigue en el resultado de `verify`: forma parte del
+  corpus, de la salida del CLI y del informe. Extraerlo alteraría además qué
+  error informa primero un archive inválido.
+- `usage baseline binding mismatch` protege la integridad de la evidencia
+  archivada; relajarlo sería un cambio de política, no una separación.
+- El presupuesto por tokens de `fleet_ledger`/`fleet_budget` es control de
+  admisión deliberado del carril legacy.
+
+Hallazgo pendiente de decisión, fuera de S5: `observe` escribe el inicio y el fin
+de cada intervalo alrededor de callbacks del controlador (llamadas al backend,
+incluido `submit`, ejecución funcional y espera del supervisor). Si falla la
+escritura del inicio, el callback no se ejecuta; si falla la del fin, esa
+excepción sustituye el resultado o la excepción del callback. Hacerlo tolerante
+cambia la semántica del ledger («un fin ausente es desconocido») y exige una
+decisión propia.
+
+Verificación: la suite completa conserva el mismo conjunto de fallos (solo
+bloqueos del sandbox) antes (2.183 tests) y tras el traslado (2.191), con los
+tests nuevos en verde. El replay del corpus coincide con S4: los ledgers de los
+tres archives Herdr llevan 2.950 eventos de intervalo por el validador y el
+reductor trasladados. `surface_check.sh` reproduce `dry` y `status` byte a byte y
+los módulos afectados importan en frío sin ciclos. El ajuste final del anclaje de
+dirección (también llamadas por nombre importado) y las precisiones de este texto
+se verificaron con los tests afectados.
+
+Sigue S6. El pipeline predeterminado y las políticas de reparación todavía no se
+han refactorizado.

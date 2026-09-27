@@ -100,6 +100,9 @@ LEGACY_FINALIZATION_CONTRACT = {
     "permissions_policy_version": frozenset({1, 2}),  # 2: legacy capsule execution
     "required_turns": frozenset({5}),
 }
+# Controller interval events are ledger schema; fleet_herdr_metrics records and
+# reads them but never defines what the ledger accepts.
+HERDR_INTERVAL_KINDS = frozenset({"controller_operation", "controller_wait", "functional_execution", "supervisor_idle"})
 MISSION_LEDGER_TEMP = re.compile(
     r"^\.mission\.jsonl\.(?:[0-9a-f]{32}|[0-9a-f]{64})\.tmp$"
 )
@@ -574,6 +577,39 @@ def validate_decision_notification_outcome_payload(payload: dict[str, Any]) -> N
         raise MissionStateError("notification failure reason cannot carry returncode")
 
 
+def _validate_herdr_interval(kind: str, payload: dict[str, Any]) -> None:
+    if kind == "herdr_interval_started":
+        _require_fields(kind, payload, {"interval_id", "kind", "run_id"})
+        if payload["kind"] not in HERDR_INTERVAL_KINDS:
+            raise MissionStateError("unsupported controller interval")
+        if payload["run_id"] is not None:
+            _require_uuid(payload["run_id"], "observed run")
+    else:
+        _require_fields(kind, payload, {"interval_id", "elapsed_ns", "outcome"})
+        _require_uint(payload["elapsed_ns"], "monotonic duration")
+        if payload["outcome"] not in {"returned", "raised"}:
+            raise MissionStateError("invalid interval outcome")
+    _require_uuid(payload["interval_id"], "interval identity")
+
+
+def _reduce_herdr_interval(current: dict[str, Any], event: dict[str, Any]) -> None:
+    if event["actor"] != "CONTROL":
+        raise MissionConflict("controller interval requires CONTROL")
+    intervals = current.setdefault("herdr_intervals", {})
+    payload = event["payload"]
+    identifier = payload["interval_id"]
+    if event["kind"] == "herdr_interval_started":
+        if identifier in intervals:
+            raise MissionConflict("interval identity cannot be reused")
+        intervals[identifier] = {**payload, "started_at": event["timestamp"], "ended_at": None,
+                                "elapsed_ns": None, "outcome": None}
+    else:
+        interval = intervals.get(identifier)
+        if not interval or interval["ended_at"] is not None:
+            raise MissionConflict("interval completion lacks its unique start")
+        interval.update(ended_at=event["timestamp"], elapsed_ns=payload["elapsed_ns"], outcome=payload["outcome"])
+
+
 def _validate_assured_action(kind: str, payload: dict[str, Any]) -> None:
     action = payload.get("action")
     dispatch = {"action", "instance", "prompt_sha256", "controller_sequence"}
@@ -849,8 +885,7 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         if payload["sequence"] != 0 and payload["decision"] == "allow":
             raise MissionStateError("native tool authorization is unavailable")
     elif kind in {"herdr_interval_started", "herdr_interval_finished"}:
-        import fleet_herdr_metrics
-        fleet_herdr_metrics.validate_payload(kind, payload)
+        _validate_herdr_interval(kind, payload)
     elif kind in {"herdr_supervision_enabled", "herdr_control_requested", "herdr_control_applied", "herdr_dispatch_intent"}:
         import fleet_herdr_control
         fleet_herdr_control.validate_payload(kind, payload)
@@ -2664,8 +2699,7 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                 raise MissionConflict("native observation sequence reused or disconnected")
             observed.append({**payload, "event_sha256": event["event_sha256"]})
         elif kind in {"herdr_interval_started", "herdr_interval_finished"}:
-            import fleet_herdr_metrics
-            fleet_herdr_metrics.reduce(result, event)
+            _reduce_herdr_interval(result, event)
         elif kind in {"herdr_supervision_enabled", "herdr_control_requested", "herdr_control_applied", "herdr_dispatch_intent"}:
             import fleet_herdr_control
             if kind == "herdr_supervision_enabled":
