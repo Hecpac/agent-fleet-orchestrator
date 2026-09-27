@@ -44,6 +44,11 @@ def verify_terminal(raw, final, *, contract, admission, native_binding=None):
     """Called only against an existing admission in the controller journal."""
     contracts.validate(contract)
     contracts.validate_admission(admission, contract)
+    if contract["version"] == "owner-cycle-contract-v3":
+        from fleet_harness_delivery import verify_terminal as verify_mini
+        try:return verify_mini(raw, final, contract=contract, admission=admission)
+        except (AttributeError,IndexError,KeyError,TypeError) as exc:
+            raise contracts.ContractError("malformed Mini runtime evidence") from exc
     expected = validate_binding(contract["runtime"])
     identity = admission
     if admission["version"] == "owner-cycle-admission-v2":

@@ -225,14 +225,27 @@ class Cycle:
         response = attempt["response"]
         raw, final = self.get(response["transcript"]), self.get(response["final"])
         try:
+            if attempt["admission"]["version"]=="owner-cycle-admission-v3":
+                from fleet_harness_delivery import verify_continuity
+                prior=[]
+                for earlier in current["attempts"]:
+                    if earlier["admission"]==attempt["admission"]:break
+                    if earlier["response"] is None:raise ValueError("previous request history unavailable")
+                    prior.append((self.get(earlier["response"]["transcript"]),earlier["admission"]))
+                verify_continuity(raw,prior,limits=current["contract"]["request_budget"],admission=attempt["admission"])
             attestation = runtime.verify_terminal(raw, final, contract=current["contract"], admission=attempt["admission"],
                                                   native_binding=attempt.get("native_binding"))
+            if "public_read" in current["contract"]["prepared"]["sources"]:
+                from fleet_harness_read_scope import editable_files
+                initial=editable_files(self.json(attempt["input_snapshot"]),current["contract"]["prepared"]["sources"]["scope"])
+                if attestation["effects"]["before"]!=initial:
+                    raise CycleError("delivery input differs from immutable admission snapshot")
             if attempt["admission"]["version"] == "owner-cycle-admission-v2":
                 attestation["usage"] = native.usage(raw, attempt["native_binding"], self.json(attempt["native_baseline"]),
                                                    attempt["admission"], self.get, contract=current["contract"])
             message = protocol.parse_response(final, current["contract"]["prepared"]["work_packet"])
             return {"valid": True, "message": message, "runtime": attestation}
-        except (ValueError, KeyError, TypeError) as exc:
+        except (ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
             return {"valid": False, "error": str(exc), "message": None, "runtime": None}
 
     def _checks(self, current, revision_pin):
@@ -242,6 +255,12 @@ class Cycle:
         if revision["version"] != "owner-revision-v1":
             raise CycleError("unsupported revision")
         spec = current["contract"]["prepared"]["sources"]
+        if "public_read" in spec:
+            from fleet_harness_read_scope import editable_files
+            delivered=next((a for a in current["attempts"] if work.digest(a["admission"])==revision["admission_sha256"]),None)
+            if (delivered is None or not delivered["classified"] or not delivered["classified"]["valid"]
+                    or delivered["classified"]["runtime"]["effects"]["after"]!=editable_files(revision["inventory"],spec["scope"])):
+                raise CycleError("frozen revision differs from delivered executor bytes")
         tree = self.get(revision["tree"])
         self.get(revision["patch"])
         # Verify tree identity independently of the mutable Git repository.
@@ -316,10 +335,26 @@ class Cycle:
             current["attempts"].append({"admission": admission, "task": p["task"], "intent": False,
                 "response": None, "conflicts": [], "observation_errors": [], "classified": None, "quiescent": False,
                 "revision": None, "functional": None, "checks": None, "settled": False, "decision": None})
+            if "public_read" in contract["prepared"]["sources"]:
+                current["attempts"][-1]["input_snapshot"]=None
             if admission["version"] == "owner-cycle-admission-v2":
                 current["attempts"][-1].update(native_baseline=None, native_observations=[], native_binding=None,
                                                native_frontier=None, native_binding_snapshot=None,
                                                cancel_intent=False, cancel_signal=None)
+        elif kind == "input_snapshot":
+            contracts.exact(p,{"admission_sha256","snapshot"},"harness admission input")
+            sources=contract["prepared"]["sources"]
+            if ("public_read" not in sources or a is None or a["intent"] or a.get("input_snapshot") is not None
+                    or p["admission_sha256"]!=work.digest(a["admission"]) or current["control"] or current["paused"]
+                    or event["at"]>=contract["deadline_at"]):
+                raise CycleError("input snapshot must uniquely precede this admission's dispatch")
+            observed=self.json(p["snapshot"])
+            from fleet_harness_read_scope import editable_files
+            editable_files(observed,sources["scope"])
+            if (scope.evaluate(current["baseline"],observed,sources["scope"])["status"]!="accepted"
+                    or any(observed["entries"].get(name,{}).get("sha256")!=sha for name,sha in sources["public_read"]["read_only"].items())):
+                raise CycleError("admission input differs from physical scope or public readonly authority")
+            a["input_snapshot"]=p["snapshot"]
         elif kind == "native_baseline":
             contracts.exact(p, {"admission_sha256", "snapshot"}, "native baseline")
             if (a is None or a["admission"]["version"] != "owner-cycle-admission-v2" or a["intent"]
@@ -387,6 +422,8 @@ class Cycle:
                 raise CycleError("dispatch is not authorized")
             if a["admission"]["version"] == "owner-cycle-admission-v2" and a["native_baseline"] is None:
                 raise CycleError("native dispatch lacks a preserved frontier")
+            if "public_read" in contract["prepared"]["sources"] and a.get("input_snapshot") is None:
+                raise CycleError("harness dispatch lacks its immutable input snapshot")
             a["intent"] = True
         elif kind == "cancel_intent":
             if (a is None or a["admission"]["version"] != "owner-cycle-admission-v2" or not a["intent"]
@@ -409,7 +446,7 @@ class Cycle:
             a["cancel_signal"] = p
         elif kind == "response":
             contracts.exact(p, {"admission_sha256", "transcript", "final"}, "response")
-            if (a is None or a["admission"]["version"] != "owner-cycle-admission-v1" or not a["intent"]
+            if (a is None or a["admission"]["version"] not in {"owner-cycle-admission-v1", "owner-cycle-admission-v3"} or not a["intent"]
                     or a["response"] is not None or p["admission_sha256"] != work.digest(a["admission"])):
                 raise CycleError("response is not for the pending admission")
             self.get(p["transcript"]); self.get(p["final"])
@@ -432,7 +469,7 @@ class Cycle:
             work.text(p["detail"], "observation error")
             a["observation_errors"].append(p)
         elif kind == "quiescent":
-            if a is None or a["admission"]["version"] != "owner-cycle-admission-v1" or not a["intent"] or a["quiescent"]:
+            if a is None or a["admission"]["version"] not in {"owner-cycle-admission-v1", "owner-cycle-admission-v3"} or not a["intent"] or a["quiescent"]:
                 raise CycleError("unexpected quiescence")
             runtime.verify_quiescence(p, a["admission"])
             a["quiescent"] = True
@@ -602,7 +639,7 @@ class Cycle:
             "failed_requirements": [r["id"] for r in checks["artifacts"]["requirements"] if not r["passed"]],
             "scope_issues": checks["scope"]["issues"][:10],
             "scope_issue_count": len(checks["scope"]["issues"]),
-            **({"functional": {k: checks["functional"][k] for k in ("status", "reason")}}
+            **({"functional": {k: checks["functional"][k] for k in ("status", "reason", "public_feedback", "revision_sha256") if k in checks["functional"]}}
                if checks.get("functional") is not None else {})}}
 
     @staticmethod
@@ -612,8 +649,12 @@ class Cycle:
                     or (check and (check["conflicts"] or any(e["kind"] == "retention" for e in check["errors"]))))
 
     def control(self, action, *, request_id, target, reason, now=None):
-        return self._append("control_requested", {"request_id": request_id, "action": action,
+        current = self._append("control_requested", {"request_id": request_id, "action": action,
             "target": target, "reason": reason}, now=time.time if now is None else now)
+        if action == "cancel" and current["contract"]["version"] == "owner-cycle-contract-v3":
+            from fleet_harness_budget import Ledger
+            Ledger(self.runs/self.prefix/"local-backend/budget",current["contract"]["request_budget"]).revoke("cycle_cancel_requested")
+        return current
 
     def resume(self, request_id, *, now=None):
         return self._append("resumed", {"request_id": request_id}, now=time.time if now is None else now)
@@ -771,7 +812,12 @@ class Cycle:
                 self._append("functional_quiescent", observed["quiescence"], now=clock)
 
     def tick(self, backend, *, now=None):
-        if not isinstance(backend, OfflineBackend):
+        contract = self.json(self.pin)
+        if contract["version"] == "owner-cycle-contract-v3":
+            from fleet_harness_backend import LocalHarnessBackend
+            if not isinstance(backend, LocalHarnessBackend) or backend.cycle.pin != self.pin:
+                raise CycleError("harness local profile requires its exact bound backend")
+        elif not isinstance(backend, OfflineBackend):
             raise CycleError("owner_cycle_v1 has no live backend; dispatch disabled")
         if now is not None:
             contracts.instant(now)
@@ -893,6 +939,10 @@ class Cycle:
             current = self._append("native_baseline", {"admission_sha256": work.digest(a["admission"]),
                                    "snapshot": self.put_json(snapshot)}, now=clock)
             a = current["attempts"][-1]
+        if "public_read" in current["contract"]["prepared"]["sources"] and a["input_snapshot"] is None:
+            snapshot=scope.capture(Path(current["baseline"]["inventory"]["root"]),current["contract"]["prepared"]["sources"]["scope"])
+            current=self._append("input_snapshot",{"admission_sha256":work.digest(a["admission"]),"snapshot":self.put_json(snapshot)},now=clock)
+            a=current["attempts"][-1]
         # Intent is the linearization boundary. A recovered intent only polls.
         self._append("dispatch_intent", runtime.resource(a["admission"]), now=clock)
         backend.send(copy.deepcopy(a["admission"]), self.json(a["task"]))

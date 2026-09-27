@@ -1,0 +1,21 @@
+{
+  "D1": {
+    "version": "independent-source-admission-v1",
+    "manifest": {
+      "ledger.py": "b2e04e10bcc474883533c4e7e60b7e2df039ef02c32ca10f052f2388e4651d3f",
+      "paths.py": "61a4bebeaa404d3cd443a30f8df778d9d137f8415cb8f6373fed0134efd07348"
+    },
+    "reviewer": "/root/contract_review",
+    "scope": "bridge-integrity-no-reflection-no-stdout-or-process-interference",
+    "accepted": true
+  },
+  "D2": {
+    "version": "independent-source-admission-v1",
+    "manifest": {
+      "report.py": "873b8a619eeb3666f6551828b36afb6d39298fbbc5020d3b6f3f47e081f9b995"
+    },
+    "reviewer": "/root/contract_review",
+    "scope": "bridge-integrity-no-reflection-no-stdout-or-process-interference",
+    "accepted": true
+  }
+}

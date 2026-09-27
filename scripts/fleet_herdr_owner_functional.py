@@ -16,6 +16,9 @@ import fleet_json
 
 
 def binding(contract, revision_pin, revision):
+    if contract["version"] == "owner-cycle-contract-v3":
+        from fleet_harness_functional import binding as harness_binding
+        return harness_binding(contract, revision_pin, revision)
     spec = contract["prepared"]["sources"]["functional"]
     if spec is None:
         raise contracts.ContractError("no configured functional check")
@@ -31,6 +34,9 @@ def binding(contract, revision_pin, revision):
 
 
 def receipt(bound, outcome, put):
+    if bound["version"] == "owner-harness-functional-v1":
+        from fleet_harness_functional import receipt as harness_receipt
+        return harness_receipt(bound, outcome, put)
     contracts.exact(outcome, {"status", "reason", "evidence"}, "functional outcome")
     if not isinstance(outcome["evidence"], dict):
         raise contracts.ContractError("functional evidence must be a mapping of original bytes")
@@ -47,6 +53,10 @@ def receipt(bound, outcome, put):
 
 
 def verify(bound, observed, read, tests):
+    if bound["version"] == "owner-harness-functional-v1":
+        from fleet_harness_functional import verify as harness_verify
+        try:return harness_verify(bound, observed, read, tests)
+        except (AttributeError,IndexError) as exc:raise contracts.ContractError("malformed harness runtime evidence") from exc
     try:
         result = functional.verify_receipt(bound["native_contract"], observed, read)
     except AttributeError as exc:
@@ -70,6 +80,9 @@ def verify(bound, observed, read, tests):
 
 
 def resource(bound):
+    if bound["version"] == "owner-harness-functional-v1":
+        from fleet_harness_functional import resource as harness_resource
+        return harness_resource(bound)
     native = bound["native_contract"]
     return {"cycle_id": bound["cycle_id"], "revision_sha256": bound["revision_sha256"],
             "binding_sha256": work.digest(bound), "attempt_id": native["attempt_id"],
