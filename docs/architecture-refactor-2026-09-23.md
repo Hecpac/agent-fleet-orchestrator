@@ -40,7 +40,7 @@ no se alteran sus planes, pins, deadlines, autorizaciones ni evidencia.
 | S3 | Composición moderna y compatibilidad | Completado: raíz moderna, soporte neutral y driver legacy explícito, sin cambio de comportamiento |
 | S4 | Catálogo de perfiles e identidad | Completado: catálogo como fuente única, identidades fijadas y copias ancladas por test |
 | S5 | Telemetría separada de autoridad | Completado: el ledger es dueño del esquema de intervalos y la dirección medición → autoridad queda fijada por test |
-| S6 | Scope y aceptación independientes del perfil | Pendiente |
+| S6 | Scope y aceptación independientes del perfil | Completado: cada política declarada una vez en el catálogo, mecánicas sin perfil y esquema v8 como capa de scope |
 | S7 | Mecanismos comunes de Owner Cycle | Pendiente |
 | S8 | Política opt-in de reparación | Pendiente; calidad live requiere autorización propia |
 | S9 | Retirada de duplicación y extracción de experimentos | Pendiente de equivalencia y consumidores |
@@ -106,6 +106,23 @@ Verificadores, formatos archivados y resultados de `verify` no cambian;
 antes lanzaba (ver la entrega). Quedan fuera los otros módulos en los que el
 ledger delega esquema (`fleet_herdr_inference`, `fleet_herdr_control`), que son
 autoridad y no medición, y la semántica de escritura de `observe`.
+
+### D6 — Alcance de S6
+
+Como en D3–D5, S6 se interpreta a partir de su nombre. Las mecánicas de scope
+físico, aceptación de artefactos y contrato funcional ya no leen el perfil:
+reciben candidato, contrato y árbol por parámetro. Lo que dependía del perfil
+eran dos políticas de admisión (qué perfil admite scope y cuál exige contrato de
+aceptación al crear) expresadas como comparaciones sueltas, y el lector de
+archives, que trataba el esquema v8 como si fuera un perfil. S6 declara cada
+política una vez en `fleet_herdr_profile`, fuera de `contract()`, y hace que cada
+comprobación la consulte. No se admite ni se relaja nada: los demás perfiles
+siguen rechazando el scope; habilitarlo en otro perfil es una decisión de
+producto, no de este slice. Quedan fuera la proyección de trabajo del Owner
+(`fleet_herdr_work_packet`, S7), el momento en que el driver ejecuta la
+aceptación funcional (tras el único escritor en el perfil mínimo; antes de la
+síntesis en los demás), que depende de la topología del perfil, y la duplicación
+entre `run` y `dry` de `mission-run` (S9).
 
 ## Entrega inicial: S0, S1 y extracción inicial de S2
 
@@ -335,5 +352,42 @@ eventos de intervalo por el validador y el reductor trasladados, y sus 180
 ajuste final del anclaje de dirección (también llamadas por nombre importado) y
 las precisiones de este texto se verificaron con los tests afectados.
 
-Sigue S6. El pipeline predeterminado y las políticas de reparación todavía no se
+## Entrega S6: scope y aceptación independientes del perfil (2026-09-27)
+
+Interpretación en D6. Evidencia en `outputs/refactor-20260927-s6/`.
+
+- `fleet_herdr_profile` declara `ACCEPTANCE_REQUIRED_PROFILE` junto a
+  `PHYSICAL_SCOPE_PROFILE`, fuera de `contract()`: los tres digests no cambian.
+  `fleet_mission.create_mission` y las comprobaciones de `run` y `dry` de
+  `mission-run` consultan la declaración en lugar de comparar con `MINIMAL`;
+  mensajes, tipos de excepción y orden de las comprobaciones no cambian.
+- `fleet_herdr_scope.validate_binding` admite el scope según la constante del
+  ledger (`PHYSICAL_SCOPE_PROFILE_ID`), que es la vinculación de creación que
+  `mission_created` ya impone, y deja de importar el catálogo. Revierte a
+  propósito una conversión de S4: el catálogo sigue siendo la fuente del dato a
+  través del anclaje de S4 sobre esa constante.
+- `fleet_herdr_archive` deriva `VERSIONED_ARCHIVE_PROFILES` del catálogo más la
+  capa de scope (`ARCHIVE_VERSION` → perfil de scope), y de él los esquemas
+  legibles y los que admiten evidencia funcional. Sustituye `{6, 7, 8}`, el
+  ternario «6 → Research, si no Minimal», `{2, …, 8}` y `{4, …, 8}`; los
+  resultados son idénticos. Queda derivada la mitad del residuo de S4; las
+  versiones de permisos `{1, 2, 3, 4}` siguen siendo literales ancladas.
+- `tests/test_fleet_herdr_policy_admission.py` fija, en verde sobre el árbol sin
+  cambios, los rechazos que ningún test cubría: scope en Legacy y Research por
+  `dry`, `run`, creación, ledger y vinculación; aceptación obligatoria del
+  perfil mínimo por `dry`, `run` y creación, y la precedencia del rechazo
+  funcional sobre el de scope. Con el cambio añade que scope, aceptación y
+  contrato funcional no importan el catálogo ni contienen identificadores de
+  perfil, que los sitios de admisión consultan las declaraciones y que los
+  esquemas del lector siguen al catálogo.
+
+Verificación: la suite completa conserva el mismo conjunto de fallos (solo
+bloqueos del sandbox) antes (2.193 tests) y después (2.207), con los tests nuevos
+en verde. El replay del corpus coincide con S5 y `surface_check.sh` reproduce
+`dry` y `status` byte a byte; los módulos tocados importan en frío. Los tres
+archives Herdr del corpus son de esquema 3, así que el mapa derivado para los
+esquemas 6, 7 y 8 solo lo ejercitan los tests (Research, mínimo y
+`test_fleet_herdr_scope` con archive v8), no el replay.
+
+Sigue S7. El pipeline predeterminado y las políticas de reparación todavía no se
 han refactorizado.

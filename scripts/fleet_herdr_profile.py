@@ -134,8 +134,14 @@ MINIMAL = HerdrProfile(
 BY_PRESET = {profile.preset: profile for profile in (LEGACY, RESEARCH, MINIMAL)}
 BY_PROFILE_ID = {profile.profile_id: profile for profile in (LEGACY, RESEARCH, MINIMAL)}
 VERSIONED = (RESEARCH, MINIMAL)
+# Opt-in policies a profile admits or requires. They stay outside contract(), so
+# declaring them moves no ledger-pinned digest; the policies are profile-free.
 # Physical scope v1 is admitted only for the single-writer minimal profile.
 PHYSICAL_SCOPE_PROFILE = MINIMAL
+# Its Worker PASS cannot close the Mission, so the minimal profile requires
+# artifact acceptance already at creation and in dry runs; live Herdr runs
+# require it for every profile before launching agents.
+ACCEPTANCE_REQUIRED_PROFILE = MINIMAL
 
 
 def role_models(profile: HerdrProfile) -> dict[str, str]:

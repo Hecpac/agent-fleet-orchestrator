@@ -32,6 +32,16 @@ import fleet_mission
 import fleet_mission_state as state
 import fleet_safe_paths
 
+# Archive schema -> profile for versioned readers. Physical scope is an overlay
+# schema on the one profile that admits it, not a profile of its own.
+VERSIONED_ARCHIVE_PROFILES = {
+    **{profile.archive_schema_version: profile for profile in fleet_herdr_profile.VERSIONED},
+    fleet_herdr_scope.ARCHIVE_VERSION: fleet_herdr_profile.PHYSICAL_SCOPE_PROFILE,
+}
+READABLE_ARCHIVE_SCHEMAS = frozenset({2, 3, 4, 5, *VERSIONED_ARCHIVE_PROFILES})
+# Functional evidence exists from legacy v4 and in every versioned schema.
+FUNCTIONAL_ARCHIVE_SCHEMAS = frozenset({4, 5, *VERSIONED_ARCHIVE_PROFILES})
+
 MAX_BYTES = 32 * 1024 * 1024
 ROLES = {"lead", "worker", "reviewer", "verifier"}
 
@@ -507,7 +517,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
     with fleet_safe_paths.RootedFS(runs_dir) as store:
         raw = _read(store, archive / "archive-index.json")
         index = fleet_json.loads(raw)
-        if not isinstance(index, dict) or raw != _bytes(index) or (type(index.get("schema_version")) is not int or index["schema_version"] not in {2, 3, 4, 5, 6, 7, 8}) or index.get("backend") != "herdr" or index.get("mission_id") != mission_id:
+        if not isinstance(index, dict) or raw != _bytes(index) or (type(index.get("schema_version")) is not int or index["schema_version"] not in READABLE_ARCHIVE_SCHEMAS) or index.get("backend") != "herdr" or index.get("mission_id") != mission_id:
             raise HerdrArchiveError("invalid Herdr archive index")
         if index["schema_version"] >= 3 and (type(index.get("permissions_policy_version")) is not int
                 or index["permissions_policy_version"] not in {1, 2, 3, 4}):
@@ -527,9 +537,8 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
             profile = fleet_herdr_profile.resolve_profile(compiled)
         except fleet_herdr_profile.ProfileError as exc:
             raise HerdrArchiveError(str(exc)) from exc
-        if index["schema_version"] in {6, 7, 8}:
-            expected_profile = (fleet_herdr_profile.RESEARCH if index["schema_version"] == 6
-                                else fleet_herdr_profile.MINIMAL)
+        expected_profile = VERSIONED_ARCHIVE_PROFILES.get(index["schema_version"])
+        if expected_profile is not None:
             if (profile is not expected_profile
                     or index.get("herdr_profile") != profile.profile_id
                     or index.get("herdr_profile_sha256") != profile.digest
@@ -785,7 +794,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
         if bool(functional_spec) != bool(archived_state.get("functional_policy")):
             raise HerdrArchiveError("archive functional options/policy mismatch")
         if functional_spec is not None:
-            if (index["schema_version"] not in {4, 5, 6, 7, 8} or fleet_functional.digest(fleet_functional.validate(functional_spec))
+            if (index["schema_version"] not in FUNCTIONAL_ARCHIVE_SCHEMAS or fleet_functional.digest(fleet_functional.validate(functional_spec))
                     != archived_state["functional_policy"]["spec_artifact_id"]):
                 raise HerdrArchiveError("archive functional contract/schema mismatch")
             try:

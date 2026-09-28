@@ -136,7 +136,7 @@ def create_and_drive(
         workflow_path(workflow_name), router_path=router_path
     )
     if (fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"])
-            and fleet_herdr_profile.resolve_profile(compiled) is fleet_herdr_profile.MINIMAL
+            and fleet_herdr_profile.resolve_profile(compiled) is fleet_herdr_profile.ACCEPTANCE_REQUIRED_PROFILE
             and acceptance_contract is None):
         raise MissionRunError("minimal Herdr profile requires --acceptance-contract")
     is_herdr = fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"])
@@ -278,7 +278,7 @@ def dry_run(
         workflow_path(workflow_name), router_path=router_path
     )
     if (fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"])
-            and fleet_herdr_profile.resolve_profile(compiled) is fleet_herdr_profile.MINIMAL
+            and fleet_herdr_profile.resolve_profile(compiled) is fleet_herdr_profile.ACCEPTANCE_REQUIRED_PROFILE
             and acceptance_contract is None):
         raise MissionRunError("minimal Herdr profile requires --acceptance-contract")
     if functional_contract is not None and not fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):

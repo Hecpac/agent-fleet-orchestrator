@@ -115,11 +115,12 @@ class CatalogPinTests(unittest.TestCase):
         })
 
     def test_archive_reader_residual_literals_match_the_catalog(self) -> None:
-        # fleet_herdr_archive.verify still selects the profile by archive schema
-        # (6 -> Research, else Minimal) and allows permission versions {1, 2, 3, 4}.
-        # Deriving them belongs to the archive reader work; this pin is the tripwire.
-        self.assertEqual({p.archive_schema_version: p for p in profiles.VERSIONED},
-                         {6: profiles.RESEARCH, 7: profiles.MINIMAL})
+        # The schema -> profile map is derived since S6 (fleet_herdr_archive
+        # VERSIONED_ARCHIVE_PROFILES); the permission versions {1, 2, 3, 4} are
+        # still a literal in fleet_herdr_archive.verify, and this pin is the tripwire.
+        import fleet_herdr_archive
+        self.assertEqual(fleet_herdr_archive.VERSIONED_ARCHIVE_PROFILES,
+                         {6: profiles.RESEARCH, 7: profiles.MINIMAL, 8: profiles.MINIMAL})
         self.assertEqual({1, 2, 3, 4}, {profiles.LEGACY.permissions_policy_version, 2,
                                         profiles.RESEARCH.permissions_policy_version,
                                         profiles.MINIMAL.permissions_policy_version})

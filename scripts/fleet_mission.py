@@ -233,7 +233,7 @@ def create_mission(
         if fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]):
             profile = fleet_herdr_profile.validate_profile_binding(compiled, options)
             profile_binding = fleet_herdr_profile.creation_binding(compiled)
-            if profile is fleet_herdr_profile.MINIMAL:
+            if profile is fleet_herdr_profile.ACCEPTANCE_REQUIRED_PROFILE:
                 import fleet_acceptance
                 contract = options.get("acceptance_contract")
                 if contract is None:

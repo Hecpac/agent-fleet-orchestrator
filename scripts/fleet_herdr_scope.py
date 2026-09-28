@@ -14,7 +14,6 @@ import stat
 import tarfile
 
 import fleet_artifacts
-import fleet_herdr_profile
 import fleet_json
 import fleet_mission_state as state
 import fleet_safe_paths
@@ -85,9 +84,9 @@ def validate_binding(current, options):
     pin = digest(validate(contract)) if contract is not None else None
     if current.get(FIELD) != pin:
         raise ScopeError("scope contract differs from creation ledger")
-    scope_profile = fleet_herdr_profile.PHYSICAL_SCOPE_PROFILE.profile_id
-    if pin is not None and current.get("herdr_profile") != scope_profile:
-        raise ScopeError(f"physical scope v1 requires {scope_profile}")
+    # Admission follows the creation binding the ledger enforces on mission_created.
+    if pin is not None and current.get("herdr_profile") != state.PHYSICAL_SCOPE_PROFILE_ID:
+        raise ScopeError(f"physical scope v1 requires {state.PHYSICAL_SCOPE_PROFILE_ID}")
     return contract
 
 
