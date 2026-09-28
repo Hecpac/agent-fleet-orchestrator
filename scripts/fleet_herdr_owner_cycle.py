@@ -446,7 +446,7 @@ class Cycle:
             a["cancel_signal"] = p
         elif kind == "response":
             contracts.exact(p, {"admission_sha256", "transcript", "final"}, "response")
-            if (a is None or a["admission"]["version"] not in {"owner-cycle-admission-v1", "owner-cycle-admission-v3", "owner-cycle-admission-v4"} or not a["intent"]
+            if (a is None or a["admission"]["version"] not in contracts.DELIVERED_ADMISSION_VERSIONS or not a["intent"]
                     or a["response"] is not None or p["admission_sha256"] != work.digest(a["admission"])):
                 raise CycleError("response is not for the pending admission")
             self.get(p["transcript"]); self.get(p["final"])
@@ -469,7 +469,7 @@ class Cycle:
             work.text(p["detail"], "observation error")
             a["observation_errors"].append(p)
         elif kind == "quiescent":
-            if a is None or a["admission"]["version"] not in {"owner-cycle-admission-v1", "owner-cycle-admission-v3", "owner-cycle-admission-v4"} or not a["intent"] or a["quiescent"]:
+            if a is None or a["admission"]["version"] not in contracts.DELIVERED_ADMISSION_VERSIONS or not a["intent"] or a["quiescent"]:
                 raise CycleError("unexpected quiescence")
             runtime.verify_quiescence(p, a["admission"])
             a["quiescent"] = True

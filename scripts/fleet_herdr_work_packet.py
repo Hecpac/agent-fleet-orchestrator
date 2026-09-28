@@ -174,7 +174,8 @@ def _project(sources):
     bundle = guidance.validate_bundle(sources["guidance"])
     snapshot = sources["instructions"]
     expected = sources["permissions"]
-    if expected != permissions.policy("worker", expected.get("cwd"), version=permissions.MINIMAL_VERSION):
+    if expected != permissions.policy("worker", expected.get("cwd"),
+                                      version=profiles.OWNER_WORK_PROFILE.permissions_policy_version):
         raise WorkPacketError("owner packet requires the existing minimal permission configuration")
     functional = _functional(sources["functional"], sources["functional_tests"], sources["source_validator"])
     timeout = sources["timeout_seconds"]
@@ -231,8 +232,8 @@ def prepare(*, objective, candidate_repo, base_sha, compiled, acceptance_contrac
     No Mission/session/run is fabricated here. Those are injected by the actual
     controller when binding a response, never supplied by the model.
     """
-    if profiles.resolve_profile(compiled) is not profiles.MINIMAL:
-        raise WorkPacketError("owner work projection requires sol_minimal_v1")
+    if profiles.resolve_profile(compiled) is not profiles.OWNER_WORK_PROFILE:
+        raise WorkPacketError(f"owner work projection requires {profiles.OWNER_WORK_PROFILE.profile_id}")
     candidate_repo = Path(candidate_repo).resolve(strict=True)
     if not isinstance(base_sha, str) or not state.GIT_OID.fullmatch(base_sha):
         raise WorkPacketError("invalid baseline identity")
@@ -257,13 +258,14 @@ def prepare(*, objective, candidate_repo, base_sha, compiled, acceptance_contrac
         "functional": functional_contract, "functional_tests": tests, "source_validator": validator,
         "instructions": instructions.snapshot(candidate_repo, base_sha),
         "guidance": guidance.validate_bundle(guidance.build_bundle()),
-        "permissions": permissions.policy("worker", str(candidate_repo), version=permissions.MINIMAL_VERSION),
+        "permissions": permissions.policy("worker", str(candidate_repo),
+                                          version=profiles.OWNER_WORK_PROFILE.permissions_policy_version),
         "timeout_seconds": timeout, "compiled_digest": compiled["compiled_digest"]})
     packet = _project(sources)
     envelope = {"contract_version": ENVELOPE_VERSION, "result_protocol": RESULT_VERSION,
         "work_packet_sha256": digest(packet), "source_pins": {k: digest(v) for k, v in sources.items()},
         "candidate_repo": str(candidate_repo), "base_sha": base_sha,
-        "compiled_digest": compiled["compiled_digest"], "profile": profiles.MINIMAL.profile_id,
+        "compiled_digest": compiled["compiled_digest"], "profile": profiles.OWNER_WORK_PROFILE.profile_id,
         "runtime_contract": versions.TASK_CONTEXT_CONTRACT, "dispatch_enabled": False}
     return {"work_packet": packet, "execution_envelope": copy.deepcopy(envelope), "sources": sources}
 
@@ -292,7 +294,7 @@ def verify(prepared):
             "work_packet_sha256": digest(prepared["work_packet"]),
             "source_pins": {k: digest(v) for k, v in sources.items()},
             "candidate_repo": sources["permissions"]["cwd"], "base_sha": sources["instructions"]["base_sha"],
-            "compiled_digest": sources["compiled_digest"], "profile": profiles.MINIMAL.profile_id,
+            "compiled_digest": sources["compiled_digest"], "profile": profiles.OWNER_WORK_PROFILE.profile_id,
             "runtime_contract": versions.TASK_CONTEXT_CONTRACT, "dispatch_enabled": False}
         if envelope != expected or prepared["work_packet"] != _project(sources):
             raise WorkPacketError("work packet/source/envelope binding mismatch")

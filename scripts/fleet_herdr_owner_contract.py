@@ -17,6 +17,16 @@ PROFILE = {"version": "owner-cycle-profile-v1", "profile_id": "owner_cycle_v1",
            "lane": "offline-conformance", "result_protocol": work.RESULT_VERSION}
 
 
+# Contract versions delegated to the harness lane (fleet_harness_contract v3 and
+# fleet_harness_live_contract v4); earlier versions use the native Codex lane.
+HARNESS_CONTRACT_VERSIONS = frozenset({"owner-cycle-contract-v3", "owner-cycle-contract-v4"})
+# Admissions whose transcript and final answer arrive as a controller `response`
+# event; native v2 admissions are observed instead.
+DELIVERED_ADMISSION_VERSIONS = frozenset({"owner-cycle-admission-v1", "owner-cycle-admission-v3",
+                                          "owner-cycle-admission-v4"})
+PERMISSION_KEYS = ("cwd", "approval_policy", "sandbox_policy")
+
+
 class ContractError(ValueError):
     pass
 
@@ -24,6 +34,18 @@ class ContractError(ValueError):
 def exact(value, fields, where):
     if not isinstance(value, dict) or set(value) != set(fields):
         raise ContractError("invalid fields: " + where)
+
+
+def permission_drift(context, policy):
+    """First recorded permission key that differs from the admitted policy, or None."""
+    for key in PERMISSION_KEYS:
+        actual = copy.deepcopy(context.get(key))
+        if key == "sandbox_policy" and isinstance(actual, dict) and actual.get("writable_roots") == []:
+            actual.pop("writable_roots")
+        # Canonical JSON also distinguishes booleans from integers.
+        if fleet_json.canonical_bytes(actual) != fleet_json.canonical_bytes(policy[key]):
+            return key
+    return None
 
 
 def pin(value):
@@ -134,7 +156,7 @@ def task(contract, *, attempt, feedback, decisions):
                         "max_attempts": contract["limits"]["max_attempts"],
                         "deadline_at": contract["deadline_at"],
                         "runtime_lane": PROFILE["lane"]}
-    if contract["version"] in {"owner-cycle-contract-v3", "owner-cycle-contract-v4"}:
+    if contract["version"] in HARNESS_CONTRACT_VERSIONS:
         packet["contract_version"] = "owner-cycle-task-v2"
         packet["limits"]["runtime_lane"] = contract["profile"]["lane"]
     packet["continuation"] = {"attempt": attempt, "feedback": copy.deepcopy(feedback),
@@ -170,7 +192,7 @@ def admission(contract, *, ordinal, run_id, admission_id, generation,
             "deadline_at": contract["deadline_at"]}
     if observed:
         result.update(version="owner-cycle-admission-v2", surface=copy.deepcopy(contract["surfaces"][ordinal-1]))
-    elif contract["version"] in {"owner-cycle-contract-v3", "owner-cycle-contract-v4"}:
+    elif contract["version"] in HARNESS_CONTRACT_VERSIONS:
         result["version"] = "owner-cycle-admission-v4" if contract["version"] == "owner-cycle-contract-v4" else "owner-cycle-admission-v3"
     return result
 

@@ -111,12 +111,9 @@ def observe(snapshot, *, contract, admission, baseline, read):
                 if (context.get("turn_id") != tid or context.get("model") != expected["model"]
                         or context.get("effort") != expected["effort"]):
                     raise contracts.ContractError("observed native runtime differs from admission")
-                for key in ("cwd", "approval_policy", "sandbox_policy"):
-                    actual = copy.deepcopy(context.get(key))
-                    if key == "sandbox_policy" and isinstance(actual, dict) and actual.get("writable_roots") == []:
-                        actual.pop("writable_roots")
-                    if fleet_json.canonical_bytes(actual) != fleet_json.canonical_bytes(policy[key]):
-                        raise contracts.ContractError("observed native permission drift: " + key)
+                key = contracts.permission_drift(context, policy)
+                if key is not None:
+                    raise contracts.ContractError("observed native permission drift: " + key)
             result["binding"] = {"resource": runtime.resource(admission), "agent_session": sid,
                                  "turn_id": tid, "runtime": expected}
             ends = [r["payload"] for r in rows if r.get("type") == "event_msg"

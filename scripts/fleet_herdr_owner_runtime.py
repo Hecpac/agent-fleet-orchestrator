@@ -44,7 +44,7 @@ def verify_terminal(raw, final, *, contract, admission, native_binding=None):
     """Called only against an existing admission in the controller journal."""
     contracts.validate(contract)
     contracts.validate_admission(admission, contract)
-    if contract["version"] in {"owner-cycle-contract-v3", "owner-cycle-contract-v4"}:
+    if contract["version"] in contracts.HARNESS_CONTRACT_VERSIONS:
         from fleet_harness_delivery import verify_terminal as verify_mini
         from fleet_herdr_scope import ScopeError
         try:return verify_mini(raw, final, contract=contract, admission=admission)
@@ -105,13 +105,9 @@ def verify_terminal(raw, final, *, contract, admission, native_binding=None):
     policy = contract["prepared"]["sources"]["permissions"]
     contexts = [r["payload"] for r in rows if r.get("type") == "turn_context"]
     for context in contexts:
-        for key in ("cwd", "approval_policy", "sandbox_policy"):
-            actual = copy.deepcopy(context.get(key))
-            if key == "sandbox_policy" and isinstance(actual, dict) and actual.get("writable_roots") == []:
-                actual.pop("writable_roots")
-            # Canonical JSON also distinguishes booleans from integers.
-            if fleet_json.canonical_bytes(actual) != fleet_json.canonical_bytes(policy[key]):
-                raise evidence.EvidenceError("recorded permissions differ from admission: " + key)
+        key = contracts.permission_drift(context, policy)
+        if key is not None:
+            raise evidence.EvidenceError("recorded permissions differ from admission: " + key)
     return {"version": "owner-runtime-evidence-v1", "observed": expected,
             "agent_session": identity["agent_session"], "turn_id": identity["turn_id"],
             "transcript_sha256": state.artifact_id(raw),

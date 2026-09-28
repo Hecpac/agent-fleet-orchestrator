@@ -41,7 +41,7 @@ no se alteran sus planes, pins, deadlines, autorizaciones ni evidencia.
 | S4 | Catálogo de perfiles e identidad | Completado: catálogo como fuente única, identidades fijadas y copias ancladas por test |
 | S5 | Telemetría separada de autoridad | Completado: el ledger es dueño del esquema de intervalos y la dirección medición → autoridad queda fijada por test |
 | S6 | Scope y aceptación independientes del perfil | Completado: cada política declarada una vez en el catálogo, mecánicas sin perfil y esquema v8 como capa de scope |
-| S7 | Mecanismos comunes de Owner Cycle | Pendiente |
+| S7 | Mecanismos comunes de Owner Cycle | Completado: primitivas comunes verificadas, duplicados internos con un solo hogar y proyección del Owner como política declarada |
 | S8 | Política opt-in de reparación | Pendiente; calidad live requiere autorización propia |
 | S9 | Retirada de duplicación y extracción de experimentos | Pendiente de equivalencia y consumidores |
 
@@ -123,6 +123,21 @@ producto, no de este slice. Quedan fuera la proyección de trabajo del Owner
 aceptación funcional (tras el único escritor en el perfil mínimo; antes de la
 síntesis en los demás), que depende de la topología del perfil, y la duplicación
 entre `run` y `dry` de `mission-run` (S9).
+
+### D7 — Alcance de S7
+
+Como en D3–D6, S7 se interpreta a partir de su nombre. El Owner Cycle ya consume
+las primitivas comunes del carril de Missions: CAS (`fleet_artifacts`), bloqueos y
+escritura atómica (`RootedFS`), scope físico, aceptación de artefactos, snapshot
+del candidato (`fleet_herdr_archive.snapshot`), normalización de uso y
+verificación de transcripciones. Su journal y su sello son un formato propio,
+sellado y fijado por el replay de pilot-07, y no se unifican con el ledger de
+Missions. S7 da un solo hogar a los duplicados internos que son predicados o
+comparaciones puras y declara la proyección de trabajo del Owner como política
+del catálogo (patrón de S6). Esquema de eventos, `_seal()`, formas de
+`_classify`/`_checks` y todo mensaje alcanzable desde ellos no cambian.
+Generalizar el bucle de intentos y revisiones es el prerrequisito de S8 y una
+decisión de diseño; queda para S8.
 
 ## Entrega inicial: S0, S1 y extracción inicial de S2
 
@@ -389,5 +404,56 @@ archives Herdr del corpus son de esquema 3, así que el mapa derivado para los
 esquemas 6, 7 y 8 solo lo ejercitan los tests (Research, mínimo y
 `test_fleet_herdr_scope` con archive v8), no el replay.
 
-Sigue S7. El pipeline predeterminado y las políticas de reparación todavía no se
+## Entrega S7: mecanismos comunes de Owner Cycle (2026-09-27)
+
+Interpretación en D7. Evidencia en `outputs/refactor-20260927-s7/`.
+
+- `fleet_herdr_profile` declara `OWNER_WORK_PROFILE` junto a las políticas de S6.
+  `fleet_herdr_work_packet` la consulta para admitir la proyección, para el
+  perfil del envelope y para la versión de permisos del Worker; el mensaje
+  `owner work projection requires sol_minimal_v1` y los valores hasheados del
+  envelope no cambian.
+- `fleet_herdr_owner_contract` declara las familias `HARNESS_CONTRACT_VERSIONS`
+  (v3/v4, carril harness) y `DELIVERED_ADMISSION_VERSIONS` (v1/v3/v4, cuya
+  respuesta llega como evento `response`; v2 se observa de forma nativa), que
+  sustituyen seis conjuntos literales en `owner_contract`, `owner_runtime`,
+  `owner_functional` y `owner_cycle`.
+- `permission_drift` en `fleet_herdr_owner_contract` es el único hogar de la
+  comparación de permisos registrados (`writable_roots: []` tolerado, JSON
+  canónico que distingue booleanos de enteros, orden `cwd`, `approval_policy`,
+  `sandbox_policy`). `owner_runtime.verify_terminal` y `owner_native.observe`
+  conservan su clase de excepción y su mensaje; los bucles extraídos son
+  AST-equivalentes salvo `raise` → `return key` (`drift-ast.json`). No se
+  enruta por `fleet_herdr_permissions.attest`, que comprueba otros campos con
+  otros mensajes.
+- `tests/test_fleet_herdr_owner_common.py` fija, en verde sobre el árbol sin
+  cambios, los mensajes exactos de deriva de permisos (terminal y nativo, primera
+  clave, `writable_roots`, booleanos) y el rechazo de proyección para Legacy y
+  Research, que ningún test fijaba por texto; con el cambio añade que cada
+  familia y la regla de `writable_roots` tienen un solo hogar entre los módulos
+  `fleet_herdr_owner_*` y que la proyección consulta la política declarada.
+
+Revisado y conservado a propósito:
+
+- Las dos `verify_quiescence`: parametrizarlas calcularía `resource()` antes de
+  `exact()` y cambiaría el error ante una observación malformada.
+- `owner_cycle` compara el final con `hashlib.sha256` en línea: `artifact_id`
+  codifica `str`, y hoy un `TypeError` se registra como error de retención.
+- La comprobación de pins de `owner_protocol.verify_receipt` usa otra clase y
+  otro mensaje que `contracts.pin`.
+- El emparejamiento de llamadas a herramientas de `owner_runtime` y
+  `owner_native` tiene semántica distinta (rechazo inmediato frente a marca
+  `unsafe` reevaluada en cada observación).
+
+Verificación: la suite completa conserva el mismo conjunto de fallos (solo
+bloqueos del sandbox) antes (2.207 tests, la suite posterior de S6 sobre el mismo
+árbol commiteado) y después (2.217), con los tests nuevos en verde. Los 11 Owner
+Cycles de conformance generados con el árbol anterior verifican con el código
+nuevo, sello incluido, y los regenerados dan los mismos resultados
+(`conformance.json`). El replay del corpus coincide con S6, incluido el sello de
+pilot-07; pilot-07 es contrato v4 (carril harness), así que el camino nativo
+v1/v2 cambiado solo lo ejercitan los tests y conformance. `surface_check.sh`
+reproduce `dry` y `status` byte a byte y los módulos tocados importan en frío.
+
+Sigue S8. El pipeline predeterminado y las políticas de reparación todavía no se
 han refactorizado.

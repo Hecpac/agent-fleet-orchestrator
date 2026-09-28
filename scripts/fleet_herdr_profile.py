@@ -142,6 +142,8 @@ PHYSICAL_SCOPE_PROFILE = MINIMAL
 # artifact acceptance already at creation and in dry runs; live Herdr runs
 # require it for every profile before launching agents.
 ACCEPTANCE_REQUIRED_PROFILE = MINIMAL
+# Owner work projection (WorkPacket and Owner Cycle) targets its single writer.
+OWNER_WORK_PROFILE = MINIMAL
 
 
 def role_models(profile: HerdrProfile) -> dict[str, str]:
