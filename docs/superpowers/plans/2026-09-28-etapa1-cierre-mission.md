@@ -1,6 +1,6 @@
 # Etapa 1 — Cerrar el ciclo de una Mission: plan de implementación
 
-> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 implementado ·
+> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 y S2 implementados ·
 > **Especificación (leer primero):**
 > [`docs/superpowers/specs/2026-09-28-etapa1-cierre-mission-design.md`](../specs/2026-09-28-etapa1-cierre-mission-design.md) ·
 > **Base:** `main` en `75baa80`.
@@ -67,10 +67,10 @@ SCN-022, con casos negativos por campo. Los tests existentes de `mission-run` y
 
 **Cambios:** `fleet_attempt_loop.py`, `fleet_herdr_owner_cycle.py`.
 
-- [ ] Extraer el cálculo de ordinal, la comprobación de `max_attempts`, el
+- [x] Extraer el cálculo de ordinal, la comprobación de `max_attempts`, el
       feedback `checks_rejected` y la causa de agotamiento
       (`fleet_herdr_owner_cycle.py:944-946` y `_repair_feedback`).
-- [ ] Owner Cycle usa el módulo común; su journal, su sello y su espacio no
+- [x] Owner Cycle usa el módulo común; su journal, su sello y su espacio no
       cambian (E4).
 
 **Comprobaciones:** `test_fleet_herdr_owner_cycle`,

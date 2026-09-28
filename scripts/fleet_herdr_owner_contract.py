@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import math
 
+import fleet_attempt_loop as attempt_loop
 import fleet_herdr_work_packet as work
 import fleet_json
 import fleet_mission_state as state
@@ -139,7 +140,7 @@ def task(contract, *, attempt, feedback, decisions):
         raise ContractError("attempt budget exhausted")
     if feedback is not None:
         exact(feedback, {"reason", "detail"}, "continuation feedback")
-        if feedback["reason"] not in {"invalid_delivery", "decision_resolved", "checks_rejected"}:
+        if feedback["reason"] not in attempt_loop.FEEDBACK_REASONS:
             raise ContractError("unknown continuation reason")
     if not isinstance(decisions, list) or len(decisions) > contract["limits"]["max_attempts"]:
         raise ContractError("unbounded decision context")

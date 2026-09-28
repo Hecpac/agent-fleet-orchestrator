@@ -14,6 +14,7 @@ import time
 import uuid
 
 import fleet_acceptance as acceptance
+import fleet_attempt_loop as attempt_loop
 import fleet_artifacts as artifacts
 import fleet_herdr_archive as archive
 import fleet_herdr_evidence as evidence
@@ -592,7 +593,8 @@ class Cycle:
                 valid = current["control"] and current["control"]["action"] == "cancel"
             elif p["status"] == "exhausted":
                 valid = (event["at"] >= contract["deadline_at"] or
-                         (a and a["settled"] and len(current["attempts"]) >= contract["limits"]["max_attempts"]))
+                         (a and a["settled"] and attempt_loop.attempts_exhausted(
+                             len(current["attempts"]), contract["limits"]["max_attempts"])))
             elif p["status"] == "accepted_contract":
                 valid = (a and a["checks"] and self.json(a["checks"])["accepted"]
                          and not self._delivery_veto(a)
@@ -635,12 +637,11 @@ class Cycle:
 
     @staticmethod
     def _repair_feedback(pin, checks):
-        return {"reason": "checks_rejected", "detail": {"checks_sha256": pin,
-            "failed_requirements": [r["id"] for r in checks["artifacts"]["requirements"] if not r["passed"]],
-            "scope_issues": checks["scope"]["issues"][:10],
-            "scope_issue_count": len(checks["scope"]["issues"]),
-            **({"functional": {k: checks["functional"][k] for k in ("status", "reason", "public_feedback", "revision_sha256") if k in checks["functional"]}}
-               if checks.get("functional") is not None else {})}}
+        return attempt_loop.checks_rejected(pin,
+            failed_requirements=[r["id"] for r in checks["artifacts"]["requirements"] if not r["passed"]],
+            scope_issues=checks["scope"]["issues"],
+            functional=(attempt_loop.functional_feedback(checks["functional"])
+                        if checks.get("functional") is not None else None))
 
     @staticmethod
     def _delivery_veto(attempt):
@@ -941,8 +942,8 @@ class Cycle:
             self._append("settled", feedback, now=clock)
             return {"status": "repair_ready"}
         if a is None or a["settled"]:
-            ordinal = len(current["attempts"]) + 1
-            if ordinal > current["contract"]["limits"]["max_attempts"]:
+            ordinal = attempt_loop.next_ordinal(len(current["attempts"]), current["contract"]["limits"]["max_attempts"])
+            if ordinal is None:
                 return self._terminal(current, "exhausted", clock)
             task = contracts.task(current["contract"], attempt=ordinal, feedback=current["feedback"], decisions=current["decisions"])
             admission = contracts.admission(current["contract"], ordinal=ordinal,
