@@ -84,6 +84,7 @@ billed cost remain NOT_VERIFIED without the corresponding evidence.
 
 Read only the documentation relevant to the task:
 
+- [Constitution](docs/fleet-constitution.md): ratified project commitments `C1`–`C9`, revisable plan and amendment rules; grants no permissions.
 - [Mission control](docs/herdr-mission-control.md): stage orchestration, task contracts and closure.
 - [Functional checks](docs/herdr-functional-checks.md): frozen-tree execution, Python subset and isolation limits.
 - [Supervision and measurement](docs/herdr-supervision-and-measurement.md): pause/resume/cancel, recovery and measurement semantics.
