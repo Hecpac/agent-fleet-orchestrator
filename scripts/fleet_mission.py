@@ -175,6 +175,7 @@ def _created_request(
     sdd_plan_sha256: str | None = None,
     profile_binding: dict[str, Any] | None = None,
     scope_contract_sha256: str | None = None,
+    repair_policy_sha256: str | None = None,
 ) -> dict[str, Any]:
     request = {
         "feature": feature,
@@ -189,6 +190,8 @@ def _created_request(
     request.update(profile_binding or {})
     if scope_contract_sha256 is not None:
         request["scope_contract_sha256"] = scope_contract_sha256
+    if repair_policy_sha256 is not None:
+        request["repair_policy_sha256"] = repair_policy_sha256
     return request
 
 
@@ -256,6 +259,12 @@ def create_mission(
         scope_pin = fleet_herdr_scope.digest(fleet_herdr_scope.validate(options["scope_contract"]))
     if not runs_dir.exists():
         state.ensure_private_directory(runs_dir)
+    repair_pin = None
+    if options.get("repair_policy") is not None:
+        import fleet_herdr_repair_policy
+        fleet_herdr_repair_policy.admit(options["repair_policy"], compiled=compiled, runs_dir=runs_dir,
+            functional_contract=options.get("functional_contract"), scope_contract=options.get("scope_contract"))
+        repair_pin = fleet_herdr_repair_policy.digest(options["repair_policy"])
     mission_relative = Path("missions") / mission_id
     try:
         with fleet_safe_paths.RootedFS(runs_dir) as rooted:
@@ -352,6 +361,7 @@ def create_mission(
                     sdd_plan_sha256=sdd_plan_sha256,
                     profile_binding=profile_binding,
                     scope_contract_sha256=scope_pin,
+                    repair_policy_sha256=repair_pin,
                 )
                 creation = state.canonical_bytes(
                     {
@@ -421,6 +431,9 @@ def create_mission(
                 )
                 if options.get("functional_contract") is not None:
                     fleet_functional.freeze_policy(runs_dir, mission_id, compiled["compiled_digest"], options["functional_contract"])
+                if repair_pin is not None:
+                    fleet_herdr_repair_policy.freeze_policy(runs_dir, mission_id, compiled["compiled_digest"],
+                                                            options["repair_policy"])
                 rooted.assert_root_binding()
                 return mission_id, first_appended and not existed
     except fleet_safe_paths.SafePathError as exc:

@@ -682,7 +682,8 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
             "initial_risk",
         }
         if not required <= set(payload) or not set(payload) <= required | {
-            "sdd_plan_sha256", "herdr_profile", "herdr_profile_sha256", "scope_contract_sha256"
+            "sdd_plan_sha256", "herdr_profile", "herdr_profile_sha256", "scope_contract_sha256",
+            "repair_policy_sha256"
         }:
             raise MissionStateError("mission_created payload fields do not match schema")
         if not isinstance(payload["feature"], str) or not SAFE_FEATURE.fullmatch(
@@ -697,6 +698,11 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
             _require_sha(payload["scope_contract_sha256"], "scope_contract_sha256")
             if payload.get("herdr_profile") != PHYSICAL_SCOPE_PROFILE_ID:
                 raise MissionStateError(f"physical scope v1 requires {PHYSICAL_SCOPE_PROFILE_ID}")
+        if "repair_policy_sha256" in payload:
+            _require_sha(payload["repair_policy_sha256"], "repair_policy_sha256")
+            # Stage 1 repair is bound to the physical-scope MINIMAL profile (E17).
+            if "scope_contract_sha256" not in payload:
+                raise MissionStateError("repair policy requires a physical scope contract")
         if ("herdr_profile" in payload) is not ("herdr_profile_sha256" in payload):
             raise MissionStateError("Herdr profile creation binding is incomplete")
         if "herdr_profile" in payload:
@@ -897,6 +903,10 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         _require_fields(kind, payload, {"compiled_digest", "spec_artifact_id", "tests_sha256"})
         for field in payload:
             _require_sha(payload[field], "functional policy " + field)
+    elif kind == "repair_policy_frozen":
+        _require_fields(kind, payload, {"compiled_digest", "policy_artifact_id"})
+        for field in payload:
+            _require_sha(payload[field], "repair policy " + field)
     elif kind == "functional_check_started":
         _require_fields(kind, payload, {"contract_artifact_id", "attempt_id", "tree_sha"})
         _require_sha(payload["contract_artifact_id"], "functional contract")
@@ -2216,6 +2226,8 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
         result["sdd_plan_sha256"] = created["sdd_plan_sha256"]
     if "scope_contract_sha256" in created:
         result["scope_contract_sha256"] = created["scope_contract_sha256"]
+    if "repair_policy_sha256" in created:
+        result["repair_policy_sha256"] = created["repair_policy_sha256"]
     if "herdr_profile" in created:
         result["herdr_profile"] = created["herdr_profile"]
         result["herdr_profile_sha256"] = created["herdr_profile_sha256"]
@@ -2718,6 +2730,12 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                     or payload["compiled_digest"] != result["compiled_digest"] or result.get("functional_policy")):
                 raise MissionConflict("functional policy must be frozen by CONTROL once before boot")
             result["functional_policy"] = {**payload, "event_sha256": event["event_sha256"]}
+        elif kind == "repair_policy_frozen":
+            if (event["actor"] != "CONTROL" or result["status"] != "compiled"
+                    or payload["compiled_digest"] != result["compiled_digest"] or result.get("repair_policy")
+                    or payload["policy_artifact_id"] != result.get("repair_policy_sha256")):
+                raise MissionConflict("repair policy must be frozen by CONTROL once, as bound at creation, before boot")
+            result["repair_policy"] = {**payload, "event_sha256": event["event_sha256"]}
         elif kind == "functional_check_started":
             if (event["actor"] != "CONTROL" or not result.get("functional_policy")
                     or result.get("functional_attempt") or result["status"] not in {"running", "completing"}

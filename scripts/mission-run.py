@@ -24,6 +24,7 @@ import fleet_admission
 import fleet_acceptance
 import fleet_functional
 import fleet_herdr_scope
+import fleet_herdr_repair_policy
 import fleet_herdr_work_packet
 import fleet_herdr_control
 import fleet_artifacts
@@ -118,6 +119,7 @@ def create_and_drive(
     functional_contract: dict[str, Any] | None = None,
     sdd_plan_path: Path | None = None,
     scope_contract: dict[str, Any] | None = None,
+    repair_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not FEATURE.fullmatch(feature):
         raise MissionRunError("invalid feature")
@@ -148,6 +150,12 @@ def create_and_drive(
             raise MissionRunError(f"--scope-contract requires {scope_profile.preset}")
     if sdd_plan_path is not None and not is_herdr:
         raise MissionRunError("--sdd-plan requires a supported Herdr workflow")
+    if repair_policy is not None:
+        try:
+            fleet_herdr_repair_policy.admit(repair_policy, compiled=compiled, runs_dir=runs_dir,
+                functional_contract=functional_contract, scope_contract=scope_contract)
+        except fleet_herdr_repair_policy.RepairPolicyError as exc:
+            raise MissionRunError(str(exc)) from exc
     herdr_runtime_options = {}
     if herdr_runtime_root is not None:
         if not is_herdr:
@@ -210,6 +218,8 @@ def create_and_drive(
         if not is_herdr:
             raise MissionRunError("functional v1 requires Herdr")
         key += ":functional:" + fleet_functional.digest(functional_contract)
+    if repair_policy is not None:
+        key += ":repair:" + fleet_herdr_repair_policy.digest(repair_policy)
     if acceptance_contract is not None:
         key = fleet_acceptance.bound_key(key, acceptance_contract)
     if (
@@ -238,6 +248,7 @@ def create_and_drive(
             **({"herdr_session": herdr_session} if herdr_session else {}),
             **({"acceptance_contract": acceptance_contract} if acceptance_contract is not None else {}),
             **({"functional_contract": functional_contract} if functional_contract is not None else {}),
+            **({"repair_policy": repair_policy} if repair_policy is not None else {}),
         },
         sdd_plan_path=sdd_plan_path,
     )
@@ -264,6 +275,8 @@ def dry_run(
     scope_contract: dict[str, Any] | None = None,
     work_packet: bool = False,
     work_context: dict[str, Any] | None = None,
+    repair_policy: dict[str, Any] | None = None,
+    runs_dir: Path | None = None,
 ) -> dict[str, Any]:
     if work_context is not None and not work_packet:
         raise MissionRunError("--work-context requires --work-packet")
@@ -292,6 +305,13 @@ def dry_run(
         fleet_acceptance.validate(acceptance_contract)
         if compiled["workflow"]["archive"]["content_policy"] != "full" or not compiled["workflow"]["archive"]["include_final_tree"]:
             raise MissionRunError("artifact acceptance requires a full archive with final tree")
+    if repair_policy is not None:
+        try:
+            fleet_herdr_repair_policy.admit(repair_policy, compiled=compiled,
+                runs_dir=runs_dir if runs_dir is not None else DEFAULT_RUNS_DIR,
+                functional_contract=functional_contract, scope_contract=scope_contract)
+        except fleet_herdr_repair_policy.RepairPolicyError as exc:
+            raise MissionRunError(str(exc)) from exc
     assessment = fleet_risk.assess(
         workflow_minimum=compiled["workflow"]["risk"]["minimum"],
         objective=objective,
@@ -331,6 +351,7 @@ def dry_run(
                                "archive_schema_version": 8}} if scope_contract is not None else {}),
         **({"functional": {"schema_version": 1, "spec_sha256": fleet_functional.digest(functional_contract),
                             "check_id": functional_contract["check_id"]}} if functional_contract is not None else {}),
+        **({"repair": fleet_herdr_repair_policy.preview(repair_policy)} if repair_policy is not None else {}),
         "backend": "herdr" if fleet_herdr_profile.is_herdr_preset(compiled["resolved"]["preset"]) else "cmux-legacy",
         "acceptance": {"mode": "artifact_contract", "contract_sha256": fleet_acceptance.digest(acceptance_contract)} if acceptance_contract is not None else {"mode": "legacy_not_evaluated"},
     }
@@ -365,6 +386,7 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--acceptance-contract", type=Path)
         command.add_argument("--functional-contract", type=Path, help="versioned required functional check frozen before launch")
         command.add_argument("--scope-contract", type=Path, help=f"opt-in physical candidate acceptance ({fleet_herdr_profile.PHYSICAL_SCOPE_PROFILE.preset} only)")
+        command.add_argument("--repair-policy", type=Path, help="opt-in stage 1 repair/delivery policy frozen at creation (repair execution not yet available)")
         if name == "dry":
             command.add_argument("--work-packet", action="store_true", help="preview owner-work-v1; owner cycle and dispatch remain disabled")
             command.add_argument("--work-context", type=Path, help="initial context, requirements, preferences and decisions for the work packet")
@@ -519,6 +541,8 @@ def main(argv: list[str] | None = None) -> int:
                 acceptance_contract=fleet_acceptance.load(args.acceptance_contract) if args.acceptance_contract else None,
                 functional_contract=fleet_functional.load(args.functional_contract) if args.functional_contract else None,
                 scope_contract=fleet_herdr_scope.load(args.scope_contract) if args.scope_contract else None,
+                repair_policy=fleet_herdr_repair_policy.load(args.repair_policy) if args.repair_policy else None,
+                runs_dir=runs_dir,
                 work_packet=args.work_packet,
                 work_context=fleet_herdr_work_packet.load_context(args.work_context) if args.work_context else None,
                 router_path=args.router,
@@ -545,6 +569,7 @@ def main(argv: list[str] | None = None) -> int:
                 acceptance_contract=fleet_acceptance.load(args.acceptance_contract) if args.acceptance_contract else None,
                 functional_contract=fleet_functional.load(args.functional_contract) if args.functional_contract else None,
                 scope_contract=fleet_herdr_scope.load(args.scope_contract) if args.scope_contract else None,
+                repair_policy=fleet_herdr_repair_policy.load(args.repair_policy) if args.repair_policy else None,
                 router_path=args.router,
             )
             emit(value, json_mode=args.json)

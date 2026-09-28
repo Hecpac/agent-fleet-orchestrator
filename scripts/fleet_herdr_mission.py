@@ -38,6 +38,7 @@ import fleet_herdr_launch
 import fleet_herdr_runtime
 import fleet_herdr_sdd
 import fleet_herdr_scope
+import fleet_herdr_repair_policy
 import fleet_herdr_control as control
 import fleet_herdr_metrics as metrics
 import fleet_herdr_instructions
@@ -200,6 +201,11 @@ class _Driver:
             fleet_herdr_scope.validate_binding(current, self.options)
         except fleet_herdr_scope.ScopeError as exc:
             self.scope_error = str(exc)
+        self.repair_error = None
+        try:
+            fleet_herdr_repair_policy.validate_binding(current, self.options)
+        except fleet_herdr_repair_policy.RepairPolicyError as exc:
+            self.repair_error = str(exc)
         contract = self.options.get("acceptance_contract")
         fleet_acceptance.check_binding(creation["idempotency_key"], contract)
         functional_spec = self.options.get("functional_contract")
@@ -1092,6 +1098,13 @@ class _Driver:
         if self.scope_error is not None:
             return self.response(next_action="physical scope binding failed before new effects: " + self.scope_error,
                                  scope_rejection={"status": "rejected", "reason": self.scope_error})
+        if self.repair_error is not None:
+            return self.response(next_action="repair policy binding failed before new effects: " + self.repair_error)
+        if self.current().get("repair_policy_sha256"):
+            # The policy is admitted and frozen, but this driver has no repair
+            # loop yet; running it would silently apply the non-repairing path.
+            return self.response(next_action="blocked: repair policy is frozen but repair execution is "
+                                             "not available; no candidate or agent is launched")
         if (self.current()["status"] in {"compiled", "booting", "running"} and self.remaining_seconds() <= 0
                 and not self.completed_turns() and not any(a["active"] for a in self.current()["admissions"].values())):
             return self.timed_out()
