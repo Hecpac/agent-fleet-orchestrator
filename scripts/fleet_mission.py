@@ -425,7 +425,10 @@ def create_mission(
                     deadline_at=deadline.isoformat(timespec="microseconds").replace(
                         "+00:00", "Z"
                     ),
-                    delegation_credits=int(limits["delegation_credits"]),
+                    # A repair policy buys one Worker turn per attempt; the credit
+                    # budget is derived from it, never from a later request.
+                    delegation_credits=int(limits["delegation_credits"])
+                        * (options["repair_policy"]["max_attempts"] if repair_pin is not None else 1),
                     max_active_delegations=int(limits["max_active_delegations"]),
                     idempotency_key=f"{idempotency_key}:admission-policy",
                 )

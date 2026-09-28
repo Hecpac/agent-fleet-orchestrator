@@ -1,6 +1,6 @@
 # Etapa 1 — Cerrar el ciclo de una Mission: plan de implementación
 
-> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1, S2 y S3 implementados ·
+> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 a S4 implementados ·
 > **Especificación (leer primero):**
 > [`docs/superpowers/specs/2026-09-28-etapa1-cierre-mission-design.md`](../specs/2026-09-28-etapa1-cierre-mission-design.md) ·
 > **Base:** `main` en `75baa80`.
@@ -104,16 +104,25 @@ SCN-022, con casos negativos por campo. Los tests existentes de `mission-run` y
 
 **Cambios:** `fleet_herdr_mission.py`, `fleet_herdr_control.py`.
 
-- [ ] Sustituir el terminal de `fleet_herdr_mission.py:1242-1247` por un nuevo
+- [x] Sustituir el terminal de `fleet_herdr_mission.py:1242-1247` por un nuevo
       intento del Worker solo cuando hay `repair_policy`, el check es `failed` y
       quedan intentos y plazo (E2, E5). Sin política, el comportamiento actual
       se conserva.
-- [ ] Cada intento es una admisión nueva con clave de idempotencia por ordinal;
-      reanudar reconcilia el mismo turno y el mismo intento funcional (E3).
-- [ ] No abrir un intento con cancelación solicitada o plazo vencido (SCN-005,
+- [x] Cada intento es una admisión nueva con clave de idempotencia por ordinal;
+      reanudar reconcilia el mismo turno y el mismo intento funcional (E3). El
+      turno de reparación separa su clave (`build-repair-<n>`) de su contrato de
+      rol (`build`), y cada ordinal congela su revisión en un archivo propio de
+      una sola escritura.
+- [x] No abrir un intento con cancelación solicitada o plazo vencido (SCN-005,
       SCN-009).
-- [ ] La confirmación de control exige que todos los intentos tengan resultado.
-- [ ] Sustituir el bloqueo de S1 por la ejecución del bucle.
+- [x] La confirmación de control exige que todos los intentos tengan resultado:
+      solo el intento abierto puede carecer de él, y ese caso ya bloquea.
+- [x] Sustituir el bloqueo de S1 por la ejecución del bucle.
+- [x] Una política de reparación fija al crear la Mission un crédito de
+      delegación por intento: créditos del workflow × `max_attempts`.
+- [x] Hasta S6 y S7, un intento aceptado deja la Mission en ejecución con la
+      causa «delivery and closure are not available yet»: el archivo actual
+      exige un único turno y todavía no hay entrega.
 
 **Comprobaciones:** `tests/test_fleet_herdr_repair_loop.py` (nuevo), sobre
 `MinimalFixture` de `test_fleet_herdr_orchestration_closure.py`: SCN-001,

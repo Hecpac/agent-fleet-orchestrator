@@ -297,7 +297,8 @@ def main():
                 with fs.exclusive_lock(Path("missions") / mid / "herdr-driver.lock", directory_modes=(0o700, 0o700), blocking=False) as acquired:
                     if not acquired:
                         raise FunctionalError("mission driver is busy")
-                    frozen = fleet_herdr_mission._Driver(args.runs_dir, mid).read("candidate-freeze.json")
+                    driver = fleet_herdr_mission._Driver(args.runs_dir, mid)
+                    frozen = driver.read(fleet_herdr_mission.freeze_name(driver.current()))
                     result = run(args.runs_dir, mid, frozen)
         print(json.dumps(result, sort_keys=True))
         return 0 if result.get("status", "passed") == "passed" else 3

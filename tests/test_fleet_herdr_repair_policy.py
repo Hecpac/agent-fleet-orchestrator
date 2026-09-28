@@ -142,14 +142,6 @@ class CreationTests(MinimalFixture):
         self.assertEqual(created["payload"][repair.FIELD], pin)
         self.assertEqual(fleet_artifacts.get_bytes(self.runs, mid, pin), fleet_json.canonical_bytes(self.policy))
 
-    def test_driver_fails_closed_before_any_candidate_or_agent(self):
-        mid = self.create_repair()
-        result = fleet_herdr_mission.drive(self.runs, mid)
-        self.assertIn("repair execution is not available", result["next_action"])
-        self.assertEqual(MinimalBackend.calls, [])
-        self.assertFalse((self.runs / "missions" / mid / "candidate").exists())
-        self.assertEqual(fleet_mission.load_state(self.runs, mid)["status"], "compiled")
-
     def test_changed_or_removed_runtime_policy_fails_binding_before_effects(self):
         mid = self.create_repair()
         root = self.runs / "missions" / mid

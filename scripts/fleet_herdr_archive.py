@@ -9,6 +9,7 @@ import hashlib
 import io
 import os
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -118,8 +119,15 @@ def snapshot(candidate_repo: Path, *, expected_base: str | None = None,
     return tree_sha, tree, patch
 
 
-def freeze(runs_dir: Path, mission_id: str, candidate_repo: Path) -> dict[str, Any]:
-    """Freeze the candidate before reviewers run; replay rejects later drift."""
+def freeze(runs_dir: Path, mission_id: str, candidate_repo: Path, *,
+           name: str = "candidate-freeze.json") -> dict[str, Any]:
+    """Freeze the candidate before reviewers run; replay rejects later drift.
+
+    Each freeze file is written once. A stage 1 repair attempt after the first
+    freezes its own revision under ``candidate-freeze-repair-<ordinal>.json``.
+    """
+    if name != "candidate-freeze.json" and not re.fullmatch(r"candidate-freeze-repair-[0-9]+\.json", name):
+        raise HerdrArchiveError("unsupported candidate freeze name")
     compiled, current = fleet_mission.load_mission_compiled(runs_dir, mission_id, mode="effect")
     root = Path("missions") / mission_id
     if _git(candidate_repo, "rev-parse", "HEAD").decode().strip() != current["base_sha"]:
@@ -151,7 +159,7 @@ def freeze(runs_dir: Path, mission_id: str, candidate_repo: Path) -> dict[str, A
         frozen.update(scope_contract_sha256=current[fleet_herdr_scope.FIELD],
                       scope_baseline_artifact_id=current["herdr_scope_baseline"]["baseline_artifact_id"])
     with fleet_safe_paths.RootedFS(runs_dir) as store:
-        _write(store, root / "candidate-freeze.json", _bytes(frozen))
+        _write(store, root / name, _bytes(frozen))
     return frozen
 
 
