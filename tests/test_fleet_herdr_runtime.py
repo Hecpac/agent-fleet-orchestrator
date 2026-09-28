@@ -21,11 +21,12 @@ import fleet_mission
 import fleet_mission_state as state
 import workflow_config
 from tests import test_fleet_herdr_mission as fixtures
+from tests.repo_outputs import repo_outputs
 
 
 class RuntimeLayoutTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(dir=ROOT / "outputs", prefix="runtime-contract-")
+        self.temp = tempfile.TemporaryDirectory(dir=repo_outputs(), prefix="runtime-contract-")
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.runs, self.target, self.runtime = (self.root / name for name in ("runs", "target", "runtime"))
@@ -100,7 +101,7 @@ class RuntimeMissionTests(unittest.TestCase):
     create = fixtures.HerdrMissionTests.create
 
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(dir=ROOT / "outputs", prefix="runtime-mission-")
+        self.temporary = tempfile.TemporaryDirectory(dir=repo_outputs(), prefix="runtime-mission-")
         self.addCleanup(self.temporary.cleanup)
         self.tmp = Path(self.temporary.name).resolve()
         self.target, self.runs = self.tmp / "target", self.tmp / "runs"

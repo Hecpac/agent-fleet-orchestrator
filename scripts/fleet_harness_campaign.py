@@ -125,7 +125,8 @@ def prepare(root,*,dependencies=mini.DIST,requests_per_task=6,profile="legacy-8k
     tasks=[]
     for task in ("D1","D2"):
         candidate=root/task/"candidate";candidate.parent.mkdir(mode=0o700)
-        shutil.copytree(FIXTURES/task.lower(),candidate)
+        # Bytecode caches (e.g. from compileall in CI) are never fixture content.
+        shutil.copytree(FIXTURES/task.lower(),candidate,ignore=shutil.ignore_patterns("__pycache__","*.pyc"))
         names=[p.name for p in sorted(candidate.iterdir())]
         for name in names:
             target=root/"private-controls"/task/name;target.parent.mkdir(mode=0o700,parents=True,exist_ok=True)

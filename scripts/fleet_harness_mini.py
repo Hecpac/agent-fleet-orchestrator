@@ -7,6 +7,7 @@ historical terminal consumer remains pure and its original bytes are retained.
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 import shutil
 
@@ -18,13 +19,28 @@ GUEST = Path(__file__).with_name("fleet_harness_mini_guest.py")
 SENTINEL = "echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
 SYSTEM = "You are the sole Worker. Use bash within the supplied scope. Return the exact owner JSON as the content accompanying the sole echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT tool call."
 TEMPLATE = "{{task}}"
-DIST = Path("/Users/hector/.local/share/fleet-harness-comparison/20260915-01/dist")
+LOCK = Path(__file__).resolve().parents[1] / "requirements/mini-2.4.6.txt"
+
+
+def default_dist():
+    """Locate the Mini runtime sources installed from LOCK for the Linux sandbox."""
+    configured = os.environ.get("FLEET_MINI_DIST")
+    if configured:
+        return Path(configured)
+    data_home = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share"
+    return Path(data_home) / "fleet-harness/mini-2.4.6/dist"
+
+
+DIST = default_dist()
 DEPENDENCIES = ("minisweagent", "pydantic", "pydantic_core", "jinja2", "markupsafe", "dotenv",
                 "platformdirs", "rich", "pygments", "typing_extensions.py", "typing_inspection", "annotated_types")
 
 
 def freeze_dependencies(source, destination):
     source, destination = Path(source), Path(destination)
+    if not source.is_dir():
+        raise FileNotFoundError(f"Mini runtime sources are not installed at {source}; "
+                                f"run scripts/install-mini-deps.sh (lock {LOCK.name}) or set FLEET_MINI_DIST")
     destination.mkdir(mode=0o755, parents=True, exist_ok=False)
     manifest = {}
     for package in DEPENDENCIES:

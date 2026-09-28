@@ -12,6 +12,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]/'scripts'))
 import fleet_codex_sandbox as capsule
+from tests.repo_outputs import repo_outputs
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,7 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 class BoundaryTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.build = tempfile.TemporaryDirectory(prefix='capsule-canary-', dir=ROOT/'outputs')
+        cls.build = tempfile.TemporaryDirectory(prefix='capsule-canary-', dir=repo_outputs())
         cls.addClassCleanup(cls.build.cleanup)
         cls.image = Path(cls.build.name)/'canary'
         subprocess.run(['/usr/bin/clang', '-Wall', '-Wextra', '-Werror',

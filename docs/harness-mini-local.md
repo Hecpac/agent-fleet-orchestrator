@@ -13,6 +13,14 @@ Requiere las dependencias Mini 2.4.6 ya presentes y la imagen local fijada en
 `fleet_harness_sandbox.IMAGE`. Los comandos no instalan paquetes ni descargan
 imágenes. La infraestructura Docker propia necesita autorización aplicable.
 
+Las fuentes Mini proceden de `requirements/mini-2.4.6.txt`, fijado por hash. Se
+buscan en `FLEET_MINI_DIST` o, si no está definido, en
+`$XDG_DATA_HOME/fleet-harness/mini-2.4.6/dist` (por defecto bajo
+`~/.local/share`). `scripts/install-mini-deps.sh [destino]` las instala para la
+plataforma Linux de la arquitectura local, porque Mini se ejecuta en el sandbox
+Linux; esa instalación descarga paquetes y debe ejecutarse de forma explícita.
+Una instalación anterior se puede reutilizar apuntando `FLEET_MINI_DIST` a ella.
+
 ```sh
 FLEET_HARNESS_LOCAL_TESTS=1 python3 -B -m unittest \
   tests.test_fleet_harness_acceptance tests.test_fleet_harness_budget \

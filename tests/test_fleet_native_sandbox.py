@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 import fleet_native_sandbox as sandbox
 import fleet_herdr_effects as effects
+from tests.repo_outputs import repo_outputs
 
 
 class ContractTests(unittest.TestCase):
@@ -50,7 +51,7 @@ class ContractTests(unittest.TestCase):
                 effects.require_native_mediation()
 
     def test_export_rejects_replaced_root_before_reading_host(self):
-        with tempfile.TemporaryDirectory(dir=ROOT / "outputs") as temp:
+        with tempfile.TemporaryDirectory(dir=repo_outputs()) as temp:
             root = Path(temp) / "work"
             root.mkdir()
             identity = (root.stat().st_dev, root.stat().st_ino)
@@ -63,7 +64,7 @@ class ContractTests(unittest.TestCase):
 @unittest.skipUnless(sys.platform == "darwin" and sandbox.SANDBOX_EXEC.exists(), "macOS OS lane required")
 class SeatbeltTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="native-os-test-", dir=ROOT / "outputs")
+        self.temp = tempfile.TemporaryDirectory(prefix="native-os-test-", dir=repo_outputs())
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
 

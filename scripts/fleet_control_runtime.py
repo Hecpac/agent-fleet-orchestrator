@@ -453,46 +453,98 @@ def process_observation(pid: int) -> tuple[dict[str, Any] | None, bool]:
         )
         return identity, value.pbi_status == 5
     if sys.platform.startswith("linux"):
-        proc_root = Path("/proc") / str(pid)
-        try:
-            raw = (proc_root / "stat").read_text(encoding="ascii")
-            status = (proc_root / "status").read_text(encoding="ascii")
-            boot_id = (
-                Path("/proc/sys/kernel/random/boot_id")
-                .read_text(encoding="ascii")
-                .strip()
-            )
-        except FileNotFoundError:
-            return None, False
-        except OSError as exc:
-            raise RuntimeIdentityError(
-                "cannot read exact Linux process identity"
-            ) from exc
-        # The /proc inode owner flips to root for the duration of execve
-        # (the kernel clears dumpable until the new credentials are
-        # computed), so observing a just-spawned child through the inode
-        # owner misreports uid 0. The status Uid credential line is stable
-        # across that window and is the only honest owner source here.
-        euid: int | None = None
-        for line in status.splitlines():
-            if line.startswith("Uid:"):
-                parts = line.split()
-                if len(parts) >= 3 and parts[2].isdigit():
-                    euid = int(parts[2])
-                break
-        if euid is None:
-            raise RuntimeIdentityError("invalid Linux process status record")
-        close = raw.rfind(")")
-        fields = raw[close + 2 :].split() if close >= 0 else []
-        if len(fields) < 20:
-            raise RuntimeIdentityError("invalid Linux process stat record")
-        identity = validate_process_identity(
-            {
-                "kind": "linux-proc-stat-v1",
-                "uid": euid,
-                "boot_id": boot_id,
-                "start_ticks": int(fields[19]),
-            }
-        )
-        return identity, fields[0] == "Z"
+        return _linux_process_observation(pid)
     raise RuntimeIdentityError("platform lacks an exact control process identity")
+
+
+class _ReleasedLinuxTask(Exception):
+    """The task pinned by one ``/proc/<pid>`` descriptor no longer exists."""
+
+
+# A pinned task can vanish (exit and reap) between opening its /proc entry and
+# reading it.  Each retry observes the PID afresh; a bounded number of
+# consecutive vanishings is reported as an inspection failure, never absence.
+_LINUX_OBSERVATION_ATTEMPTS = 3
+_PROC_ROOT = Path("/proc")
+
+
+def _linux_process_observation(pid: int) -> tuple[dict[str, Any] | None, bool]:
+    for _ in range(_LINUX_OBSERVATION_ATTEMPTS):
+        try:
+            return _linux_pinned_observation(pid)
+        except _ReleasedLinuxTask:
+            continue
+    raise RuntimeIdentityError("cannot read exact Linux process identity")
+
+
+def _read_pinned_proc_entry(directory: int, name: str) -> str:
+    try:
+        descriptor = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=directory)
+    except (FileNotFoundError, ProcessLookupError) as exc:
+        raise _ReleasedLinuxTask from exc
+    try:
+        chunks = []
+        while True:
+            try:
+                chunk = os.read(descriptor, 65536)
+            except ProcessLookupError as exc:
+                raise _ReleasedLinuxTask from exc
+            if not chunk:
+                break
+            chunks.append(chunk)
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks).decode("ascii")
+
+
+def _linux_pinned_observation(pid: int) -> tuple[dict[str, Any] | None, bool]:
+    # The directory descriptor pins one task: after that task is released,
+    # entries opened through it fail instead of resolving to a process that
+    # reused the PID, so stat and status always describe the same task.
+    try:
+        directory = os.open(
+            _PROC_ROOT / str(pid), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+    except FileNotFoundError:
+        return None, False
+    except OSError as exc:
+        raise RuntimeIdentityError("cannot read exact Linux process identity") from exc
+    try:
+        raw = _read_pinned_proc_entry(directory, "stat")
+        status = _read_pinned_proc_entry(directory, "status")
+        boot_id = (
+            (_PROC_ROOT / "sys/kernel/random/boot_id")
+            .read_text(encoding="ascii")
+            .strip()
+        )
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RuntimeIdentityError("cannot read exact Linux process identity") from exc
+    finally:
+        os.close(directory)
+    # The /proc inode owner flips to root for the duration of execve
+    # (the kernel clears dumpable until the new credentials are
+    # computed), so observing a just-spawned child through the inode
+    # owner misreports uid 0. The status Uid credential line is stable
+    # across that window and is the only honest owner source here.
+    euid: int | None = None
+    for line in status.splitlines():
+        if line.startswith("Uid:"):
+            parts = line.split()
+            if len(parts) >= 3 and parts[2].isdigit():
+                euid = int(parts[2])
+            break
+    if euid is None:
+        raise RuntimeIdentityError("invalid Linux process status record")
+    close = raw.rfind(")")
+    fields = raw[close + 2 :].split() if close >= 0 else []
+    if len(fields) < 20:
+        raise RuntimeIdentityError("invalid Linux process stat record")
+    identity = validate_process_identity(
+        {
+            "kind": "linux-proc-stat-v1",
+            "uid": euid,
+            "boot_id": boot_id,
+            "start_ticks": int(fields[19]),
+        }
+    )
+    return identity, fields[0] == "Z"

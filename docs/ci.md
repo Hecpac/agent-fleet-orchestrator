@@ -21,6 +21,13 @@ alguna de esas dependencias. Los tests de coherencia del router desactivan las
 comprobaciones de binarios de proveedores porque validan configuración
 estática; el lane portátil no necesita instalar Codex, Claude, OpenCode o Kimi.
 
+Los tests del harness Mini necesitan las fuentes reales de Mini 2.4.6. Si
+`FLEET_MINI_DIST` no está definido, `scripts/check-ci.sh` las instala desde
+`requirements/mini-2.4.6.txt` con `--require-hashes` en una caché indexada por
+el hash del lock (`$FLEET_CI_CACHE`, o `~/.cache/agent-fleet-ci`) y las reutiliza
+en ejecuciones posteriores. Esa instalación requiere acceso a PyPI. Sin fuentes,
+los tests fallan con un diagnóstico explícito; no se omiten.
+
 La validación de `workflows/regulated.yaml` en CI es estática. No implica que
 pueda admitir efectos: el compilador de ejecución exige `hard_total` en todos
 los proveedores resolubles y el run regulado exige WORM externo, dependencias
