@@ -5,8 +5,8 @@
 
 Este documento fija los compromisos estables del proyecto. Las especificaciones,
 diseños y tareas SDD se derivan de él. Son normativas las secciones 1–3, 6 y 8.
-Las secciones 4 (decisiones y método experimental), 5 (etapas) y 7 (decisiones
-pendientes) forman un plan revisable: cambian mediante un cambio revisado, sin
+Las secciones 4 (decisiones y método experimental), 5 (etapas) y 7 (decisiones de las
+especificaciones) forman un plan revisable: cambian mediante un cambio revisado, sin
 enmendar los principios, siempre que respeten C1–C9. El Anexo A describe el
 estado del código en la revisión base, sin valor normativo. El documento no
 concede permisos ni describe capacidades implementadas.
@@ -381,17 +381,17 @@ publicación externa y migración de historiales.
   resultados, falsos éxitos, violaciones de alcance, intervención humana
   necesaria, recuperación y coste por resultado aceptado.
 
-## 7. Decisiones pendientes para las especificaciones
+## 7. Decisiones de las especificaciones
 
 Estas decisiones corresponden al usuario y no forman parte de la constitución:
 
-| ID | Decisión | Qué bloquea |
+| ID | Decisión | Estado |
 | --- | --- | --- |
-| D1 | Primera tarea real: qué debe existir al terminar y en qué destino | Especificación de la etapa 1 |
-| D2 | Uso personal o atención a otros usuarios | Alcance de aislamiento. Supuesto de trabajo vigente: un operador con estado local durable, coherente con la frontera de [fleet-threat-model.md](fleet-threat-model.md). No es un principio |
-| D3 | Qué datos pueden enviarse a proveedores externos y cuáles deben permanecer locales | Etapa 2 y cualquier fase con proveedores |
-| D4 | Cierre automático cuando las comprobaciones acordadas sean concluyentes | Especificación de la etapa 1 |
-| D5 | Prioridad inicial entre calidad, tiempo y coste, y límites aceptables de tiempo y gasto | Especificación de la etapa 1 y fase con proveedores |
+| D1 | Primera tarea real: qué debe existir al terminar y en qué destino | Decidida (2026-09-28): perfil de estadísticas `python-stats-rpc-v1`, con entrega local en `outputs/sdd-deliveries/owner-loop-v0/` ([especificación de la etapa 1](superpowers/specs/2026-09-28-etapa1-cierre-mission-design.md), D1 y D1b) |
+| D2 | Uso personal o atención a otros usuarios | Pendiente; afecta al alcance de aislamiento. Supuesto de trabajo vigente: un operador con estado local durable, coherente con la frontera de [fleet-threat-model.md](fleet-threat-model.md). No es un principio |
+| D3 | Qué datos pueden enviarse a proveedores externos y cuáles deben permanecer locales | Pendiente; bloquea la etapa 2 y cualquier fase con proveedores |
+| D4 | Cierre automático cuando las comprobaciones acordadas sean concluyentes | Decidida (2026-09-28): `automatic` para la etapa 1, sin éxito con efectos indeterminados ni comprobaciones pendientes |
+| D5 | Prioridad inicial entre calidad, tiempo y coste, y límites aceptables de tiempo y gasto | Decidida para la fase offline de la etapa 1 (2026-09-28): `max_attempts: 3` en la política de reparación y plazo total de 3600 s fijado en la admisión, gasto de proveedores cero. Pendiente el límite de gasto de la fase con proveedores |
 
 ## 8. Ratificación y enmiendas
 

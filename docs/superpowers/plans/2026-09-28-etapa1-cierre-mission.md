@@ -1,6 +1,6 @@
 # Etapa 1 — Cerrar el ciclo de una Mission: plan de implementación
 
-> **Fecha:** 2026-09-28 · **Estado:** borrador pendiente de aprobación ·
+> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 implementado ·
 > **Especificación (leer primero):**
 > [`docs/superpowers/specs/2026-09-28-etapa1-cierre-mission-design.md`](../specs/2026-09-28-etapa1-cierre-mission-design.md) ·
 > **Base:** `main` en `75baa80`.
@@ -43,14 +43,21 @@ dentro de una misma Mission MINIMAL con el contrato funcional
 **Cambios:** `fleet_herdr_repair_policy.py`, `mission-run.py`,
 `fleet_mission_state.py` (campo congelado).
 
-- [ ] Validar el esquema: campos exactos, `max_attempts` entre 1 y el máximo
+- [x] Validar el esquema: campos exactos, `max_attempts` entre 1 y el máximo
       del contrato, `closure_policy` en `{automatic}`, `delivery_root` absoluto.
-- [ ] Rechazar al crear la Mission, antes de lanzar agentes: ausencia de
+- [x] Rechazar al crear la Mission, antes de lanzar agentes: ausencia de
       contrato de scope (E17), perfil distinto de MINIMAL, ausencia de contrato
       funcional, `token_budget > 0` y una raíz de entrega que, tras resolver
       enlaces, contenga el directorio de runs o esté dentro de él (E8).
-- [ ] Congelar la política y su digest en el evento de creación; reanudar nunca
+- [x] Congelar la política y su digest en el evento de creación; reanudar nunca
       la relee del disco.
+- [x] El plazo total no forma parte de la política: es el `deadline_at` que la
+      admisión ya congela al crear la Mission (E14), así que hay una sola fuente.
+- [x] El driver compara la política de las opciones con el pin del ledger y
+      bloquea antes de cualquier efecto si difiere o falta.
+- [x] Mientras no exista el bucle de reparación, el driver bloquea toda Mission
+      con `repair_policy` antes de preparar el candidato o lanzar agentes, en
+      lugar de aplicarle en silencio el camino sin reparación.
 
 **Comprobaciones:** `tests/test_fleet_herdr_repair_policy.py` (nuevo): SCN-015 y
 SCN-022, con casos negativos por campo. Los tests existentes de `mission-run` y
@@ -100,6 +107,7 @@ SCN-022, con casos negativos por campo. Los tests existentes de `mission-run` y
 - [ ] No abrir un intento con cancelación solicitada o plazo vencido (SCN-005,
       SCN-009).
 - [ ] La confirmación de control exige que todos los intentos tengan resultado.
+- [ ] Sustituir el bloqueo de S1 por la ejecución del bucle.
 
 **Comprobaciones:** `tests/test_fleet_herdr_repair_loop.py` (nuevo), sobre
 `MinimalFixture` de `test_fleet_herdr_orchestration_closure.py`: SCN-001,
@@ -120,6 +128,9 @@ CHK-004 a CHK-006, CHK-012). `test_fleet_herdr_orchestration_closure` y
 - [ ] Relectura con hashes por archivo y conjunto exacto de archivos (E10).
 - [ ] Colisión, colisión concurrente y directorio vacío preexistente (E11, §3.3).
 - [ ] Reconciliación tras reinicio (E12).
+- [ ] Volver a resolver la raíz de entrega en el momento de entregar: S1 la
+      admite con `resolve(strict=False)` al crear la Mission, así que un enlace
+      simbólico creado después solo se detecta en la entrega.
 
 **Comprobaciones:** `tests/test_fleet_herdr_delivery.py` (nuevo), puro y válido en
 macOS y Linux: SCN-010 a SCN-014 y SCN-025 a SCN-028 (CHK-007 a CHK-009,

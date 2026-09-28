@@ -1,7 +1,7 @@
 # Etapa 1 — Cerrar el ciclo de una Mission: diseño
 
-> **Fecha:** 2026-09-28 · **Estado:** borrador pendiente de aprobación; D1, D1b,
-> D4 y D5 decididas (§6) · **Deriva de:** [constitución v1.0](../../fleet-constitution.md),
+> **Fecha:** 2026-09-28 · **Estado:** aprobada por el operador el 2026-09-28; D1,
+> D1b, D4 y D5 decididas (§6) · **Deriva de:** [constitución v1.0](../../fleet-constitution.md),
 > §5 Etapa 1 · **Base examinada:** `main` en `75baa80`.
 
 Los identificadores `C1`–`C9` remiten a los principios de la constitución. Este
@@ -64,7 +64,7 @@ especifica aquí.
 | E11 | Colisión | Si la ruta final ya existe con el mismo contenido que la revisión aceptada, se trata como entrega ya realizada (E12). Si existe con otro contenido, se bloquea solo esa entrega: no se escribe nada, la Mission termina `blocked` con causa `delivery_collision` y la revisión aceptada y su receipt se conservan. Los cambios sin commit en otros archivos del repositorio no bloquean la entrega | Decidida (D1b) |
 | E12 | Recuperación de la entrega | Tras reinicio: si la ruta final coincide con la revisión, `delivered` sin segunda escritura; si no existe y solo queda la preparación propia de esa entrega, se limpia esa preparación y puede reintentarse; en cualquier otro caso, resultado indeterminado (C6) | Propuesta |
 | E13 | Cierre | `closure_policy: automatic`. Éxito solo si se cumplen todos los requisitos obligatorios, la revisión entregada es exactamente la aceptada y la lectura en destino es satisfactoria. Nunca se declara éxito con efectos indeterminados ni con comprobaciones obligatorias pendientes | Decidida (D4) |
-| E14 | Límites | `max_attempts: 3`, que incluye el intento inicial y hasta dos reparaciones; `deadline_seconds: 3600` como plazo total de la Mission, que reiniciar o reanudar no renueva; `token_budget: 0`, porque Herdr rechaza cualquier valor positivo ([mission-run.py:186](../../../scripts/mission-run.py)) | Decidida (D5) |
+| E14 | Límites | `max_attempts: 3`, que incluye el intento inicial y hasta dos reparaciones; plazo total de 3600 s, el `deadline_seconds` del workflow MINIMAL, que se congela como `deadline_at` en la política de admisión al crear la Mission y que reiniciar o reanudar no renueva. La política de reparación no lo duplica, para que haya una sola fuente del plazo; `token_budget: 0`, porque Herdr rechaza cualquier valor positivo ([mission-run.py:186](../../../scripts/mission-run.py)) | Decidida (D5) |
 | E15 | Archivo | Esquema v9 = capa de scope de v8 más intentos, receipts, feedback y recibo de entrega (§3.1). Los archivos v2–v8 se leen y verifican sin cambios y sin inventar intentos ni entrega (C9) | Propuesta |
 | E16 | Transporte | Fase offline con `FakeBackend`/`MinimalFixture` y un runner funcional simulado que devuelve `failed` y después `passed`, sin llamadas a proveedores ni gasto. El carril Docker (`FLEET_FUNCTIONAL_DOCKER_TESTS=1`) y la validación con modelos requieren autorizaciones separadas | Decidida (D5) en la fase offline |
 | E17 | Scope obligatorio | Una `repair_policy` exige contrato de scope físico: sin él no se crea la Mission. Así todo archivo v9 lleva la capa de scope y un incumplimiento de alcance impide el éxito (C7) | Propuesta |
@@ -240,6 +240,6 @@ evidencia.
 | D4 | Cierre | `automatic`, con las condiciones de E13 |
 | D5 | Límites | `max_attempts: 3` (inicial más dos reparaciones) y `deadline_seconds: 3600` totales, no renovables al reiniciar o reanudar. Agotar un límite conserva el trabajo parcial y registra la causa. Fase offline sin llamadas a proveedores y con gasto cero |
 
-Al aprobar esta especificación, las filas D1, D4 y D5 de la constitución (§7)
-pasan a «decididas» y se redacta el plan de implementación en
-`docs/superpowers/plans/`.
+Con la aprobación, las filas D1, D4 y D5 de la constitución (§7) constan como
+decididas. El plan de implementación está en
+[`docs/superpowers/plans/2026-09-28-etapa1-cierre-mission.md`](../plans/2026-09-28-etapa1-cierre-mission.md).
