@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager
+import copy
 from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
@@ -907,6 +908,35 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         _require_fields(kind, payload, {"compiled_digest", "policy_artifact_id"})
         for field in payload:
             _require_sha(payload[field], "repair policy " + field)
+    elif kind == "repair_attempt_opened":
+        _require_fields(kind, payload, {"ordinal", "feedback_artifact_id"})
+        ordinal = payload["ordinal"]
+        if type(ordinal) is not int or not 1 <= ordinal <= 20:
+            raise MissionStateError("invalid repair attempt ordinal")
+        if (payload["feedback_artifact_id"] is None) is not (ordinal == 1):
+            raise MissionStateError("only repair attempts after the first carry feedback")
+        if payload["feedback_artifact_id"] is not None:
+            _require_sha(payload["feedback_artifact_id"], "repair feedback")
+    elif kind == "repair_attempt_settled":
+        _require_fields(kind, payload, {"ordinal", "tree_sha", "functional_attempt_id", "receipt_artifact_id",
+                                        "status", "unchanged_from", "feedback_artifact_id"})
+        ordinal = payload["ordinal"]
+        if type(ordinal) is not int or not 1 <= ordinal <= 20:
+            raise MissionStateError("invalid repair attempt ordinal")
+        if not isinstance(payload["tree_sha"], str) or not GIT_OID.fullmatch(payload["tree_sha"]):
+            raise MissionStateError("invalid repair attempt tree identity")
+        _require_uuid(payload["functional_attempt_id"], "repair functional attempt")
+        _require_sha(payload["receipt_artifact_id"], "repair functional receipt")
+        if payload["status"] not in {"passed", "failed"}:
+            raise MissionStateError("only passed or failed functional checks settle a repair attempt")
+        if (payload["feedback_artifact_id"] is None) is not (payload["status"] == "passed"):
+            raise MissionStateError("a failed repair attempt, and only it, carries feedback")
+        if payload["feedback_artifact_id"] is not None:
+            _require_sha(payload["feedback_artifact_id"], "repair feedback")
+        unchanged = payload["unchanged_from"]
+        if unchanged is not None and (type(unchanged) is not int or not 1 <= unchanged < ordinal
+                                      or payload["status"] != "failed"):
+            raise MissionStateError("an unchanged revision reuses an earlier failed attempt")
     elif kind == "functional_check_started":
         _require_fields(kind, payload, {"contract_artifact_id", "attempt_id", "tree_sha"})
         _require_sha(payload["contract_artifact_id"], "functional contract")
@@ -2736,6 +2766,46 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                     or payload["policy_artifact_id"] != result.get("repair_policy_sha256")):
                 raise MissionConflict("repair policy must be frozen by CONTROL once, as bound at creation, before boot")
             result["repair_policy"] = {**payload, "event_sha256": event["event_sha256"]}
+            result["repair_attempts"] = []
+        elif kind == "repair_attempt_opened":
+            attempts = result.get("repair_attempts")
+            previous = attempts[-1] if attempts else None
+            if (event["actor"] != "CONTROL" or attempts is None or result["status"] != "running"
+                    or payload["ordinal"] != len(attempts) + 1
+                    or (previous is not None and (previous["settled"] is None or previous["settled"]["status"] != "failed"))
+                    or result.get("herdr_control", {}).get("desired", "running") != "running"
+                    or parse_timestamp(event["timestamp"], "repair attempt")
+                    >= parse_timestamp(result["admission_policy"]["deadline_at"], "repair deadline")):
+                raise MissionConflict("a repair attempt opens once, in order, after a failed attempt, "
+                                      "while running, uncancelled and before the deadline")
+            _require_no_active_admissions(result, "repair attempt opening")
+            if previous is not None:
+                # The previous attempt's functional record is retained in its
+                # settlement; the new ordinal starts without a functional attempt.
+                result["functional_attempt"] = None
+            attempts.append({**payload, "event_sha256": event["event_sha256"], "functional": None, "settled": None})
+        elif kind == "repair_attempt_settled":
+            attempts = result.get("repair_attempts") or []
+            attempt = attempts[-1] if attempts else None
+            functional = result.get("functional_attempt")
+            if (event["actor"] != "CONTROL" or attempt is None or attempt["settled"] is not None
+                    or payload["ordinal"] != attempt["ordinal"]):
+                raise MissionConflict("a repair attempt settles once, as the open attempt")
+            if payload["unchanged_from"] is None:
+                if (not functional or not functional.get("result")
+                        or functional["attempt_id"] != payload["functional_attempt_id"]
+                        or functional["tree_sha"] != payload["tree_sha"]
+                        or functional["result"]["receipt_artifact_id"] != payload["receipt_artifact_id"]
+                        or functional["result"]["status"] != payload["status"]):
+                    raise MissionConflict("repair settlement must match this attempt's functional result")
+                attempt["functional"] = copy.deepcopy(functional)
+            else:
+                source = attempts[payload["unchanged_from"] - 1]["settled"]
+                if (functional or source is None or source["status"] != "failed"
+                        or any(source[key] != payload[key] for key in
+                               ("tree_sha", "functional_attempt_id", "receipt_artifact_id"))):
+                    raise MissionConflict("an unchanged revision must reuse the earlier failed receipt without a new run")
+            attempt["settled"] = {**payload, "event_sha256": event["event_sha256"]}
         elif kind == "functional_check_started":
             if (event["actor"] != "CONTROL" or not result.get("functional_policy")
                     or result.get("functional_attempt") or result["status"] not in {"running", "completing"}

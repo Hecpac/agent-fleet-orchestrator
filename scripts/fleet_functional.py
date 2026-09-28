@@ -154,7 +154,8 @@ def load_policy(runs, mid):
     return current, spec
 
 
-def run(runs, mid, frozen, *, interrupt=None):
+def bind_attempt(runs, mid, frozen):
+    """Bind the frozen tree to its functional contract; returns (current, spec, contract, id)."""
     current, spec = load_policy(runs, mid)
     if spec is None:
         raise FunctionalError("functional policy is required before execution")
@@ -164,7 +165,27 @@ def run(runs, mid, frozen, *, interrupt=None):
             or fleet_archive_tree.tree_hash_from_tar(tree, "sha1" if len(frozen["tree_sha"]) == 40 else "sha256") != frozen["tree_sha"]):
         raise FunctionalError("functional frozen tree binding mismatch")
     contract = contract_for(mid, frozen, spec)
-    identifier = digest(contract)
+    return current, spec, contract, digest(contract)
+
+
+def attempt_keys(current):
+    """Idempotency keys of the functional check for the open attempt.
+
+    Missions without a repair policy, and a repair Mission's first attempt,
+    keep the historical keys; later repair attempts are keyed by ordinal.
+    """
+    attempts = current.get("repair_attempts")
+    if attempts is None:
+        return "functional:started", "functional:finished"
+    if not attempts or attempts[-1]["settled"] is not None:
+        raise FunctionalError("functional execution requires an open repair attempt")
+    suffix = "" if attempts[-1]["ordinal"] == 1 else f":repair-{attempts[-1]['ordinal']}"
+    return "functional:started" + suffix, "functional:finished" + suffix
+
+
+def run(runs, mid, frozen, *, interrupt=None):
+    current, spec, contract, identifier = bind_attempt(runs, mid, frozen)
+    started_key, finished_key = attempt_keys(current)
     read = lambda key: fleet_artifacts.get_bytes(runs, mid, key)
     prior = current.get("functional_attempt")
     def stop_requested():
@@ -192,7 +213,7 @@ def run(runs, mid, frozen, *, interrupt=None):
             outcome["reason"] = "interrupted_attempt_cleanup_unconfirmed"
     else:
         fleet_artifacts.put_bytes(runs, mid, fleet_json.canonical_bytes(contract))
-        state.append_event(runs, mid, kind="functional_check_started", actor="CONTROL", idempotency_key="functional:started",
+        state.append_event(runs, mid, kind="functional_check_started", actor="CONTROL", idempotency_key=started_key,
             payload={"contract_artifact_id": identifier, "attempt_id": contract["attempt_id"], "tree_sha": frozen["tree_sha"]})
         try:
             tests_path = Path(spec["tests"]["path"])
@@ -212,7 +233,7 @@ def run(runs, mid, frozen, *, interrupt=None):
         "evidence": {name: fleet_artifacts.put_bytes(runs, mid, raw)["artifact_id"] for name, raw in outcome["evidence"].items()}}
     verify_receipt(contract, receipt, read)
     stored = fleet_artifacts.put_bytes(runs, mid, fleet_json.canonical_bytes(receipt))
-    state.append_event(runs, mid, kind="functional_check_finished", actor="CONTROL", idempotency_key="functional:finished",
+    state.append_event(runs, mid, kind="functional_check_finished", actor="CONTROL", idempotency_key=finished_key,
         payload={"contract_artifact_id": identifier, "attempt_id": contract["attempt_id"],
                  "receipt_artifact_id": stored["artifact_id"], "status": receipt["status"]})
     return receipt

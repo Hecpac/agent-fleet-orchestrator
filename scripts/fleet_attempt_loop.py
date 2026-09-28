@@ -30,10 +30,16 @@ def functional_feedback(check: dict[str, Any]) -> dict[str, Any]:
 
 
 def checks_rejected(checks_sha256: str, *, failed_requirements: Iterable[str],
-                    scope_issues: list[Any], functional: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Feedback for a revision the controller's checks rejected."""
+                    scope_issues: list[Any], functional: dict[str, Any] | None = None,
+                    unchanged_from: int | None = None) -> dict[str, Any]:
+    """Feedback for a revision the controller's checks rejected.
+
+    ``unchanged_from`` names an earlier attempt whose revision was identical;
+    it is present only when given, so existing feedback bytes do not change.
+    """
     return {"reason": "checks_rejected", "detail": {"checks_sha256": checks_sha256,
         "failed_requirements": list(failed_requirements),
         "scope_issues": scope_issues[:SCOPE_ISSUE_LIMIT],
         "scope_issue_count": len(scope_issues),
-        **({"functional": functional} if functional is not None else {})}}
+        **({"functional": functional} if functional is not None else {}),
+        **({"unchanged_from": unchanged_from} if unchanged_from is not None else {})}}

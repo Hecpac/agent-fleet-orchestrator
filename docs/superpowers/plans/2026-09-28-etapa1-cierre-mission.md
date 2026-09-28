@@ -1,6 +1,6 @@
 # Etapa 1 — Cerrar el ciclo de una Mission: plan de implementación
 
-> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 y S2 implementados ·
+> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1, S2 y S3 implementados ·
 > **Especificación (leer primero):**
 > [`docs/superpowers/specs/2026-09-28-etapa1-cierre-mission-design.md`](../specs/2026-09-28-etapa1-cierre-mission-design.md) ·
 > **Base:** `main` en `75baa80`.
@@ -27,6 +27,7 @@ dentro de una misma Mission MINIMAL con el contrato funcional
 | --- | --- | --- |
 | `scripts/fleet_herdr_repair_policy.py` | Nuevo | Esquema `fleet.repair-policy.v1` (`max_attempts`, `closure_policy`, `delivery_root`), validación y congelación en la creación |
 | `scripts/fleet_attempt_loop.py` | Nuevo | Mecánica común de intentos: límite, feedback `checks_rejected`, agotamiento. Extraída de Owner Cycle |
+| `scripts/fleet_herdr_repair.py` | Nuevo | Apertura, evaluación y cierre de intentos por ordinal, reutilización de receipts de árboles repetidos, feedback acotado y agotamiento |
 | `scripts/fleet_herdr_delivery.py` | Nuevo | Preparación, publicación sin reemplazo, relectura, colisión y reconciliación |
 | `scripts/fleet_herdr_owner_cycle.py` | Cambio | Consume `fleet_attempt_loop` sin cambiar su comportamiento |
 | `scripts/fleet_mission_state.py` | Cambio | Eventos de intento y de entrega; `repair_policy` en el estado |
@@ -80,15 +81,20 @@ SCN-022, con casos negativos por campo. Los tests existentes de `mission-run` y
 
 ### S3 — Intentos en el ledger y check funcional por ordinal
 
-**Cambios:** `fleet_mission_state.py`, `fleet_functional.py`.
+**Cambios:** `fleet_mission_state.py`, `fleet_functional.py`,
+`fleet_herdr_repair.py` (nuevo), `fleet_attempt_loop.py`.
 
-- [ ] Eventos `repair_attempt_opened` y `repair_attempt_settled` con ordinal,
-      `tree_sha`, `attempt_id` funcional, resultado y feedback en CAS (E3).
-- [ ] El guard de `fleet_functional.py:179-181` se aplica dentro de cada ordinal;
+- [x] Eventos `repair_attempt_opened` y `repair_attempt_settled` con ordinal,
+      `tree_sha`, `attempt_id` funcional, resultado y feedback en CAS (E3). El
+      ledger exige orden, un intento anterior fallido, Mission en ejecución, sin
+      cancelación solicitada y antes de `deadline_at`.
+- [x] El guard de `fleet_functional.py:179-181` se aplica dentro de cada ordinal;
       un ordinal nuevo admite un árbol distinto o reutiliza el receipt de un
-      árbol ya evaluado, sin ejecución física (E18, §3.2).
-- [ ] Feedback solo desde el receipt, con límite de bytes y campos fijos (E6).
-- [ ] Agotamiento: terminal `failed` con `repair_attempts_exhausted` (E7).
+      árbol ya evaluado, sin ejecución física (E18, §3.2). Las claves de
+      idempotencia del check llevan el ordinal a partir del segundo intento;
+      las Missions sin política conservan las históricas.
+- [x] Feedback solo desde el receipt, con límite de bytes y campos fijos (E6).
+- [x] Agotamiento: terminal `failed` con `repair_attempts_exhausted` (E7).
 
 **Comprobaciones:** `tests/test_fleet_functional.py` (clase pura
 `FunctionalContractTests`) y `tests/test_fleet_herdr_repair_attempts.py`
