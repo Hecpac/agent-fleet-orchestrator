@@ -1553,7 +1553,7 @@ class _Driver:
         self.event("herdr_finalization_policy_frozen", "finalization-policy",
                    fleet_herdr_permissions.finalization_policy(current["compiled_digest"],
                        capsule=options.get("herdr_capsule_manifest") is not None,
-                       profile=self.profile,
+                       profile=self.profile, repair_policy_sha256=current.get("repair_policy_sha256"),
                        turns=len(current["repair_attempts"]) if current.get("repair_attempts") is not None else None))
         return self.current()["herdr_finalization_policy"]
 

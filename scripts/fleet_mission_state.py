@@ -966,16 +966,21 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         legacy = {"compiled_digest", "minimum_archive_schema_version",
                   "permissions_policy_version", "required_turns"}
         versioned = legacy | {"herdr_profile", "herdr_profile_sha256"}
+        repair = versioned | {"repair_policy_sha256"}
         fields = set(payload)
-        if fields != legacy and fields != versioned:
+        if fields != legacy and fields != versioned and fields != repair:
             raise MissionStateError("Herdr finalization policy fields are invalid")
         _require_sha(payload["compiled_digest"], "Herdr finalization compiled_digest")
-        if fields == versioned:
+        if fields in (versioned, repair):
             expected = VERSIONED_FINALIZATION_CONTRACTS.get(payload["herdr_profile"])
-            # A stage 1 repair Mission of the physical-scope profile owns one Worker
-            # turn per attempt; the reducer binds the exact count to its ledger.
-            repair_turns = (payload["herdr_profile"] == PHYSICAL_SCOPE_PROFILE_ID
-                            and type(payload["required_turns"]) is int and 1 <= payload["required_turns"] <= 20)
+            # Only a declared stage 1 repair Mission of the physical-scope profile
+            # owns one Worker turn per attempt; the reducer binds the exact count.
+            repair_turns = fields == repair
+            if repair_turns:
+                _require_sha(payload["repair_policy_sha256"], "Herdr finalization repair policy")
+                if (payload["herdr_profile"] != PHYSICAL_SCOPE_PROFILE_ID
+                        or type(payload["required_turns"]) is not int or not 1 <= payload["required_turns"] <= 20):
+                    raise MissionStateError("unsupported repair Herdr finalization policy")
             if (expected is None or any(type(payload[field]) is not int or payload[field] != value
                     for field, value in zip(("minimum_archive_schema_version",
                                              "permissions_policy_version", "required_turns"), expected)
@@ -2875,12 +2880,11 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                 raise MissionConflict("Herdr finalization policy is immutable")
             if event["actor"] != "CONTROL" or payload["compiled_digest"] != result["compiled_digest"]:
                 raise MissionStateError("Herdr finalization policy authority mismatch")
-            if payload.get("herdr_profile") in VERSIONED_FINALIZATION_CONTRACTS:
-                attempts = result.get("repair_attempts")
-                turns = (len(attempts) if attempts is not None
-                         else VERSIONED_FINALIZATION_CONTRACTS[payload["herdr_profile"]][2])
-                if payload["required_turns"] != turns:
-                    raise MissionStateError("Herdr finalization turns differ from the Mission's owned turns")
+            if payload.get("repair_policy_sha256") != result.get("repair_policy_sha256"):
+                raise MissionStateError("Herdr finalization repair policy differs from creation")
+            if ("repair_policy_sha256" in payload
+                    and payload["required_turns"] != len(result.get("repair_attempts") or [])):
+                raise MissionStateError("Herdr finalization turns differ from the Mission's repair attempts")
             result["herdr_finalization_policy"] = {**payload, "event_sha256": event["event_sha256"]}
         elif kind == "mission_admission_policy_frozen":
             if result["admission_policy"] is not None:

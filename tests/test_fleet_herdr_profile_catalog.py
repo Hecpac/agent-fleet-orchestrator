@@ -81,6 +81,16 @@ class LedgerContractPinTests(unittest.TestCase):
                     with self.assertRaises(state.MissionStateError):
                         state._validate_payload("herdr_finalization_policy_frozen", wrong)
 
+    def test_repair_turns_require_a_declared_repair_policy(self) -> None:
+        repair = self.finalization(profiles.MINIMAL, required_turns=3, repair_policy_sha256="b" * 64)
+        state._validate_payload("herdr_finalization_policy_frozen", repair)
+        for wrong in (self.finalization(profiles.RESEARCH, required_turns=3, repair_policy_sha256="b" * 64),
+                      self.finalization(profiles.MINIMAL, required_turns=21, repair_policy_sha256="b" * 64),
+                      self.finalization(profiles.MINIMAL, required_turns=3, repair_policy_sha256="short"),
+                      self.finalization(profiles.MINIMAL, required_turns=3)):
+            with self.subTest(payload=wrong), self.assertRaises(state.MissionStateError):
+                state._validate_payload("herdr_finalization_policy_frozen", wrong)
+
     def test_legacy_finalization_contract_follows_the_catalog(self) -> None:
         legacy = self.finalization(profiles.LEGACY)
         for key in ("herdr_profile", "herdr_profile_sha256"):
@@ -120,7 +130,7 @@ class CatalogPinTests(unittest.TestCase):
         # still a literal in fleet_herdr_archive.verify, and this pin is the tripwire.
         import fleet_herdr_archive
         self.assertEqual(fleet_herdr_archive.VERSIONED_ARCHIVE_PROFILES,
-                         {6: profiles.RESEARCH, 7: profiles.MINIMAL, 8: profiles.MINIMAL})
+                         {6: profiles.RESEARCH, 7: profiles.MINIMAL, 8: profiles.MINIMAL, 9: profiles.MINIMAL})
         self.assertEqual({1, 2, 3, 4}, {profiles.LEGACY.permissions_policy_version, 2,
                                         profiles.RESEARCH.permissions_policy_version,
                                         profiles.MINIMAL.permissions_policy_version})

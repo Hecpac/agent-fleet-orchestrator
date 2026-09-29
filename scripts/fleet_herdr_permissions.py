@@ -25,8 +25,8 @@ class PermissionError(ValueError):
     pass
 
 
-def finalization_policy(compiled_digest: str, *, capsule: bool = False,
-                        profile=None, turns: int | None = None) -> dict[str, Any]:
+def finalization_policy(compiled_digest: str, *, capsule: bool = False, profile=None,
+                        repair_policy_sha256: str | None = None, turns: int | None = None) -> dict[str, Any]:
     """Controller policy frozen in the Mission ledger, never inferred from an index."""
     if profile is not None and profile.permissions_policy_version in {RESEARCH_VERSION, MINIMAL_VERSION}:
         if capsule:
@@ -34,10 +34,11 @@ def finalization_policy(compiled_digest: str, *, capsule: bool = False,
         return {"compiled_digest": compiled_digest,
                 "minimum_archive_schema_version": profile.minimum_archive_schema_version,
                 "permissions_policy_version": profile.permissions_policy_version,
-                # A stage 1 repair Mission owns one Worker turn per attempt.
-                "required_turns": len(profile.stages) if turns is None else turns,
+                # A declared stage 1 repair Mission owns one Worker turn per attempt.
+                "required_turns": len(profile.stages) if repair_policy_sha256 is None else turns,
                 "herdr_profile": profile.profile_id,
-                "herdr_profile_sha256": profile.digest}
+                "herdr_profile_sha256": profile.digest,
+                **({"repair_policy_sha256": repair_policy_sha256} if repair_policy_sha256 is not None else {})}
     return {"compiled_digest": compiled_digest,
             "minimum_archive_schema_version": MINIMUM_ARCHIVE_SCHEMA_VERSION,
             "permissions_policy_version": 2 if capsule else VERSION, "required_turns": REQUIRED_TURNS}

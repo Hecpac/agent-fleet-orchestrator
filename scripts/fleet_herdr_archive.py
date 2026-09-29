@@ -705,7 +705,7 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
             finalization_policy = live_state.get("herdr_finalization_policy")
             expected_policy = fleet_herdr_permissions.finalization_policy(compiled["compiled_digest"],
                 capsule=bool(fleet_json.loads(contents["runtime-options.json"]).get("herdr_capsule_manifest")),
-                profile=profile,
+                profile=profile, repair_policy_sha256=archived_state.get("repair_policy_sha256"),
                 turns=len(archived_state["repair_attempts"]) if repair_required else None)
             if (not finalization_policy or
                     {k: v for k, v in finalization_policy.items() if k != "event_sha256"} != expected_policy):
