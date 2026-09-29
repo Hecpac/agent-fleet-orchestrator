@@ -58,6 +58,7 @@ EVENT_FIELDS = {
     "event_sha256",
 }
 TERMINAL_STATUSES = {"succeeded", "failed", "blocked", "abandoned", "indeterminate"}
+DELIVERY_STATUSES = frozenset({"delivered", "collision", "blocked", "indeterminate", "aborted"})
 ADMISSION_PHASES = {
     "reserved",
     "committed",
@@ -937,6 +938,17 @@ def _validate_payload(kind: str, payload: dict[str, Any]) -> None:
         if unchanged is not None and (type(unchanged) is not int or not 1 <= unchanged < ordinal
                                       or payload["status"] != "failed"):
             raise MissionStateError("an unchanged revision reuses an earlier failed attempt")
+    elif kind in {"delivery_started", "delivery_finished"}:
+        fields = {"ordinal", "tree_sha"} | ({"status", "receipt_artifact_id"} if kind == "delivery_finished" else set())
+        _require_fields(kind, payload, fields)
+        if type(payload["ordinal"]) is not int or not 1 <= payload["ordinal"] <= 20:
+            raise MissionStateError("invalid delivery ordinal")
+        if not isinstance(payload["tree_sha"], str) or not GIT_OID.fullmatch(payload["tree_sha"]):
+            raise MissionStateError("invalid delivery tree identity")
+        if kind == "delivery_finished":
+            if payload["status"] not in DELIVERY_STATUSES:
+                raise MissionStateError("unsupported delivery status")
+            _require_sha(payload["receipt_artifact_id"], "delivery receipt")
     elif kind == "functional_check_started":
         _require_fields(kind, payload, {"contract_artifact_id", "attempt_id", "tree_sha"})
         _require_sha(payload["contract_artifact_id"], "functional contract")
@@ -2767,6 +2779,31 @@ def derive_state(events: list[dict[str, Any]]) -> dict[str, Any]:
                 raise MissionConflict("repair policy must be frozen by CONTROL once, as bound at creation, before boot")
             result["repair_policy"] = {**payload, "event_sha256": event["event_sha256"]}
             result["repair_attempts"] = []
+            result["deliveries"] = []
+        elif kind == "delivery_started":
+            deliveries = result.get("deliveries")
+            attempts = result.get("repair_attempts") or []
+            accepted = attempts[-1]["settled"] if attempts else None
+            if (event["actor"] != "CONTROL" or deliveries is None or result["status"] != "running"
+                    or accepted is None or accepted["status"] != "passed"
+                    or (accepted["ordinal"], accepted["tree_sha"]) != (payload["ordinal"], payload["tree_sha"])
+                    or (deliveries and (deliveries[-1]["finished"] is None
+                                        or deliveries[-1]["finished"]["status"] != "aborted"))
+                    or result.get("herdr_control", {}).get("desired", "running") != "running"
+                    or parse_timestamp(event["timestamp"], "delivery start")
+                    >= parse_timestamp(result["admission_policy"]["deadline_at"], "delivery deadline")):
+                raise MissionConflict("a delivery starts only for the accepted revision, once unless aborted, "
+                                      "while running, uncancelled and before the deadline")
+            _require_no_active_admissions(result, "delivery")
+            deliveries.append({"started": {**payload, "event_sha256": event["event_sha256"],
+                                           "timestamp": event["timestamp"]}, "finished": None})
+        elif kind == "delivery_finished":
+            deliveries = result.get("deliveries") or []
+            last = deliveries[-1] if deliveries else None
+            if (event["actor"] != "CONTROL" or last is None or last["finished"] is not None
+                    or (last["started"]["ordinal"], last["started"]["tree_sha"]) != (payload["ordinal"], payload["tree_sha"])):
+                raise MissionConflict("a delivery finishes once, as the delivery in flight")
+            last["finished"] = {**payload, "event_sha256": event["event_sha256"], "timestamp": event["timestamp"]}
         elif kind == "repair_attempt_opened":
             attempts = result.get("repair_attempts")
             previous = attempts[-1] if attempts else None

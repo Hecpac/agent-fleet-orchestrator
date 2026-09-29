@@ -38,6 +38,7 @@ import fleet_herdr_launch
 import fleet_herdr_runtime
 import fleet_herdr_sdd
 import fleet_herdr_scope
+import fleet_herdr_delivery
 import fleet_herdr_repair
 import fleet_herdr_repair_policy
 import fleet_herdr_control as control
@@ -1111,6 +1112,10 @@ class _Driver:
             return self.timed_out(self.backend())
         if self.remaining_seconds() <= 0 and not any(a["active"] for a in self.current()["admissions"].values()) and not self.completed_turns():
             return self.timed_out()
+        deliveries = self.current().get("deliveries") or []
+        if deliveries and deliveries[-1]["finished"] is None and self.current()["status"] == "running":
+            # An in-flight delivery is reconciled before control can confirm (§3.4).
+            return self.deliver_accepted(None)
         stopped = self.control_stop()
         if stopped is not None:
             return stopped
@@ -1322,6 +1327,10 @@ class _Driver:
         while True:
             if self.observation_deadline is not None and time.monotonic() >= self.observation_deadline:
                 return self.response(next_action="observation budget exhausted before the next repair step")
+            deliveries = self.current().get("deliveries") or []
+            if deliveries and deliveries[-1]["finished"] is None:
+                # A delivery in flight is reconciled before control can confirm (§3.4).
+                return self.deliver_accepted(backend)
             stopped = self.control_stop(backend)
             if stopped is not None:
                 return stopped
@@ -1332,8 +1341,7 @@ class _Driver:
                 return self.response(next_action="mission authority changed; reconcile before further effects")
             step = fleet_herdr_repair.next_step(self.runs, self.mid, current)
             if step == "accepted":
-                return self.response(repair=self.repair_view(),
-                    next_action="repair attempt accepted by the functional check; delivery and closure are not available yet")
+                return self.deliver_accepted(backend)
             if step == "exhausted":
                 fleet_herdr_repair.exhaust(self.runs, self.mid)
                 return self.finish(self.response(terminal=self.current()["terminal"], repair=self.repair_view()))
@@ -1399,6 +1407,107 @@ class _Driver:
             if not outcome["settled"]:
                 return self.response(repair=self.repair_view(), next_action="required functional check "
                     + outcome["status"] + "; reconcile without automatic replay")
+
+    def delivery_stop(self) -> str | None:
+        desired = control.view(self.current())["desired"]
+        if desired == "cancel_requested":
+            return "cancel_requested"
+        if desired == "pause_requested":
+            return "pause_requested"
+        return "deadline_expired" if self.remaining_seconds() <= 0 else None
+
+    def finish_delivery(self, attempt: dict[str, Any], receipt: dict[str, Any]) -> None:
+        stored = fleet_artifacts.put_bytes(self.runs, self.mid, state.canonical_bytes(receipt))
+        self.event("delivery_finished", f"delivery:{len(self.current()['deliveries'])}:finished",
+                   {"ordinal": attempt["ordinal"], "tree_sha": attempt["tree_sha"], "status": receipt["status"],
+                    "receipt_artifact_id": stored["artifact_id"]})
+
+    def delivery_deadline_terminal(self) -> dict[str, Any]:
+        # Direct terminal: timed_out() would re-enter execute() once turns are complete.
+        state.append_terminal(self.runs, self.mid, status="failed", reason="Herdr mission deadline expired",
+                              idempotency_key="herdr:timeout-terminal")
+        return self.finish(self.response(delivery=self.delivery_view(), repair=self.repair_view()))
+
+    def deliver_accepted(self, backend: Any) -> dict[str, Any]:
+        """Deliver the accepted revision (S5 primitive) under the P0-P4 matrix of §3.4.
+
+        Closure after a correct delivery needs the multi-turn archive of S7; until
+        then the Mission stays running with an explicit pending cause.
+        """
+        current = self.current()
+        attempt = current["repair_attempts"][-1]["settled"]
+        policy = fleet_herdr_repair.load_policy(self.runs, self.mid, current)
+        root = policy["delivery_root"]
+        deliveries = current["deliveries"]
+        last = deliveries[-1] if deliveries else None
+        if last is None or (last["finished"] is not None and last["finished"]["status"] == "aborted"):
+            stop = self.delivery_stop()
+            if stop == "deadline_expired":
+                return self.delivery_deadline_terminal()  # P0
+            if stop is not None:
+                stopped = self.control_stop(backend)  # P0: nothing delivered
+                return stopped if stopped is not None else self.response(next_action="control request blocks delivery")
+            self.event("delivery_started", f"delivery:{len(deliveries) + 1}:started",
+                       {"ordinal": attempt["ordinal"], "tree_sha": attempt["tree_sha"]})
+            current = self.current()
+            last = current["deliveries"][-1]
+        if last["finished"] is None:
+            frozen = self.read(freeze_name(current))
+            if frozen["tree_sha"] != attempt["tree_sha"]:
+                raise HerdrMissionError("accepted freeze does not bind the accepted revision")
+            tree = fleet_artifacts.get_bytes(self.runs, self.mid, frozen["tree_artifact_id"])
+            try:
+                receipt = fleet_herdr_delivery.reconcile(root, self.mid, attempt["ordinal"], attempt["tree_sha"], tree,
+                                                         runs_dir=self.runs)
+                if receipt["status"] == "retry":
+                    stop = self.delivery_stop()
+                    if stop is not None:
+                        receipt = {**receipt, "status": "aborted", "reason": stop}  # P1-P2
+                    else:
+                        def guard(_final):
+                            reason = self.delivery_stop()
+                            if reason is not None:
+                                raise fleet_herdr_delivery.Aborted(reason)
+                        receipt = fleet_herdr_delivery.deliver(root, self.mid, attempt["ordinal"], attempt["tree_sha"],
+                                                               tree, runs_dir=self.runs, before_publish=guard)
+            except fleet_herdr_delivery.Aborted as exc:
+                receipt = {"status": "aborted", "path": str(fleet_herdr_delivery.final_path(
+                    root, self.mid, attempt["ordinal"], attempt["tree_sha"])), "written": False, "reason": str(exc)}
+            except fleet_herdr_delivery.DeliveryError as exc:
+                receipt = {"status": "blocked", "written": False, "reason": str(exc)}
+            self.finish_delivery(attempt, receipt)
+            current = self.current()
+            last = current["deliveries"][-1]
+        finished = last["finished"]
+        receipt = state.loads_strict(fleet_artifacts.get_bytes(self.runs, self.mid, finished["receipt_artifact_id"]))
+        if finished["status"] == "aborted":
+            if receipt.get("reason") == "deadline_expired" or self.remaining_seconds() <= 0:
+                return self.delivery_deadline_terminal()
+            stopped = self.control_stop(backend)
+            return stopped if stopped is not None else self.response(next_action="delivery aborted; resume to deliver")
+        if finished["status"] in {"collision", "blocked"}:
+            state.append_terminal(self.runs, self.mid, status="blocked",
+                reason=receipt.get("reason") or f"delivery {finished['status']}", idempotency_key="herdr:delivery-terminal")
+            return self.finish(self.response(delivery=self.delivery_view(), repair=self.repair_view()))
+        if finished["status"] == "indeterminate":
+            state.append_terminal(self.runs, self.mid, status="indeterminate",
+                reason=receipt.get("reason") or "delivery effect indeterminate", idempotency_key="herdr:delivery-terminal")
+            return self.finish(self.response(delivery=self.delivery_view(), repair=self.repair_view()))
+        # Delivered. Cancellation or the deadline still prevail over success (P3-P4).
+        if control.view(current)["desired"] == "cancel_requested":
+            stopped = self.control_stop(backend)
+            if stopped is not None:
+                return stopped
+        if (state.parse_timestamp(finished["timestamp"], "delivery receipt")
+                >= state.parse_timestamp(current["admission_policy"]["deadline_at"], "delivery deadline")):
+            return self.delivery_deadline_terminal()
+        return self.response(delivery=self.delivery_view(), repair=self.repair_view(),
+                             next_action="delivered; archive and closure pending")
+
+    def delivery_view(self) -> list[dict[str, Any]]:
+        return [{"started": {k: d["started"][k] for k in ("ordinal", "tree_sha")},
+                 "status": (d["finished"] or {}).get("status")}
+                for d in self.current().get("deliveries") or []]
 
     def repair_view(self) -> list[dict[str, Any]]:
         return [{"ordinal": a["ordinal"], "status": (a["settled"] or {}).get("status"),

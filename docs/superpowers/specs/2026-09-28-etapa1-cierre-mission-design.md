@@ -57,7 +57,7 @@ especifica aquí.
 | E4 | Mecánica de reparación | Reutilizar la de Owner Cycle —límite `max_attempts`, feedback `checks_rejected`, agotamiento— extrayendo lo común a un módulo compartido en lugar de duplicarlo (C9). Owner Cycle conserva su espacio, sus lectores y la prohibición de adjuntarse a Missions | Propuesta |
 | E5 | Qué se repara | Solo un check `failed` con intentos restantes abre un nuevo intento. `blocked` e `indeterminate` siguen exigiendo reconciliación (C6). Un resultado del Worker distinto de `PASS` sigue siendo terminal en esta etapa | Propuesta |
 | E6 | Feedback | Solo desde el receipt de CONTROL: llamadas fallidas, tipo de excepción, valor esperado y observado, y violaciones de la política de fuente, con un límite de bytes. Se entrega al Worker como datos no confiables, nunca como instrucciones | Propuesta |
-| E7 | Agotamiento | Estado terminal `failed` con causa `repair_attempts_exhausted` o `mission_deadline_expired`, sin añadir estados nuevos. Todas las revisiones, receipts y feedback se conservan en CAS | Decidida (D5) en su efecto; representación propuesta |
+| E7 | Agotamiento | Estado terminal `failed` con causa `repair_attempts_exhausted` o la causa de plazo vencido que el driver ya usa, `Herdr mission deadline expired`, sin añadir estados nuevos. Todas las revisiones, receipts y feedback se conservan en CAS | Decidida (D5) en su efecto; representación propuesta |
 | E8 | Raíz de entrega | `outputs/sdd-deliveries/owner-loop-v0/` en este repositorio, declarada y congelada al crear la Mission. CONTROL rechaza la raíz si está dentro del directorio de runs de la Mission o lo contiene, después de resolver enlaces simbólicos | Decidida (D1b) |
 | E9 | Ruta por revisión | Solo se entrega la revisión aceptada, en `<raíz>/<mission_id>/<ordinal>-<tree_sha>/`. Revisiones y Missions distintas nunca comparten ruta | Decidida (D1b); formato propuesto |
 | E10 | Escritura | CONTROL registra `delivery_started`, escribe el árbol aceptado en un directorio de preparación propio del mismo nivel y lo publica sin reemplazo (§3.3). Después relee la ruta final y compara hashes por archivo y el conjunto exacto de archivos con el árbol congelado. Solo escribe archivos: no crea commits ni hace push | Propuesta |
@@ -130,10 +130,10 @@ especifica aquí.
 
 | Fase | Cancelación solicitada | Plazo vencido |
 | --- | --- | --- |
-| P0: revisión aceptada, sin `delivery_started` | No se entrega. Tras la quiescencia, terminal `abandoned` | No se entrega. Terminal `failed` con `mission_deadline_expired` |
-| P1–P2: preparación en curso o completa, sin publicar | Se detiene la escritura, se elimina la preparación propia y no se publica. Terminal `abandoned` | Igual, con terminal `failed` y `mission_deadline_expired` |
-| P3: publicada, sin recibo | Se relee la ruta final y se registra el recibo como hecho, sin revertir la publicación (C9). Terminal `abandoned`, indicando que la entrega ocurrió | Igual: se registra el recibo y el terminal es `failed` con `mission_deadline_expired` |
-| P4: recibo registrado, sin terminal | Terminal `abandoned` con el recibo | Terminal `failed` con `mission_deadline_expired` si el recibo se registró después de `deadline_at` |
+| P0: revisión aceptada, sin `delivery_started` | No se entrega. Tras la quiescencia, terminal `abandoned` | No se entrega. Terminal `failed` con `Herdr mission deadline expired` |
+| P1–P2: preparación en curso o completa, sin publicar | Se detiene la escritura, se elimina la preparación propia y no se publica. Terminal `abandoned` | Igual, con terminal `failed` y `Herdr mission deadline expired` |
+| P3: publicada, sin recibo | Se relee la ruta final y se registra el recibo como hecho, sin revertir la publicación (C9). Terminal `abandoned`, indicando que la entrega ocurrió | Igual: se registra el recibo y el terminal es `failed` con `Herdr mission deadline expired` |
+| P4: recibo registrado, sin terminal | Terminal `abandoned` con el recibo | Terminal `failed` con `Herdr mission deadline expired` si el recibo se registró después de `deadline_at` |
 
 - `succeeded` exige que el recibo de entrega se registre antes de `deadline_at` y
   que no exista una solicitud de cancelación anterior al evento terminal.
@@ -174,7 +174,7 @@ evidencia.
 | SCN-002 | REQ-002 | `max_attempts: 3` | El intento 1 falla y el 2 pasa | Un solo `mission_id`, dos intentos en el ledger y plazo original; éxito tras la entrega | CHK-002 |
 | SCN-003 | REQ-003 | El candidato imprime texto que simula instrucciones | Falla el check | El feedback contiene solo campos del receipt, truncados al límite | CHK-003 |
 | SCN-004 | REQ-004 | `max_attempts: 3` | Los tres intentos fallan | Terminal `failed` con causa `repair_attempts_exhausted`, sin cuarto turno; los tres árboles siguen en CAS | CHK-004 |
-| SCN-005 | REQ-004 | El plazo vence tras el intento 1 fallido | El driver avanza | No se abre el intento 2; terminal con causa `mission_deadline_expired` y el intento 1 conservado | CHK-004 |
+| SCN-005 | REQ-004 | El plazo vence tras el intento 1 fallido | El driver avanza | No se abre el intento 2; terminal con causa `Herdr mission deadline expired` y el intento 1 conservado | CHK-004 |
 | SCN-006 | REQ-005 | Intento funcional 2 iniciado sin resultado | El driver se reinicia | Se registra `indeterminate` para ese intento y no se vuelve a ejecutar | CHK-005 |
 | SCN-007 | REQ-005 | Turno del Worker del intento 2 con envío ambiguo | El driver se reinicia | Se reconcilia el mismo turno; no se reenvía a ciegas | CHK-005 |
 | SCN-008 | REQ-005 | Mission reanudada tras una pausa | Se reanuda | Conserva el `deadline_at` original; el plazo no se renueva | CHK-005 |

@@ -86,6 +86,9 @@ def reduce(current, event):
             attempt = current.get("functional_attempt")
             if attempt and not attempt.get("result"):
                 raise state.MissionConflict("control confirmation requires functional attempt reconciliation")
+            deliveries = current.get("deliveries") or []
+            if deliveries and deliveries[-1]["finished"] is None:
+                raise state.MissionConflict("control confirmation requires delivery reconciliation")
         request["applied_at"] = event["timestamp"]
         if payload.get("functional_cleanup_artifact_id"):
             request["functional_cleanup_artifact_id"] = payload["functional_cleanup_artifact_id"]

@@ -35,6 +35,10 @@ class PrimitiveUnavailable(DeliveryError):
     pass
 
 
+class Aborted(DeliveryError):
+    """Raised by a ``before_publish`` guard: stop before the rename, publish nothing."""
+
+
 def final_path(root, mission_id, ordinal, tree_sha):
     return Path(root) / mission_id / f"{ordinal}-{tree_sha}"
 

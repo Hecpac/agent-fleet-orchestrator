@@ -1,6 +1,6 @@
 # Etapa 1 — Cerrar el ciclo de una Mission: plan de implementación
 
-> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 a S5 implementados ·
+> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 a S6 implementados ·
 > **Especificación (leer primero):**
 > [`docs/superpowers/specs/2026-09-28-etapa1-cierre-mission-design.md`](../specs/2026-09-28-etapa1-cierre-mission-design.md) ·
 > **Base:** `main` en `75baa80`.
@@ -155,13 +155,25 @@ el rename.
 
 ### S6 — Entrega, cierre y fases en el driver
 
-**Cambios:** `fleet_herdr_mission.py`, `fleet_mission_state.py`.
+**Cambios:** `fleet_herdr_mission.py`, `fleet_mission_state.py`,
+`fleet_herdr_control.py`.
 
-- [ ] Eventos `delivery_started` y `delivery_finished`; recibo en CAS.
-- [ ] Cierre automático solo con requisitos cumplidos, recibo idéntico al árbol
-      aceptado y registrado antes de `deadline_at`, y sin cancelación solicitada
-      (E13, §3.4).
-- [ ] Matriz de fases P0–P4 para cancelación y plazo; `indeterminate` si no puede
+El terminal `succeeded` no se añade en S6: el cierre exige el archivo
+verificado, que hoy admite un único turno y la congelación del primer intento.
+Una entrega correcta deja la Mission en ejecución con la causa «delivered;
+archive and closure pending» hasta S7. Sí son terminales de S6 `abandoned`,
+`failed`, `blocked` e `indeterminate` de la matriz P0–P4.
+
+- [x] Eventos `delivery_started` y `delivery_finished`; recibo en CAS. El ledger
+      solo admite el inicio para la revisión aceptada, en ejecución, sin
+      cancelación y antes de `deadline_at`; una entrega abortada por pausa puede
+      reiniciarse.
+- [x] La confirmación de pausa o cancelación exige que no haya una entrega en
+      curso; el driver la concilia antes de cualquier confirmación.
+- [x] Regla de cierre de §3.4 aplicada a las causas de no éxito: una cancelación
+      o un recibo posterior a `deadline_at` impiden el éxito. El terminal
+      `succeeded` queda para S7.
+- [x] Matriz de fases P0–P4 para cancelación y plazo; `indeterminate` si no puede
       establecerse la publicación (E20).
 
 **Comprobaciones:** ampliar `tests/test_fleet_herdr_repair_loop.py`: SCN-002
@@ -170,7 +182,14 @@ completo, SCN-017, SCN-018, SCN-029 y SCN-030 (CHK-002, CHK-011, CHK-016).
 ### S7 — Archivo v9 y verificación
 
 **Cambios:** `fleet_herdr_archive.py`, `fleet_herdr_profile.py` si hace falta
-declarar la versión.
+declarar la versión, `fleet_functional.py` y el cierre en `fleet_herdr_mission.py`.
+
+- [ ] `archive.create`, `archive.verify` y `fleet_functional.archived_receipt`
+      usan la congelación del intento aceptado (`freeze_name`), no la del primero.
+- [ ] La política de finalización y la prueba de permisos cuentan los turnos
+      reales de la Mission de reparación en lugar de `len(profile.stages)`.
+- [ ] El terminal `succeeded` llega aquí, con la regla de §3.4: recibo de entrega
+      registrado antes de `deadline_at` y ninguna cancelación solicitada.
 
 - [ ] v9 = capa de scope de v8 más `attempts/` y `delivery/receipt.json` (§3.1).
 - [ ] Generalizar `fleet_herdr_archive.py:561`: con scope, v8 o v9; con

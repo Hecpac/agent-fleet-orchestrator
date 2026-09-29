@@ -11,7 +11,9 @@ from tests.test_fleet_herdr_repair_attempts import failed_outcome
 from tests.test_fleet_herdr_scope import contract as scope_contract
 
 import fleet_acceptance
+import fleet_artifacts
 import fleet_functional
+import fleet_herdr_delivery
 import fleet_herdr_control
 import fleet_herdr_mission
 import fleet_herdr_repair
@@ -20,7 +22,7 @@ import fleet_mission
 import fleet_mission_state as state
 
 
-class RepairLoopTests(MinimalFixture):
+class RepairFixture(MinimalFixture):
     def setUp(self):
         super().setUp()
         self.outcomes, self.physical_runs = [], 0
@@ -70,6 +72,8 @@ class RepairLoopTests(MinimalFixture):
     def attempts(self, mid):
         return fleet_mission.load_state(self.runs, mid)["repair_attempts"]
 
+
+class RepairLoopTests(RepairFixture):
     def test_without_policy_a_failed_check_still_ends_the_mission(self):
         mid = self.create_repair(policy=False, key="no-policy")
         self.outcomes = [failed_outcome()]
@@ -85,7 +89,7 @@ class RepairLoopTests(MinimalFixture):
         self.outcomes, self.contents = [failed_outcome(), "passed"], {2: "implemented v2\n"}
         result = fleet_herdr_mission.drive(self.runs, mid)
         self.assertEqual(result["status"], "running")
-        self.assertIn("repair attempt accepted", result["next_action"])
+        self.assertIn("delivered; archive and closure pending", result["next_action"])
         self.assertEqual([a["status"] for a in result["repair"]], ["failed", "passed"])
         submits = self.submits()
         self.assertEqual([call[1] for call in submits], ["build", "build"])
@@ -186,7 +190,7 @@ class RepairLoopTests(MinimalFixture):
         with self.assertRaises(RuntimeError):
             fleet_herdr_mission.drive(self.runs, mid)
         result = fleet_herdr_mission.drive(self.runs, mid)
-        self.assertIn("repair attempt accepted", result["next_action"])
+        self.assertIn("delivered; archive and closure pending", result["next_action"])
         self.assertEqual(len(self.submits()), 2)
 
     def test_offline_loop_uses_only_the_simulated_backend_and_runner(self):
@@ -195,7 +199,7 @@ class RepairLoopTests(MinimalFixture):
         with mock.patch.object(fleet_functional.runner, "Docker", side_effect=AssertionError("no Docker")), \
              mock.patch.object(fleet_herdr_mission.fleet_herdr, "HerdrBackend", MinimalBackend):
             result = fleet_herdr_mission.drive(self.runs, mid)
-        self.assertIn("repair attempt accepted", result["next_action"])
+        self.assertIn("delivered; archive and closure pending", result["next_action"])
         self.assertEqual({call[0] for call in MinimalBackend.calls} - {"boot", "submit", "collect", "wait", "recover"},
                          set())
         self.assertEqual((self.physical_runs, self.outcomes), (2, []))
@@ -206,6 +210,168 @@ class RepairLoopTests(MinimalFixture):
         plain = self.create_repair(policy=False, key="plain-credits")
         self.assertEqual(fleet_mission.load_state(self.runs, plain)["admission_policy"]["delegation_credits"], 1)
 
+
+class RepairDeliveryTests(RepairFixture):
+    """Stage 1 S6: delivery of the accepted revision and the P0-P4 matrix of §3.4."""
+
+    def accepted_mission(self, key="delivery"):
+        mid = self.create_repair(key=key)
+        self.outcomes, self.contents = [failed_outcome(), "passed"], {2: "implemented v2\n"}
+        return mid
+
+    def final(self, mid):
+        current = fleet_mission.load_state(self.runs, mid)
+        accepted = current["repair_attempts"][-1]["settled"]
+        return fleet_herdr_delivery.final_path(self.root / "deliveries", mid, accepted["ordinal"], accepted["tree_sha"])
+
+    def terminal(self, mid):
+        return fleet_mission.load_state(self.runs, mid).get("terminal")
+
+    def test_accepted_revision_is_delivered_and_read_back(self):
+        mid = self.accepted_mission()
+        result = fleet_herdr_mission.drive(self.runs, mid)
+        final = self.final(mid)
+        self.assertEqual(result["status"], "running")
+        self.assertEqual(result["delivery"], [{"started": {"ordinal": 2, "tree_sha": final.name.split("-", 1)[1]},
+                                               "status": "delivered"}])
+        self.assertEqual((final / "notes.txt").read_text(), "implemented v2\n")
+        self.assertEqual((final / "answer.txt").read_text(), "implemented\n")
+        self.assertIsNone(self.terminal(mid))
+        self.assertEqual(sorted(p.name for p in final.parent.iterdir()), [final.name])
+
+    def test_collision_blocks_only_the_delivery_and_keeps_the_result(self):
+        mid = self.accepted_mission("collision")
+        original = fleet_herdr_delivery.deliver
+
+        def foreign_first(root, mission_id, ordinal, tree_sha, tree, **kwargs):
+            final = fleet_herdr_delivery.final_path(root, mission_id, ordinal, tree_sha)
+            final.mkdir(parents=True)
+            (final / "foreign.txt").write_text("keep\n")
+            return original(root, mission_id, ordinal, tree_sha, tree, **kwargs)
+
+        with mock.patch.object(fleet_herdr_delivery, "deliver", foreign_first):
+            result = fleet_herdr_mission.drive(self.runs, mid)
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(self.terminal(mid)["reason"], "delivery_collision")
+        self.assertEqual([p.name for p in self.final(mid).iterdir()], ["foreign.txt"])
+        self.assertEqual(fleet_mission.load_state(self.runs, mid)["repair_attempts"][-1]["settled"]["status"], "passed")
+
+    def crash_after(self, publish):
+        original = fleet_herdr_delivery.deliver
+
+        def crash(*args, **kwargs):
+            if publish:
+                original(*args, **kwargs)
+            raise KeyboardInterrupt("controller lost during delivery")
+
+        return mock.patch.object(fleet_herdr_delivery, "deliver", crash)
+
+    def test_restart_after_publication_records_it_without_a_second_write(self):
+        mid = self.accepted_mission("after-publish")
+        with self.crash_after(publish=True), self.assertRaises(KeyboardInterrupt):
+            fleet_herdr_mission.drive(self.runs, mid)
+        written = (self.final(mid) / "notes.txt").stat().st_mtime_ns
+        with mock.patch.object(fleet_herdr_delivery, "deliver", side_effect=AssertionError("no second write")):
+            result = fleet_herdr_mission.drive(self.runs, mid)
+        self.assertIn("delivered; archive and closure pending", result["next_action"])
+        self.assertEqual((self.final(mid) / "notes.txt").stat().st_mtime_ns, written)
+
+    def test_restart_before_publication_delivers_once(self):
+        mid = self.accepted_mission("before-publish")
+        with self.crash_after(publish=False), self.assertRaises(KeyboardInterrupt):
+            fleet_herdr_mission.drive(self.runs, mid)
+        self.assertFalse(self.final(mid).exists())
+        result = fleet_herdr_mission.drive(self.runs, mid)
+        self.assertIn("delivered; archive and closure pending", result["next_action"])
+        self.assertEqual([d["status"] for d in result["delivery"]], ["delivered"])
+
+    def test_foreign_destination_after_restart_is_indeterminate(self):
+        mid = self.accepted_mission("indeterminate")
+        with self.crash_after(publish=False), self.assertRaises(KeyboardInterrupt):
+            fleet_herdr_mission.drive(self.runs, mid)
+        self.final(mid).mkdir(parents=True)
+        (self.final(mid) / "foreign.txt").write_text("unknown writer\n")
+        result = fleet_herdr_mission.drive(self.runs, mid)
+        self.assertEqual((result["status"], self.terminal(mid)["reason"]),
+                         ("indeterminate", "destination_changed_after_start"))
+
+    def cancel_when(self, target, *, before=True):
+        original = getattr(fleet_herdr_delivery, target) if target != "evaluate" else fleet_herdr_repair.evaluate
+        module = fleet_herdr_repair if target == "evaluate" else fleet_herdr_delivery
+
+        def wrapped(runs_or_root, mission_id, *args, **kwargs):
+            if before:
+                fleet_herdr_control.request(self.runs, mission_id, action="cancel", reason="stop", idempotency_key="stop")
+            value = original(runs_or_root, mission_id, *args, **kwargs)
+            if not before:
+                fleet_herdr_control.request(self.runs, mission_id, action="cancel", reason="stop", idempotency_key="stop")
+            return value
+
+        return mock.patch.object(module, target, wrapped)
+
+    def test_cancel_in_each_delivery_phase(self):
+        cases = (("p0", "evaluate", False, False), ("p1-p2", "deliver", True, False), ("p3-p4", "deliver", False, True))
+        for label, target, before, delivered in cases:
+            with self.subTest(phase=label):
+                mid = self.accepted_mission("cancel-" + label)
+                if label == "p0":
+                    self.outcomes = [failed_outcome(), "passed"]
+                with self.cancel_when(target, before=before):
+                    result = fleet_herdr_mission.drive(self.runs, mid)
+                current = fleet_mission.load_state(self.runs, mid)
+                self.assertEqual((result["status"], current["status"]), ("abandoned", "abandoned"))
+                self.assertEqual(self.final(mid).exists(), delivered)
+                statuses = [(d["finished"] or {}).get("status") for d in current["deliveries"]]
+                self.assertEqual(statuses, {"p0": [], "p1-p2": ["aborted"], "p3-p4": ["delivered"]}[label])
+                self.assertFalse(any(p.name.startswith(".staging") for p in self.final(mid).parent.glob("*"))
+                                 if self.final(mid).parent.exists() else False)
+
+    def test_deadline_in_each_delivery_phase(self):
+        original = fleet_herdr_mission._Driver.remaining_seconds
+        for label in ("p0", "p1-p2", "p4"):
+            with self.subTest(phase=label):
+                mid = self.accepted_mission("deadline-" + label)
+                calls = {"n": 0}
+
+                def remaining(driver):
+                    current = driver.current()
+                    accepted = next((a for a in current.get("repair_attempts") or []
+                                     if (a["settled"] or {}).get("status") == "passed"), None)
+                    started = current.get("deliveries")
+                    if label == "p0" and accepted:
+                        return 0
+                    if label == "p1-p2" and started:
+                        calls["n"] += 1
+                        return 0 if calls["n"] > 1 else original(driver)
+                    return original(driver)
+
+                finish = fleet_herdr_mission._Driver.finish_delivery
+
+                def late_finish(driver, attempt, receipt):
+                    deadline = driver.current()["admission_policy"]["deadline_at"]
+                    with mock.patch.object(state, "_next_timestamp", return_value=deadline):
+                        return finish(driver, attempt, receipt)
+
+                with mock.patch.object(fleet_herdr_mission._Driver, "remaining_seconds", remaining), \
+                     mock.patch.object(fleet_herdr_mission._Driver, "finish_delivery",
+                                       late_finish if label == "p4" else finish):
+                    result = fleet_herdr_mission.drive(self.runs, mid)
+                self.assertEqual((result["status"], self.terminal(mid)["reason"]),
+                                 ("failed", "Herdr mission deadline expired"))
+                self.assertEqual(self.final(mid).exists(), label == "p4")
+
+    def test_control_confirmation_waits_for_an_inflight_delivery(self):
+        mid = self.accepted_mission("confirm")
+        with self.crash_after(publish=False), self.assertRaises(KeyboardInterrupt):
+            fleet_herdr_mission.drive(self.runs, mid)
+        fleet_herdr_control.request(self.runs, mid, action="cancel", reason="stop", idempotency_key="stop")
+        view = fleet_herdr_control.view(fleet_mission.load_state(self.runs, mid))
+        with self.assertRaisesRegex(state.MissionConflict, "delivery reconciliation"):
+            fleet_herdr_control.acknowledge(self.runs, mid, view["requests"][view["latest"]])
+        result = fleet_herdr_mission.drive(self.runs, mid)
+        self.assertEqual(result["status"], "abandoned")
+        self.assertEqual([(d["finished"] or {}).get("status")
+                          for d in fleet_mission.load_state(self.runs, mid)["deliveries"]], ["aborted"])
 
 if __name__ == "__main__":
     import unittest
