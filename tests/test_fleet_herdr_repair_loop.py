@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from unittest import mock
 
 from tests import test_fleet_herdr_research as research_fixtures
@@ -22,6 +23,9 @@ import fleet_herdr_repair_policy
 import fleet_json
 import fleet_mission
 import fleet_mission_state as state
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 class RepairFixture(MinimalFixture):
@@ -452,6 +456,41 @@ class RepairArchiveTests(RepairFixture):
             {"repair/attempts.json": self.entry(archive, "repair/attempts.json")}))
         with self.assertRaises(fleet_herdr_archive.HerdrArchiveError):
             fleet_herdr_archive.verify(self.runs, mid, require_anchor=False)
+
+
+class RepairEndToEndTests(RepairFixture):
+    """Stage 1 S8: the stats task with its SDD plan, repaired, delivered and closed offline."""
+
+    PLAN = ROOT / "examples" / "sdd" / "stats-repair-delivery.json"
+
+    def test_stats_task_repairs_delivers_and_closes_with_its_sdd_plan(self):
+        scope = scope_contract()
+        scope["editable_paths"].append("notes.txt")
+        options = {**self.options(), "functional_contract": synthetic_spec(), "scope_contract": scope,
+                   "repair_policy": {"schema": fleet_herdr_repair_policy.SCHEMA, "max_attempts": 3,
+                                     "closure_policy": "automatic", "delivery_root": str(self.root / "deliveries")}}
+        mid = fleet_mission.create_mission(self.runs, compiled=self.compiled, feature="stats-e2e",
+            objective="Implement sample_stats.stats", target_repo=self.target, base_sha=self.head,
+            idempotency_key=fleet_acceptance.bound_key("stats-e2e", self.contract), runtime_options=options,
+            sdd_plan_path=self.PLAN)[0]
+        self.outcomes, self.contents = [failed_outcome(), "passed"], {2: "implemented v2\n"}
+        with mock.patch.object(fleet_functional.runner, "Docker", side_effect=AssertionError("no Docker")):
+            result = fleet_herdr_mission.drive(self.runs, mid)
+        current = fleet_mission.load_state(self.runs, mid)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual([a["settled"]["status"] for a in current["repair_attempts"]], ["failed", "passed"])
+        accepted = current["repair_attempts"][-1]["settled"]
+        final = fleet_herdr_delivery.final_path(self.root / "deliveries", mid, 2, accepted["tree_sha"])
+        self.assertEqual((final / "notes.txt").read_text(), "implemented v2\n")
+        verified = fleet_herdr_archive.verify(self.runs, mid)
+        self.assertEqual((verified["valid"], verified["archive_schema_version"]), (True, 9))
+        self.assertEqual(verified["final_tree_sha"], accepted["tree_sha"])
+        self.assertEqual(verified["acceptance"]["status"], "accepted")
+        archive = self.runs / "missions" / mid / "herdr-archive"
+        self.assertTrue((archive / "sdd" / "plan.json").exists())
+        self.assertEqual(current["sdd_plan_sha256"],
+                         fleet_json.loads((archive / "sdd" / "binding.json").read_bytes())["plan_sha256"])
+        self.assertEqual((self.physical_runs, len(self.submits())), (2, 2))
 
 if __name__ == "__main__":
     import unittest

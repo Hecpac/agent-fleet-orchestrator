@@ -42,7 +42,7 @@ no se alteran sus planes, pins, deadlines, autorizaciones ni evidencia.
 | S5 | Telemetría separada de autoridad | Completado: el ledger es dueño del esquema de intervalos y la dirección medición → autoridad queda fijada por test |
 | S6 | Scope y aceptación independientes del perfil | Completado: cada política declarada una vez en el catálogo, mecánicas sin perfil y esquema v8 como capa de scope |
 | S7 | Mecanismos comunes de Owner Cycle | Completado: primitivas comunes verificadas, duplicados internos con un solo hogar y proyección del Owner como política declarada |
-| S8 | Política opt-in de reparación | Pendiente; calidad live requiere autorización propia |
+| S8 | Política opt-in de reparación | Implementada como etapa 1 de la constitución (`repair_policy`, verificada offline); la calidad live y el carril Docker requieren autorización propia |
 | S9 | Retirada de duplicación y extracción de experimentos | Pendiente de equivalencia y consumidores |
 
 Cada slice conserva contratos anteriores, exige pruebas proporcionales y una

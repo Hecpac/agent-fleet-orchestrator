@@ -1,6 +1,6 @@
 # Etapa 1 — Cerrar el ciclo de una Mission: plan de implementación
 
-> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 a S7 implementados ·
+> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 a S8 implementados ·
 > **Especificación (leer primero):**
 > [`docs/superpowers/specs/2026-09-28-etapa1-cierre-mission-design.md`](../specs/2026-09-28-etapa1-cierre-mission-design.md) ·
 > **Base:** `main` en `75baa80`.
@@ -209,15 +209,15 @@ SCN-020 y SCN-021 (CHK-010, CHK-013).
 
 ### S8 — Recorrido completo offline y documentación
 
-- [ ] Test de extremo a extremo con el plan SDD
+- [x] Test de extremo a extremo con el plan SDD
       [`examples/sdd/stats-repair-delivery.json`](../../../examples/sdd/stats-repair-delivery.json)
       vinculado: intento 1 `failed`, intento 2 `passed`, entrega en una raíz
-      temporal, relectura y `succeeded`.
-- [ ] Actualizar `docs/herdr-functional-checks.md` («A corrected check needs a new
+      temporal, relectura y `succeeded` con archivo v9.
+- [x] Actualizar `docs/herdr-functional-checks.md` («A corrected check needs a new
       explicitly created Mission» deja de ser cierto con `repair_policy`),
       `docs/herdr-mission-control.md` y el estado de S8 en
       `docs/architecture-refactor-2026-09-23.md`.
-- [ ] Marcar D1, D4 y D5 como decididas en §7 de la constitución, en el mismo
+- [x] Marcar D1, D4 y D5 como decididas en §7 de la constitución, en el mismo
       commit que apruebe la especificación.
 
 **Comprobaciones:** suite completa con `./scripts/check-ci.sh` en un checkout

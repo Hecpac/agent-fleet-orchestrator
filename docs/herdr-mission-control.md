@@ -28,8 +28,28 @@ archive schema v7 do not migrate or reinterpret either historical profile.
 The optional `--scope-contract` adds physical candidate acceptance to this
 minimal profile and selects archive v8. It inventories ignored files against a
 pre-admission baseline, permits declared temporary directories without exporting
-them, and rejects incomplete captures. It does not add a repair loop. See
+them, and rejects incomplete captures. It does not add a repair loop by itself. See
 [physical scope acceptance](herdr-physical-scope.md) for the contract and limits.
+
+Stage 1 of the [constitution](fleet-constitution.md) adds an opt-in
+`--repair-policy` (`fleet.repair-policy.v1`: `max_attempts`, `closure_policy:
+automatic`, `delivery_root`) to this minimal profile. Creation requires the
+functional and physical scope contracts, a zero token budget and a delivery root
+outside the runs directory; the policy digest is pinned in `mission_created`,
+frozen in CAS and buys one delegation credit per attempt. The driver then opens
+an attempt, runs one Worker build turn keyed by its ordinal, freezes that
+revision under its own name and settles it with the independent functional
+check. A failed check with attempts left gives the Worker bounded controller
+feedback as untrusted data; an identical revision reuses its receipt and still
+consumes its ordinal; blocked or indeterminate checks stop for reconciliation.
+The accepted revision is published once under
+`<delivery_root>/<mission_id>/<ordinal>-<tree_sha>/` with a rename that never
+replaces a destination, read back, and closed through archive v9 (the v8 scope
+layer plus `repair/attempts.json` and `delivery/receipt.json`). Cancellation or
+the deadline before publication abort it; after publication the receipt is kept
+without rollback and success is not declared. This path is verified offline with
+simulated transport and runner; Docker execution and model quality remain
+`NOT_VERIFIED`. See the [stage 1 specification](superpowers/specs/2026-09-28-etapa1-cierre-mission-design.md).
 
 Unit B adds a local `dry --work-packet` preview and a staged owner response
 protocol. Functional requirements, scope and limits travel without requiring the

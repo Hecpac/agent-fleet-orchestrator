@@ -115,7 +115,10 @@ The additional filter follows the Linux [seccomp ABI](https://docs.kernel.org/us
 An existing completed receipt is verified and returned without a second physical
 run. A lost attempt is reconciled through exact-container cleanup and recorded
 as indeterminate. Changing the tree or environment within that attempt is
-rejected. A corrected check needs a new explicitly created Mission/contract.
+rejected. A corrected check needs a new explicitly created Mission/contract,
+except under a stage 1 repair policy, where each attempt of the same Mission
+binds its own contract to its own frozen revision with ordinal-scoped keys (see
+[Mission control](herdr-mission-control.md)).
 
 Archive v4 contains the functional receipt and its CAS evidence. Closure and
 recovery require the bound `passed` receipt, artifact acceptance, role evidence
