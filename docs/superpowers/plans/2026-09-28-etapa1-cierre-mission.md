@@ -1,6 +1,6 @@
 # Etapa 1 — Cerrar el ciclo de una Mission: plan de implementación
 
-> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 a S4 implementados ·
+> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 a S5 implementados ·
 > **Especificación (leer primero):**
 > [`docs/superpowers/specs/2026-09-28-etapa1-cierre-mission-design.md`](../specs/2026-09-28-etapa1-cierre-mission-design.md) ·
 > **Base:** `main` en `75baa80`.
@@ -134,18 +134,19 @@ CHK-004 a CHK-006, CHK-012). `test_fleet_herdr_orchestration_closure` y
 
 **Cambios:** `fleet_herdr_delivery.py`.
 
-- [ ] Ruta `<raíz>/<mission_id>/<ordinal>-<tree_sha>/` y preparación
+- [x] Ruta `<raíz>/<mission_id>/<ordinal>-<tree_sha>/` y preparación
       `.staging-<ordinal>-<tree_sha>` hermana (E9, §3.3).
-- [ ] Escribir el árbol desde CAS, sincronizar archivos y directorio, publicar con
+- [x] Escribir el árbol desde CAS, sincronizar archivos y directorio, publicar con
       `renameat2(RENAME_NOREPLACE)` o `renamex_np(RENAME_EXCL)` mediante
       `ctypes` y sincronizar el padre. Sin primitivo:
       `delivery_primitive_unavailable` (E19).
-- [ ] Relectura con hashes por archivo y conjunto exacto de archivos (E10).
-- [ ] Colisión, colisión concurrente y directorio vacío preexistente (E11, §3.3).
-- [ ] Reconciliación tras reinicio (E12).
-- [ ] Volver a resolver la raíz de entrega en el momento de entregar: S1 la
-      admite con `resolve(strict=False)` al crear la Mission, así que un enlace
-      simbólico creado después solo se detecta en la entrega.
+- [x] Relectura con hashes por archivo, modo y conjunto exacto de archivos (E10).
+      Solo se entregan archivos regulares; un árbol con enlaces o rutas que
+      escapan se rechaza.
+- [x] Colisión, colisión concurrente y directorio vacío preexistente (E11, §3.3).
+- [x] Reconciliación tras reinicio (E12).
+- [x] Volver a resolver la raíz de entrega en el momento de entregar: si ya no
+      resuelve a sí misma o se solapa con los runs, la entrega se rechaza.
 
 **Comprobaciones:** `tests/test_fleet_herdr_delivery.py` (nuevo), puro y válido en
 macOS y Linux: SCN-010 a SCN-014 y SCN-025 a SCN-028 (CHK-007 a CHK-009,
