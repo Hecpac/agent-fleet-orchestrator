@@ -14,10 +14,12 @@ import fleet_acceptance
 import fleet_artifacts
 import fleet_functional
 import fleet_herdr_delivery
+import fleet_herdr_archive
 import fleet_herdr_control
 import fleet_herdr_mission
 import fleet_herdr_repair
 import fleet_herdr_repair_policy
+import fleet_json
 import fleet_mission
 import fleet_mission_state as state
 
@@ -88,9 +90,8 @@ class RepairLoopTests(RepairFixture):
         deadline = fleet_mission.load_state(self.runs, mid)["admission_policy"]["deadline_at"]
         self.outcomes, self.contents = [failed_outcome(), "passed"], {2: "implemented v2\n"}
         result = fleet_herdr_mission.drive(self.runs, mid)
-        self.assertEqual(result["status"], "running")
-        self.assertIn("delivered; archive and closure pending", result["next_action"])
-        self.assertEqual([a["status"] for a in result["repair"]], ["failed", "passed"])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual([a["settled"]["status"] for a in self.attempts(mid)], ["failed", "passed"])
         submits = self.submits()
         self.assertEqual([call[1] for call in submits], ["build", "build"])
         self.assertEqual(len({call[2] for call in submits}), 2)
@@ -190,7 +191,7 @@ class RepairLoopTests(RepairFixture):
         with self.assertRaises(RuntimeError):
             fleet_herdr_mission.drive(self.runs, mid)
         result = fleet_herdr_mission.drive(self.runs, mid)
-        self.assertIn("delivered; archive and closure pending", result["next_action"])
+        self.assertEqual(result["status"], "succeeded")
         self.assertEqual(len(self.submits()), 2)
 
     def test_offline_loop_uses_only_the_simulated_backend_and_runner(self):
@@ -199,7 +200,7 @@ class RepairLoopTests(RepairFixture):
         with mock.patch.object(fleet_functional.runner, "Docker", side_effect=AssertionError("no Docker")), \
              mock.patch.object(fleet_herdr_mission.fleet_herdr, "HerdrBackend", MinimalBackend):
             result = fleet_herdr_mission.drive(self.runs, mid)
-        self.assertIn("delivered; archive and closure pending", result["next_action"])
+        self.assertEqual(result["status"], "succeeded")
         self.assertEqual({call[0] for call in MinimalBackend.calls} - {"boot", "submit", "collect", "wait", "recover"},
                          set())
         self.assertEqual((self.physical_runs, self.outcomes), (2, []))
@@ -231,13 +232,19 @@ class RepairDeliveryTests(RepairFixture):
         mid = self.accepted_mission()
         result = fleet_herdr_mission.drive(self.runs, mid)
         final = self.final(mid)
-        self.assertEqual(result["status"], "running")
-        self.assertEqual(result["delivery"], [{"started": {"ordinal": 2, "tree_sha": final.name.split("-", 1)[1]},
-                                               "status": "delivered"}])
+        self.assertEqual(result["status"], "succeeded")
+        current = fleet_mission.load_state(self.runs, mid)
+        self.assertEqual([(d["finished"] or {}).get("status") for d in current["deliveries"]], ["delivered"])
         self.assertEqual((final / "notes.txt").read_text(), "implemented v2\n")
         self.assertEqual((final / "answer.txt").read_text(), "implemented\n")
-        self.assertIsNone(self.terminal(mid))
         self.assertEqual(sorted(p.name for p in final.parent.iterdir()), [final.name])
+        verified = fleet_herdr_archive.verify(self.runs, mid)
+        self.assertTrue(verified["valid"])
+        self.assertEqual(verified["archive_schema_version"], 9)
+        self.assertEqual(verified["permissions"]["runs"], 2)
+        self.assertEqual(verified["final_tree_sha"], final.name.split("-", 1)[1])
+        self.assertLess(state.parse_timestamp(current["deliveries"][-1]["finished"]["timestamp"], "t"),
+                        state.parse_timestamp(current["admission_policy"]["deadline_at"], "t"))
 
     def test_collision_blocks_only_the_delivery_and_keeps_the_result(self):
         mid = self.accepted_mission("collision")
@@ -273,7 +280,7 @@ class RepairDeliveryTests(RepairFixture):
         written = (self.final(mid) / "notes.txt").stat().st_mtime_ns
         with mock.patch.object(fleet_herdr_delivery, "deliver", side_effect=AssertionError("no second write")):
             result = fleet_herdr_mission.drive(self.runs, mid)
-        self.assertIn("delivered; archive and closure pending", result["next_action"])
+        self.assertEqual(result["status"], "succeeded")
         self.assertEqual((self.final(mid) / "notes.txt").stat().st_mtime_ns, written)
 
     def test_restart_before_publication_delivers_once(self):
@@ -282,8 +289,9 @@ class RepairDeliveryTests(RepairFixture):
             fleet_herdr_mission.drive(self.runs, mid)
         self.assertFalse(self.final(mid).exists())
         result = fleet_herdr_mission.drive(self.runs, mid)
-        self.assertIn("delivered; archive and closure pending", result["next_action"])
-        self.assertEqual([d["status"] for d in result["delivery"]], ["delivered"])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual([(d["finished"] or {}).get("status")
+                          for d in fleet_mission.load_state(self.runs, mid)["deliveries"]], ["delivered"])
 
     def test_foreign_destination_after_restart_is_indeterminate(self):
         mid = self.accepted_mission("indeterminate")
@@ -372,6 +380,78 @@ class RepairDeliveryTests(RepairFixture):
         self.assertEqual(result["status"], "abandoned")
         self.assertEqual([(d["finished"] or {}).get("status")
                           for d in fleet_mission.load_state(self.runs, mid)["deliveries"]], ["aborted"])
+
+
+class RepairArchiveTests(RepairFixture):
+    """Stage 1 S7: archive v9 binds attempts, the accepted revision and the delivery."""
+
+    def closed(self, key):
+        mid = self.create_repair(key=key)
+        self.outcomes, self.contents = [failed_outcome(), "passed"], {2: "implemented v2\n"}
+        self.assertEqual(fleet_herdr_mission.drive(self.runs, mid)["status"], "succeeded")
+        return mid, self.runs / "missions" / mid / "herdr-archive"
+
+    def rewrite(self, archive, name, mutate):
+        path = archive / name
+        path.write_bytes(fleet_json.canonical_bytes(mutate(fleet_json.loads(path.read_bytes()))) + b"\n"
+                         if name.endswith(".json") and name != "archive-index.json" else mutate(path.read_bytes()))
+
+    def reindex(self, archive, mutate):
+        index_path = archive / "archive-index.json"
+        index = fleet_json.loads(index_path.read_bytes())
+        mutate(index)
+        index_path.write_bytes(fleet_json.canonical_bytes(index))
+
+    def entry(self, archive, name):
+        raw = (archive / name).read_bytes()
+        return {"sha256": state.artifact_id(raw), "bytes": len(raw)}
+
+    def test_v9_verifies_and_rejects_downgrade_or_missing_layers(self):
+        mid, archive = self.closed("archive-v9")
+        verified = fleet_herdr_archive.verify(self.runs, mid)
+        self.assertEqual((verified["valid"], verified["archive_schema_version"]), (True, 9))
+        attempts = fleet_json.loads((archive / "repair" / "attempts.json").read_bytes())
+        self.assertEqual([a["status"] for a in attempts], ["failed", "passed"])
+        original = {p: p.read_bytes() for p in archive.rglob("*") if p.is_file()}
+
+        def restore():
+            for path, raw in original.items():
+                path.write_bytes(raw)
+                path.chmod(0o600)
+
+        cases = {
+            "relabel-v8": lambda: self.reindex(archive, lambda i: i.update(schema_version=8)),
+            "drop-attempts": lambda: ((archive / "repair" / "attempts.json").unlink(),
+                                      self.reindex(archive, lambda i: i["entries"].pop("repair/attempts.json"))),
+            "forged-receipt": lambda: ((archive / "delivery" / "receipt.json").write_bytes(
+                                           fleet_json.canonical_bytes({"status": "delivered"})),
+                                       self.reindex(archive, lambda i: i["entries"].update(
+                                           {"delivery/receipt.json": self.entry(archive, "delivery/receipt.json")}))),
+            "forged-attempts": lambda: ((archive / "repair" / "attempts.json").write_bytes(
+                                            fleet_json.canonical_bytes([])),
+                                        self.reindex(archive, lambda i: i["entries"].update(
+                                            {"repair/attempts.json": self.entry(archive, "repair/attempts.json")}))),
+        }
+        for label, tamper in cases.items():
+            with self.subTest(tamper=label):
+                tamper()
+                with self.assertRaises(fleet_herdr_archive.HerdrArchiveError):
+                    fleet_herdr_archive.verify(self.runs, mid, require_anchor=False)
+                restore()
+        self.assertTrue(fleet_herdr_archive.verify(self.runs, mid)["valid"])
+
+    def test_scope_mission_without_policy_stays_v8_and_rejects_repair_layers(self):
+        mid = self.create_repair(policy=False, key="plain-v8")
+        self.outcomes = ["passed"]
+        self.assertEqual(fleet_herdr_mission.drive(self.runs, mid)["status"], "succeeded")
+        archive = self.runs / "missions" / mid / "herdr-archive"
+        self.assertEqual(fleet_herdr_archive.verify(self.runs, mid)["archive_schema_version"], 8)
+        (archive / "repair").mkdir()
+        (archive / "repair" / "attempts.json").write_bytes(fleet_json.canonical_bytes([]))
+        self.reindex(archive, lambda i: i["entries"].update(
+            {"repair/attempts.json": self.entry(archive, "repair/attempts.json")}))
+        with self.assertRaises(fleet_herdr_archive.HerdrArchiveError):
+            fleet_herdr_archive.verify(self.runs, mid, require_anchor=False)
 
 if __name__ == "__main__":
     import unittest

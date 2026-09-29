@@ -72,10 +72,9 @@ def repair_turn_key(ordinal: int) -> str:
 
 
 def freeze_name(current: dict[str, Any]) -> str:
-    """Freeze file of the attempt whose functional check is current."""
-    attempts = current.get("repair_attempts") or []
-    ordinal = attempts[-1]["ordinal"] if attempts else 1
-    return "candidate-freeze.json" if ordinal == 1 else f"candidate-freeze-repair-{ordinal}.json"
+    """Freeze file of the attempt whose functional check is current (single home: the archive)."""
+    import fleet_herdr_archive
+    return fleet_herdr_archive.freeze_name(current)
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -1088,7 +1087,10 @@ class _Driver:
         self.wait_deadline = min(time.monotonic() + 30, observation_deadline) if observation_deadline is not None else time.monotonic() + 30
         self.observation_deadline = observation_deadline
         self.load()
-        self.freeze_finalization_policy()
+        if not current.get("repair_policy_sha256"):
+            # A repair Mission's owned turns are known only once an attempt is
+            # accepted; complete_archive freezes its policy from the ledger then.
+            self.freeze_finalization_policy()
         # Rejected evidence is not a role result or proof of quiescence. Preserve
         # a pending pause even after expiry; only explicit cancellation may
         # reconcile this rejected execution. Never replay or upgrade its task.
@@ -1337,6 +1339,8 @@ class _Driver:
             current = self.current()
             if current["status"] in state.TERMINAL_STATUSES:
                 return self.finish(self.response(terminal=current["terminal"]))
+            if current["status"] == "completing":
+                return self.close_repair(backend)
             if current["status"] != "running":
                 return self.response(next_action="mission authority changed; reconcile before further effects")
             step = fleet_herdr_repair.next_step(self.runs, self.mid, current)
@@ -1501,8 +1505,26 @@ class _Driver:
         if (state.parse_timestamp(finished["timestamp"], "delivery receipt")
                 >= state.parse_timestamp(current["admission_policy"]["deadline_at"], "delivery deadline")):
             return self.delivery_deadline_terminal()
-        return self.response(delivery=self.delivery_view(), repair=self.repair_view(),
-                             next_action="delivered; archive and closure pending")
+        return self.close_repair(backend)
+
+    def close_repair(self, backend: Any) -> dict[str, Any]:
+        """Close a delivered repair Mission through the v9 archive and its independent verification."""
+        current = self.current()
+        backend = backend if backend is not None else self.backend()
+        attempt = current["repair_attempts"][-1]["settled"]
+        result = self.turn(backend, "build", "worker", "build", [], None,
+                           key=repair_turn_key(attempt["ordinal"]), result_only=True)
+        if result is None or result["status"] != "PASS":
+            raise HerdrMissionError("accepted repair attempt lacks its durable Worker result")
+        results = {"worker": result}
+        if current["status"] == "running":
+            self.event("mission_completing", "completing", {"completion_artifact_id": result["artifact_id"]})
+        archive = _archive()
+        stopped = self.control_stop(backend)
+        if stopped is not None:
+            return stopped
+        created = archive.create(self.runs, self.mid, self.candidate, results, backend.state())
+        return self.complete_archive(archive, created, results)
 
     def delivery_view(self) -> list[dict[str, Any]]:
         return [{"started": {k: d["started"][k] for k in ("ordinal", "tree_sha")},
@@ -1531,7 +1553,8 @@ class _Driver:
         self.event("herdr_finalization_policy_frozen", "finalization-policy",
                    fleet_herdr_permissions.finalization_policy(current["compiled_digest"],
                        capsule=options.get("herdr_capsule_manifest") is not None,
-                       profile=self.profile))
+                       profile=self.profile,
+                       turns=len(current["repair_attempts"]) if current.get("repair_attempts") is not None else None))
         return self.current()["herdr_finalization_policy"]
 
     def completion_receipt_matches_policy(self, receipt: dict[str, Any], policy: dict[str, Any]) -> bool:

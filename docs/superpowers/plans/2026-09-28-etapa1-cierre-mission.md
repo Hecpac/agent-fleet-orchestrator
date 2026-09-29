@@ -1,6 +1,6 @@
 # Etapa 1 — Cerrar el ciclo de una Mission: plan de implementación
 
-> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 a S6 implementados ·
+> **Fecha:** 2026-09-28 · **Estado:** aprobado con la especificación; S1 a S7 implementados ·
 > **Especificación (leer primero):**
 > [`docs/superpowers/specs/2026-09-28-etapa1-cierre-mission-design.md`](../specs/2026-09-28-etapa1-cierre-mission-design.md) ·
 > **Base:** `main` en `75baa80`.
@@ -184,17 +184,23 @@ completo, SCN-017, SCN-018, SCN-029 y SCN-030 (CHK-002, CHK-011, CHK-016).
 **Cambios:** `fleet_herdr_archive.py`, `fleet_herdr_profile.py` si hace falta
 declarar la versión, `fleet_functional.py` y el cierre en `fleet_herdr_mission.py`.
 
-- [ ] `archive.create`, `archive.verify` y `fleet_functional.archived_receipt`
-      usan la congelación del intento aceptado (`freeze_name`), no la del primero.
-- [ ] La política de finalización y la prueba de permisos cuentan los turnos
-      reales de la Mission de reparación en lugar de `len(profile.stages)`.
-- [ ] El terminal `succeeded` llega aquí, con la regla de §3.4: recibo de entrega
+- [x] `archive.create`, `archive.verify` y `fleet_functional.archived_receipt`
+      usan la congelación del intento aceptado (`freeze_name`, con un solo hogar
+      en el archivo), no la del primero.
+- [x] La política de finalización y la prueba de permisos cuentan los turnos
+      reales de la Mission de reparación en lugar de `len(profile.stages)`. En
+      estas Missions la política se congela al cerrar, desde el ledger, porque el
+      número de turnos solo se conoce entonces; el ledger exige que coincida con
+      los intentos.
+- [x] El terminal `succeeded` llega aquí, con la regla de §3.4: recibo de entrega
       registrado antes de `deadline_at` y ninguna cancelación solicitada.
 
-- [ ] v9 = capa de scope de v8 más `attempts/` y `delivery/receipt.json` (§3.1).
-- [ ] Generalizar `fleet_herdr_archive.py:561`: con scope, v8 o v9; con
+- [x] v9 = capa de scope de v8 más `repair/attempts.json` y
+      `delivery/receipt.json` (§3.1); los receipts, el feedback y los árboles de
+      cada intento viajan en `artifacts/`.
+- [x] Generalizar `fleet_herdr_archive.py:561`: con scope, v8 o v9; con
       `repair_policy`, v9; rechazar cualquier degradación o mezcla.
-- [ ] La verificación offline reevalúa intentos, receipts y recibo de entrega
+- [x] La verificación offline reevalúa intentos, receipts y recibo de entrega
       desde el archivo y el ledger, sin releer la raíz de entrega.
 
 **Comprobaciones:** `test_fleet_herdr_archive*`, `test_fleet_herdr_scope` y los

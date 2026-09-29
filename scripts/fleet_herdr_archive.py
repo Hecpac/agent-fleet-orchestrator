@@ -35,10 +35,15 @@ import fleet_safe_paths
 
 # Archive schema -> profile for versioned readers. Physical scope is an overlay
 # schema on the one profile that admits it, not a profile of its own.
+# Stage 1 repair Missions (repair policy + physical scope) use schema v9: the
+# v8 scope layer plus repair attempts and the delivery receipt.
+REPAIR_ARCHIVE_VERSION = 9
 VERSIONED_ARCHIVE_PROFILES = {
     **{profile.archive_schema_version: profile for profile in fleet_herdr_profile.VERSIONED},
     fleet_herdr_scope.ARCHIVE_VERSION: fleet_herdr_profile.PHYSICAL_SCOPE_PROFILE,
+    REPAIR_ARCHIVE_VERSION: fleet_herdr_profile.PHYSICAL_SCOPE_PROFILE,
 }
+SCOPE_ARCHIVE_SCHEMAS = frozenset({fleet_herdr_scope.ARCHIVE_VERSION, REPAIR_ARCHIVE_VERSION})
 READABLE_ARCHIVE_SCHEMAS = frozenset({2, 3, 4, 5, *VERSIONED_ARCHIVE_PROFILES})
 # Functional evidence exists from legacy v4 and in every versioned schema.
 FUNCTIONAL_ARCHIVE_SCHEMAS = frozenset({4, 5, *VERSIONED_ARCHIVE_PROFILES})
@@ -117,6 +122,25 @@ def snapshot(candidate_repo: Path, *, expected_base: str | None = None,
     if _git(repo, "rev-parse", "HEAD").decode().strip() != base:
         raise HerdrArchiveError("candidate HEAD changed during snapshot")
     return tree_sha, tree, patch
+
+
+def freeze_name(current: dict[str, Any]) -> str:
+    """Freeze file of the attempt whose functional check is current (the accepted one at closure)."""
+    attempts = current.get("repair_attempts") or []
+    ordinal = attempts[-1]["ordinal"] if attempts else 1
+    return "candidate-freeze.json" if ordinal == 1 else f"candidate-freeze-repair-{ordinal}.json"
+
+
+def repair_summary(current: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Ledger-derived attempt summary archived in v9; ``None`` without a repair policy."""
+    attempts = current.get("repair_attempts")
+    if attempts is None:
+        return None
+    return [{"ordinal": a["ordinal"], "feedback_artifact_id": a["feedback_artifact_id"],
+             **{k: (a["settled"] or {}).get(k) for k in ("tree_sha", "functional_attempt_id", "receipt_artifact_id",
+                                                         "status", "unchanged_from")},
+             "settled_feedback_artifact_id": (a["settled"] or {}).get("feedback_artifact_id")}
+            for a in attempts]
 
 
 def freeze(runs_dir: Path, mission_id: str, candidate_repo: Path, *,
@@ -261,7 +285,9 @@ def create(runs_dir: Path, mission_id: str, candidate_repo: Path,
             _require_unpublished(runs_dir, mission_id)
             _require_archive_inputs(transaction.current_state, role_results, backend_state, compiled)
     if selected is None:
-        frozen = freeze(runs_dir, mission_id, candidate_repo)
+        name = freeze_name(current)
+        frozen = freeze(runs_dir, mission_id, candidate_repo,
+                        **({"name": name} if name != "candidate-freeze.json" else {}))
         with state.MissionTransaction(runs_dir, mission_id) as transaction:
             current = transaction.current_state
             selected = current.get("herdr_archive_selection")
@@ -324,8 +350,10 @@ def _capture_contents(runs_dir, mission_id, role_results, backend_state, compile
         raise HerdrArchiveError(str(exc)) from exc
     contents: dict[str, bytes] = {"ledger.jsonl": ledger}
     with fleet_safe_paths.RootedFS(runs_dir) as store:
-        for name in ("compiled-workflow.json", "runtime-options.json", "creation-request.json", "objective.txt", "candidate-freeze.json"):
+        for name in ("compiled-workflow.json", "runtime-options.json", "creation-request.json", "objective.txt"):
             contents[name] = _read(store, root / name)
+        # The archived freeze is the accepted revision's; earlier attempts stay in CAS and the ledger.
+        contents["candidate-freeze.json"] = _read(store, root / freeze_name(current))
         if profile is fleet_herdr_profile.RESEARCH:
             contents["research-snapshot.json"] = _read(store, root / "research-snapshot.json")
     contents["backend.json"] = _bytes(backend_state)
@@ -394,12 +422,22 @@ def _capture_contents(runs_dir, mission_id, role_results, backend_state, compile
     if sdd is not None:
         contents["sdd/plan.json"] = sdd["plan"]
         contents["sdd/binding.json"] = sdd["binding"]
+    summary = repair_summary(current)
+    if summary is not None:
+        deliveries = current.get("deliveries") or []
+        finished = deliveries[-1]["finished"] if deliveries else None
+        if not finished or finished["status"] != "delivered":
+            raise HerdrArchiveError("repair archive requires a delivered accepted revision")
+        contents["repair/attempts.json"] = _bytes(summary)
+        contents["delivery/receipt.json"] = fleet_artifacts.get_bytes(runs_dir, mission_id, finished["receipt_artifact_id"])
     # Reject missing or incompatible recorded permissions before staging files.
     attest_admissions(contents, current, frozen["candidate_repo"], profile=profile)
     versioned = profile is not fleet_herdr_profile.LEGACY
     schema_version = profile.archive_schema_version if versioned else (5 if sdd is not None else (4 if functional is not None else 3))
     if scope_contract is not None:
         schema_version = fleet_herdr_scope.ARCHIVE_VERSION
+    if summary is not None:
+        schema_version = REPAIR_ARCHIVE_VERSION
     index = {"schema_version": schema_version, "permissions_policy_version": profile.permissions_policy_version if versioned else (2 if options.get("herdr_capsule_manifest") else 1), "backend": "herdr", "mission_id": mission_id,
         "compiled_digest": compiled["compiled_digest"], "ledger_head": current["head_sha256"],
         "base_sha": current["base_sha"], "final_tree_sha": frozen["tree_sha"],
@@ -456,8 +494,11 @@ def attest_admissions(contents: dict[str, bytes], current: dict[str, Any], cwd: 
                       *, profile=fleet_herdr_profile.LEGACY) -> dict[str, Any]:
     """Check every selected turn, including planning and synthesis admissions."""
     expected = {f"herdr:{stage}": instance for stage, instance, _ in profile.stages}
+    for attempt in current.get("repair_attempts") or []:
+        if attempt["ordinal"] > 1:
+            expected[f"herdr:build-repair-{attempt['ordinal']}"] = "worker"
     admissions = list(current["admissions"].values())
-    if len(admissions) != len(profile.stages) or {a["request_key"] for a in admissions} != set(expected):
+    if len(admissions) != len(expected) or {a["request_key"] for a in admissions} != set(expected):
         raise HerdrArchiveError("permission attestation requires every profile stage admission")
 
     def read(digest):
@@ -517,6 +558,38 @@ def attest_admissions(contents: dict[str, bytes], current: dict[str, Any], cwd: 
             "runs": len(proofs), "by_run": proofs, "usage_by_run": usage_by_run}
 
 
+def _verify_repair(archived_state: dict[str, Any], contents: dict[str, bytes], tree: bytes,
+                   index: dict[str, Any]) -> None:
+    """v9: attempts, accepted revision and delivery receipt, offline from the archive only."""
+    import fleet_herdr_delivery
+    summary = repair_summary(archived_state)
+    if fleet_json.loads(contents["repair/attempts.json"]) != summary or not summary:
+        raise HerdrArchiveError("archived repair attempts differ from the ledger")
+    accepted = summary[-1]
+    if accepted["status"] != "passed" or accepted["tree_sha"] != index["final_tree_sha"]:
+        raise HerdrArchiveError("repair archive does not bind the accepted revision")
+    for attempt in summary:
+        for key in ("receipt_artifact_id", "feedback_artifact_id", "settled_feedback_artifact_id"):
+            if attempt[key] is not None and "artifacts/" + attempt[key] not in contents:
+                raise HerdrArchiveError("repair archive lacks attempt evidence")
+    deliveries = archived_state.get("deliveries") or []
+    finished = deliveries[-1]["finished"] if deliveries else None
+    receipt_raw = contents["delivery/receipt.json"]
+    if (not finished or finished["status"] != "delivered" or finished["receipt_artifact_id"] != _sha(receipt_raw)
+            or (finished["ordinal"], finished["tree_sha"]) != (accepted["ordinal"], accepted["tree_sha"])):
+        raise HerdrArchiveError("repair archive delivery receipt differs from the ledger")
+    receipt = fleet_json.loads(receipt_raw)
+    try:
+        expected = fleet_herdr_delivery.manifest(fleet_herdr_delivery.tree_files(tree))
+    except fleet_herdr_delivery.DeliveryError as exc:
+        raise HerdrArchiveError("accepted tree is not deliverable") from exc
+    if (receipt.get("status") != "delivered"
+            or receipt.get("manifest_sha256") != hashlib.sha256(fleet_json.canonical_bytes(expected)).hexdigest()
+            or receipt.get("files") != len(expected)
+            or Path(str(receipt.get("path"))).name != f"{accepted['ordinal']}-{accepted['tree_sha']}"):
+        raise HerdrArchiveError("repair archive delivery receipt does not bind the accepted tree")
+
+
 def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
            attest_permissions: bool = False, for_completion: bool = False) -> dict[str, Any]:
     """Verify offline from durable files, including the live ledger anchor."""
@@ -566,10 +639,15 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
             required.add("functional-result.json")
         ledger_sdd = archived_state.get("sdd_plan_sha256")
         scope_required = archived_state.get(fleet_herdr_scope.FIELD) is not None
-        if scope_required != (index["schema_version"] == fleet_herdr_scope.ARCHIVE_VERSION):
+        if scope_required != (index["schema_version"] in SCOPE_ARCHIVE_SCHEMAS):
             raise HerdrArchiveError("scope archive version/creation binding mismatch")
         if scope_required:
             required.update({"scope/baseline.json", "scope/result.json"})
+        repair_required = archived_state.get("repair_policy_sha256") is not None
+        if repair_required != (index["schema_version"] == REPAIR_ARCHIVE_VERSION):
+            raise HerdrArchiveError("repair archive version/creation binding mismatch")
+        if repair_required:
+            required.update({"repair/attempts.json", "delivery/receipt.json"})
         if index["schema_version"] == 5 and ledger_sdd is None:
             raise HerdrArchiveError("archive schema v5 lacks its ledger SDD plan pin")
         if ledger_sdd is not None:
@@ -627,7 +705,8 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
             finalization_policy = live_state.get("herdr_finalization_policy")
             expected_policy = fleet_herdr_permissions.finalization_policy(compiled["compiled_digest"],
                 capsule=bool(fleet_json.loads(contents["runtime-options.json"]).get("herdr_capsule_manifest")),
-                profile=profile)
+                profile=profile,
+                turns=len(archived_state["repair_attempts"]) if repair_required else None)
             if (not finalization_policy or
                     {k: v for k, v in finalization_policy.items() if k != "event_sha256"} != expected_policy):
                 raise HerdrArchiveError("archive completion lacks its durable finalization policy")
@@ -669,6 +748,8 @@ def verify(runs_dir: Path, mission_id: str, *, require_anchor: bool = True,
             research_format = "sha1" if len(research["tree_sha"]) == 40 else "sha256"
             if fleet_archive_tree.tree_hash_from_tar(research_tree, research_format) != research["tree_sha"]:
                 raise HerdrArchiveError("archived investigated tree proof failed")
+        if repair_required:
+            _verify_repair(archived_state, contents, tree, index)
         roles = fleet_json.loads(contents["role-results.json"])
         if set(roles) != profile.result_roles or any(roles[role].get("artifact_id") != _sha(contents[f"results/{role}.txt"]) for role in profile.result_roles):
             raise HerdrArchiveError("archive role artifact binding mismatch")

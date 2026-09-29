@@ -210,9 +210,12 @@ class PolicyDeclarationTests(unittest.TestCase):
     def test_archive_schemas_follow_the_catalog(self) -> None:
         self.assertEqual(fleet_herdr_archive.VERSIONED_ARCHIVE_PROFILES, {
             **{p.archive_schema_version: p for p in profiles.VERSIONED},
-            scope.ARCHIVE_VERSION: profiles.PHYSICAL_SCOPE_PROFILE})
-        self.assertEqual(fleet_herdr_archive.READABLE_ARCHIVE_SCHEMAS, {2, 3, 4, 5, 6, 7, 8})
-        self.assertEqual(fleet_herdr_archive.FUNCTIONAL_ARCHIVE_SCHEMAS, {4, 5, 6, 7, 8})
+            scope.ARCHIVE_VERSION: profiles.PHYSICAL_SCOPE_PROFILE,
+            fleet_herdr_archive.REPAIR_ARCHIVE_VERSION: profiles.PHYSICAL_SCOPE_PROFILE})
+        self.assertEqual(fleet_herdr_archive.REPAIR_ARCHIVE_VERSION, 9)
+        self.assertEqual(fleet_herdr_archive.READABLE_ARCHIVE_SCHEMAS, {2, 3, 4, 5, 6, 7, 8, 9})
+        self.assertEqual(fleet_herdr_archive.FUNCTIONAL_ARCHIVE_SCHEMAS, {4, 5, 6, 7, 8, 9})
+        self.assertEqual(fleet_herdr_archive.SCOPE_ARCHIVE_SCHEMAS, {8, 9})
 
 
 if __name__ == "__main__":
