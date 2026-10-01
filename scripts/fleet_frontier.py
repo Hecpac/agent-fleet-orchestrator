@@ -61,7 +61,10 @@ OPENCODE_STATE_ROOT = Path("/tmp/agent-fleet-orchestrator-opencode")
 KIMI_STATE_ROOT = Path(
     os.environ.get("FLEET_KIMI_STATE_ROOT", "/tmp/agent-fleet-orchestrator-kimi")
 )
-KIMI_WIRE_PROTOCOLS = {"1.2", "1.3", "1.4", "1.10"}
+KIMI_WIRE_PROTOCOLS = {"1.2", "1.3", "1.4", "1.5", "1.10"}
+# Record-shaped Wire (turn.prompt / context.append_loop_event); the others use
+# the TurnBegin/TurnEnd message envelope. 1.5 keeps the 1.4 turn records.
+KIMI_RECORD_WIRE_PROTOCOLS = {"1.4", "1.5"}
 SAFE_FEATURE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SAFE_RESULT_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -791,7 +794,7 @@ def kimi_turn_evidence(
     ]
     if len(metadata) != 1:
         raise FrontierError("Kimi transcript has invalid Wire metadata")
-    if metadata[0].get("protocol_version") == "1.4":
+    if metadata[0].get("protocol_version") in KIMI_RECORD_WIRE_PROTOCOLS:
         marker = f"FLEET_RESULT:{run_id}:<STATUS>"
         matching_turns = [
             index

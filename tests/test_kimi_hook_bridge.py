@@ -26,6 +26,7 @@ SURFACE_UUID = "00000000-0000-0000-0000-000000000101"
 SESSION_ID = "00000000-0000-0000-0000-000000000101"
 MISSION_ID = "00000000-0000-4000-8000-000000000201"
 GENERATION_ID = "00000000-0000-4000-8000-000000000301"
+WIRE_1_5_FIXTURE = ROOT / "tests" / "fixtures" / "kimi" / "wire-1.5-kimi-code-2.1.1.jsonl"
 
 
 def wire_record(timestamp: float, message_type: str, payload: dict) -> dict:
@@ -268,6 +269,60 @@ class KimiHookBridgeTests(unittest.TestCase):
             )
         self.assertIn(f"FLEET_RESULT:{run_id}:DONE", response)
         self.assertEqual((provider, model), ("moonshot-ai", "kimi-code/k3"))
+
+    def write_private_transcript(self, raw: bytes) -> None:
+        self.transcript.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(self.transcript,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(descriptor, raw)
+        finally:
+            os.close(descriptor)
+
+    def test_bridge_maps_captured_kimi_code_2_1_1_wire_1_5(self) -> None:
+        # Verbatim turn records from a provider-free kimi-code 2.1.1 run.
+        rows = [json.loads(line) for line in WIRE_1_5_FIXTURE.read_text().splitlines()]
+        self.assertEqual(rows[0]["protocol_version"], "1.5")
+        process = self.start_bridge()
+        self.wait_for((self.hooks / "kimi-hook-sessions.json").exists, process=process)
+        self.write_private_transcript(WIRE_1_5_FIXTURE.read_bytes())
+        self.wait_for(
+            lambda: self.events.exists()
+            and len(self.events.read_text(encoding="utf-8").splitlines()) == 2,
+            process=process,
+        )
+        events = [json.loads(line) for line in self.events.read_text().splitlines()]
+        self.assertEqual([e["name"] for e in events],
+                         ["agent.hook.UserPromptSubmit", "agent.hook.Stop"])
+        prompt = next(r for r in rows if r["type"] == "turn.prompt")
+        stop = next(r for r in rows if r.get("event", {}).get("type") == "step.end")
+        self.assertEqual(events[0]["occurred_at"], kimi_hook_bridge._occurred_at(prompt["time"]))
+        self.assertEqual(events[1]["occurred_at"], kimi_hook_bridge._occurred_at(stop["time"]))
+        self.assertIsNone(process.poll())
+
+    def test_frontier_extracts_captured_wire_1_5_turn(self) -> None:
+        rows = [json.loads(line) for line in WIRE_1_5_FIXTURE.read_text().splitlines()]
+        prompt = next(r for r in rows if r["type"] == "turn.prompt")["input"][0]["text"]
+        run_id = prompt.split("FLEET_RESULT:", 1)[1].split(":<STATUS>", 1)[0]
+        stop = next(r for r in rows if r.get("event", {}).get("type") == "step.end")
+        with (
+            mock.patch.object(fleet_frontier, "session_record",
+                              return_value={"provider": "moonshot-ai", "model": "kimi-code/k3"}),
+            mock.patch.object(fleet_frontier, "_transcript_rows", return_value=rows),
+        ):
+            response, provider, model = fleet_frontier.kimi_turn_evidence(
+                f"kimi-{SESSION_ID}", run_id, kimi_hook_bridge._occurred_at(stop["time"]))
+        self.assertEqual(response, f"FLEET_RESULT:{run_id}:PASS fixture reply")
+        self.assertEqual((provider, model), ("moonshot-ai", "kimi-code/k3"))
+
+    def test_bridge_still_rejects_an_unknown_wire_protocol(self) -> None:
+        process = self.start_bridge()
+        self.wait_for((self.hooks / "kimi-hook-sessions.json").exists, process=process)
+        self.write_private_transcript(
+            (json.dumps({"type": "metadata", "protocol_version": "1.6"}) + "\n").encode())
+        _stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 2)
+        self.assertIn("unsupported Kimi Wire protocol", stderr)
 
     def test_bridge_rejects_a_second_watcher_for_the_same_surface(self) -> None:
         self.start_bridge()

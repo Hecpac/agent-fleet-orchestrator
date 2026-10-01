@@ -1,0 +1,9 @@
+{"type":"metadata","protocol_version":"1.5","created_at":1790861088061}
+{"type":"turn.prompt","agentId":"main","input":[{"type":"text","text":"Reply with exactly one line: FLEET_RESULT:74309d8e-a04a-4992-bc64-65ec8e2ce4ab:<STATUS> where <STATUS> is PASS."}],"origin":{"kind":"user"},"promptId":"msg_01M3VT75AY9QTAM5DPM3V93NVM","turnId":0,"time":1790861088098}
+{"turnId":0,"queueItemId":"msg_01M3VT75AY9QTAM5DPM3V93NVM","type":"agent.turn.started","time":1790861088096,"kind":"event"}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.begin","uuid":"bbda0064-71d9-4246-8dc2-8ba00b8a4e54","turnId":"0","step":1},"time":1790861088107}
+{"type":"usage.record","agentId":"main","model":"fixture/model","usage":{"inputOther":10,"output":5,"inputCacheRead":0,"inputCacheCreation":0},"usageScope":"turn","time":1790861088137}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"content.part","uuid":"b02c2020-c788-4e1d-821d-cbbaa8f6ce62","turnId":"0","step":1,"stepUuid":"bbda0064-71d9-4246-8dc2-8ba00b8a4e54","part":{"type":"text","text":"FLEET_RESULT:74309d8e-a04a-4992-bc64-65ec8e2ce4ab:PASS fixture reply"}},"time":1790861088138}
+{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.end","uuid":"bbda0064-71d9-4246-8dc2-8ba00b8a4e54","turnId":"0","step":1,"finishReason":"end_turn","usage":{"inputOther":10,"output":5,"inputCacheRead":0,"inputCacheCreation":0},"llmFirstTokenLatencyMs":10,"llmStreamDurationMs":17,"llmRequestBuildMs":1,"llmServerFirstTokenMs":9,"llmServerDecodeMs":17,"llmClientConsumeMs":0,"llmClientBlockedMs":17,"messageId":"fx","providerFinishReason":"completed","rawFinishReason":"stop"},"time":1790861088139}
+{"turnId":0,"outcome":"done","type":"agent.turn.ended","time":1790861088138,"kind":"event"}
+{"type":"turn.ended","agentId":"main","turnId":0,"reason":"completed","durationMs":41,"time":1790861088139}

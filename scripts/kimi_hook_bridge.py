@@ -26,7 +26,10 @@ import fleet_kimi_state
 import fleet_safe_paths
 
 
-SUPPORTED_WIRE_PROTOCOLS = {"1.2", "1.3", "1.4", "1.10"}
+# Wire 1.5 (written by new sessions of kimi-code 0.39.1 through 2.1.1) only adds ``wallClockResumedAt`` to goal
+# records (its own v1.4->v1.5 migration); turn.prompt, content.part and
+# step.end keep the 1.4 shape, verified against a captured 2.1.1 transcript.
+SUPPORTED_WIRE_PROTOCOLS = {"1.2", "1.3", "1.4", "1.5", "1.10"}
 
 
 class KimiBridgeError(RuntimeError):
@@ -58,8 +61,8 @@ def _safe_directory(path: Path, field: str, *, create: bool = False) -> Path:
 def wire_path(share_dir: Path, work_dir: Path, session_id: str) -> Path:
     """Resolve the surface's wire.jsonl under an ISOLATED kimi-code home.
 
-    kimi-code mints its own session id.  Version 0.29 lays sessions out as
-    ``sessions/wd_<basename>_<sha256(work_dir)[:12]>/session_<id>/agents/main/``;
+    kimi-code mints its own session id.  Versions 0.29 through 2.x lay sessions
+    out as ``sessions/wd_<basename>_<sha256(work_dir)[:12]>/session_<id>/agents/main/``;
     0.28 used ``wd_cwd_<sha256(work_dir)[:12]>``.
     The fleet cannot choose the id (the legacy ``--session`` flag now only
     resumes), so the bridge discovers it — safely, because ``share_dir`` is
