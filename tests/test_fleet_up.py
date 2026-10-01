@@ -476,7 +476,13 @@ class FleetUpTests(unittest.TestCase):
         self.assertIn("triage.runner=local\n", manifest)
 
     def test_long_launch_uses_short_spec_launcher_and_bound_receipt(self) -> None:
-        threshold = 300
+        # The fake CMUX truncates any send at or above the threshold. Derive it
+        # from the exact launcher command fleet-up.sh sends (runs path, launch
+        # id, spec digest) so the launcher fits and the direct command would be
+        # truncated, whatever the length of the checkout or temporary paths.
+        launcher = "python3 scripts/fleet_cmux_launcher.py run {} {} {}".format(
+            os.path.realpath(self.runs), "0" * 36, "0" * 64)
+        threshold = len(launcher) + 1
         self.env["CMUX_TRUNCATE_LONG_SEND_THRESHOLD"] = str(threshold)
 
         result = self.run_fleet("async-paste", "--preset", "implementation_review")
