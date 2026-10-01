@@ -125,18 +125,22 @@ class KimiHookBridgeTests(unittest.TestCase):
         else:
             process.communicate(timeout=3)
 
-    def wait_for(self, predicate, *, timeout: float = 3.0) -> None:
+    def wait_for(self, predicate, *, timeout: float = 3.0,
+                 process: subprocess.Popen[str] | None = None) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if predicate():
                 return
+            if process is not None and process.poll() is not None:
+                _stdout, stderr = process.communicate(timeout=3)
+                self.fail(f"Kimi bridge exited {process.returncode} before its evidence: {stderr.strip()}")
             time.sleep(0.02)
         self.fail("timed out waiting for Kimi bridge evidence")
 
     def test_bridge_records_bind_and_stop_without_copying_conversation(self) -> None:
         process = self.start_bridge()
         session_file = self.hooks / "kimi-hook-sessions.json"
-        self.wait_for(session_file.exists)
+        self.wait_for(session_file.exists, process=process)
         prompt = "private task\nFLEET_RESULT:run-1:<STATUS>"
         response = "review complete\nFLEET_RESULT:run-1:DONE"
         self.transcript.parent.mkdir(parents=True, exist_ok=True)
@@ -146,13 +150,20 @@ class KimiHookBridgeTests(unittest.TestCase):
             wire_record(101.0, "ContentPart", {"type": "text", "text": response}),
             wire_record(102.0, "TurnEnd", {}),
         ]
-        self.transcript.write_text(
-            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
-        )
-        self.transcript.chmod(0o600)
+        # Kimi creates its Wire transcript privately. Creating it at 0644 and
+        # tightening it afterwards let the running bridge observe the unsafe
+        # mode and exit, which made this test intermittent.
+        descriptor = os.open(self.transcript,
+                             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(descriptor, "".join(json.dumps(row) + "\n" for row in rows).encode("utf-8"))
+        finally:
+            os.close(descriptor)
+        self.assertEqual(self.transcript.stat().st_mode & 0o777, 0o600)
         self.wait_for(
             lambda: self.events.exists()
-            and len(self.events.read_text(encoding="utf-8").splitlines()) == 2
+            and len(self.events.read_text(encoding="utf-8").splitlines()) == 2,
+            process=process,
         )
         self.assertIsNone(process.poll())
         events_text = self.events.read_text(encoding="utf-8")
