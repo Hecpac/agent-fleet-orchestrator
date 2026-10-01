@@ -49,6 +49,17 @@ def recover(root,authority,*,allow_partial=False):
     return partial
 
 
+
+def _darwin_executable():
+    """Absolute path of this process's executing image (libproc proc_pidpath)."""
+    import ctypes
+    library=ctypes.CDLL("/usr/lib/libproc.dylib",use_errno=True)
+    library.proc_pidpath.argtypes=[ctypes.c_int,ctypes.c_void_p,ctypes.c_uint32]
+    path=ctypes.create_string_buffer(4096)  # PROC_PIDPATHINFO_MAXSIZE
+    if library.proc_pidpath(os.getpid(),path,len(path))<=0:
+        raise ValueError("exact CONTROL interpreter identity unavailable")
+    return os.fsdecode(path.value)
+
 def prepare(root,*,mode,pricing_evidence=None,credential_source="env",requests_per_task=6,output_profile="legacy-8k"):
     root=Path(root).resolve()
     if mode not in {"synthetic_tls","live"}:raise ValueError("unknown pilot mode")
@@ -64,9 +75,9 @@ def prepare(root,*,mode,pricing_evidence=None,credential_source="env",requests_p
     # macOS framework python's bin launcher execs a different Mach-O binary.
     # Freeze the executable actually observed for this trusted preparation
     # process, so the Herdr argv check does not confuse launcher with runtime.
-    if sys.platform=="darwin":
-        observed=subprocess.check_output(["/bin/ps","-ww","-p",str(os.getpid()),"-o","comm="],env={"PATH":"/usr/bin:/bin"},timeout=2).decode().strip()
-        interpreter=str(Path(observed).resolve(strict=True))
+    # proc_pidpath reports that image's absolute path; `ps -o comm=` reported
+    # the invoked name instead (e.g. a bare python3.12 found through PATH).
+    if sys.platform=="darwin":interpreter=str(Path(_darwin_executable()).resolve(strict=True))
     elif sys.platform.startswith("linux"):interpreter=str(Path("/proc/self/exe").resolve(strict=True))
     else:raise ValueError("exact CONTROL interpreter identity unsupported")
     script=str(Path(__file__).resolve())
