@@ -21,7 +21,11 @@ if ! "$fleet_python" -B -c 'import sys; raise SystemExit(0 if sys.version_info >
 fi
 
 "$fleet_python" -B scripts/workflow_config.py validate workflows/*.yaml
-"$fleet_python" -B -m compileall -q scripts tests
+# Compile for syntax only: bytecode goes to a private prefix, never into the
+# tree, so fixtures that copy directories (and the tests) see source files only.
+bytecode_prefix="$(mktemp -d "${TMPDIR:-/tmp}/fleet-ci-bytecode.XXXXXX")"
+trap 'rm -rf "$bytecode_prefix"' EXIT
+PYTHONPYCACHEPREFIX="$bytecode_prefix" "$fleet_python" -B -m compileall -q scripts tests
 
 for script in scripts/*.sh; do
   [[ -f "$script" ]] || continue
