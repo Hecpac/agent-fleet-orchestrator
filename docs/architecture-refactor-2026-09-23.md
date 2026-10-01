@@ -165,6 +165,29 @@ registrado, además de la pérdida del controlador. `observe` sigue siendo el
 (`ObserveWriteTests`) fija los cuatro casos; los dos de fin no registrado fallan
 con la implementación anterior.
 
+### Resolución de D3–D7 (2026-10-01)
+
+El operador pidió cerrar estas interpretaciones («resolver el 1 y el 2»). Según
+§2 de la constitución, el alcance de un slice es una decisión de método. Antes
+de cerrarlas se comprobó que cada una sigue describiendo el código de `main` en
+`f93bb34`, con su verificación de entonces repetida sobre ese árbol:
+
+- **D3:** `outputs/refactor-20260927-s3/surface_check.sh` reproduce byte a byte
+  `dry` (`herdr-implementation`, `implementation`) y `status` de las dos
+  Missions de referencia; `tests.test_mission_run` y `tests.test_fleet_acceptance`
+  pasan.
+- **D4:** `tests.test_fleet_herdr_profile_catalog` pasa, con los tres digests
+  fijados.
+- **D5:** `tests.test_fleet_telemetry_authority` pasa (el ledger no importa
+  medición y `observe` es el único escritor); su exclusión queda resuelta en D8.
+- **D6:** `tests.test_fleet_herdr_profile_catalog` y
+  `tests.test_fleet_herdr_policy_admission` pasan.
+- **D7:** los 11 Owner Cycles de conformance generados con el árbol anterior a
+  S7 (`3b14484`) verifican con el código de `main`, sello incluido;
+  `tests.test_fleet_herdr_owner_common` pasa.
+
+Las cinco quedan adoptadas como definición de S3–S7. Su contenido no cambia.
+
 ## Entrega inicial: S0, S1 y extracción inicial de S2
 
 - `fleet_archive_tree.py`: verificación de paths y hashes del árbol sobre bytes,
