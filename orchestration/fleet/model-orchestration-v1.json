@@ -1,0 +1,283 @@
+{
+  "schema_version": "fleet.model-orchestration.v1",
+  "status": "hypothesis",
+  "activation": "none",
+  "catalog": "docs/model-capability-catalog.md",
+  "snapshot": "2026-10-01",
+  "lanes": {
+    "herdr": {"clis": ["codex"]},
+    "fusion": {"clis": ["claude", "codex"]},
+    "harness_mini": {"clis": ["mini-swe-agent"]},
+    "legacy_router": {"clis": ["claude", "codex", "kimi", "ollama", "opencode"]}
+  },
+  "bindings": [
+    {
+      "id": "codex-gpt-6-astra-high",
+      "family": "openai", "provider": "openai", "model": "gpt-6-astra", "cli": "codex", "effort": "high",
+      "status": "current", "context_tokens": 1050000, "price_usd_per_mtok": {"input": 10, "output": 50},
+      "license": "proprietary",
+      "lanes": {"herdr": "admitted", "fusion": "admitted", "harness_mini": "blocked", "legacy_router": "admitted"},
+      "blockers": {"harness_mini": ["CONTROL budget client admits only deepseek-flash"]}
+    },
+    {
+      "id": "codex-gpt-6-astra-max",
+      "family": "openai", "provider": "openai", "model": "gpt-6-astra", "cli": "codex", "effort": "max",
+      "status": "current", "context_tokens": 1050000, "price_usd_per_mtok": {"input": 10, "output": 50},
+      "license": "proprietary",
+      "lanes": {"herdr": "blocked", "fusion": "admitted", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": ["Herdr compiled launch fixes model_reasoning_effort=high"],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["router roles launch gpt-6-astra at high effort"]
+      }
+    },
+    {
+      "id": "codex-gpt-6.1-sol-xhigh",
+      "family": "openai", "provider": "openai", "model": "gpt-6.1-sol", "cli": "codex", "effort": "xhigh",
+      "status": "current", "context_tokens": 1050000, "price_usd_per_mtok": {"input": 2, "output": 10},
+      "license": "proprietary",
+      "lanes": {"herdr": "blocked", "fusion": "admitted", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": [
+          "owner evidence adapter admits only gpt-6-astra and gpt-5.6-sol",
+          "Herdr compiled launch fixes model_reasoning_effort=high"
+        ],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["no router role binds gpt-6.1-sol"]
+      }
+    },
+    {
+      "id": "codex-gpt-5.6-sol-high",
+      "family": "openai", "provider": "openai", "model": "gpt-5.6-sol", "cli": "codex", "effort": "high",
+      "status": "superseded", "context_tokens": 1050000, "price_usd_per_mtok": {"input": 4, "output": 20},
+      "license": "proprietary",
+      "lanes": {"herdr": "admitted", "fusion": "admitted", "harness_mini": "blocked", "legacy_router": "admitted"},
+      "blockers": {"harness_mini": ["CONTROL budget client admits only deepseek-flash"]}
+    },
+    {
+      "id": "codex-gpt-6-luna-max",
+      "family": "openai", "provider": "openai", "model": "gpt-6-luna", "cli": "codex", "effort": "max",
+      "status": "current", "context_tokens": 1050000, "price_usd_per_mtok": {"input": 0.1, "output": 0.5},
+      "license": "proprietary",
+      "lanes": {"herdr": "blocked", "fusion": "admitted", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": ["owner evidence adapter admits only gpt-6-astra and gpt-5.6-sol"],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["no router role binds gpt-6-luna"]
+      }
+    },
+    {
+      "id": "claude-opus-5-5-high",
+      "family": "anthropic", "provider": "anthropic", "model": "claude-opus-5-5", "cli": "claude", "effort": "high",
+      "status": "current", "context_tokens": 1000000, "price_usd_per_mtok": {"input": 4, "output": 20},
+      "license": "proprietary",
+      "lanes": {"herdr": "blocked", "fusion": "admitted", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": [
+          "Herdr roster admits only provider openai with hook_source codex",
+          "no Claude Code evidence adapter for model, effort, permissions and cancellation"
+        ],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["router claude roles pin superseded claude-opus-5 / claude-fable-5"]
+      }
+    },
+    {
+      "id": "claude-opus-5-5-max",
+      "family": "anthropic", "provider": "anthropic", "model": "claude-opus-5-5", "cli": "claude", "effort": "max",
+      "status": "current", "context_tokens": 1000000, "price_usd_per_mtok": {"input": 4, "output": 20},
+      "license": "proprietary",
+      "lanes": {"herdr": "blocked", "fusion": "admitted", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": [
+          "Herdr roster admits only provider openai with hook_source codex",
+          "no Claude Code evidence adapter for model, effort, permissions and cancellation"
+        ],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["router claude roles pin superseded claude-opus-5 / claude-fable-5"]
+      }
+    },
+    {
+      "id": "claude-sonnet-5-5-max",
+      "family": "anthropic", "provider": "anthropic", "model": "claude-sonnet-5-5", "cli": "claude", "effort": "max",
+      "status": "current", "context_tokens": 1000000, "price_usd_per_mtok": {"input": 2, "output": 10},
+      "license": "proprietary",
+      "lanes": {"herdr": "blocked", "fusion": "admitted", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": [
+          "Herdr roster admits only provider openai with hook_source codex",
+          "no Claude Code evidence adapter for model, effort, permissions and cancellation"
+        ],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["no router role binds claude-sonnet-5-5"]
+      }
+    },
+    {
+      "id": "claude-sonnet-5-5-xhigh",
+      "family": "anthropic", "provider": "anthropic", "model": "claude-sonnet-5-5", "cli": "claude", "effort": "xhigh",
+      "status": "current", "context_tokens": 1000000, "price_usd_per_mtok": {"input": 2, "output": 10},
+      "license": "proprietary",
+      "lanes": {"herdr": "blocked", "fusion": "admitted", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": [
+          "Herdr roster admits only provider openai with hook_source codex",
+          "no Claude Code evidence adapter for model, effort, permissions and cancellation"
+        ],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["no router role binds claude-sonnet-5-5"]
+      }
+    },
+    {
+      "id": "claude-fable-5-1-max",
+      "family": "anthropic", "provider": "anthropic", "model": "claude-fable-5-1", "cli": "claude", "effort": "max",
+      "status": "current", "context_tokens": 1000000, "price_usd_per_mtok": {"input": 10, "output": 50},
+      "license": "proprietary",
+      "lanes": {"herdr": "blocked", "fusion": "admitted", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": [
+          "Herdr roster admits only provider openai with hook_source codex",
+          "no Claude Code evidence adapter for model, effort, permissions and cancellation"
+        ],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["router claude roles pin superseded claude-opus-5 / claude-fable-5"]
+      }
+    },
+    {
+      "id": "claude-zai-glm-5.3-max",
+      "family": "zai", "provider": "zai", "model": "glm-5.3", "cli": "claude", "effort": "max",
+      "status": "current", "context_tokens": 1000000, "price_usd_per_mtok": {"input": 1.4, "output": 4.4},
+      "license": "glm-5.3-custom",
+      "lanes": {"herdr": "blocked", "fusion": "blocked", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": [
+          "Herdr roster admits only provider openai with hook_source codex",
+          "no Claude Code evidence adapter for model, effort, permissions and cancellation"
+        ],
+        "fusion": ["Fusion has no Anthropic-compatible base URL override for Z.ai"],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["no router role binds glm-5.3 through Claude Code"]
+      }
+    },
+    {
+      "id": "opencode-glm-5.3-max",
+      "family": "zai", "provider": "zai", "model": "glm-5.3", "cli": "opencode", "effort": "max",
+      "status": "current", "context_tokens": 1000000, "price_usd_per_mtok": {"input": 1.4, "output": 4.4},
+      "license": "glm-5.3-custom",
+      "lanes": {"herdr": "blocked", "fusion": "blocked", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": [
+          "Herdr roster admits only provider openai with hook_source codex",
+          "OpenCode permissions remain not_attested"
+        ],
+        "fusion": ["Fusion launches only claude and codex"],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["router glm role pins superseded glm-5.2"]
+      }
+    },
+    {
+      "id": "kimi-k3",
+      "family": "moonshot", "provider": "moonshot", "model": "kimi-code/k3", "cli": "kimi", "effort": null,
+      "status": "current", "context_tokens": 1048576, "price_usd_per_mtok": {"input": 3, "output": 15},
+      "license": "kimi-k3-custom",
+      "lanes": {"herdr": "blocked", "fusion": "blocked", "harness_mini": "blocked", "legacy_router": "admitted"},
+      "blockers": {
+        "herdr": [
+          "Herdr roster admits only provider openai with hook_source codex",
+          "no Kimi evidence adapter"
+        ],
+        "fusion": ["Fusion launches only claude and codex"],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"]
+      }
+    },
+    {
+      "id": "mini-deepseek-flash-max",
+      "family": "deepseek", "provider": "deepseek", "model": "deepseek-flash", "cli": "mini-swe-agent", "effort": "max",
+      "status": "current", "context_tokens": 1000000, "price_usd_per_mtok": {"input": 0.3, "output": 1.2},
+      "license": "MIT",
+      "lanes": {"herdr": "blocked", "fusion": "blocked", "harness_mini": "admitted", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": ["Herdr roster admits only provider openai with hook_source codex"],
+        "fusion": ["Fusion launches only claude and codex"],
+        "legacy_router": ["no router role binds deepseek-flash"]
+      }
+    },
+    {
+      "id": "ollama-qwen3.8-27b",
+      "family": "local", "provider": "ollama", "model": "qwen3.8:27b", "cli": "ollama", "effort": null,
+      "status": "current", "context_tokens": 262144, "price_usd_per_mtok": null,
+      "license": "Apache-2.0",
+      "lanes": {"herdr": "blocked", "fusion": "blocked", "harness_mini": "blocked", "legacy_router": "blocked"},
+      "blockers": {
+        "herdr": ["Herdr roster admits only provider openai with hook_source codex"],
+        "fusion": ["Fusion launches only claude and codex"],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"],
+        "legacy_router": ["model not pulled locally and no router role binds it"]
+      }
+    },
+    {
+      "id": "ollama-gemma3-4b",
+      "family": "local", "provider": "ollama", "model": "gemma3:4b", "cli": "ollama", "effort": null,
+      "status": "current", "context_tokens": 131072, "price_usd_per_mtok": null,
+      "license": "gemma",
+      "lanes": {"herdr": "blocked", "fusion": "blocked", "harness_mini": "blocked", "legacy_router": "admitted"},
+      "blockers": {
+        "herdr": ["Herdr roster admits only provider openai with hook_source codex"],
+        "fusion": ["Fusion launches only claude and codex"],
+        "harness_mini": ["CONTROL budget client admits only deepseek-flash"]
+      }
+    }
+  ],
+  "slots": [
+    {
+      "id": "lead", "authority": "read-only", "deliverable": "plan-and-synthesis", "diversity": "none",
+      "candidates": ["claude-opus-5-5-high", "codex-gpt-6-astra-high", "claude-fable-5-1-max"],
+      "evidence": ["catalog 4.2", "catalog 5"]
+    },
+    {
+      "id": "research", "authority": "read-only", "deliverable": "evidence-report", "diversity": "none",
+      "candidates": ["kimi-k3", "claude-fable-5-1-max", "claude-opus-5-5-high", "codex-gpt-6-astra-high"],
+      "evidence": ["catalog 4.3", "catalog 5"]
+    },
+    {
+      "id": "writer_daily", "authority": "write", "deliverable": "canonical-candidate", "diversity": "none",
+      "candidates": ["codex-gpt-6.1-sol-xhigh", "claude-sonnet-5-5-xhigh", "codex-gpt-5.6-sol-high"],
+      "evidence": ["catalog 4.1", "catalog 5"]
+    },
+    {
+      "id": "writer_frontier", "authority": "write", "deliverable": "canonical-candidate", "diversity": "none",
+      "candidates": ["claude-sonnet-5-5-max", "claude-opus-5-5-max", "codex-gpt-6-astra-max"],
+      "evidence": ["catalog 4.1", "catalog 5"]
+    },
+    {
+      "id": "writer_open_weight", "authority": "write", "deliverable": "control-gated-candidate", "diversity": "none",
+      "candidates": ["mini-deepseek-flash-max"],
+      "evidence": ["catalog 4.5", "catalog 5.1"]
+    },
+    {
+      "id": "reviewer", "authority": "read-only", "deliverable": "review-findings", "diversity": "preferred",
+      "candidates": ["claude-opus-5-5-high", "claude-zai-glm-5.3-max", "opencode-glm-5.3-max", "codex-gpt-6-astra-high"],
+      "evidence": ["catalog 4.3", "catalog 5", "catalog 5.1"]
+    },
+    {
+      "id": "verifier", "authority": "read-only", "deliverable": "verification-result", "diversity": "preferred",
+      "candidates": ["codex-gpt-6-astra-high", "claude-opus-5-5-high"],
+      "evidence": ["catalog 4.2", "catalog 5"]
+    },
+    {
+      "id": "volume", "authority": "advisory", "deliverable": "bounded-extraction", "diversity": "none",
+      "candidates": ["codex-gpt-6-luna-max", "mini-deepseek-flash-max"],
+      "evidence": ["catalog 4.4", "catalog 5", "catalog 5.1"]
+    },
+    {
+      "id": "local_panel", "authority": "advisory", "deliverable": "bounded-opinion", "diversity": "none",
+      "candidates": ["ollama-qwen3.8-27b", "ollama-gemma3-4b"],
+      "evidence": ["catalog 3", "catalog 5"]
+    }
+  ],
+  "teams": [
+    {"id": "minimal", "slots": ["writer_daily"]},
+    {"id": "standard", "slots": ["lead", "writer_daily", "reviewer", "verifier"]},
+    {"id": "research", "slots": ["lead", "research", "writer_daily", "reviewer", "verifier"]},
+    {"id": "frontier", "slots": ["lead", "writer_frontier", "reviewer", "verifier"]},
+    {"id": "open_weight", "slots": ["writer_open_weight", "volume"]}
+  ]
+}
