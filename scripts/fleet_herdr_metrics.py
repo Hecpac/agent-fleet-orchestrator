@@ -6,6 +6,7 @@ is the one writer of those events, and nothing here decides Mission authority.
 from __future__ import annotations
 
 from datetime import datetime
+import sys
 import time
 import uuid
 
@@ -16,6 +17,14 @@ KINDS = state.HERDR_INTERVAL_KINDS
 
 
 def observe(runs, mid, kind, callback, run_id=None):
+    """Run `callback` inside a ledger interval without letting measurement decide it.
+
+    The start is written before the callback: if it cannot be recorded the
+    callback does not run, so no effect escapes the ledger. The callback's
+    outcome always prevails over the end record: if the end cannot be recorded
+    the interval stays open (null duration, as after a controller loss) and the
+    result is returned, or the exception re-raised unchanged with a note.
+    """
     identifier = str(uuid.uuid4())
     current = fleet_mission.load_state(runs, mid)
     if current["status"] in state.TERMINAL_STATUSES:
@@ -23,17 +32,30 @@ def observe(runs, mid, kind, callback, run_id=None):
     state.append_event(runs, mid, kind="herdr_interval_started", actor="CONTROL",
         idempotency_key="herdr:interval:" + identifier,
         payload={"interval_id": identifier, "kind": kind, "run_id": run_id})
-    started, outcome = time.monotonic_ns(), "raised"
+    started = time.monotonic_ns()
+
+    def end(outcome):
+        elapsed = time.monotonic_ns() - started
+        try:
+            if fleet_mission.load_state(runs, mid)["status"] not in state.TERMINAL_STATUSES:
+                state.append_event(runs, mid, kind="herdr_interval_finished", actor="CONTROL",
+                    idempotency_key="herdr:interval-end:" + identifier,
+                    payload={"interval_id": identifier, "elapsed_ns": elapsed, "outcome": outcome})
+        except Exception as exc:
+            return f"interval {identifier} end not recorded ({type(exc).__name__}: {exc}); its duration is unknown"
+        return None
+
     try:
         result = callback()
-        outcome = "returned"
-        return result
-    finally:
-        elapsed = time.monotonic_ns() - started
-        if fleet_mission.load_state(runs, mid)["status"] not in state.TERMINAL_STATUSES:
-            state.append_event(runs, mid, kind="herdr_interval_finished", actor="CONTROL",
-                idempotency_key="herdr:interval-end:" + identifier,
-                payload={"interval_id": identifier, "elapsed_ns": elapsed, "outcome": outcome})
+    except BaseException as raised:
+        unrecorded = end("raised")
+        if unrecorded:
+            raised.add_note("herdr-metrics: " + unrecorded)
+        raise
+    unrecorded = end("returned")
+    if unrecorded:
+        print("herdr-metrics: " + unrecorded, file=sys.stderr)
+    return result
 
 
 def timestamp(value):

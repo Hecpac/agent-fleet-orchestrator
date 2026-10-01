@@ -139,6 +139,32 @@ del catálogo (patrón de S6). Esquema de eventos, `_seal()`, formas de
 Generalizar el bucle de intentos y revisiones es el prerrequisito de S8 y una
 decisión de diseño; queda para S8.
 
+### D8 — Escritura de intervalos en `observe` (2026-10-01)
+
+Resuelve el hallazgo que D5 dejó fuera. `fleet_herdr_metrics.observe` registra
+el inicio antes de ejecutar la operación y mantiene ese orden: si el inicio no se
+puede escribir, la operación no se ejecuta y el error se propaga. No ocurre
+ningún efecto que el ledger no pueda contar, no hay ambigüedad y la Mission
+sigue siendo reanudable.
+
+El fin ya no decide nada: el resultado de la operación prevalece siempre. Si el
+fin no se puede escribir, incluida la lectura de estado que lo precede, el
+intervalo queda abierto. `observe` devuelve el resultado o relanza la excepción
+original con su tipo y traceback, más una nota que describe el fallo de
+medición; si la operación terminó bien, el fallo se informa por stderr. Antes,
+la excepción del registro sustituía a la de la operación. Los llamadores que
+distinguen `MissionConflict`, `HerdrBackendError` o
+`ExecutionEvidenceRejected` interpretaban así un fallo de medición como uno de
+la operación, y un `submit` enviado podía verse como fallido.
+
+La semántica del ledger no cambia: un fin ausente sigue significando duración
+desconocida (`missing_end_is_unknown_not_elapsed_wait` en `timing`,
+`interval_end_not_observed` en la traza). Ahora tiene una causa más, un fin no
+registrado, además de la pérdida del controlador. `observe` sigue siendo el
+único escritor de intervalos. `tests/test_fleet_herdr_metrics.py`
+(`ObserveWriteTests`) fija los cuatro casos; los dos de fin no registrado fallan
+con la implementación anterior.
+
 ## Entrega inicial: S0, S1 y extracción inicial de S2
 
 - `fleet_archive_tree.py`: verificación de paths y hashes del árbol sobre bytes,
@@ -349,13 +375,13 @@ Revisado y conservado a propósito:
 - El presupuesto por tokens de `fleet_ledger`/`fleet_budget` es control de
   admisión deliberado del carril legacy.
 
-Hallazgo pendiente de decisión, fuera de S5: `observe` escribe el inicio y el fin
+Hallazgo fuera de S5, resuelto el 2026-10-01 en D8: `observe` escribe el inicio y el fin
 de cada intervalo alrededor de callbacks del controlador (llamadas al backend,
 incluido `submit`, ejecución funcional y espera del supervisor). Si falla la
 escritura del inicio, el callback no se ejecuta; si falla la del fin, esa
-excepción sustituye el resultado o la excepción del callback. Hacerlo tolerante
-cambia la semántica del ledger («un fin ausente es desconocido») y exige una
-decisión propia.
+excepción sustituía el resultado o la excepción del callback. D8 mantiene el
+inicio y hace que el fin nunca sustituya el resultado; el lector ya trataba un
+fin ausente como desconocido.
 
 Verificación: la suite completa conserva el mismo conjunto de fallos (solo
 bloqueos del sandbox) antes (2.183 tests), tras el traslado (2.191) y tras la

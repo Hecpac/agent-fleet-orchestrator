@@ -72,8 +72,12 @@ cleanup keeps control pending rather than claiming a stop.
 
 The Mission ledger retains paired observation intervals and monotonic durations
 for controller operations, controller waits, functional checks and supervisor
-idle waits. A missing end after controller loss has a null duration. It is not
-silently charged as execution, wait or pause. Cached functional receipts count
+idle waits. A missing end after controller loss, or after an end record that
+could not be written, has a null duration. It is not silently charged as
+execution, wait or pause. An interval start is written before the operation
+runs; if it cannot be recorded, the operation does not run. A failed end record
+never replaces the operation's result or exception: the result is returned, or
+the original exception is re-raised with a note. Cached functional receipts count
 as controller operations, not a second functional execution.
 
 Reports separate requested-pause intervals from confirmed-pause intervals and

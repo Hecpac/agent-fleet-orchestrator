@@ -1,4 +1,7 @@
+import contextlib
+import io
 import unittest
+from unittest import mock
 
 from tests import test_fleet_herdr_control
 import fleet_herdr_metrics as metrics
@@ -107,3 +110,70 @@ class IntervalTests(unittest.TestCase):
         self.assertEqual(result["controller_wait_seconds"],5)
         self.assertEqual(sum(result["wall_partition"].values()),10)
         self.assertEqual(result["wall_partition"]["unknown"],2)
+
+
+class ObserveWriteTests(unittest.TestCase):
+    """A failed interval write never replaces the observed operation's outcome."""
+
+    def setUp(self):
+        helper = test_fleet_herdr_control.HerdrControlTests()
+        helper.setUp()
+        self.addCleanup(helper.doCleanups)
+        self.runs, self.mid, self.current = helper.runs, helper.mid, helper.current
+
+    def failing(self, kind, error):
+        real = state.append_event
+        def append(runs, mid, **kwargs):
+            if kwargs["kind"] == kind:
+                raise error
+            return real(runs, mid, **kwargs)
+        return mock.patch.object(metrics.state, "append_event", append)
+
+    def events(self):
+        return state.read_events(state.ledger_path(self.runs, self.mid))
+
+    def interval(self):
+        (interval,) = self.current()["herdr_intervals"].values()
+        return interval
+
+    def test_unrecorded_end_returns_the_result_and_leaves_the_duration_unknown(self):
+        stderr = io.StringIO()
+        with self.failing("herdr_interval_finished", OSError("disk full")), contextlib.redirect_stderr(stderr):
+            self.assertEqual(metrics.observe(self.runs, self.mid, "controller_operation", lambda: "sent"), "sent")
+        self.assertIn("end not recorded (OSError: disk full); its duration is unknown", stderr.getvalue())
+        self.assertIsNone(self.interval()["ended_at"])
+        timing = metrics.timing(self.current(), self.events(), [])
+        self.assertIsNone(timing["controller_operation_seconds"])
+        self.assertEqual(timing["open_interval_reason"], "missing_end_is_unknown_not_elapsed_wait")
+        span = next(s for s in fleet_trace.events_to_spans(self.events()) if s["span_id"].startswith("interval:"))
+        self.assertEqual(span["attributes"]["reason"], "interval_end_not_observed")
+
+    def test_unrecorded_end_reraises_the_operation_error_with_a_note(self):
+        class BackendFailure(Exception):
+            pass
+        def callback():
+            raise BackendFailure("transport lost")
+        # A MissionConflict from the end write must not reach callers that handle the operation's conflicts.
+        with self.failing("herdr_interval_finished", state.MissionConflict("terminal race")):
+            with self.assertRaises(BackendFailure) as caught:
+                metrics.observe(self.runs, self.mid, "controller_operation", callback)
+        self.assertEqual(str(caught.exception), "transport lost")
+        self.assertEqual(len(caught.exception.__notes__), 1)
+        self.assertIn("end not recorded (MissionConflict: terminal race)", caught.exception.__notes__[0])
+        self.assertIsNone(self.interval()["ended_at"])
+
+    def test_recorded_end_keeps_the_operation_error_without_notes(self):
+        def callback():
+            raise KeyError("missing")
+        with self.assertRaises(KeyError) as caught:
+            metrics.observe(self.runs, self.mid, "controller_wait", callback)
+        self.assertFalse(getattr(caught.exception, "__notes__", None))
+        self.assertEqual(self.interval()["outcome"], "raised")
+
+    def test_unrecorded_start_never_runs_the_operation(self):
+        calls = []
+        with self.failing("herdr_interval_started", OSError("read-only ledger")):
+            with self.assertRaisesRegex(OSError, "read-only ledger"):
+                metrics.observe(self.runs, self.mid, "controller_operation", lambda: calls.append("sent"))
+        self.assertEqual(calls, [])
+        self.assertFalse(self.current().get("herdr_intervals"))
