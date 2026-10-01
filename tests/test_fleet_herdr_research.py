@@ -445,8 +445,8 @@ class ResearchProfileTests(unittest.TestCase):
         (runs / "missions" / mission_id).mkdir(parents=True, mode=0o700)
         (runs / "missions").chmod(0o700)
         fake = FakeHerdr()
-        fake.codex_version = "0.154.0"
-        fake.screen = "OpenAI Codex (v0.154.0)\n› Ask Codex to do anything\n"
+        fake.codex_version = "0.159.3"
+        fake.screen = "OpenAI Codex (v0.159.3)\n› Ask Codex to do anything\n"
         def local_preview(command, **kwargs):
             if command[0] == "codex" and command[-3:] == ["debug", "prompt-input", "FLEET_LOCAL_CONTEXT_PROBE"]:
                 return subprocess.CompletedProcess(command, 0, json.dumps([

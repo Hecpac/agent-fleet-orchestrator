@@ -24,8 +24,8 @@ class PersonalTests(unittest.TestCase):
         self.controller=driver._Driver(self.f.runs,self.mid);self.controller.load();self.controller.prepare_candidate()
         self.controller.event('fleet_boot_started','boot',{'feature':'driver-test','preset':'astra_sol'})
         self.fake=transport.FakeHerdr()
-        self.fake.codex_version="0.154.0"
-        self.fake.screen="OpenAI Codex (v0.154.0)\n› Ask Codex to do anything\n"
+        self.fake.codex_version="0.159.3"
+        self.fake.screen="OpenAI Codex (v0.159.3)\n› Ask Codex to do anything\n"
         self.backend=herdr.HerdrBackend(self.f.runs,self.mid,feature='driver-test',target_repo=self.controller.candidate,
             compiled=self.f.compiled,session='mission-control-test',personal_cli=True,
             environment={'PATH':'/usr/bin:/bin','CODEX_HOME':'/synthetic/default-codex-home'})
@@ -42,6 +42,55 @@ class PersonalTests(unittest.TestCase):
         self.assertFalse(any('fleet-local' in str(c) for c in calls))
         creates=[c for c in calls if c[3:5]==['workspace','create']]
         self.assertIn('CODEX_HOME=/synthetic/default-codex-home',creates[0])
+
+    def test_personal_lane_mediates_one_folder_access_enter_per_agent(self):
+        fixtures_dir=Path(__file__).resolve().parent/'fixtures'/'codex-0.159.3'
+        cwd=str(self.controller.candidate)
+        notice=(fixtures_dir/'folder-access.txt').read_text().replace('/fleet/candidate',cwd)
+        ready=(fixtures_dir/'ready.txt').read_text().replace('/fleet/candidate',cwd)
+        pressed=[]
+        def run(command,**kwargs):
+            op=self.fake.operation(command)
+            if op[1:3]==['agent','read']:
+                return herdr.subprocess.CompletedProcess(command,0,ready if op[3] in pressed else notice,'')
+            if op[1:3]==['agent','send-keys'] and op[4:]==['enter']:
+                pressed.append(op[3]);self.fake.calls.append(command)
+                return herdr.subprocess.CompletedProcess(command,0,'{"result":{"sent":true}}','')
+            return self.fake(command,**kwargs)
+        with mock.patch.object(subscription,'ChatGPTProvider',side_effect=AssertionError('adapter must not run')), \
+             mock.patch.object(herdr.subprocess,'run',side_effect=run):
+            state=self.backend.boot()
+        self.assertEqual(sorted(pressed),sorted(m['agent_name'] for m in state['members']))
+        name=state['members'][0]['agent_name']
+        session=['herdr','--session','mission-control-test']
+        with self.assertRaisesRegex(ValueError,'startup acknowledgment'):
+            personal.require_command(self.backend,[*session,'agent','send-keys',name,'enter'],'herdr')
+        with self.assertRaises(ValueError):
+            personal.require_command(self.backend,[*session,'agent','send-keys',name,'y'],'herdr')
+
+    def test_personal_boot_pins_the_certified_codex_install(self):
+        import hashlib, tempfile
+        import fleet_artifacts
+        import fleet_codex_registry as registry
+        import fleet_herdr_versions as versions
+        tmp=tempfile.TemporaryDirectory();self.addCleanup(tmp.cleanup)
+        store=registry.Registry(Path(tmp.name).resolve()/'fleet-codex')
+        bin_dir=store.bin_dir('0.159.3');bin_dir.mkdir(parents=True)
+        (bin_dir/'codex').write_bytes(b'certified fixture binary');(bin_dir/'codex').chmod(0o755)
+        entry=store.register({'schema_version':registry.RECORD_SCHEMA,'status':'PASS','codex_version':'0.159.3',
+            'binary_sha256':hashlib.sha256(b'certified fixture binary').hexdigest(),'bin_dir':str(bin_dir),
+            'startup_guard':'codex-0.159-v1','herdr_version':'0.9.0','finished_at':'2026-10-01T00:00:00+00:00'})
+        backend=herdr.HerdrBackend(self.f.runs,self.mid,feature='driver-test',target_repo=self.controller.candidate,
+            compiled=self.f.compiled,session='mission-control-test',personal_cli=True,codex_registry=store,
+            environment={'PATH':'/usr/bin:/bin','CODEX_HOME':'/synthetic/default-codex-home'})
+        with mock.patch.object(subscription,'ChatGPTProvider',side_effect=AssertionError('adapter must not run')), \
+             mock.patch.object(herdr.subprocess,'run',side_effect=self.fake):
+            state=backend.boot()
+        self.assertEqual(state['runtime_contract'],versions.certified_contract(entry))
+        self.assertEqual(fleet_artifacts.get_bytes(self.f.runs,self.mid,entry['certification_sha256']),
+                         store.record_bytes(entry['certification_sha256']))
+        creates=[c for c in self.fake.calls if c[3:5]==['workspace','create']]
+        self.assertIn('PATH='+str(bin_dir)+':/usr/bin:/bin',creates[0])
 
     def test_profile_requires_creation_and_exact_candidate(self):
         self.backend.target_repo=self.f.target
@@ -289,9 +338,9 @@ class PersonalTests(unittest.TestCase):
 
 
     def test_context_preview_allows_only_exact_frozen_flags_and_admitted_mission(self):
-        from fleet_herdr_versions import TASK_CONTEXT_CONTRACT
+        from fleet_herdr_versions import CURRENT_TASK_CONTEXT_CONTRACT
         from fleet_herdr_skill_context import PROBE, POLICY, flags
-        self.backend.initial_runtime_contract = dict(TASK_CONTEXT_CONTRACT)
+        self.backend.initial_runtime_contract = dict(CURRENT_TASK_CONTEXT_CONTRACT)
         self.backend.context = {'policy': POLICY, 'disabled_skills': ['commit']}
         valid = ['codex', *flags(self.backend.context), 'debug', 'prompt-input', PROBE]
         kwargs = {'cwd': self.backend.target_repo, 'env': self.backend.environment, 'timeout': 1}

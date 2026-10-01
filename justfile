@@ -1,5 +1,7 @@
 runs_dir := env_var_or_default("FLEET_RUNS_DIR", "orchestration/runs")
 fleet_python := env_var_or_default("FLEET_PYTHON", "python3.12")
+# Certified side-by-side Codex installs; Missions pin one through PATH (docs/cli-updates.md).
+export FLEET_CODEX_ROOT := env_var_or_default("FLEET_CODEX_ROOT", home_directory() / ".local/share/fleet-codex")
 # Retain the existing personal override; its default shares the product runtime.
 personal_python := fleet_python
 

@@ -33,8 +33,8 @@ def injected(name, turn='turn-herdr-test'):
 class StartupContextTests(unittest.TestCase):
     def setUp(self):
         self.f = fixtures.HerdrBackendTests(); self.f.setUp(); self.addCleanup(self.f.doCleanups)
-        self.f.fake.codex_version = '0.154.0'
-        self.f.fake.screen = 'OpenAI Codex (v0.154.0)\n› Ask Codex to do anything\n'
+        self.f.fake.codex_version = '0.159.3'
+        self.f.fake.screen = 'OpenAI Codex (v0.159.3)\n› Ask Codex to do anything\n'
         self.catalog_names = ['commit', 'slice-gate']
         self.previews = []
         original_run = backend_module.subprocess.run
@@ -50,7 +50,7 @@ class StartupContextTests(unittest.TestCase):
                 return fixtures.completed(command, value=[{'type': 'message', 'role': 'developer', 'content': [{'type': 'input_text', 'text': text}]}, {'type': 'message', 'role': 'user', 'content': [{'type': 'input_text', 'text': context.PROBE}]}])
             return self.f.fake(command, **kwargs)
         self.b = self.f.backend(runner=runner)
-        self.b.initial_runtime_contract = dict(versions.TASK_CONTEXT_CONTRACT)
+        self.b.initial_runtime_contract = dict(versions.CURRENT_TASK_CONTEXT_CONTRACT)
         self.b.boot()
         self.run = str(uuid.uuid4())
         task = json.loads(self.f.prompt(self.run))
@@ -75,7 +75,7 @@ class StartupContextTests(unittest.TestCase):
     def test_authorized_inline_skills_pass_and_flags_are_bound(self):
         result = self.complete()
         self.assertEqual(result['status'], 'PASS')
-        self.assertEqual(result['evidence']['runtime_contract'], versions.TASK_CONTEXT_CONTRACT)
+        self.assertEqual(result['evidence']['runtime_contract'], versions.CURRENT_TASK_CONTEXT_CONTRACT)
         current = self.b.state()
         contract = fleet_json.loads(cas.get_bytes(self.f.runs, self.f.mission_id, current['context_artifact_id']))
         self.assertEqual(contract['disabled_skills'], self.catalog_names)
@@ -308,8 +308,8 @@ class ResearchEndToEndTests(unittest.TestCase):
         from types import SimpleNamespace
         self.h = research.ResearchProfileTests(); self.h.setUp(); self.addCleanup(self.h.doCleanups)
         self.mid = self.h.create(options=self.h.options(herdr_session='mission-control-test'))
-        self.fake = fixtures.FakeHerdr(); self.fake.codex_version = '0.154.0'
-        self.fake.screen = 'OpenAI Codex (v0.154.0)\n› Ask Codex to do anything\n'
+        self.fake = fixtures.FakeHerdr(); self.fake.codex_version = '0.159.3'
+        self.fake.screen = 'OpenAI Codex (v0.159.3)\n› Ask Codex to do anything\n'
         self.tasks = []; self.transcripts = {}; self.extra = False
         original_run = backend_module.subprocess.run
         def runner(command, **kwargs):

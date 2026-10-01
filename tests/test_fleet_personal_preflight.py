@@ -10,7 +10,7 @@ import fleet_personal_preflight as preflight
 
 
 class PreflightTests(unittest.TestCase):
-    def probe(self, *, dirty=False, codex_version="0.154.0", login=True):
+    def probe(self, *, dirty=False, codex_version="0.159.3", login=True):
         calls = []
         def run(argv):
             calls.append(argv)

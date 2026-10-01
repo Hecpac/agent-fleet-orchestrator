@@ -7,6 +7,8 @@ cd "$repo_root"
 fleet_python="${FLEET_PYTHON:-python3.12}"
 export FLEET_PYTHON="$fleet_python"
 export PYTHONDONTWRITEBYTECODE=1
+# Tests never read this machine's certified Codex registry (empty disables it).
+export FLEET_CODEX_ROOT=
 
 for dependency in bash git "$fleet_python" uv; do
   if ! command -v "$dependency" >/dev/null 2>&1; then

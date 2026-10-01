@@ -65,6 +65,39 @@ class PoolTests(unittest.TestCase):
         self.assertTrue(all(not o["ready"] for o in result["observations"]))
         self.assertFalse(any(self.fake.operation(c)[1:3] == ["agent", "send-keys"] for c in self.fake.calls))
 
+    def test_folder_access_is_acknowledged_once_per_agent_with_pinned_codex(self):
+        fixtures = Path(__file__).resolve().parent / "fixtures" / "codex-0.159.3"
+        notice = (fixtures / "folder-access.txt").read_text().replace("/fleet/candidate", str(self.target))
+        ready = (fixtures / "ready.txt").read_text()
+        pressed = []
+
+        def run(argv):
+            op = self.fake.operation(argv)
+            if op[1:3] == ["agent", "read"]:
+                return pools.subprocess.CompletedProcess(argv, 0, ready if op[3] in pressed else notice, "")
+            if op[1:3] == ["agent", "send-keys"]:
+                pressed.append(op[3])
+                self.fake.calls.append(argv)
+                return pools.subprocess.CompletedProcess(argv, 0, '{"result":{"sent":true}}', "")
+            return self.fake(argv)
+
+        pin = {"codex_version": "0.159.3", "bin_dir": "/certified/codex/bin", "certification": "e" * 64}
+        self.pool.probe = lambda target: {"runtime_preflight": "PASS", "blockers": [], "codex_pin": pin,
+                                          "runtime_contract": {"startup_guard": "codex-0.159-v1"},
+                                          "binaries": {"herdr": {"path": "herdr"}}}
+        self.pool.run = run
+        result = self.pool.prepare(self.target, "mission-control-test")
+        self.assertEqual(result["phase"], "ready")
+        self.assertEqual(sorted(pressed), sorted(m["name"] for m in result["members"]))
+        self.assertTrue(all(m["startup_acknowledgments"][0]["notice"] == "folder-access-open-restricted"
+                            for m in result["members"]))
+        create = next(c for c in self.fake.calls if self.fake.operation(c)[1:3] == ["workspace", "create"])
+        self.assertTrue(any(arg.startswith("PATH=/certified/codex/bin:") for arg in create))
+        self.fake.calls.clear()
+        pressed_before = list(pressed)
+        self.pool.prepare(self.target, "mission-control-test")
+        self.assertEqual(pressed, pressed_before)
+
     def test_close_is_idempotent_and_refuses_active_agents(self):
         result = self.pool.prepare(self.target, "mission-control-test")
         name = result["members"][0]["name"]

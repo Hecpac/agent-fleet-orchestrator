@@ -6,8 +6,10 @@ carril. Los registros existentes conservan su selección y contrato de versiones
 La ruta personal mantiene admisiones, candidato separado, CAS, pausa/cancelación,
 verificación de resultados y archivo. No afirma aislamiento frente a código hostil.
 
-El contrato personal actual solicita Herdr 0.9.0 y Codex CLI 0.154.0. El contrato
-oficial histórico de 0.153.4 sigue reconocido. La versión de una sesión y sus
+El contrato actual (`codex-0.159-v1`) solicita Herdr 0.9.0 y Codex CLI 0.159.3. Los
+contratos históricos de 0.154.0 y 0.153.4 siguen reconocidos. Con `FLEET_CODEX_ROOT`
+(lo exporta `just`), el preflight, el pool y las Missions usan la última versión
+certificada instalada en paralelo, no el `codex` global ([actualización de CLI](cli-updates.md)). La versión de una sesión y sus
 permisos se contrastan con el transcript; un CLI instalado no prueba que un
 modelo esté disponible ni que una herramienta funcione.
 
@@ -38,7 +40,9 @@ ejecutable resuelto, porque pueden coexistir versiones diferentes de Codex.
 4. `just personal-show /ruta/privada/pool` comprueba las identidades y superficies
    actuales. `ready` significa disponible para input, no trabajo completado.
    Los diálogos de autenticación, hooks o actualización quedan visibles y no se
-   responden automáticamente.
+   responden automáticamente. Con Codex 0.159.3 el pool informa el aviso de
+   Folder access como `startup_blocker`; sólo el backend de una Mission lo
+   confirma, una vez y registrado ([contrato de versiones](herdr-cli-versions.md)).
 5. `just personal-assign /ruta/privada/pool feature "Objetivo" /ruta/contrato.json`
    congela la asignación y cierra el pool exacto antes de iniciar las sesiones de
    Mission Control. La primera versión reemplaza las sesiones vacías; no adopta

@@ -54,8 +54,8 @@ class FakeHerdr:
         self.cancel_quiescent = True
         self.workspace_label = ""
         self.version = fleet_herdr.HERDR_VERSION
-        self.codex_version = "0.153.4"
-        self.screen = "OpenAI Codex (v0.153.4)\n› Ask Codex to do anything\n"
+        self.codex_version = "0.159.3"
+        self.screen = "OpenAI Codex (v0.159.3)\n› Ask Codex to do anything\n"
         self.start_session_null = False
         self.start_status = "idle"
         self.raise_start_once = False

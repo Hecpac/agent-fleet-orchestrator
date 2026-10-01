@@ -1,7 +1,7 @@
 # Arranque de una sesión privada Herdr/Codex
 
-El backend personal oficial actual fija Herdr 0.9.0/Codex 0.154.0 y aplica el guard de
-superficie antes de cada envío. Consulta el [contrato de versiones](herdr-cli-versions.md):
+El backend actual fija Herdr 0.9.0/Codex 0.159.3 (contrato `codex-0.159-v1`) y aplica el
+guard de superficie antes de cada envío. Consulta el [contrato de versiones](herdr-cli-versions.md):
 los ensayos históricos descritos abajo no prueban la recuperación después de
 reiniciar el servidor con las versiones nuevas.
 
@@ -32,19 +32,26 @@ del driver original. No modifica modelos, routing ni aceptación.
    exacto. `features.hooks=true` y el archivo `hooks.json` no bastan: el TUI puede
    mostrar un hook instalado y cero activos. El ensayo autorizó únicamente el
    hook suministrado por Herdr, en ese perfil privado.
-6. Desactivar el aviso de actualización únicamente en el perfil privado o
-   seleccionar `Skip`. Herdr llegó a informar `interactive_ready=true` mientras
-   Codex esperaba una elección de actualización o confianza.
+6. Desactivar el aviso de actualización únicamente en el perfil privado
+   (`check_for_update_on_startup=false`) o seleccionar `Skip`. Herdr llegó a
+   informar `interactive_ready=true` mientras Codex esperaba una elección de
+   actualización o confianza. Con Codex 0.159.3, registrar también en el perfil
+   privado las migraciones de modelo vistas (`[notice.model_migrations]`, por
+   ejemplo `"gpt-5.6-sol" = "gpt-6-sol"`): el aviso "Meet GPT-6 Sol" consume el
+   prompt y el guard lo bloquea.
 7. Antes de admitir Plan, leer las cuatro superficies exactas con Herdr. El
    helper `codex_startup_blocker` rechaza los diálogos observados y exige el
    prompt de entrada de la versión probada. El controlador local lo aplica
-   antes de reservar una primera tarea. No pulsa elecciones ni concede permisos.
+   antes de reservar una primera tarea y no concede permisos. Con el contrato
+   `codex-0.159-v1` responde una única vez el aviso exacto de Folder access con
+   "Open restricted" y lo registra; ninguna otra elección se pulsa (ver
+   [contrato de versiones](herdr-cli-versions.md)).
 8. La identidad de sesión puede aparecer al crear el primer turno. No inventarla
    desde el nombre del panel. El hook debe reportarla a Herdr, y el collector
    original debe verificar identidad, prompt, turno, respuesta final y CAS.
 
-El helper de superficie es conservador y específico del TUI Codex 0.153
-observado. Una versión, idioma o superficie distintos pueden necesitar otra
+El helper de superficie es conservador y específico de cada TUI Codex
+observado (0.153 y 0.159.3). Una versión, idioma o superficie distintos pueden necesitar otra
 comprobación. Un prompt visible no demuestra que el modelo haya trabajado ni
 que la política efectiva esté atestada.
 

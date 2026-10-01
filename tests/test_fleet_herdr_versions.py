@@ -36,13 +36,13 @@ class VersionContractTests(unittest.TestCase):
         backend = self.fixture.booted()
         value = backend.state()
         self.assertEqual(value["schema_version"], 3)
-        self.assertEqual(value["runtime_contract"], versions.OFFICIAL_CONTRACT)
+        self.assertEqual(value["runtime_contract"], versions.CURRENT_CONTRACT)
         self.assertEqual(value["backend_version"], "0.9.0")
         self.assertTrue((self.fixture.runs / backend.runtime_relative).is_file())
 
     def test_wrong_cli_pair_fails_before_workspace_or_state_creation(self):
         fake = self.fixture.fake
-        for herdr, codex in (("0.8.2", "0.153.4"), ("0.9.0", "0.153.0"), ("0.9.1", "0.153.4")):
+        for herdr, codex in (("0.8.2", "0.159.3"), ("0.9.0", "0.154.0"), ("0.9.1", "0.159.3")):
             with self.subTest(herdr=herdr, codex=codex):
                 fake.calls.clear();fake.version=herdr;fake.codex_version=codex
                 backend=self.fixture.backend()
@@ -142,7 +142,7 @@ class VersionContractTests(unittest.TestCase):
     def test_cached_result_rejects_runtime_contract_removed_even_if_resealed(self):
         backend,run,_=self.fixture.permission_result_fixture()
         result=backend.collect_result(run)
-        self.assertEqual(result["evidence"]["runtime_contract"],versions.OFFICIAL_CONTRACT)
+        self.assertEqual(result["evidence"]["runtime_contract"],versions.CURRENT_CONTRACT)
         result["evidence"].pop("runtime_contract");result.pop("result_artifact_id")
         result["result_artifact_id"]=fleet_artifacts.put_bytes(self.fixture.runs,self.fixture.mission_id,
             fleet_json.canonical_bytes(result))["artifact_id"]

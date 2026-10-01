@@ -49,16 +49,17 @@ def require_command(backend,command,executable):
     # The task-inline startup preview is a fixed local CLI operation, not a
     # general Codex execution allowance. It precedes backend publication during
     # first boot and uses only the exact frozen selection flags thereafter.
-    from fleet_herdr_versions import TASK_CONTEXT_CONTRACT
+    from fleet_herdr_versions import task_inline
     from fleet_herdr_skill_context import PROBE, flags
-    if backend.initial_runtime_contract == TASK_CONTEXT_CONTRACT:
+    if task_inline(backend.initial_runtime_contract):
         expected = ["codex", *(flags(backend.context) if backend.context is not None else []),
                     "debug", "prompt-input", PROBE]
         if command == expected:
             return
     if (not all(type(v) is str and '\0' not in v for v in command)
             or command[:3]!=[executable,'--session',backend.session]
-            or tuple(command[3:5]) not in {('workspace','create'),('pane','split'),('agent','start'),('agent','prompt')}):
+            or tuple(command[3:5]) not in {('workspace','create'),('pane','split'),('agent','start'),('agent','prompt'),
+                                           ('agent','send-keys')}):
         raise ValueError('unsupported personal CLI operation')
 
     with fleet_safe_paths.RootedFS(backend.runs_dir) as fs:
@@ -73,6 +74,17 @@ def require_command(backend,command,executable):
         if len(matches)!=1: raise ValueError('personal prompt differs from durable send intent')
         item=matches[0]
         require(backend,run_id=item['run_id'],prompt_sha256=item['prompt_sha256'],instance_id=item['instance_id'])
+    elif operation==('agent','send-keys'):
+        # Only the codex-0.159-v1 Folder access acknowledgment: one Enter to an
+        # owned, started or starting agent that has not acknowledged before.
+        # The backend decides from the exact surface; this bounds the effect.
+        from fleet_herdr_versions import state_contract
+        contract=state_contract(saved)
+        members=[m for m in saved['members'] if len(command)==7 and m['agent_name']==command[5]
+                 and m['start_phase'] in {'starting','started'} and not m.get('startup_acknowledgments')]
+        if (len(members)!=1 or command[6]!='enter' or not contract
+                or contract['startup_guard']!='codex-0.159-v1'):
+            raise ValueError('personal key press differs from the startup acknowledgment')
     elif operation==('agent','start'):
         members=[m for m in saved['members'] if len(command)>5 and m['agent_name']==command[5]
                  and m['start_phase']=='starting']

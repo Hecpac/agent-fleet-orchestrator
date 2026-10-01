@@ -63,9 +63,9 @@ python3 scripts/mission-run.py dry research-sample "Investigate then implement" 
   --target-repo /absolute/path/to/clean/repository --json
 ```
 
-New personal CLI runs select `official-cli-personal-v1` and require Herdr **0.9.0**
-and Codex CLI **0.154.0**. Existing **0.153.4** contracts remain readable and retain
-their exact runtime requirements. Both contracts use backend state schema v3 and
+New runs in both lanes freeze the `codex-0.159-v1` contract and require Herdr **0.9.0**
+and Codex CLI **0.159.3**. Existing **0.154.0** and **0.153.4** contracts remain readable
+and retain their exact runtime requirements. Both contracts use backend state schema v3 and
 are checked against collected transcript metadata. See [personal operation](personal-autonomy.md)
 for idle fleet preparation and source snapshots.
 Historical schema v2 remains readable without an implicit upgrade. See
@@ -135,7 +135,10 @@ agent effects; `--allow-dirty-baseline` does not silently drop their changes.
 Each launch supplies an exact-candidate, invocation-only `projects` override with
 `trust_level="untrusted"`. It does not edit the global Codex configuration or enable
 project-local hooks/configuration. Update or approval dialogs are not accepted
-automatically. After an operator exits an unsubmitted startup, `retry-start
+automatically. Under `codex-0.159-v1` the backend acknowledges exactly one dialog,
+the restricted Folder access notice that Codex 0.159.3 shows for every untrusted
+folder, once per member and recorded in `startup_acknowledgments`; see
+[CLI versions](herdr-cli-versions.md). After an operator exits an unsubmitted startup, `retry-start
 --mission-id MISSION_UUID --instance lead --json` can retry only if the exact owned
 pane is back at its shell and Herdr proves the old agent absent. Attempts retain
 separate receipts; this operation refuses any existing submission.

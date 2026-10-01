@@ -598,6 +598,10 @@ class _Driver:
             if self.options["herdr_personal_cli"] != PROFILE:
                 raise HerdrMissionError("unknown personal CLI profile")
             launch_options["personal_cli"] = True
+            # Opt-in through FLEET_CODEX_ROOT (exported by `just`): pin each
+            # Mission to a certified side-by-side Codex install.
+            import fleet_codex_registry
+            launch_options["codex_registry"] = fleet_codex_registry.from_environment(os.environ)
         if self.options.get("herdr_launch_manifest") is not None:
             home = self.root / "herdr-launch" / "controller"
             launch_options = {"launch_manifest": self.options["herdr_launch_manifest"],

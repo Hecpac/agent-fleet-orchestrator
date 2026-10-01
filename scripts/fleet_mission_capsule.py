@@ -424,11 +424,12 @@ class CapsuleBackend:
 def main():
     import argparse
     parser=argparse.ArgumentParser(description='Prepare a pinned Mission capsule manifest without generating text')
-    parser.add_argument('--image',type=Path,required=True)
+    parser.add_argument('--image',type=Path,default=None,
+                        help='Codex image; defaults to the side-by-side install under FLEET_CODEX_ROOT')
     parser.add_argument('--codex-home',type=Path,required=True)
     parser.add_argument('--output',type=Path,required=True)
     args=parser.parse_args()
-    value=manifest(args.image,args.codex_home)
+    value=manifest(args.image or capsule.default_image(),args.codex_home)
     raw=fleet_json.canonical_bytes(value)
     with args.output.open('xb') as stream:
         stream.write(raw); stream.flush(); os.fsync(stream.fileno())

@@ -33,7 +33,7 @@ CAPABILITIES = {
 
 def validate_binding(value):
     contracts.exact(value, {"cli", "cli_version", "provider", "model", "effort"}, "runtime")
-    if (value["cli"] != "codex" or value["cli_version"] not in {"0.154.0", "0.155.1"}
+    if (value["cli"] != "codex" or value["cli_version"] not in {"0.154.0", "0.155.1", "0.159.3"}
             or value["provider"] != "openai" or value["model"] not in {"gpt-6-astra", "gpt-5.6-sol"}
             or value["effort"] not in {"high", "max"}):
         raise contracts.ContractError("runtime has no owner evidence adapter")

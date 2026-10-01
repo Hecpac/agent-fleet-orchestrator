@@ -227,8 +227,8 @@ class B02SharedStartupTests(unittest.TestCase):
         self.compiled = workflow_config.compile_path(
             ROOT / "workflows" / "herdr-minimal-implementation.yaml")
         self.fake = FakeHerdr()
-        self.fake.codex_version = "0.154.0"
-        self.fake.screen = "OpenAI Codex (v0.154.0)\n› Ask Codex to do anything\n"
+        self.fake.codex_version = "0.159.3"
+        self.fake.screen = "OpenAI Codex (v0.159.3)\n› Ask Codex to do anything\n"
         def transport(command, **kwargs):
             if command[0] == "codex" and command[-3:] == [
                     "debug", "prompt-input", "FLEET_LOCAL_CONTEXT_PROBE"]:
@@ -257,7 +257,7 @@ class B02SharedStartupTests(unittest.TestCase):
                              for call in self.fake.calls)
         self.fake.screen = "Hooks need review\n1 hook is new or changed\n› Ask Codex to do anything"
         with self.assertRaisesRegex(fleet_herdr.HerdrBackendError, "blocked before prompt"):
-            self.backend._require_deliverable(member)
+            self.backend._require_deliverable(member, backend_state, lambda: None)
         self.assertEqual(sum(self.fake.operation(call)[1:3] == ["agent", "prompt"]
                              for call in self.fake.calls), prompts_before)
 

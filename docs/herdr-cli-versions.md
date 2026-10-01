@@ -1,7 +1,8 @@
 # Contrato de versiones del CLI
 
-El nuevo carril personal usa **Herdr 0.9.0 y Codex CLI 0.154.0**.
-El contrato ordinario anterior de **0.153.4** se conserva sin migración implícita.
+Las Missions nuevas de ambos carriles usan **Herdr 0.9.0 y Codex CLI 0.159.3**
+(contrato `codex-0.159-v1`, certificado el 2026-10-01). Los contratos anteriores
+de **0.154.0** (personal) y **0.153.4** (oficial) se conservan sin migración implícita.
 La matriz está definida en `scripts/fleet_herdr_versions.py`; no se acepta un
 rango abierto de versiones ni se modifica automáticamente un run histórico.
 Modelos, routing, política de permisos y contratos de resultado conservan sus
@@ -10,7 +11,9 @@ evidencia nueva; no concede autoridad a stdout ni a una respuesta del modelo.
 
 | Carril | Estado durable | Reglas |
 |---|---|---|
-| CLI personal nuevo | `schema_version=3`, `backend_version=0.9.0`, `runtime_contract` | Exige `cli_version=0.154.0`; el arranque en espera no demuestra inferencia |
+| CLI certificado (carril personal con `FLEET_CODEX_ROOT`) | `schema_version=3`, contrato `version: 2` con `certification` | Fija la Mission a la instalación certificada en paralelo (`PATH` del pane) y comprueba su SHA-256; ver [actualización de CLI](cli-updates.md) |
+| CLI actual (ambos carriles) | `schema_version=3`, `backend_version=0.9.0`, `runtime_contract` | Exige `cli_version=0.159.3` y el guard `codex-0.159-v1`; el arranque en espera no demuestra inferencia |
+| CLI personal anterior | `schema_version=3`, `backend_version=0.9.0`, `runtime_contract` | Exige `cli_version=0.154.0`; legible y operable sólo con ese binario |
 | CLI oficial anterior | `schema_version=3`, `backend_version=0.9.0`, `runtime_contract` | Verifica ambos CLI antes de efectos; el transcript de resultado debe declarar `cli_version=0.153.4` |
 | Backend histórico | `schema_version=2`, `backend_version=0.8.2`, sin `runtime_contract` | Sigue siendo legible sin consultar binarios. Sus operaciones conservan la comprobación histórica de Herdr 0.8.2; no se convierten al carril nuevo |
 | Launcher experimental instrumentado | Manifiestos v1/v2 originales | Mantiene Herdr 0.8.2 y Codex 0.153.0 fijados por identidad de archivo. El CLI oficial nuevo no incorpora sus extensiones |
@@ -51,9 +54,25 @@ envíos pasan por el guard de entrega antes de guardar un nuevo intento de
 transporte. El guard usa `agent read --source visible` y después vuelve a
 comprobar la identidad exacta y el estado del agente. Rechaza avisos de confianza
 de proyecto/hooks, actualización, autenticación, `Resuming session` y superficies
-sin el prompt reconocido. No pulsa Enter para resolverlos.
+sin el prompt reconocido. Con los contratos 0.153/0.154 no pulsa ninguna tecla.
 
-Esta comprobación es específica del TUI Codex 0.153 observado, no una API atómica
+El guard `codex-0.159-v1` añade los diálogos de 0.159.3 (Folder access, confianza,
+tarea existente, migración de modelo) y responde **sólo uno**: el aviso exacto de
+Folder access que Codex muestra siempre para una carpeta `untrusted`, como el
+candidate. Su opción resaltada, "Open restricted", mantiene las restricciones y
+no cambia la confianza guardada. El backend exige coincidencia exacta de texto,
+ruta y opción resaltada, envía un único Enter antes de cualquier prompt, persiste
+la confirmación en el miembro (`startup_acknowledgments`, hashes de pantalla
+antes/después) y vuelve a juzgar la superficie. Si el aviso reaparece o queda
+otro diálogo, bloquea; nunca pulsa una segunda vez ni elige "Trust and continue".
+El carril personal sólo media ese `agent send-keys <agente> enter`. La
+migración de modelo no se responde: el perfil privado debe registrarla en
+`[notice.model_migrations]` (por ejemplo `"gpt-5.6-sol" = "gpt-6-sol"`); si
+aparece, el guard bloquea. Codex 0.159.3 también genera un título de tarea con
+una petición adicional al modelo tras cada turno, sin clave documentada para
+desactivarlo; el consumo medido debe contemplarla.
+
+Esta comprobación es específica de cada TUI Codex observado, no una API atómica
 de admisión de input: cambios de idioma, diálogos desconocidos, texto del historial
 y carreras entre lectura y envío siguen siendo limitaciones. Un rechazo del guard
 de superficie no crea un nuevo `submission`. La rama previa `agent_status=blocked`
@@ -85,7 +104,9 @@ python3 -B -m unittest discover -s tests -p 'test_fleet_herdr*.py'
 git diff --check
 ```
 
-El ensayo real de mantenimiento se conserva en
+La certificación de 0.159.3 se conserva en `outputs/c6_xyujij/RESULTADO.md`
+(observaciones previas en `outputs/cex91_aoh/` y `outputs/cgsta7oq9/`).
+El ensayo real de mantenimiento de 0.153.4 se conserva en
 `outputs/vcxdp5z3c/`. Para repetirlo en **otro** directorio privado:
 
 ```sh

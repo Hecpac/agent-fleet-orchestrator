@@ -112,7 +112,7 @@ def _inspect_transcript(raw: bytes, *, agent_session: str, model: str, turn_id: 
     if not observation_only and any(r.get("type") == "response_item" and r["payload"].get("type") == "message"
            and r["payload"].get("role") == "user" for r in rows[prompt_index + 1:end]):
         raise EvidenceError("additional user input after bound prompt")
-    if not observation_only and runtime_contract == versions.TASK_CONTEXT_CONTRACT:
+    if not observation_only and versions.task_inline(runtime_contract):
         for row in rows[start:prompt_index]:
             payload = row["payload"]
             if (row.get("type") == "response_item" and payload.get("role") == "user"
@@ -172,7 +172,7 @@ def verify_result(result: dict[str, Any], *, read_artifact, role: str, cwd: str,
                 prompt_sha256=prompt_sha256, expected_manifest=capsule_manifest, current=current)
         if 'capsule_launch_artifact_id' in proof:
             raise EvidenceError('capsule evidence requires creation-bound permission policy')
-        if proof.get("runtime_contract") == versions.TASK_CONTEXT_CONTRACT:
+        if versions.task_inline(proof.get("runtime_contract")):
             fleet_herdr_skill_context.validate(fleet_json.loads(read_artifact(proof["context_artifact_id"])))
             fleet_herdr_skill_context.verify_task(read_artifact(prompt_sha256), role, read_artifact)
         expected = permissions.policy(role, cwd, version=permission_version)

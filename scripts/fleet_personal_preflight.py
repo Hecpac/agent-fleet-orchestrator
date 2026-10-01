@@ -5,23 +5,39 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import os
 import shutil
 import subprocess
 import sys
 
-from fleet_herdr_versions import PERSONAL_CONTRACT
+import fleet_codex_registry as codex_registry
+import fleet_herdr_versions as versions
+from fleet_herdr_versions import CURRENT_CONTRACT
 
 
 def command(argv: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(argv, capture_output=True, text=True, timeout=15, check=False)
 
 
-def inspect(target: Path, *, run=command, which=shutil.which) -> dict:
+def inspect(target: Path, *, run=command, which=shutil.which, environment=None) -> dict:
     target = target.resolve(strict=True)
+    # With FLEET_CODEX_ROOT the Missions use the latest certified side-by-side
+    # Codex, not the operator's global binary, which may be newer.
+    store = codex_registry.from_environment(os.environ if environment is None else environment)
+    entry = store.latest_certified(herdr_version=CURRENT_CONTRACT["herdr_version"]) if store else None
+    contract = versions.certified_contract(entry) if entry else dict(CURRENT_CONTRACT)
+    pin = None
+    if entry:
+        pin = {"codex_version": entry["codex_version"], "bin_dir": entry["bin_dir"],
+               "certification": entry["certification_sha256"]}
+        try:
+            store.verify_install(entry)
+        except codex_registry.RegistryError:
+            pin["status"] = "changed_or_missing"
     checks, binaries = {}, {}
-    for name, expected in (("herdr", PERSONAL_CONTRACT["herdr_version"]),
-                           ("codex", PERSONAL_CONTRACT["codex_version"])):
-        binary = which(name)
+    for name, expected in (("herdr", contract["herdr_version"]),
+                           ("codex", contract["codex_version"])):
+        binary = str(Path(entry["bin_dir"]) / "codex") if name == "codex" and entry else which(name)
         binaries[name] = binary
         check = {"path": binary, "expected": expected, "observed": None, "status": "missing"}
         if binary:
@@ -58,13 +74,15 @@ def inspect(target: Path, *, run=command, which=shutil.which) -> dict:
         source.update(status="dirty" if entries else "clean", changed_entries=len(entries))
     blockers = [f"{name}_{check['status']}" for name, check in checks.items()
                 if check["status"] != "compatible"]
+    if pin and pin.get("status"):
+        blockers.append("certified_codex_install_" + pin["status"])
     if auth != "chatgpt":
         blockers.append("personal_chatgpt_login_unavailable")
     if source["status"] != "clean":
         blockers.append("target_requires_exact_snapshot" if source["status"] == "dirty"
                         else "target_git_unavailable")
     return {"schema_version": 1, "lane": "official-cli-personal-v1",
-            "runtime_contract": dict(PERSONAL_CONTRACT), "binaries": checks,
+            "runtime_contract": contract, "codex_pin": pin, "binaries": checks,
             "authentication": auth, "target": source, "capabilities": advertised,
             "blockers": blockers, "runtime_preflight": "PASS" if not blockers else "BLOCKED",
             "mission_requirements": ["explicit_session", "objective", "acceptance_contract"],

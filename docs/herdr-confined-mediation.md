@@ -59,7 +59,11 @@ Los módulos relevantes son `test_fleet_native_sandbox`,
 `test_fleet_chatgpt_provider`, `test_fleet_mission_capsule` y
 `test_fleet_mediation_contract`. Son pruebas con proveedor sintético.
 El carril nativo requiere fijar `FLEET_CODEX_IMAGE` al binario ya instalado;
-sin él esas pruebas se omiten y no acreditan ejecución del CLI.
+sin él esas pruebas se omiten y no acreditan ejecución del CLI. Su versión sigue
+siendo 0.154.0: con 0.159.3 la suite real falla. Desde el 2026-10-01 se usa la
+instalación en paralelo `~/.local/share/fleet-codex/versions/0.154.0/`, que es
+también la imagen por defecto de `fleet_mission_capsule.py` cuando
+`FLEET_CODEX_ROOT` está definido ([actualización de CLI](cli-updates.md)).
 
 La evidencia de esta integración queda en
 `outputs/complete-mediation-_ka4jd2a/`: baseline/diff previo, logs de pruebas,

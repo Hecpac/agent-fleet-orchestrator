@@ -18,7 +18,12 @@ import uuid
 import fleet_acceptance
 import fleet_herdr as herdr
 import fleet_herdr_permissions as permissions
+import hashlib
+import time
+
+import fleet_herdr_startup as startup
 from fleet_herdr_startup import codex_startup_blocker
+from fleet_herdr_versions import CURRENT_CONTRACT
 import fleet_json
 import fleet_personal_preflight as preflight
 import fleet_safe_paths
@@ -88,7 +93,7 @@ class Pool:
         screen = self.call(saved, "agent", "read", member["name"], "--source", "visible")
         if screen.returncode or len(screen.stdout) > 128 * 1024:
             raise PoolError("prepared Codex surface is unavailable")
-        reason = codex_startup_blocker(screen.stdout)
+        reason = codex_startup_blocker(screen.stdout, saved.get("startup_guard", CURRENT_CONTRACT["startup_guard"]))
         return {"role": member["role"], "name": member["name"], "pane_id": member["pane_id"],
                 "status": observed["agent_status"], "startup_blocker": reason,
                 "ready": observed["agent_status"] in {"idle", "done"} and reason is None,
@@ -112,9 +117,15 @@ class Pool:
                              "target": str(target), "session": session, "phase": "allocating",
                              "label": "Agent Fleet · Lista · " + pool_id[:8], "workspace": None,
                              "herdr_binary": diagnostic["binaries"]["herdr"]["path"], "members": [],
-                             "controller_prompts_sent": 0, "mission_id": None, "pending": "workspace.create"}
+                             "controller_prompts_sent": 0, "mission_id": None, "pending": "workspace.create",
+                             "startup_guard": diagnostic.get("runtime_contract", CURRENT_CONTRACT)["startup_guard"],
+                             "codex_pin": diagnostic.get("codex_pin")}
                     self.save(fs, saved)
-                    env = ["--env", "PATH=" + os.environ.get("PATH", "")]
+                    path = os.environ.get("PATH", "")
+                    if saved["codex_pin"]:
+                        # Same pin as the Missions: the certified install leads PATH.
+                        path = saved["codex_pin"]["bin_dir"] + ":" + path
+                    env = ["--env", "PATH=" + path]
                     for name in ("CODEX_HOME", "HOME"):
                         if os.environ.get(name):
                             env += ["--env", name + "=" + os.environ[name]]
@@ -165,10 +176,37 @@ class Pool:
                         raise PoolError("agent start identity differs")
                     member["phase"] = "started"
                     self.save(fs, saved)
+                    self.acknowledge_folder_access(fs, saved, member, target)
                 observations = [self.observe_member(saved, m) for m in saved["members"]]
                 saved["phase"] = "ready" if all(o["ready"] for o in observations) else "blocked"
                 self.save(fs, saved)
                 return {**saved, "observations": observations}
+
+    def acknowledge_folder_access(self, fs, saved, member, target):
+        """Answer only the exact 0.159 Folder access notice, once, and record it.
+
+        Same rule as the Mission backend: "Open restricted" keeps restrictions
+        and changes no saved trust; any other dialog stays visible and blocks.
+        """
+        guard = saved.get("startup_guard", CURRENT_CONTRACT["startup_guard"])
+        screen = self.call(saved, "agent", "read", member["name"], "--source", "visible")
+        if screen.returncode or not startup.folder_access_notice(
+                screen.stdout, guard=guard, cwd=str(target), home=os.environ.get("HOME")):
+            return
+        if member.get("startup_acknowledgments"):
+            raise PoolError("Codex folder access notice reappeared after its acknowledgment")
+        before = hashlib.sha256(screen.stdout.encode()).hexdigest()
+        if self.call(saved, "agent", "send-keys", member["name"], "enter").returncode:
+            raise PoolError("Codex folder access acknowledgment was not delivered")
+        member["startup_acknowledgments"] = [{"guard": guard, "notice": "folder-access-open-restricted",
+                                              "key": "enter", "screen_before_sha256": before}]
+        self.save(fs, saved)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            screen = self.call(saved, "agent", "read", member["name"], "--source", "visible")
+            if screen.returncode == 0 and codex_startup_blocker(screen.stdout, guard) is None:
+                break
+            time.sleep(0.25)
 
     @staticmethod
     def member(saved, role, pane):

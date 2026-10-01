@@ -38,6 +38,10 @@ TERMINAL = {"succeeded", "failed", "blocked", "abandoned", "indeterminate", "not
 # The whole task travels as one argv element; the controller refuses larger
 # prompts before admission instead of discovering the limit at exec time.
 MAX_PROMPT_BYTES = 512 * 1024
+# Bounded wait for Codex to leave the acknowledged Folder access notice.
+STARTUP_ACK_SETTLE_SECONDS = 10.0
+STARTUP_ACK_FIELDS = frozenset({"guard", "notice", "key", "screen_before_sha256",
+                                "screen_after_sha256", "acknowledged_at"})
 QUIESCENT = {"idle", "done", "blocked"}
 RunCommand = Callable[..., subprocess.CompletedProcess[str]]
 TranscriptResolver = Callable[[str], Optional[Path]]
@@ -227,6 +231,8 @@ class HerdrBackend:
         personal_cli: bool = False,
         run_command: RunCommand | None = None,
         transcript_resolver: TranscriptResolver | None = None,
+        codex_registry: Any = None,
+        codex_candidate: Mapping[str, Any] | None = None,
     ) -> None:
         try:
             self.runs_dir = fleet_safe_paths.canonical_root(runs_dir)
@@ -242,7 +248,8 @@ class HerdrBackend:
         if type(personal_cli) is not bool or personal_cli and launch_manifest is not None:
             raise HerdrBackendError("personal CLI cannot use the experimental launcher")
         self.personal_cli = personal_cli
-        self.initial_runtime_contract = dict(versions.PERSONAL_CONTRACT if personal_cli else versions.OFFICIAL_CONTRACT)
+        # New Missions use the current certified CLI pair in both lanes.
+        self.initial_runtime_contract = dict(versions.CURRENT_CONTRACT)
         self.launch_manifest = fleet_herdr_launch.validate_manifest(launch_manifest) if launch_manifest is not None else None
         if not isinstance(session, str) or not SESSION_NAME.fullmatch(session):
             raise HerdrBackendError("Herdr session must be an explicit safe name")
@@ -283,10 +290,53 @@ class HerdrBackend:
         if self.profile is not fleet_herdr_profile.LEGACY and (launch_manifest is not None or not personal_cli):
             raise HerdrBackendError("versioned profile requires the personal Codex lane without experimental launch")
         if self.profile is not fleet_herdr_profile.LEGACY:
-            self.initial_runtime_contract = dict(versions.TASK_CONTEXT_CONTRACT)
+            self.initial_runtime_contract = dict(versions.CURRENT_TASK_CONTEXT_CONTRACT)
+        # Codex version pinning (Herdr resolves `codex` from the pane PATH). A
+        # candidate under certification or the latest registered certification
+        # selects the contract of a new Mission; _load re-pins existing ones.
+        self.codex_registry = codex_registry
+        self.codex_pin: dict[str, Any] | None = None
+        self._base_path = self.environment["PATH"]
+        if codex_candidate is not None or codex_registry is not None:
+            if launch_manifest is not None or not personal_cli and codex_candidate is None:
+                raise HerdrBackendError("Codex version pinning requires the personal CLI lane")
+            if codex_candidate is not None:
+                entry = {**dict(codex_candidate), "certification_sha256": versions.CANDIDATE_CERTIFICATION}
+            else:
+                entry = codex_registry.latest_certified(herdr_version=versions.HERDR_VERSION)
+            if entry is not None:
+                self.initial_runtime_contract = versions.certified_contract(
+                    entry, task_inline_skills=versions.task_inline(self.initial_runtime_contract))
+                self._pin_codex(entry)
         self.context = None
         self.member_contract = self.profile.members
         self.members = self._compiled_members()
+
+    def _pin_codex(self, entry: Mapping[str, Any]) -> None:
+        bin_dir = str(entry["bin_dir"])
+        if not Path(bin_dir).is_absolute() or ":" in bin_dir:
+            raise HerdrBackendError("pinned Codex directory must be an absolute PATH entry")
+        self.codex_pin = {"codex_version": entry["codex_version"], "bin_dir": bin_dir,
+                          "binary_sha256": entry["binary_sha256"],
+                          "certification": entry["certification_sha256"]}
+        self.environment["PATH"] = bin_dir + ":" + self._base_path
+
+    def _resolve_pin(self, contract: Mapping[str, Any] | None) -> None:
+        """Bind an existing Mission to the exact install its contract certified."""
+        if not versions.certified(contract):
+            self.codex_pin = None
+            self.environment["PATH"] = self._base_path
+            return
+        if contract["certification"] == versions.CANDIDATE_CERTIFICATION:
+            if self.codex_pin is None or self.codex_pin["certification"] != versions.CANDIDATE_CERTIFICATION:
+                raise HerdrBackendError("candidate Codex contract requires its certification run")
+            return
+        if self.codex_registry is None:
+            raise HerdrBackendError("certified Codex contract requires FLEET_CODEX_ROOT")
+        entry = self.codex_registry.by_certification(contract["certification"])
+        if entry is None or entry["codex_version"] != contract["codex_version"]:
+            raise HerdrBackendError("certified Codex install missing; reconcile without relaunch")
+        self._pin_codex(entry)
 
     def _default_transcript(self, agent_session: str) -> Path | None:
         if self.launch_manifest is not None:
@@ -425,9 +475,34 @@ class HerdrBackend:
             raise HerdrBackendError("Herdr compiled router launch identity drift")
         return list(command)
 
+    def _verify_codex_pin(self, contract: Mapping[str, Any]) -> None:
+        """The pane PATH must resolve `codex` to the certified bytes."""
+        import shutil
+        pin = self.codex_pin
+        if pin is None or pin["certification"] != contract["certification"]:
+            raise HerdrBackendError("certified Codex contract is not pinned")
+        expected = Path(pin["bin_dir"]) / "codex"
+        found = shutil.which("codex", path=self.environment["PATH"])
+        if found is None or Path(found) != expected:
+            raise HerdrBackendError("pinned Codex is not first on the Mission PATH")
+        try:
+            digest = hashlib.sha256(expected.resolve(strict=True).read_bytes()).hexdigest()
+        except OSError as exc:
+            raise HerdrBackendError("certified Codex install missing; reconcile without relaunch") from exc
+        if digest != pin["binary_sha256"]:
+            raise HerdrBackendError("certified Codex binary changed since certification")
+
     def _initial_state(self) -> dict[str, Any]:
         context_pin = None
-        if self.initial_runtime_contract == versions.TASK_CONTEXT_CONTRACT:
+        contract = self.initial_runtime_contract
+        if (versions.certified(contract) and contract["certification"] != versions.CANDIDATE_CERTIFICATION):
+            # The certification record enters this Mission's CAS under its own id,
+            # so readers can see what was certified without the machine registry.
+            stored = fleet_artifacts.put_bytes(self.runs_dir, self.mission_id,
+                self.codex_registry.record_bytes(contract["certification"]))["artifact_id"]
+            if stored != contract["certification"]:
+                raise HerdrBackendError("Codex certification record identity differs")
+        if versions.task_inline(self.initial_runtime_contract):
             names = fleet_herdr_skill_context.catalog(self._context_preview([]))
             self.context = {"policy": fleet_herdr_skill_context.POLICY, "disabled_skills": names}
             self._check_context()
@@ -589,6 +664,17 @@ class HerdrBackend:
                 member["pending_retry"], dict
             ):
                 raise HerdrBackendError("Herdr durable pending retry is invalid")
+            acknowledgments = member.get("startup_acknowledgments")
+            if acknowledgments is not None:
+                contract = versions.state_contract(state)
+                if (not contract or contract["startup_guard"] != fleet_herdr_startup.GUARD_0159
+                        or not isinstance(acknowledgments, list) or len(acknowledgments) != 1
+                        or not isinstance(acknowledgments[0], dict)
+                        or set(acknowledgments[0]) != STARTUP_ACK_FIELDS
+                        or acknowledgments[0]["guard"] != fleet_herdr_startup.GUARD_0159
+                        or acknowledgments[0]["notice"] != "folder-access-open-restricted"
+                        or acknowledgments[0]["key"] != "enter"):
+                    raise HerdrBackendError("Herdr durable startup acknowledgment is invalid")
             if member.get("start_phase") == "started":
                 if not all(
                     isinstance(member.get(key), str) and member[key]
@@ -659,8 +745,9 @@ class HerdrBackend:
         except ValueError as exc:
             raise HerdrBackendError(str(exc)) from exc
         if value is not None:
+            self._resolve_pin(value.get("runtime_contract"))
             self.context = None
-            if value.get("runtime_contract") == versions.TASK_CONTEXT_CONTRACT:
+            if versions.task_inline(value.get("runtime_contract")):
                 self.context = fleet_herdr_skill_context.validate(fleet_json.loads(fleet_artifacts.get_bytes(
                     self.runs_dir, self.mission_id, value["context_artifact_id"])))
         return self._validate_state(value) if value is not None else None
@@ -707,6 +794,8 @@ class HerdrBackend:
         if version.returncode != 0 or version.stdout.strip() != f"herdr {expected_herdr}":
             raise HerdrBackendError(f"Herdr backend requires exact CLI version {expected_herdr}; no implicit runtime migration")
         if contract:
+            if versions.certified(contract):
+                self._verify_codex_pin(contract)
             codex = self._command(["codex", "--version"])
             if codex.returncode != 0 or codex.stdout.strip() != f"codex-cli {contract['codex_version']}":
                 raise HerdrBackendError(f"Herdr backend requires exact Codex CLI version {contract['codex_version']}")
@@ -878,17 +967,51 @@ class HerdrBackend:
             raise HerdrBackendError("Herdr agent surface was not observed ready after start")
         return receipt
 
-    def _require_deliverable(self, member: Mapping[str, Any]) -> None:
-        """A ready receipt can describe a modal or a restored metadata-only pane.
-
-        This is a conservative delivery guard, never an acceptance or sandbox
-        proof. No key is sent to dismiss a dialog, and no prompt is retried.
-        """
+    def _read_surface(self, member: Mapping[str, Any]) -> str:
         screen = self._command(["herdr", "agent", "read", str(member["agent_name"]),
                                 "--source", "visible"])
         if screen.returncode != 0 or len(screen.stdout) > 128 * 1024:
             raise HerdrBackendError("Codex delivery surface is unavailable")
-        reason = fleet_herdr_startup.codex_startup_blocker(screen.stdout)
+        return screen.stdout
+
+    def _require_deliverable(self, member: dict[str, Any], state: Mapping[str, Any],
+                             persist: Callable[[], None]) -> None:
+        """A ready receipt can describe a modal or a restored metadata-only pane.
+
+        This is a conservative delivery guard, never an acceptance or sandbox
+        proof, and no prompt is retried. The contract's guard decides. Only
+        ``codex-0.159-v1`` may answer one dialog: the exact restricted Folder
+        access notice, whose default keeps restrictions and changes no saved
+        trust. One Enter per member, before any prompt, then the surface must
+        be ready. The acknowledgment is persisted on the member right after the
+        key press, before the surface is judged again.
+        """
+        contract = versions.state_contract(dict(state))
+        guard = contract["startup_guard"] if contract else fleet_herdr_startup.GUARD_0153
+        screen = self._read_surface(member)
+        if fleet_herdr_startup.folder_access_notice(
+                screen, guard=guard, cwd=str(self.target_repo), home=self.environment.get("HOME")):
+            if member.get("startup_acknowledgments"):
+                raise HerdrBackendError("Codex folder access notice reappeared after its acknowledgment")
+            before = hashlib.sha256(screen.encode()).hexdigest()
+            sent = self._command(["herdr", "agent", "send-keys", str(member["agent_name"]), "enter"])
+            if sent.returncode != 0:
+                raise HerdrBackendError("Codex folder access acknowledgment was not delivered")
+            record = {"guard": guard, "notice": "folder-access-open-restricted", "key": "enter",
+                      "screen_before_sha256": before, "screen_after_sha256": None,
+                      "acknowledged_at": _now()}
+            member["startup_acknowledgments"] = [record]
+            persist()
+            deadline = time.monotonic() + STARTUP_ACK_SETTLE_SECONDS
+            while True:
+                screen = self._read_surface(member)
+                if (fleet_herdr_startup.codex_startup_blocker(screen, guard) is None
+                        or time.monotonic() >= deadline):
+                    break
+                time.sleep(0.25)
+            record["screen_after_sha256"] = hashlib.sha256(screen.encode()).hexdigest()
+            persist()
+        reason = fleet_herdr_startup.codex_startup_blocker(screen, guard)
         if reason:
             raise HerdrBackendError(f"Codex delivery blocked before prompt: {reason}")
         receipt = self._get_agent(member, allow_missing_session=member.get("agent_session") is None)
@@ -940,7 +1063,8 @@ class HerdrBackend:
                                 allow_missing_session=member["agent_session"] is None,
                             )
                             if state.get("runtime_contract"):
-                                self._require_deliverable(member)
+                                self._require_deliverable(
+                                    member, state, lambda: self._save(rooted, state, exists=True))
                         return _copy(state)
                     workspace = state["workspace"]
                     if workspace["workspace_id"] is None:
@@ -1077,7 +1201,8 @@ class HerdrBackend:
                                     "Herdr agent surface was not observed ready after start"
                                 )
                         if state.get("runtime_contract"):
-                            self._require_deliverable(member)
+                            self._require_deliverable(
+                                member, state, lambda: self._save(rooted, state, exists=True))
                         if ready_receipt["agent_session"] is not None:
                             if (
                                 member["agent_session"] is not None
@@ -1404,7 +1529,8 @@ class HerdrBackend:
                         raise HerdrBackendError(
                             "Herdr agent is not quiescent for an unambiguous prompt"
                         )
-                    self._require_deliverable(member)
+                    self._require_deliverable(
+                        member, state, lambda: self._save(rooted, state, exists=True))
                     usage_baseline_artifact_id = self._capture_usage_baseline(
                         run_id=normalized_run, prompt_sha256=prompt_sha256,
                         generation=state["generation"], member=member)

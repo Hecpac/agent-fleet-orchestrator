@@ -27,7 +27,22 @@ import fleet_json
 import fleet_native_sandbox as sandbox
 
 # Separate compatibility profile: never relabel historical Herdr 0.153 runs.
+# Its real Seatbelt suite passes with 0.154.0 and fails with 0.159.3 (2026-10-01),
+# so the capsule keeps its own side-by-side install while the global CLI updates.
 CODEX_VERSION = "0.154.0"
+
+
+def default_image(environment=None) -> Path:
+    """The side-by-side install of CODEX_VERSION under FLEET_CODEX_ROOT."""
+    import fleet_codex_registry
+    store = fleet_codex_registry.from_environment(os.environ if environment is None else environment)
+    if store is None:
+        raise sandbox.SandboxError("set FLEET_CODEX_ROOT or pass the Codex image explicitly")
+    link = store.bin_dir(CODEX_VERSION) / "codex"
+    if not link.exists():
+        raise sandbox.SandboxError(f"Codex {CODEX_VERSION} is not installed side by side; "
+                                   "install it with fleet_codex_registry")
+    return link.resolve(strict=True)
 
 
 @dataclass(frozen=True)
